@@ -40,11 +40,12 @@ from ai_backend import execute_ai as _REAL_NATIVE_AI
 from dataclasses import replace
 from runtime_context import using_runtime_context
 
-@pytest.fixture
+@pytest.fixture(autouse=True)
 def selected_host_context(host, selected_host_context, tmp_path, tmp_path_factory):
     private = tmp_path_factory.mktemp("smart-private")
     selected = replace(selected_host_context, vault_path=tmp_path,
         state_path=private / "state", index_path=private / "index.sqlite3",
+        user_home=tmp_path_factory.mktemp("smart-account-home"),
         config=dict(selected_host_context.config, vault_path=str(tmp_path),
                     codex_ai_model="gpt-native-configured"))
     with using_runtime_context(selected):
@@ -1102,11 +1103,12 @@ def test_outer_telemetry_invariant_with_partial_parse(selected_host_context, mon
     evidence = {"p": {"commits": [], "merged_prs": [], "closed_issues": []}}
 
     parsed = oid.classify_groups_with_agent(merged_groups, evidence)
-    # Native results are all-or-none: missing g2 cannot produce success telemetry.
-    assert parsed == []
-    assert oid.get_last_classifier_mode() == "heuristic-fallback"
+    # Covered and prefiltered verdicts survive; g2 remains explicitly unclassified.
+    assert {item["group_id"] for item in parsed} == {"g1", "g3"}
+    assert oid.get_last_classifier_mode() == "partial"
     captured = capsys.readouterr()
-    assert "[check-items] classifier-result:" not in captured.err
+    assert "classifier PARTIAL: 1 of 3" in captured.err
+    assert "total_classified=2 prefiltered=1 subagent=1" in captured.err
 
 
 # ---------------------------------------------------------------------------
@@ -1421,7 +1423,7 @@ def test_verify_before_edit_handles_line_out_of_range(tmp_path):
 def test_dashboard_report_always_written_on_dry_run(tmp_path):
     """Test 7 - --dry-run still writes the report."""
     from check_items_report import write_check_items_dashboard
-    vault = tmp_path / "vault"
+    vault = tmp_path
     (vault / "claude-dashboards").mkdir(parents=True)
 
     path = write_check_items_dashboard(
@@ -1454,7 +1456,7 @@ def test_dashboard_report_threads_skipped_count(tmp_path):
     can see cascade candidates that were refused or lost, not only the
     ones that succeeded."""
     from check_items_report import write_check_items_dashboard
-    vault = tmp_path / "vault"
+    vault = tmp_path
     (vault / "claude-dashboards").mkdir(parents=True)
 
     path = write_check_items_dashboard(
@@ -1482,7 +1484,7 @@ def test_report_filename_scope_suffix(tmp_path):
     """Test 8 - project scope -> check-items-<project>-<date>.md;
     'vault' -> check-items-vault-<date>.md."""
     from check_items_report import write_check_items_dashboard
-    vault = tmp_path / "vault"
+    vault = tmp_path
     (vault / "claude-dashboards").mkdir(parents=True)
 
     p1 = write_check_items_dashboard(
@@ -1505,7 +1507,7 @@ def test_dashboard_body_includes_merged_groups_audit(tmp_path):
     """Spec § Dashboard audit — body must list each merge with reasoning.
     Also exercises all four classification buckets and action_required."""
     from check_items_report import write_check_items_dashboard
-    vault = tmp_path / "vault"
+    vault = tmp_path
     (vault / "claude-dashboards").mkdir(parents=True)
     merges = [
         {"canonical_group_id": "ob-0004", "absorbed_group_ids": ["ob-0003"],
@@ -1549,7 +1551,7 @@ def test_dashboard_body_includes_review_section(tmp_path):
     REVIEW classification would look correct in the live Step-7 print but
     silently vanish from the file that gets left behind for the user."""
     from check_items_report import write_check_items_dashboard
-    vault = tmp_path / "vault"
+    vault = tmp_path
     (vault / "claude-dashboards").mkdir(parents=True)
     classifications = [
         {"group_id": "g1", "classification": "REVIEW",
@@ -1582,7 +1584,7 @@ def test_applied_review_item_renders_checked(tmp_path):
     stamped by Step 8's primary-flip loop) must render `- [x]`, even though
     REVIEW is never auto-checked by classification alone."""
     from check_items_report import write_check_items_dashboard
-    vault = tmp_path / "vault"
+    vault = tmp_path
     (vault / "claude-dashboards").mkdir(parents=True)
     classifications = [
         {"group_id": "g1", "classification": "REVIEW",
@@ -1605,7 +1607,7 @@ def test_unapplied_done_item_renders_unchecked(tmp_path):
     render `- [ ]`, not `- [x]` -- this is what stops the by-fact fix from
     marking everything checked (DONE no longer means auto-checked)."""
     from check_items_report import write_check_items_dashboard
-    vault = tmp_path / "vault"
+    vault = tmp_path
     (vault / "claude-dashboards").mkdir(parents=True)
     classifications = [
         {"group_id": "g1", "classification": "DONE",
@@ -1627,7 +1629,7 @@ def test_done_heading_counts_only_applied_done_items(tmp_path):
     """The ## Done heading must count applied DONE items, not the run's
     total applied count -- an applied REVIEW flip must not inflate it."""
     from check_items_report import write_check_items_dashboard
-    vault = tmp_path / "vault"
+    vault = tmp_path
     (vault / "claude-dashboards").mkdir(parents=True)
     classifications = [
         {"group_id": "g1", "classification": "DONE",
@@ -1653,7 +1655,7 @@ def test_applied_elsewhere_line_names_non_done_flips(tmp_path):
     the arithmetic once the ## Done heading stops over-counting -- a summary
     line must name it."""
     from check_items_report import write_check_items_dashboard
-    vault = tmp_path / "vault"
+    vault = tmp_path
     (vault / "claude-dashboards").mkdir(parents=True)
     classifications = [
         {"group_id": "g1", "classification": "DONE",
@@ -1684,7 +1686,7 @@ def test_applied_outside_done_derived_from_stamps_not_subtraction(tmp_path):
     outside DONE" (5 - 1) though only ONE record anywhere outside DONE
     renders checked. The correct, fact-derived count is 1."""
     from check_items_report import write_check_items_dashboard
-    vault = tmp_path / "vault"
+    vault = tmp_path
     (vault / "claude-dashboards").mkdir(parents=True)
     classifications = [
         {"group_id": "g1", "classification": "DONE",
@@ -1711,7 +1713,7 @@ def test_applied_outside_done_derived_from_stamps_not_subtraction(tmp_path):
 def test_dashboard_idempotent_overwrite(tmp_path):
     """Same scope + same date overwrites previous file."""
     from check_items_report import write_check_items_dashboard
-    vault = tmp_path / "vault"
+    vault = tmp_path
     (vault / "claude-dashboards").mkdir(parents=True)
     p1 = write_check_items_dashboard(
         vault_path=str(vault), scope_name="x", date_str="2026-05-11",
@@ -1732,7 +1734,7 @@ def test_dashboard_idempotent_overwrite(tmp_path):
 def test_dashboard_active_truncation_and_path_guard(tmp_path):
     """ACTIVE >50 items are truncated in the body; path-containment guard is present."""
     from check_items_report import write_check_items_dashboard
-    vault = tmp_path / "vault"
+    vault = tmp_path
     (vault / "claude-dashboards").mkdir(parents=True)
     active_items = [
         {"group_id": f"g{i}", "classification": "ACTIVE",
@@ -1826,7 +1828,7 @@ def test_dashboard_renders_merge_records(tmp_path):
     """Records shaped by merge_records_from_groups render in the dashboard
     body's Merged Groups section."""
     from check_items_report import write_check_items_dashboard
-    vault = tmp_path / "vault"
+    vault = tmp_path
     (vault / "claude-dashboards").mkdir(parents=True)
     groups = [
         {"group_id": "ob-1",
@@ -1849,7 +1851,7 @@ def test_dashboard_tolerates_int_merges(tmp_path):
     (type + repr), not silently coerce to [] and read as 'no merges this
     run', which would hide the caller bug."""
     from check_items_report import write_check_items_dashboard
-    vault = tmp_path / "vault"
+    vault = tmp_path
     (vault / "claude-dashboards").mkdir(parents=True)
     path = write_check_items_dashboard(
         vault_path=str(vault), scope_name="x", date_str="2026-05-11",
@@ -1870,7 +1872,7 @@ def test_dashboard_tolerates_huge_merges_repr_truncated(tmp_path):
     The warning must cap the repr length and say so, rather than writing
     an unbounded blob into a kept artefact."""
     from check_items_report import write_check_items_dashboard
-    vault = tmp_path / "vault"
+    vault = tmp_path
     (vault / "claude-dashboards").mkdir(parents=True)
     huge_bad_value = "x" * 5000
     path = write_check_items_dashboard(
@@ -1891,7 +1893,7 @@ def test_dashboard_tolerates_none_merges(tmp_path):
     """merges=None is a legitimate 'nothing to report' -- renders the plain
     fallback with NO warning line (unlike the int case above)."""
     from check_items_report import write_check_items_dashboard
-    vault = tmp_path / "vault"
+    vault = tmp_path
     (vault / "claude-dashboards").mkdir(parents=True)
     path = write_check_items_dashboard(
         vault_path=str(vault), scope_name="x", date_str="2026-05-11",
@@ -1911,7 +1913,7 @@ def test_dashboard_tolerates_none_merges(tmp_path):
 
 def test_dashboard_renders_evidence_gap_section(tmp_path):
     from check_items_report import write_check_items_dashboard
-    vault = tmp_path / "vault"
+    vault = tmp_path
     (vault / "claude-dashboards").mkdir(parents=True)
     evidence_gaps = {
         "projects_scanned": 1, "projects_with_evidence": 0,
@@ -1934,7 +1936,7 @@ def test_dashboard_omits_gap_section_when_no_gaps(tmp_path):
     render the section -- a section that always renders would pass the
     test above while saying nothing."""
     from check_items_report import write_check_items_dashboard
-    vault = tmp_path / "vault"
+    vault = tmp_path
     (vault / "claude-dashboards").mkdir(parents=True)
     evidence_gaps = {
         "projects_scanned": 1, "projects_with_evidence": 1,
@@ -1955,7 +1957,7 @@ def test_dashboard_gap_frontmatter_field(tmp_path):
     when N is 0 for a caller who passed a real (gap-free) dict -- distinct
     from the argument being omitted entirely (see the no-op test below)."""
     from check_items_report import write_check_items_dashboard
-    vault = tmp_path / "vault"
+    vault = tmp_path
     (vault / "claude-dashboards").mkdir(parents=True)
 
     gapped = {
@@ -1987,7 +1989,7 @@ def test_dashboard_without_evidence_gaps_argument_is_unchanged(tmp_path):
     """Every existing caller omits evidence_gaps entirely -- the default
     must be a true no-op: no heading, no frontmatter key, no exception."""
     from check_items_report import write_check_items_dashboard
-    vault = tmp_path / "vault"
+    vault = tmp_path
     (vault / "claude-dashboards").mkdir(parents=True)
     path = write_check_items_dashboard(
         vault_path=str(vault), scope_name="x", date_str="2026-05-11",
@@ -2015,13 +2017,17 @@ def test_dashboard_rejects_path_traversal_in_scope_name(tmp_path, monkeypatch):
     import json
     cfg_path = tmp_path / "obsidian-brain-config.json"
     cfg_path.write_text(json.dumps({"vault_path": str(tmp_path / "vault")}))
-    monkeypatch.setattr("obsidian_utils._CONFIG_PATH", cfg_path)
+    from runtime_context import current_runtime_context
+    context = current_runtime_context()
+    configured = json.loads(cfg_path.read_text())
+    configured["vault_path"] = str(context.vault_path)
+    context.config.update(configured)
     _reset_load_config_cache()
 
     try:
         from check_items_report import write_check_items_dashboard
-        vault = tmp_path / "vault"
-        vault.mkdir(parents=True)
+        vault = tmp_path
+        vault.mkdir(parents=True, exist_ok=True)
         # Path-traversal scope name: should be sanitized, not escape
         path = write_check_items_dashboard(
             vault_path=str(vault), scope_name="../../etc/passwd", date_str="2026-05-11",
@@ -2112,7 +2118,7 @@ def test_dashboard_yaml_frontmatter_rejects_injection(tmp_path):
     sanitized token — no standalone `malicious_field: pwned` line is injected.
     """
     from check_items_report import write_check_items_dashboard
-    vault = tmp_path / "vault"
+    vault = tmp_path
     (vault / "claude-dashboards").mkdir(parents=True)
     crafted = "obsidian-brain\nmalicious_field: pwned\nscope2"
     path = write_check_items_dashboard(
@@ -2144,7 +2150,7 @@ def test_dashboard_yaml_rejects_date_injection(tmp_path):
     extra standalone YAML key-value lines inside the frontmatter block.
     """
     from check_items_report import write_check_items_dashboard
-    vault = tmp_path / "vault"
+    vault = tmp_path
     (vault / "claude-dashboards").mkdir(parents=True)
     crafted = "2026-05-11\nmalicious_field: pwned\nextra"
     path = write_check_items_dashboard(
@@ -2377,11 +2383,15 @@ def test_check_items_report_default_folder_is_claude_check_items(tmp_path, monke
     # so the default kicks in.
     cfg_path = tmp_path / "obsidian-brain-config.json"
     cfg_path.write_text(json.dumps({"vault_path": str(tmp_path / "vault")}))
-    monkeypatch.setattr("obsidian_utils._CONFIG_PATH", cfg_path)
+    from runtime_context import current_runtime_context
+    context = current_runtime_context()
+    configured = json.loads(cfg_path.read_text())
+    configured["vault_path"] = str(context.vault_path)
+    context.config.update(configured)
     _reset_load_config_cache()
 
-    vault = tmp_path / "vault"
-    vault.mkdir()
+    vault = tmp_path
+    vault.mkdir(exist_ok=True)
     from check_items_report import write_check_items_dashboard
     try:
         path = write_check_items_dashboard(
@@ -2421,11 +2431,15 @@ def test_check_items_report_honors_check_items_folder_config(tmp_path, monkeypat
         "vault_path": str(tmp_path / "vault"),
         "check_items_folder": "claude-dashboards",
     }))
-    monkeypatch.setattr("obsidian_utils._CONFIG_PATH", cfg_path)
+    from runtime_context import current_runtime_context
+    context = current_runtime_context()
+    configured = json.loads(cfg_path.read_text())
+    configured["vault_path"] = str(context.vault_path)
+    context.config.update(configured)
     _reset_load_config_cache()
 
-    vault = tmp_path / "vault"
-    vault.mkdir()
+    vault = tmp_path
+    vault.mkdir(exist_ok=True)
     from check_items_report import write_check_items_dashboard
     try:
         path = write_check_items_dashboard(
@@ -2483,11 +2497,15 @@ def test_check_items_report_rejects_parent_traversal_in_folder_config(tmp_path, 
         "vault_path": str(tmp_path / "vault"),
         "check_items_folder": "../../etc",
     }))
-    monkeypatch.setattr("obsidian_utils._CONFIG_PATH", cfg_path)
+    from runtime_context import current_runtime_context
+    context = current_runtime_context()
+    configured = json.loads(cfg_path.read_text())
+    configured["vault_path"] = str(context.vault_path)
+    context.config.update(configured)
     _reset_load_config_cache()
 
-    vault = tmp_path / "vault"
-    vault.mkdir()
+    vault = tmp_path
+    vault.mkdir(exist_ok=True)
     from check_items_report import write_check_items_dashboard
     try:
         with _pytest.raises(ValueError, match="parent-traversing|outside vault root"):
@@ -2509,11 +2527,15 @@ def test_check_items_report_rejects_absolute_folder_config(tmp_path, monkeypatch
         "vault_path": str(tmp_path / "vault"),
         "check_items_folder": "/tmp/escape",
     }))
-    monkeypatch.setattr("obsidian_utils._CONFIG_PATH", cfg_path)
+    from runtime_context import current_runtime_context
+    context = current_runtime_context()
+    configured = json.loads(cfg_path.read_text())
+    configured["vault_path"] = str(context.vault_path)
+    context.config.update(configured)
     _reset_load_config_cache()
 
-    vault = tmp_path / "vault"
-    vault.mkdir()
+    vault = tmp_path
+    vault.mkdir(exist_ok=True)
     from check_items_report import write_check_items_dashboard
     try:
         with _pytest.raises(ValueError, match="absolute|outside vault root"):
@@ -2534,11 +2556,15 @@ def test_check_items_report_empty_string_folder_uses_default(tmp_path, monkeypat
         "vault_path": str(tmp_path / "vault"),
         "check_items_folder": "",
     }))
-    monkeypatch.setattr("obsidian_utils._CONFIG_PATH", cfg_path)
+    from runtime_context import current_runtime_context
+    context = current_runtime_context()
+    configured = json.loads(cfg_path.read_text())
+    configured["vault_path"] = str(context.vault_path)
+    context.config.update(configured)
     _reset_load_config_cache()
 
-    vault = tmp_path / "vault"
-    vault.mkdir()
+    vault = tmp_path
+    vault.mkdir(exist_ok=True)
     from check_items_report import write_check_items_dashboard
     try:
         path = write_check_items_dashboard(**_make_minimal_dashboard_kwargs(vault))

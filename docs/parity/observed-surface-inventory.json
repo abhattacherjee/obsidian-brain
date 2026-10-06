@@ -25,13 +25,10 @@
     "check-items": [
       "apply-reviewed",
       "artifact-store",
-      "classify",
       "collect",
       "config",
-      "partition",
       "prepare",
       "scope",
-      "semantic-merge",
       "stage-01",
       "stage-02",
       "stage-03",
@@ -39,8 +36,7 @@
       "stage-05",
       "stage-06",
       "stage-07",
-      "stage-08",
-      "update-cache"
+      "stage-08"
     ],
     "compress": [
       "artifact-store",
@@ -448,8 +444,7 @@
     "scripts/vault_doctor.py": [
       "insights_folder",
       "sessions_folder",
-      "vault",
-      "vault_path"
+      "vault"
     ],
     "scripts/vault_doctor_checks/__init__.py": [
       "vault_path"
@@ -529,7 +524,8 @@
       "OBSIDIAN_BRAIN_DB",
       "OBSIDIAN_BRAIN_STATE_DIR",
       "PLUGIN_ROOT",
-      "XDG_DATA_HOME"
+      "XDG_DATA_HOME",
+      "XDG_STATE_HOME"
     ],
     "hooks/skill_procedures.py": [
       "BUCKETS_PATH",
@@ -542,6 +538,9 @@
       "RAW_PATH",
       "SCOPE_PATH",
       "SKIPS_FILE"
+    ],
+    "scripts/ci-checks/check-parity-acceptance.py": [
+      "NATIVE_ACCEPTANCE_BUNDLE"
     ],
     "scripts/dev-test/codex_install.py": [
       "CODEX_HOME"
@@ -566,9 +565,6 @@
     ],
     "scripts/vault_doctor_checks/audit_historic_repairs.py": [
       "OBSIDIAN_BRAIN_DOCTOR_BACKUP_ROOT"
-    ],
-    "scripts/ci-checks/check-parity-acceptance.py": [
-      "NATIVE_ACCEPTANCE_BUNDLE"
     ]
   },
   "unresolved_environment_reads": []

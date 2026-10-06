@@ -47,18 +47,7 @@ procedure variables `VAULT_PATH`/`VAULT`, `SESSIONS_FOLDER`/`SESS`, and
 `INSIGHTS_FOLDER`/`INS`. Use the canonical project returned in config JSON (and native `session` when available),
 not the basename of an unrelated shell working directory.
 
-Before preparing edits or requesting a summary of an existing note, call
-`note-read` and retain its exact `expected_revision`. Apply the proposed note
-with `note-apply` and that revision. A conflict leaves the current note intact;
-show the pending result and do not count the note as saved. New curated notes
-use `note-create`; they never overwrite a collision. Native memory discovery
-is unsupported for Codex because it has no equivalent native memory-file API; shared vault retrieval
-and wiki filing continue without borrowing another host's memory.
-
-Read `references/host-claude.md` or `references/host-codex.md` when present.
-All note writes described below use `note-create` or revision-bound `note-apply`,
-including bidirectional related links. Content is a JSON string, never shell code.
-Every later save or edit follows this revision-bound publication rule.
+Use only the operations documented for this skill. Their writes bind the source revisions before analysis and preserve manual edits on conflict. Content is JSON data, never shell code. Read `references/host-claude.md` or `references/host-codex.md` when present. Codex has no native memory-file API; shared vault retrieval and wiki filing continue without borrowing another host's memory.
 
 
 # vault-doctor — Audit and Repair the Obsidian Vault
@@ -79,12 +68,28 @@ Audit and repair the Obsidian vault. Ships with 13 checks — 9 in the default s
 - `/vault-doctor --check audit-historic-repairs` — one-shot audit of historic source-sessions repairs: diffs doctor backups against current notes, classifies each repair (A restore / B keep / C ambiguous / D both-wrong) by date agreement, and restores category-A mtime-bug corruptions on `fix`. **Opt-in** — excluded from the default all-checks sweep; must be named via `--check`. `--days` bounds backup-run age (default 180).
 - `/vault-doctor --check missing-frontmatter-fence` — repair notes whose frontmatter lost its opening `---` fence (the leading-fence-eaten failure mode: the first byte is the first frontmatter key, so the note parses as having no frontmatter at all and is invisible to tag-based Dataview queries). Only flags a note when all four preconditions hold: first line is not `---`, first line is `key:`-shaped, a closing `---` exists within the frontmatter line bound, and every line above it is frontmatter-shaped. The fix inserts `---` as a new first line and changes nothing else (line endings and file mode preserved). `--days` is ignored (the damage is historic). Re-run `/vault-reindex` afterwards so the recovered frontmatter reaches the index.
 - `/vault-doctor --check memory-index`: use the selected host memory capability. Detailed Claude index rules and the explicit Codex limitation are in the paired references.
-- `/vault-doctor --check wiki-pages` — check the LLM wiki's pages under `<wiki_folder>/queries/` (#396). Per page: `stale` (a source changed, a newer note matches the question, or the fingerprint is unverifiable), `broken-source` (a cited note or memory file is gone), `reviewed-stale` (a page marked `reviewed` that is stale; `/vault-ask` never refreshes these on its own, so you re-check your edits), `auto-filed` (`filed_by: auto`, listed for review), `orphan` (no vault note links `[[page]]` except the page itself and the wiki's own `index.md`, `index-<project>.md` and `log-<year>.md` at the wiki root; only pages whose `updated` date is inside `--days`) and `page-unreadable` (always shown, even under `--project`, because its project is unknown). Once for the wiki: `index-drift` when the index files differ from a fresh rebuild (a hand edit, a missing `index.md`, or a leftover `index-*.md` typed `claude-wiki-index`). **Only `index-drift` is fixed by `fix`:** it backs up the current index files under the backup root, then rebuilds them under the wiki lock (skipped with a reason if another process holds it). Every other row is report-only (unresolved, confidence 0.0), so `--min-confidence` above 0.0 hides every row except `index-drift`. The wiki folder comes from the config file, read at run time; a wiki that is turned off or not created yet reports nothing, and so does an empty wiki (no pages and no index files yet). A corrupt config, an invalid `wiki_folder`, or a `queries/` folder that cannot be read crashes the check (exit 2) instead of looking clean. The check lists the pages, then syncs the vault index, because index lines come from it. The index is shared and belongs to the configured `vault_path`, so a `--vault` (or `OBSIDIAN_BRAIN_VAULT`) that names another folder skips this check with one stderr line. In the default sweep; `--days` defaults to all time here.
+- `/vault-doctor --check wiki-pages` — check the LLM wiki's pages under `<wiki_folder>/queries/` (#396). Per page: `stale` (a source changed, a newer note matches the question, or the fingerprint is unverifiable), `broken-source` (a cited note or memory file is gone), `reviewed-stale` (a page marked `reviewed` that is stale; `/vault-ask` never refreshes these on its own, so you re-check your edits), `auto-filed` (`filed_by: auto`, listed for review), `orphan` (no vault note links `[[page]]` except the page itself and the wiki's own `index.md`, `index-<project>.md` and `log-<year>.md` at the wiki root; only pages whose `updated` date is inside `--days`) and `page-unreadable` (always shown, even under `--project`, because its project is unknown). Once for the wiki: `index-drift` when the index files differ from a fresh rebuild (a hand edit, a missing `index.md`, or a leftover `index-*.md` typed `claude-wiki-index`). **Only `index-drift` is fixed by `fix`:** it backs up the current index files under the backup root, then rebuilds them under the shared vault lock (skipped with a reason if another process holds it). Every other row is report-only (unresolved, confidence 0.0), so `--min-confidence` above 0.0 hides every row except `index-drift`. The wiki folder comes from the config file, read at run time; a wiki that is turned off or not created yet reports nothing, and so does an empty wiki (no pages and no index files yet). A corrupt config, an invalid `wiki_folder`, or a `queries/` folder that cannot be read crashes the check (exit 2) instead of looking clean. The check lists the pages, then syncs the vault index, because index lines come from it. The index is shared and belongs to the configured `vault_path`, so a `--vault` (or `OBSIDIAN_BRAIN_VAULT`) that names another folder skips this check with one stderr line. In the default sweep; `--days` defaults to all time here.
 - `/vault-doctor --days 14` — override default window (default: 7 days)
 - `/vault-doctor --project obsidian-brain` — limit to one project
 - `/vault-doctor fix --check source-sessions --days 7` — combine flags
 - `/vault-doctor --min-confidence 0.9` — dry-run showing only issues with confidence >= 0.9; report header notes the active filter and dropped count
 - `/vault-doctor fix --min-confidence 0.9` — apply only the high-confidence subset (conf >= 0.9); preview matches apply scope exactly
+
+## Explicit pending-intent acknowledgment
+
+Ordinary `fix` retains conflicting pending intents and manual note edits. Dry-run
+reports registered same-vault pending state without replay or migration. A bounded
+audit is incomplete, not clean. Pending information exits 1; actual recovery
+errors or lost input exit 2. Explicit apply allows up to 60 seconds for verified
+coordination migration before the separate bounded recovery pass.
+
+Discard an intent only when the user explicitly names that private intent and
+approves its exact SHA256 digest. Send `--apply --discard-pending <absolute private
+intent path> --expected-pending-sha256 <64 lowercase hex digits>` in the doctor
+request's `argv`. This acknowledges only that unchanged registered intent, then
+returns. It never applies its proposed note changes or repairs other notes.
+`--yes` alone does not authorize discard. A changed digest or an unrelated path
+is refused. Keep private intent contents out of the report and conversation.
 
 ## Procedure
 
@@ -170,7 +175,7 @@ python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_C
 Capture stdout as the JSON report. Exit codes:
 
 - `0` — clean vault, nothing to do
-- `1` — issues found (expected for a dry-run that finds things)
+- `1` — issues found or capture recovery pending; read `capture_recovery` even when `total_issues` is zero
 - `2` — apply errors OR one or more checks crashed (results incomplete; see `crashed_checks` in JSON)
 - `3` — usage error (bad args, missing config)
 
@@ -178,7 +183,13 @@ If exit code is `3`, surface the stderr message directly to the user and stop.
 
 ### Step 3 — Present the report to the user
 
-Parse the JSON and present a grouped-by-project table.
+Parse the JSON and present a grouped-by-project table. Also read `capture_recovery`
+when present, including pending source/mutation counts, warnings, and loss of
+input. Pending retained input is not a clean report even when there are zero
+note-repair issues. `pending_intents` gives at most 32 private paths and exact
+SHA256 digests for operator review. A true `pending_intent_references_bounded`
+means those references are incomplete. Never print proposed intent contents or
+discard an intent without the user approving its exact path and digest.
 
 For each issue, after the `proposed:` line (when present), render a
 `signal: <capture_signal> (conf <capture_confidence>)` line. The values
@@ -252,37 +263,24 @@ Stop here.
 
 If the user DID pass `fix`:
 
-> Found **N** repairable issue(s) across **K** project(s). I'll apply per project with confirmation.
-
-Re-run the dispatcher with `--apply` (do NOT pass `--yes` — let the dispatcher prompt per project interactively):
-
-Request for `doctor` (substitute the values as data):
+Ask the user to approve the listed repairs. After approval, send `--apply --yes` in
+`argv`. This applies exactly the approved scan scope without a second prompt.
 
 ```json
 {
-  "argv": [
-    "--json",
-    "<selected doctor flags>"
-  ]
+  "argv": ["--json", "--apply", "--yes", "<selected doctor flags>"]
 }
 ```
 
-Request for `doctor`:
-
-```json
-{
-  "argv": [
-    "--json",
-    "<selected doctor flags>"
-  ]
-}
-```
+If approval is per project, run only the approved project with `--project`.
+The launcher closes child stdin unless the request supplies a `stdin` string.
+To use the dispatcher's prompts instead, omit `--yes` and put one approved
+`y\n` or `n\n` answer per prompt in `stdin`, in the displayed check/project order.
+Never claim that a child can read further answers from the parent terminal.
 
 ```bash
 python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'doctor' < "$REQUEST_PATH"
 ```
-
-The dispatcher will prompt `Apply N fix(es) for project 'X' in check 'Y'? [y/N]` on stderr for each project. Relay each prompt to the user and pipe their response to the dispatcher's stdin.
 
 ### Step 5 — Report the outcome
 

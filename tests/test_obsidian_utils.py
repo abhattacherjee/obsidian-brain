@@ -52,6 +52,7 @@ def selected_host_context(selected_host_context, host, tmp_path, tmp_path_factor
         config_path.write_text(json.dumps(config))
         selected = replace(selected, vault_path=tmp_path, state_path=private / "state",
                            index_path=private / "index.sqlite3", config_path=config_path,
+                           user_home=tmp_path_factory.mktemp("utils-account-home"),
                            config=MappingProxyType(config))
     with using_runtime_context(selected):
         yield selected
@@ -72,136 +73,144 @@ def tmp_vault(selected_host_context):
 
 class TestLoadConfig:
     def test_load_config_valid(self, tmp_path, monkeypatch):
-        """Write a valid config JSON, verify it merges with defaults."""
-        config_file = tmp_path / "obsidian-brain-config.json"
-        user_cfg = {
-            "vault_path": str(tmp_path / "vault"),
-            "sessions_folder": "my-sessions",
-        }
-        config_file.write_text(json.dumps(user_cfg), encoding="utf-8")
+        with using_runtime_context(None):
+            """Write a valid config JSON, verify it merges with defaults."""
+            config_file = tmp_path / "obsidian-brain-config.json"
+            user_cfg = {
+                "vault_path": str(tmp_path / "vault"),
+                "sessions_folder": "my-sessions",
+            }
+            config_file.write_text(json.dumps(user_cfg), encoding="utf-8")
 
-        monkeypatch.setattr(obsidian_utils, "_CONFIG_PATH", config_file)
-        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
+            monkeypatch.setattr(obsidian_utils, "_CONFIG_PATH", config_file)
+            monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
 
-        result = obsidian_utils.load_config()
+            result = obsidian_utils.load_config()
 
-        assert result["vault_path"] == str(tmp_path / "vault")
-        assert result["sessions_folder"] == "my-sessions"
-        # Default keys still present
-        assert result["insights_folder"] == "claude-insights"
-        assert result["min_messages"] == 3
-        assert result["summary_model"] == "haiku"
+            assert result["vault_path"] == str(tmp_path / "vault")
+            assert result["sessions_folder"] == "my-sessions"
+            # Default keys still present
+            assert result["insights_folder"] == "claude-insights"
+            assert result["min_messages"] == 3
+            assert result["summary_model"] == "haiku"
 
     def test_load_config_missing(self, tmp_path, monkeypatch):
-        """Monkeypatch to nonexistent path — defaults should be returned."""
-        monkeypatch.setattr(
-            obsidian_utils, "_CONFIG_PATH", tmp_path / "no-such-config.json"
-        )
-        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
+        with using_runtime_context(None):
+            """Monkeypatch to nonexistent path — defaults should be returned."""
+            monkeypatch.setattr(
+                obsidian_utils, "_CONFIG_PATH", tmp_path / "no-such-config.json"
+            )
+            monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
 
-        result = obsidian_utils.load_config()
+            result = obsidian_utils.load_config()
 
-        assert result["vault_path"] == ""
-        assert result["sessions_folder"] == "claude-sessions"
-        assert result["min_messages"] == 3
-        assert result["auto_log_enabled"] is True
+            assert result["vault_path"] == ""
+            assert result["sessions_folder"] == "claude-sessions"
+            assert result["min_messages"] == 3
+            assert result["auto_log_enabled"] is True
 
     def test_get_project_name(self):
-        """Test get_project_name with a path and with empty string."""
-        assert obsidian_utils.get_project_name("/home/user/my-project") == "my-project"
-        assert obsidian_utils.get_project_name("") == "unknown"
+        with using_runtime_context(None):
+            """Test get_project_name with a path and with empty string."""
+            assert obsidian_utils.get_project_name("/home/user/my-project") == "my-project"
+            assert obsidian_utils.get_project_name("") == "unknown"
 
     def test_load_config_summary_pipeline_user_override(self, tmp_path, monkeypatch):
-        """User config with summary_pipeline=subagent must surface through load_config."""
-        config_file = tmp_path / "obsidian-brain-config.json"
-        config_file.write_text(json.dumps({"summary_pipeline": "subagent"}), encoding="utf-8")
+        with using_runtime_context(None):
+            """User config with summary_pipeline=subagent must surface through load_config."""
+            config_file = tmp_path / "obsidian-brain-config.json"
+            config_file.write_text(json.dumps({"summary_pipeline": "subagent"}), encoding="utf-8")
 
-        monkeypatch.setattr(obsidian_utils, "_CONFIG_PATH", config_file)
-        # Use a unique sid per call so the session-scoped config cache never
-        # bleeds between test invocations (mirrors the pattern used throughout
-        # this class — see _get_session_id_fast mock above).
-        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
+            monkeypatch.setattr(obsidian_utils, "_CONFIG_PATH", config_file)
+            # Use a unique sid per call so the session-scoped config cache never
+            # bleeds between test invocations (mirrors the pattern used throughout
+            # this class — see _get_session_id_fast mock above).
+            monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
 
-        cfg = obsidian_utils.load_config()
-        assert cfg["summary_pipeline"] == "subagent"
+            cfg = obsidian_utils.load_config()
+            assert cfg["summary_pipeline"] == "subagent"
 
     def test_load_config_summary_pipeline_default_is_auto(self, tmp_path, monkeypatch):
-        """No user override → summary_pipeline defaults to 'auto'."""
-        config_file = tmp_path / "obsidian-brain-config.json"
-        config_file.write_text(json.dumps({"vault_path": str(tmp_path)}), encoding="utf-8")
+        with using_runtime_context(None):
+            """No user override → summary_pipeline defaults to 'auto'."""
+            config_file = tmp_path / "obsidian-brain-config.json"
+            config_file.write_text(json.dumps({"vault_path": str(tmp_path)}), encoding="utf-8")
 
-        monkeypatch.setattr(obsidian_utils, "_CONFIG_PATH", config_file)
-        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
+            monkeypatch.setattr(obsidian_utils, "_CONFIG_PATH", config_file)
+            monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
 
-        cfg = obsidian_utils.load_config()
-        assert cfg["summary_pipeline"] == "auto"
+            cfg = obsidian_utils.load_config()
+            assert cfg["summary_pipeline"] == "auto"
 
 
 class TestGetWorkspaceRoots:
     """Tests for the get_workspace_roots() helper (R13 C5 — config-driven workspace roots)."""
 
     def test_reads_workspace_roots_from_config(self, tmp_path, monkeypatch):
-        """Config with workspace_roots returns tilde-expanded, existing dirs."""
-        ws1 = tmp_path / "ws1"
-        ws2 = tmp_path / "ws2"
-        ws1.mkdir()
-        ws2.mkdir()
+        with using_runtime_context(None):
+            """Config with workspace_roots returns tilde-expanded, existing dirs."""
+            ws1 = tmp_path / "ws1"
+            ws2 = tmp_path / "ws2"
+            ws1.mkdir()
+            ws2.mkdir()
 
-        config_file = tmp_path / "obsidian-brain-config.json"
-        config_file.write_text(
-            json.dumps({"workspace_roots": [str(ws1), str(ws2)]}),
-            encoding="utf-8",
-        )
-        config_file.chmod(0o600)
+            config_file = tmp_path / "obsidian-brain-config.json"
+            config_file.write_text(
+                json.dumps({"workspace_roots": [str(ws1), str(ws2)]}),
+                encoding="utf-8",
+            )
+            config_file.chmod(0o600)
 
-        monkeypatch.setattr(obsidian_utils, "_CONFIG_PATH", config_file)
-        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
+            monkeypatch.setattr(obsidian_utils, "_CONFIG_PATH", config_file)
+            monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
 
-        roots = obsidian_utils.get_workspace_roots()
-        assert str(ws1) in roots
-        assert str(ws2) in roots
+            roots = obsidian_utils.get_workspace_roots()
+            assert str(ws1) in roots
+            assert str(ws2) in roots
 
     def test_falls_back_to_defaults_when_key_absent(self, tmp_path, monkeypatch):
-        """Config without workspace_roots key returns historical defaults (if they exist)."""
-        config_file = tmp_path / "obsidian-brain-config.json"
-        config_file.write_text(json.dumps({"vault_path": str(tmp_path)}), encoding="utf-8")
-        config_file.chmod(0o600)
+        with using_runtime_context(None):
+            """Config without workspace_roots key returns historical defaults (if they exist)."""
+            config_file = tmp_path / "obsidian-brain-config.json"
+            config_file.write_text(json.dumps({"vault_path": str(tmp_path)}), encoding="utf-8")
+            config_file.chmod(0o600)
 
-        # Create the historical default dirs so they pass the isdir filter
-        home = os.path.expanduser("~")
-        default1 = os.path.join(home, "dev", "claude_workspace")
-        default2 = os.path.join(home, "projects")
+            # Create the historical default dirs so they pass the isdir filter
+            home = os.path.expanduser("~")
+            default1 = os.path.join(home, "dev", "claude_workspace")
+            default2 = os.path.join(home, "projects")
 
-        monkeypatch.setattr(obsidian_utils, "_CONFIG_PATH", config_file)
-        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
+            monkeypatch.setattr(obsidian_utils, "_CONFIG_PATH", config_file)
+            monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
 
-        roots = obsidian_utils.get_workspace_roots()
-        # We can't assert the exact paths since the test machine may not have them,
-        # but every returned root must exist on disk.
-        for r in roots:
-            assert os.path.isdir(r), f"get_workspace_roots returned non-existent dir: {r}"
-        # Roots must be the defaults — verify by checking they are a subset of the expected set
-        assert all(r in {default1, default2} for r in roots)
+            roots = obsidian_utils.get_workspace_roots()
+            # We can't assert the exact paths since the test machine may not have them,
+            # but every returned root must exist on disk.
+            for r in roots:
+                assert os.path.isdir(r), f"get_workspace_roots returned non-existent dir: {r}"
+            # Roots must be the defaults — verify by checking they are a subset of the expected set
+            assert all(r in {default1, default2} for r in roots)
 
     def test_filters_out_missing_directories(self, tmp_path, monkeypatch):
-        """Paths that don't exist on disk are excluded from the returned list."""
-        existing = tmp_path / "real-ws"
-        existing.mkdir()
-        missing = tmp_path / "ghost-ws"  # not created
+        with using_runtime_context(None):
+            """Paths that don't exist on disk are excluded from the returned list."""
+            existing = tmp_path / "real-ws"
+            existing.mkdir()
+            missing = tmp_path / "ghost-ws"  # not created
 
-        config_file = tmp_path / "obsidian-brain-config.json"
-        config_file.write_text(
-            json.dumps({"workspace_roots": [str(existing), str(missing)]}),
-            encoding="utf-8",
-        )
-        config_file.chmod(0o600)
+            config_file = tmp_path / "obsidian-brain-config.json"
+            config_file.write_text(
+                json.dumps({"workspace_roots": [str(existing), str(missing)]}),
+                encoding="utf-8",
+            )
+            config_file.chmod(0o600)
 
-        monkeypatch.setattr(obsidian_utils, "_CONFIG_PATH", config_file)
-        monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
+            monkeypatch.setattr(obsidian_utils, "_CONFIG_PATH", config_file)
+            monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: _unique_sid())
 
-        roots = obsidian_utils.get_workspace_roots()
-        assert str(existing) in roots
-        assert str(missing) not in roots
+            roots = obsidian_utils.get_workspace_roots()
+            assert str(existing) in roots
+            assert str(missing) not in roots
 
 
 # ===========================================================================
@@ -2284,233 +2293,241 @@ class TestBuildContextBriefSort:
 
 
 def test_get_session_id_fast_rejects_stale_bootstrap(tmp_path, monkeypatch):
-    """Fast path must fall through to slow path when a newer JSONL exists."""
-    import obsidian_utils
-    import os
-    import time
+    with using_runtime_context(None):
+        """Fast path must fall through to slow path when a newer JSONL exists."""
+        import obsidian_utils
+        import os
+        import time
 
-    # Fake ~/.claude/projects/<project>/ with two JSONL files
-    project_basename = "fake-proj-abc"
-    cc_projects = tmp_path / ".claude" / "projects" / f"-foo-{project_basename}"
-    cc_projects.mkdir(parents=True)
+        # Fake ~/.claude/projects/<project>/ with two JSONL files
+        project_basename = "fake-proj-abc"
+        cc_projects = tmp_path / ".claude" / "projects" / f"-foo-{project_basename}"
+        cc_projects.mkdir(parents=True)
 
-    old_jsonl = cc_projects / "old-sid-0000.jsonl"
-    new_jsonl = cc_projects / "new-sid-9999.jsonl"
-    old_jsonl.write_text("{}", encoding="utf-8")
-    new_jsonl.write_text("{}", encoding="utf-8")
-    os.utime(old_jsonl, (time.time() - 7200, time.time() - 7200))
-    os.utime(new_jsonl, (time.time() - 60, time.time() - 60))
+        old_jsonl = cc_projects / "old-sid-0000.jsonl"
+        new_jsonl = cc_projects / "new-sid-9999.jsonl"
+        old_jsonl.write_text("{}", encoding="utf-8")
+        new_jsonl.write_text("{}", encoding="utf-8")
+        os.utime(old_jsonl, (time.time() - 7200, time.time() - 7200))
+        os.utime(new_jsonl, (time.time() - 60, time.time() - 60))
 
-    proj_dir = tmp_path / project_basename
-    proj_dir.mkdir()
-    monkeypatch.chdir(proj_dir)
-    monkeypatch.setenv("HOME", str(tmp_path))
+        proj_dir = tmp_path / project_basename
+        proj_dir.mkdir()
+        monkeypatch.chdir(proj_dir)
+        monkeypatch.setenv("HOME", str(tmp_path))
 
-    bootstrap = tmp_path / f".obsidian-brain-sid-{project_basename}"
-    bootstrap.write_text("old-sid-0000", encoding="utf-8")
-    os.utime(bootstrap, (time.time() - 3600, time.time() - 3600))
+        bootstrap = tmp_path / f".obsidian-brain-sid-{project_basename}"
+        bootstrap.write_text("old-sid-0000", encoding="utf-8")
+        os.utime(bootstrap, (time.time() - 3600, time.time() - 3600))
 
-    monkeypatch.setattr(obsidian_utils, "_BOOTSTRAP_PREFIX", str(tmp_path / ".obsidian-brain-sid-"))
+        monkeypatch.setattr(obsidian_utils, "_BOOTSTRAP_PREFIX", str(tmp_path / ".obsidian-brain-sid-"))
 
-    result = obsidian_utils._get_session_id_fast()
-    assert result == "new-sid-9999", f"expected newest sid, got {result}"
+        result = obsidian_utils._get_session_id_fast()
+        assert result == "new-sid-9999", f"expected newest sid, got {result}"
 
 
 def test_get_session_id_fast_trusts_fresh_bootstrap(tmp_path, monkeypatch):
-    """Fast path must return bootstrap sid when bootstrap is newer than all JSONLs."""
-    import obsidian_utils
-    import os
-    import time
+    with using_runtime_context(None):
+        """Fast path must return bootstrap sid when bootstrap is newer than all JSONLs."""
+        import obsidian_utils
+        import os
+        import time
 
-    project_basename = "fresh-proj-xyz"
-    cc_projects = tmp_path / ".claude" / "projects" / f"-foo-{project_basename}"
-    cc_projects.mkdir(parents=True)
+        project_basename = "fresh-proj-xyz"
+        cc_projects = tmp_path / ".claude" / "projects" / f"-foo-{project_basename}"
+        cc_projects.mkdir(parents=True)
 
-    jsonl = cc_projects / "fresh-sid-1234.jsonl"
-    jsonl.write_text("{}", encoding="utf-8")
-    os.utime(jsonl, (time.time() - 3600, time.time() - 3600))
+        jsonl = cc_projects / "fresh-sid-1234.jsonl"
+        jsonl.write_text("{}", encoding="utf-8")
+        os.utime(jsonl, (time.time() - 3600, time.time() - 3600))
 
-    proj_dir = tmp_path / project_basename
-    proj_dir.mkdir()
-    monkeypatch.chdir(proj_dir)
-    monkeypatch.setenv("HOME", str(tmp_path))
+        proj_dir = tmp_path / project_basename
+        proj_dir.mkdir()
+        monkeypatch.chdir(proj_dir)
+        monkeypatch.setenv("HOME", str(tmp_path))
 
-    bootstrap = tmp_path / f".obsidian-brain-sid-{project_basename}"
-    bootstrap.write_text("fresh-sid-1234", encoding="utf-8")
-    os.utime(bootstrap, (time.time() - 60, time.time() - 60))
+        bootstrap = tmp_path / f".obsidian-brain-sid-{project_basename}"
+        bootstrap.write_text("fresh-sid-1234", encoding="utf-8")
+        os.utime(bootstrap, (time.time() - 60, time.time() - 60))
 
-    monkeypatch.setattr(obsidian_utils, "_BOOTSTRAP_PREFIX", str(tmp_path / ".obsidian-brain-sid-"))
+        monkeypatch.setattr(obsidian_utils, "_BOOTSTRAP_PREFIX", str(tmp_path / ".obsidian-brain-sid-"))
 
-    result = obsidian_utils._get_session_id_fast()
-    assert result == "fresh-sid-1234"
+        result = obsidian_utils._get_session_id_fast()
+        assert result == "fresh-sid-1234"
 
 
 def test_get_session_id_fast_invalidates_when_cached_jsonl_deleted(tmp_path, monkeypatch):
-    """Bootstrap points at a sid whose JSONL has been removed — slow path picks newest survivor."""
-    import obsidian_utils
-    import os
-    import time
+    with using_runtime_context(None):
+        """Bootstrap points at a sid whose JSONL has been removed — slow path picks newest survivor."""
+        import obsidian_utils
+        import os
+        import time
 
-    project_basename = "deleted-proj"
-    cc_projects = tmp_path / ".claude" / "projects" / f"-foo-{project_basename}"
-    cc_projects.mkdir(parents=True)
+        project_basename = "deleted-proj"
+        cc_projects = tmp_path / ".claude" / "projects" / f"-foo-{project_basename}"
+        cc_projects.mkdir(parents=True)
 
-    # Create only the "surviving" JSONL; the cached one in the bootstrap doesn't exist on disk
-    survivor = cc_projects / "survivor-sid-ffff.jsonl"
-    survivor.write_text("{}", encoding="utf-8")
-    os.utime(survivor, (time.time() - 60, time.time() - 60))
+        # Create only the "surviving" JSONL; the cached one in the bootstrap doesn't exist on disk
+        survivor = cc_projects / "survivor-sid-ffff.jsonl"
+        survivor.write_text("{}", encoding="utf-8")
+        os.utime(survivor, (time.time() - 60, time.time() - 60))
 
-    proj_dir = tmp_path / project_basename
-    proj_dir.mkdir()
-    monkeypatch.chdir(proj_dir)
-    monkeypatch.setenv("HOME", str(tmp_path))
+        proj_dir = tmp_path / project_basename
+        proj_dir.mkdir()
+        monkeypatch.chdir(proj_dir)
+        monkeypatch.setenv("HOME", str(tmp_path))
 
-    bootstrap = tmp_path / f".obsidian-brain-sid-{project_basename}"
-    bootstrap.write_text("deleted-sid-0000", encoding="utf-8")
+        bootstrap = tmp_path / f".obsidian-brain-sid-{project_basename}"
+        bootstrap.write_text("deleted-sid-0000", encoding="utf-8")
 
-    monkeypatch.setattr(
-        obsidian_utils, "_BOOTSTRAP_PREFIX", str(tmp_path / ".obsidian-brain-sid-")
-    )
+        monkeypatch.setattr(
+            obsidian_utils, "_BOOTSTRAP_PREFIX", str(tmp_path / ".obsidian-brain-sid-")
+        )
 
-    result = obsidian_utils._get_session_id_fast()
-    assert result == "survivor-sid-ffff", (
-        f"expected fast path to fall through and return newest survivor, got {result}"
-    )
+        result = obsidian_utils._get_session_id_fast()
+        assert result == "survivor-sid-ffff", (
+            f"expected fast path to fall through and return newest survivor, got {result}"
+        )
 
 
 def test_check_hook_status_matches(tmp_path, monkeypatch):
-    """check_hook_status returns ok=True when bootstrap matches current sid."""
-    import obsidian_utils
-    import os
+    with using_runtime_context(None):
+        """check_hook_status returns ok=True when bootstrap matches current sid."""
+        import obsidian_utils
+        import os
 
-    project_basename = "stat-proj"
-    cc_projects = tmp_path / ".claude" / "projects" / f"-foo-{project_basename}"
-    cc_projects.mkdir(parents=True)
-    jsonl = cc_projects / "live-sid-1111.jsonl"
-    jsonl.write_text("{}", encoding="utf-8")
+        project_basename = "stat-proj"
+        cc_projects = tmp_path / ".claude" / "projects" / f"-foo-{project_basename}"
+        cc_projects.mkdir(parents=True)
+        jsonl = cc_projects / "live-sid-1111.jsonl"
+        jsonl.write_text("{}", encoding="utf-8")
 
-    proj_dir = tmp_path / project_basename
-    proj_dir.mkdir()
-    monkeypatch.chdir(proj_dir)
-    monkeypatch.setenv("HOME", str(tmp_path))
+        proj_dir = tmp_path / project_basename
+        proj_dir.mkdir()
+        monkeypatch.chdir(proj_dir)
+        monkeypatch.setenv("HOME", str(tmp_path))
 
-    bootstrap_prefix = str(tmp_path / ".obsidian-brain-sid-")
-    monkeypatch.setattr(obsidian_utils, "_BOOTSTRAP_PREFIX", bootstrap_prefix)
-    bootstrap = tmp_path / f".obsidian-brain-sid-{project_basename}"
-    bootstrap.write_text("live-sid-1111", encoding="utf-8")
-    # Make bootstrap newer than the JSONL so the fast path trusts it
-    import time
-    os.utime(jsonl, (time.time() - 3600, time.time() - 3600))
-    os.utime(bootstrap, (time.time() - 60, time.time() - 60))
+        bootstrap_prefix = str(tmp_path / ".obsidian-brain-sid-")
+        monkeypatch.setattr(obsidian_utils, "_BOOTSTRAP_PREFIX", bootstrap_prefix)
+        bootstrap = tmp_path / f".obsidian-brain-sid-{project_basename}"
+        bootstrap.write_text("live-sid-1111", encoding="utf-8")
+        # Make bootstrap newer than the JSONL so the fast path trusts it
+        import time
+        os.utime(jsonl, (time.time() - 3600, time.time() - 3600))
+        os.utime(bootstrap, (time.time() - 60, time.time() - 60))
 
-    status = obsidian_utils.check_hook_status()
-    assert status["ok"] is True
-    assert status["bootstrap_sid"] == "live-sid-1111"
-    assert status["current_sid"] == "live-sid-1111"
+        status = obsidian_utils.check_hook_status()
+        assert status["ok"] is True
+        assert status["bootstrap_sid"] == "live-sid-1111"
+        assert status["current_sid"] == "live-sid-1111"
 
 
 def test_check_hook_status_sid_mismatch_is_ok(tmp_path, monkeypatch):
-    """SID mismatch (e.g. after reconnect) is ok=True when bootstrap exists."""
-    import obsidian_utils
-    import os, time
+    with using_runtime_context(None):
+        """SID mismatch (e.g. after reconnect) is ok=True when bootstrap exists."""
+        import obsidian_utils
+        import os, time
 
-    project_basename = "mismatch-proj"
-    cc_projects = tmp_path / ".claude" / "projects" / f"-foo-{project_basename}"
-    cc_projects.mkdir(parents=True)
-    # Two JSONLs: old one matching bootstrap, newer one for current session
-    old_jsonl = cc_projects / "old-sid-aaaa.jsonl"
-    old_jsonl.write_text("{}", encoding="utf-8")
-    new_jsonl = cc_projects / "new-sid-bbbb.jsonl"
-    new_jsonl.write_text("{}", encoding="utf-8")
-    os.utime(old_jsonl, (time.time() - 3600, time.time() - 3600))
-    os.utime(new_jsonl, (time.time() - 10, time.time() - 10))
+        project_basename = "mismatch-proj"
+        cc_projects = tmp_path / ".claude" / "projects" / f"-foo-{project_basename}"
+        cc_projects.mkdir(parents=True)
+        # Two JSONLs: old one matching bootstrap, newer one for current session
+        old_jsonl = cc_projects / "old-sid-aaaa.jsonl"
+        old_jsonl.write_text("{}", encoding="utf-8")
+        new_jsonl = cc_projects / "new-sid-bbbb.jsonl"
+        new_jsonl.write_text("{}", encoding="utf-8")
+        os.utime(old_jsonl, (time.time() - 3600, time.time() - 3600))
+        os.utime(new_jsonl, (time.time() - 10, time.time() - 10))
 
-    proj_dir = tmp_path / project_basename
-    proj_dir.mkdir()
-    monkeypatch.chdir(proj_dir)
-    monkeypatch.setenv("HOME", str(tmp_path))
+        proj_dir = tmp_path / project_basename
+        proj_dir.mkdir()
+        monkeypatch.chdir(proj_dir)
+        monkeypatch.setenv("HOME", str(tmp_path))
 
-    bootstrap_prefix = str(tmp_path / ".obsidian-brain-sid-")
-    monkeypatch.setattr(obsidian_utils, "_BOOTSTRAP_PREFIX", bootstrap_prefix)
-    bootstrap = tmp_path / f".obsidian-brain-sid-{project_basename}"
-    bootstrap.write_text("old-sid-aaaa", encoding="utf-8")
+        bootstrap_prefix = str(tmp_path / ".obsidian-brain-sid-")
+        monkeypatch.setattr(obsidian_utils, "_BOOTSTRAP_PREFIX", bootstrap_prefix)
+        bootstrap = tmp_path / f".obsidian-brain-sid-{project_basename}"
+        bootstrap.write_text("old-sid-aaaa", encoding="utf-8")
 
-    status = obsidian_utils.check_hook_status()
-    assert status["ok"] is True
-    assert status["current_sid"] == "new-sid-bbbb"
-    assert status["bootstrap_sid"] == "old-sid-aaaa"
-    assert "resumed session" in status["message"]
+        status = obsidian_utils.check_hook_status()
+        assert status["ok"] is True
+        assert status["current_sid"] == "new-sid-bbbb"
+        assert status["bootstrap_sid"] == "old-sid-aaaa"
+        assert "resumed session" in status["message"]
 
 
 def test_check_hook_status_no_session_files(tmp_path, monkeypatch):
-    """check_hook_status returns ok=False when bootstrap exists but no JSONLs."""
-    import obsidian_utils
+    with using_runtime_context(None):
+        """check_hook_status returns ok=False when bootstrap exists but no JSONLs."""
+        import obsidian_utils
 
-    project_basename = "no-sessions-proj"
-    # CC projects dir exists but has NO .jsonl files
-    cc_projects = tmp_path / ".claude" / "projects" / f"-foo-{project_basename}"
-    cc_projects.mkdir(parents=True)
+        project_basename = "no-sessions-proj"
+        # CC projects dir exists but has NO .jsonl files
+        cc_projects = tmp_path / ".claude" / "projects" / f"-foo-{project_basename}"
+        cc_projects.mkdir(parents=True)
 
-    proj_dir = tmp_path / project_basename
-    proj_dir.mkdir()
-    monkeypatch.chdir(proj_dir)
-    monkeypatch.setenv("HOME", str(tmp_path))
+        proj_dir = tmp_path / project_basename
+        proj_dir.mkdir()
+        monkeypatch.chdir(proj_dir)
+        monkeypatch.setenv("HOME", str(tmp_path))
 
-    bootstrap_prefix = str(tmp_path / ".obsidian-brain-sid-")
-    monkeypatch.setattr(obsidian_utils, "_BOOTSTRAP_PREFIX", bootstrap_prefix)
-    bootstrap = tmp_path / f".obsidian-brain-sid-{project_basename}"
-    bootstrap.write_text("some-old-sid", encoding="utf-8")
+        bootstrap_prefix = str(tmp_path / ".obsidian-brain-sid-")
+        monkeypatch.setattr(obsidian_utils, "_BOOTSTRAP_PREFIX", bootstrap_prefix)
+        bootstrap = tmp_path / f".obsidian-brain-sid-{project_basename}"
+        bootstrap.write_text("some-old-sid", encoding="utf-8")
 
-    status = obsidian_utils.check_hook_status()
-    assert status["ok"] is False
-    assert "No session files found" in status["message"] or "not be active" in status["message"]
-    assert status["bootstrap_sid"] == "some-old-sid"
-    assert status["current_sid"] == "unknown"
+        status = obsidian_utils.check_hook_status()
+        assert status["ok"] is False
+        assert "No session files found" in status["message"] or "not be active" in status["message"]
+        assert status["bootstrap_sid"] == "some-old-sid"
+        assert status["current_sid"] == "unknown"
 
 
 def test_slow_path_underscore_to_hyphen_fallback(tmp_path, monkeypatch):
-    """_slow_path_newest_sid matches when cwd has underscores but CC dir has hyphens."""
-    import obsidian_utils
+    with using_runtime_context(None):
+        """_slow_path_newest_sid matches when cwd has underscores but CC dir has hyphens."""
+        import obsidian_utils
 
-    # cwd basename has underscores
-    proj_dir = tmp_path / "personal_ws"
-    proj_dir.mkdir()
-    monkeypatch.chdir(proj_dir)
-    monkeypatch.setenv("HOME", str(tmp_path))
+        # cwd basename has underscores
+        proj_dir = tmp_path / "personal_ws"
+        proj_dir.mkdir()
+        monkeypatch.chdir(proj_dir)
+        monkeypatch.setenv("HOME", str(tmp_path))
 
-    # Claude Code normalizes underscores to hyphens in project dir names
-    cc_projects = tmp_path / ".claude" / "projects" / "-Users-foo-personal-ws"
-    cc_projects.mkdir(parents=True)
-    jsonl = cc_projects / "abc123.jsonl"
-    jsonl.write_text("{}", encoding="utf-8")
+        # Claude Code normalizes underscores to hyphens in project dir names
+        cc_projects = tmp_path / ".claude" / "projects" / "-Users-foo-personal-ws"
+        cc_projects.mkdir(parents=True)
+        jsonl = cc_projects / "abc123.jsonl"
+        jsonl.write_text("{}", encoding="utf-8")
 
-    sid = obsidian_utils._slow_path_newest_sid()
-    assert sid == "abc123", f"Expected 'abc123' but got '{sid}' — hyphen fallback failed"
+        sid = obsidian_utils._slow_path_newest_sid()
+        assert sid == "abc123", f"Expected 'abc123' but got '{sid}' — hyphen fallback failed"
 
 
 def test_fast_path_underscore_to_hyphen_fallback(tmp_path, monkeypatch):
-    """_get_session_id_fast matches when cwd has underscores but CC dir has hyphens."""
-    import obsidian_utils
+    with using_runtime_context(None):
+        """_get_session_id_fast matches when cwd has underscores but CC dir has hyphens."""
+        import obsidian_utils
 
-    proj_dir = tmp_path / "my_project"
-    proj_dir.mkdir()
-    monkeypatch.chdir(proj_dir)
-    monkeypatch.setenv("HOME", str(tmp_path))
+        proj_dir = tmp_path / "my_project"
+        proj_dir.mkdir()
+        monkeypatch.chdir(proj_dir)
+        monkeypatch.setenv("HOME", str(tmp_path))
 
-    # CC dir uses hyphens
-    cc_projects = tmp_path / ".claude" / "projects" / "-Users-foo-my-project"
-    cc_projects.mkdir(parents=True)
-    jsonl = cc_projects / "sess-fast-123.jsonl"
-    jsonl.write_text("{}", encoding="utf-8")
+        # CC dir uses hyphens
+        cc_projects = tmp_path / ".claude" / "projects" / "-Users-foo-my-project"
+        cc_projects.mkdir(parents=True)
+        jsonl = cc_projects / "sess-fast-123.jsonl"
+        jsonl.write_text("{}", encoding="utf-8")
 
-    # Bootstrap file points to the correct sid
-    bootstrap_prefix = str(tmp_path / ".obsidian-brain-sid-")
-    monkeypatch.setattr(obsidian_utils, "_BOOTSTRAP_PREFIX", bootstrap_prefix)
-    bootstrap = tmp_path / ".obsidian-brain-sid-my_project"
-    bootstrap.write_text("sess-fast-123", encoding="utf-8")
+        # Bootstrap file points to the correct sid
+        bootstrap_prefix = str(tmp_path / ".obsidian-brain-sid-")
+        monkeypatch.setattr(obsidian_utils, "_BOOTSTRAP_PREFIX", bootstrap_prefix)
+        bootstrap = tmp_path / ".obsidian-brain-sid-my_project"
+        bootstrap.write_text("sess-fast-123", encoding="utf-8")
 
-    sid = obsidian_utils._get_session_id_fast()
-    assert sid == "sess-fast-123", f"Expected 'sess-fast-123' but got '{sid}'"
+        sid = obsidian_utils._get_session_id_fast()
+        assert sid == "sess-fast-123", f"Expected 'sess-fast-123' but got '{sid}'"
 
 
 @pytest.mark.usefixtures("selected_host_context")
@@ -2550,26 +2567,27 @@ def test_extract_session_metadata_normalizes_case_and_spaces():
 
 
 def test_check_hook_status_missing_bootstrap(tmp_path, monkeypatch):
-    """check_hook_status returns ok=False when bootstrap file is absent."""
-    import obsidian_utils
+    with using_runtime_context(None):
+        """check_hook_status returns ok=False when bootstrap file is absent."""
+        import obsidian_utils
 
-    project_basename = "missing-proj"
-    cc_projects = tmp_path / ".claude" / "projects" / f"-foo-{project_basename}"
-    cc_projects.mkdir(parents=True)
-    (cc_projects / "sid-xxxx.jsonl").write_text("{}", encoding="utf-8")
+        project_basename = "missing-proj"
+        cc_projects = tmp_path / ".claude" / "projects" / f"-foo-{project_basename}"
+        cc_projects.mkdir(parents=True)
+        (cc_projects / "sid-xxxx.jsonl").write_text("{}", encoding="utf-8")
 
-    proj_dir = tmp_path / project_basename
-    proj_dir.mkdir()
-    monkeypatch.chdir(proj_dir)
-    monkeypatch.setenv("HOME", str(tmp_path))
+        proj_dir = tmp_path / project_basename
+        proj_dir.mkdir()
+        monkeypatch.chdir(proj_dir)
+        monkeypatch.setenv("HOME", str(tmp_path))
 
-    monkeypatch.setattr(
-        obsidian_utils, "_BOOTSTRAP_PREFIX", str(tmp_path / ".obsidian-brain-sid-")
-    )
+        monkeypatch.setattr(
+            obsidian_utils, "_BOOTSTRAP_PREFIX", str(tmp_path / ".obsidian-brain-sid-")
+        )
 
-    status = obsidian_utils.check_hook_status()
-    assert status["ok"] is False
-    assert "not be active" in status["message"]
+        status = obsidian_utils.check_hook_status()
+        assert status["ok"] is False
+        assert "not be active" in status["message"]
 
 
 def test_build_context_brief_prepends_hook_status(tmp_path):
@@ -2625,196 +2643,200 @@ def test_build_context_brief_without_hook_status(tmp_path):
 
 
 def test_get_session_id_fast_same_second_tiebreaker(tmp_path, monkeypatch):
-    """Same-second mtime ties: cached sid wins when its JSONL is tied for newest."""
-    import obsidian_utils
-    import os
-    import time
+    with using_runtime_context(None):
+        """Same-second mtime ties: cached sid wins when its JSONL is tied for newest."""
+        import obsidian_utils
+        import os
+        import time
 
-    project_basename = "tie-proj"
-    cc_projects = tmp_path / ".claude" / "projects" / f"-foo-{project_basename}"
-    cc_projects.mkdir(parents=True)
+        project_basename = "tie-proj"
+        cc_projects = tmp_path / ".claude" / "projects" / f"-foo-{project_basename}"
+        cc_projects.mkdir(parents=True)
 
-    # Two JSONLs with IDENTICAL mtimes
-    now = time.time()
-    old_jsonl = cc_projects / "aaa-previous.jsonl"
-    current_jsonl = cc_projects / "zzz-current.jsonl"
-    old_jsonl.write_text("{}", encoding="utf-8")
-    current_jsonl.write_text("{}", encoding="utf-8")
-    os.utime(old_jsonl, (now, now))
-    os.utime(current_jsonl, (now, now))
+        # Two JSONLs with IDENTICAL mtimes
+        now = time.time()
+        old_jsonl = cc_projects / "aaa-previous.jsonl"
+        current_jsonl = cc_projects / "zzz-current.jsonl"
+        old_jsonl.write_text("{}", encoding="utf-8")
+        current_jsonl.write_text("{}", encoding="utf-8")
+        os.utime(old_jsonl, (now, now))
+        os.utime(current_jsonl, (now, now))
 
-    proj_dir = tmp_path / project_basename
-    proj_dir.mkdir()
-    monkeypatch.chdir(proj_dir)
-    monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.setattr(obsidian_utils, "_BOOTSTRAP_PREFIX", str(tmp_path / ".obsidian-brain-sid-"))
+        proj_dir = tmp_path / project_basename
+        proj_dir.mkdir()
+        monkeypatch.chdir(proj_dir)
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setattr(obsidian_utils, "_BOOTSTRAP_PREFIX", str(tmp_path / ".obsidian-brain-sid-"))
 
-    # Bootstrap claims "aaa-previous" is current. Because path-sort tiebreak
-    # would otherwise pick "zzz-current" (lexicographically larger) as the
-    # newest, the cached sid must win via the same-mtime tie-breaker.
-    bootstrap = tmp_path / f".obsidian-brain-sid-{project_basename}"
-    bootstrap.write_text("aaa-previous", encoding="utf-8")
+        # Bootstrap claims "aaa-previous" is current. Because path-sort tiebreak
+        # would otherwise pick "zzz-current" (lexicographically larger) as the
+        # newest, the cached sid must win via the same-mtime tie-breaker.
+        bootstrap = tmp_path / f".obsidian-brain-sid-{project_basename}"
+        bootstrap.write_text("aaa-previous", encoding="utf-8")
 
-    result = obsidian_utils._get_session_id_fast()
-    assert result == "aaa-previous", (
-        f"expected cached sid to win same-mtime tie, got {result}"
-    )
+        result = obsidian_utils._get_session_id_fast()
+        assert result == "aaa-previous", (
+            f"expected cached sid to win same-mtime tie, got {result}"
+        )
 
 
 def test_get_session_id_fast_multiple_cached_matches_tiebreak(tmp_path, monkeypatch):
-    """When multiple project dirs contain the cached sid's JSONL, at least one
-    must tie the newest mtime for the cache to be trusted.
+    with using_runtime_context(None):
+        """When multiple project dirs contain the cached sid's JSONL, at least one
+        must tie the newest mtime for the cache to be trusted.
 
-    The competing JSONL is named so that it sorts AFTER the cached sid. That is
-    load-bearing: `max(viable)` breaks an mtime tie on the path string, so with
-    a lexicographically smaller competitor the cached sid would come back as
-    `newest_sid` and the function would return one branch EARLIER — the
-    tiebreaker this test is named for would never execute (it did not, before
-    this rename).
+        The competing JSONL is named so that it sorts AFTER the cached sid. That is
+        load-bearing: `max(viable)` breaks an mtime tie on the path string, so with
+        a lexicographically smaller competitor the cached sid would come back as
+        `newest_sid` and the function would return one branch EARLIER — the
+        tiebreaker this test is named for would never execute (it did not, before
+        this rename).
 
-    The two directories are the two path ENCODINGS Claude Code has used for
-    this same cwd (older CC kept '_' in the encoded name, current CC folds it
-    to '-'), which is how a single checkout legitimately owns more than one
-    dir under ~/.claude/projects/ — verified on a live machine, where both
-    `-Users-<me>-...-claude_workspace-obsidian-brain` and
-    `-Users-<me>-...-claude-workspace-obsidian-brain` exist. Unrelated dirs that
-    merely share the basename suffix are NOT the same project and are refused
-    outright since #260 — see
-    test_glob_project_jsonls_refuses_when_no_dir_encodes_cwd.
-    """
-    import obsidian_utils
-    import os
-    import time
+        The two directories are the two path ENCODINGS Claude Code has used for
+        this same cwd (older CC kept '_' in the encoded name, current CC folds it
+        to '-'), which is how a single checkout legitimately owns more than one
+        dir under ~/.claude/projects/ — verified on a live machine, where both
+        `-Users-<me>-...-claude_workspace-obsidian-brain` and
+        `-Users-<me>-...-claude-workspace-obsidian-brain` exist. Unrelated dirs that
+        merely share the basename suffix are NOT the same project and are refused
+        outright since #260 — see
+        test_glob_project_jsonls_refuses_when_no_dir_encodes_cwd.
+        """
+        import obsidian_utils
+        import os
+        import time
 
-    project_basename = "multi-proj"
-    # The '_' lives in a PARENT segment, so both encodings still END in
-    # "-multi-proj" and the `*<basename>` suffix glob matches both dirs —
-    # which is what makes this a multi-match tiebreaker test at all.
-    proj_dir = tmp_path / "multi_ws" / project_basename
-    proj_dir.mkdir(parents=True)
-    monkeypatch.chdir(proj_dir)
-    cwd = os.getcwd()  # resolved (macOS /private/... ) — encode from the real cwd
+        project_basename = "multi-proj"
+        # The '_' lives in a PARENT segment, so both encodings still END in
+        # "-multi-proj" and the `*<basename>` suffix glob matches both dirs —
+        # which is what makes this a multi-match tiebreaker test at all.
+        proj_dir = tmp_path / "multi_ws" / project_basename
+        proj_dir.mkdir(parents=True)
+        monkeypatch.chdir(proj_dir)
+        cwd = os.getcwd()  # resolved (macOS /private/... ) — encode from the real cwd
 
-    projects_root = tmp_path / ".claude" / "projects"
-    # Variant A keeps '_', variant B folds it to '-' — both encode THIS cwd.
-    dir_a = projects_root / cwd.replace("/", "-")
-    dir_b = projects_root / cwd.replace("/", "-").replace("_", "-")
-    assert dir_a != dir_b, "fixture needs two distinct encodings of one cwd"
-    dir_a.mkdir(parents=True)
-    dir_b.mkdir(parents=True)
+        projects_root = tmp_path / ".claude" / "projects"
+        # Variant A keeps '_', variant B folds it to '-' — both encode THIS cwd.
+        dir_a = projects_root / cwd.replace("/", "-")
+        dir_b = projects_root / cwd.replace("/", "-").replace("_", "-")
+        assert dir_a != dir_b, "fixture needs two distinct encodings of one cwd"
+        dir_a.mkdir(parents=True)
+        dir_b.mkdir(parents=True)
 
-    cached_sid = "shared-sid-1234"
-    # Put the cached sid's jsonl in BOTH project dirs
-    a_jsonl = dir_a / f"{cached_sid}.jsonl"
-    b_jsonl = dir_b / f"{cached_sid}.jsonl"
-    other_jsonl = dir_b / "zzz-other-sid-5678.jsonl"  # sorts after cached_sid
-    a_jsonl.write_text("{}", encoding="utf-8")
-    b_jsonl.write_text("{}", encoding="utf-8")
-    other_jsonl.write_text("{}", encoding="utf-8")
+        cached_sid = "shared-sid-1234"
+        # Put the cached sid's jsonl in BOTH project dirs
+        a_jsonl = dir_a / f"{cached_sid}.jsonl"
+        b_jsonl = dir_b / f"{cached_sid}.jsonl"
+        other_jsonl = dir_b / "zzz-other-sid-5678.jsonl"  # sorts after cached_sid
+        a_jsonl.write_text("{}", encoding="utf-8")
+        b_jsonl.write_text("{}", encoding="utf-8")
+        other_jsonl.write_text("{}", encoding="utf-8")
 
-    # Scenario: a_jsonl is OLDER, b_jsonl matches newest mtime, other_jsonl
-    # is also at newest mtime. Tiebreaker MUST trust the cache because
-    # at least one cached match (b_jsonl) ties newest mtime.
-    now = time.time()
-    os.utime(a_jsonl, (now - 3600, now - 3600))  # old
-    os.utime(b_jsonl, (now, now))  # tied with other
-    os.utime(other_jsonl, (now, now))  # tied with b
+        # Scenario: a_jsonl is OLDER, b_jsonl matches newest mtime, other_jsonl
+        # is also at newest mtime. Tiebreaker MUST trust the cache because
+        # at least one cached match (b_jsonl) ties newest mtime.
+        now = time.time()
+        os.utime(a_jsonl, (now - 3600, now - 3600))  # old
+        os.utime(b_jsonl, (now, now))  # tied with other
+        os.utime(other_jsonl, (now, now))  # tied with b
 
-    monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.setattr(obsidian_utils, "_BOOTSTRAP_PREFIX", str(tmp_path / ".obsidian-brain-sid-"))
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setattr(obsidian_utils, "_BOOTSTRAP_PREFIX", str(tmp_path / ".obsidian-brain-sid-"))
 
-    bootstrap = tmp_path / f".obsidian-brain-sid-{project_basename}"
-    bootstrap.write_text(cached_sid, encoding="utf-8")
+        bootstrap = tmp_path / f".obsidian-brain-sid-{project_basename}"
+        bootstrap.write_text(cached_sid, encoding="utf-8")
 
-    result = obsidian_utils._get_session_id_fast()
-    assert result == cached_sid, (
-        f"expected cached sid to win multi-match tiebreak, got {result}"
-    )
+        result = obsidian_utils._get_session_id_fast()
+        assert result == cached_sid, (
+            f"expected cached sid to win multi-match tiebreak, got {result}"
+        )
 
 
 def test_get_session_id_fast_slow_path_is_readonly(tmp_path, monkeypatch):
-    """Slow path must NOT write to the bootstrap file.
+    with using_runtime_context(None):
+        """Slow path must NOT write to the bootstrap file.
 
-    Regression test for the SessionStart-hook race: the hook writes the
-    authoritative sid, then downstream hook code can trigger
-    _get_session_id_fast() before CC has flushed the new session's JSONL.
-    In that window, the cached_pattern glob misses and the slow path fires.
-    If the slow path writes back to the bootstrap, it clobbers the hook's
-    authoritative write with a stale result.
-    """
-    import obsidian_utils
-    import os
-    import time
+        Regression test for the SessionStart-hook race: the hook writes the
+        authoritative sid, then downstream hook code can trigger
+        _get_session_id_fast() before CC has flushed the new session's JSONL.
+        In that window, the cached_pattern glob misses and the slow path fires.
+        If the slow path writes back to the bootstrap, it clobbers the hook's
+        authoritative write with a stale result.
+        """
+        import obsidian_utils
+        import os
+        import time
 
-    project_basename = "readonly-proj"
-    cc_projects = tmp_path / ".claude" / "projects" / f"-foo-{project_basename}"
-    cc_projects.mkdir(parents=True)
+        project_basename = "readonly-proj"
+        cc_projects = tmp_path / ".claude" / "projects" / f"-foo-{project_basename}"
+        cc_projects.mkdir(parents=True)
 
-    # Previous session's JSONL exists (what the hook race would find as 'newest')
-    old_jsonl = cc_projects / "old-sid-0000.jsonl"
-    old_jsonl.write_text("{}", encoding="utf-8")
-    os.utime(old_jsonl, (time.time() - 600, time.time() - 600))
+        # Previous session's JSONL exists (what the hook race would find as 'newest')
+        old_jsonl = cc_projects / "old-sid-0000.jsonl"
+        old_jsonl.write_text("{}", encoding="utf-8")
+        os.utime(old_jsonl, (time.time() - 600, time.time() - 600))
 
-    # New session's JSONL does NOT exist yet — this is the race window
-    # (CC hasn't flushed it yet when the hook fires)
+        # New session's JSONL does NOT exist yet — this is the race window
+        # (CC hasn't flushed it yet when the hook fires)
 
-    proj_dir = tmp_path / project_basename
-    proj_dir.mkdir()
-    monkeypatch.chdir(proj_dir)
-    monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.setattr(obsidian_utils, "_BOOTSTRAP_PREFIX", str(tmp_path / ".obsidian-brain-sid-"))
+        proj_dir = tmp_path / project_basename
+        proj_dir.mkdir()
+        monkeypatch.chdir(proj_dir)
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setattr(obsidian_utils, "_BOOTSTRAP_PREFIX", str(tmp_path / ".obsidian-brain-sid-"))
 
-    # Bootstrap contains the NEW authoritative sid (just written by the hook)
-    bootstrap = tmp_path / f".obsidian-brain-sid-{project_basename}"
-    bootstrap.write_text("new-sid-9999", encoding="utf-8")
-    bootstrap_mtime_before = os.path.getmtime(bootstrap)
-    bootstrap_contents_before = bootstrap.read_text(encoding="utf-8").strip()
+        # Bootstrap contains the NEW authoritative sid (just written by the hook)
+        bootstrap = tmp_path / f".obsidian-brain-sid-{project_basename}"
+        bootstrap.write_text("new-sid-9999", encoding="utf-8")
+        bootstrap_mtime_before = os.path.getmtime(bootstrap)
+        bootstrap_contents_before = bootstrap.read_text(encoding="utf-8").strip()
 
-    # Trigger _get_session_id_fast: cached JSONL doesn't exist yet, fall
-    # through to slow path which finds old-sid-0000 as newest.
-    result = obsidian_utils._get_session_id_fast()
+        # Trigger _get_session_id_fast: cached JSONL doesn't exist yet, fall
+        # through to slow path which finds old-sid-0000 as newest.
+        result = obsidian_utils._get_session_id_fast()
 
-    # The function may return either value — the return value is not what
-    # we're testing. What matters: the bootstrap file MUST NOT be clobbered.
-    bootstrap_contents_after = bootstrap.read_text(encoding="utf-8").strip()
-    assert bootstrap_contents_after == bootstrap_contents_before, (
-        f"slow path clobbered the bootstrap: before={bootstrap_contents_before!r} "
-        f"after={bootstrap_contents_after!r}"
-    )
-    # And the mtime must be unchanged
-    assert os.path.getmtime(bootstrap) == bootstrap_mtime_before
+        # The function may return either value — the return value is not what
+        # we're testing. What matters: the bootstrap file MUST NOT be clobbered.
+        bootstrap_contents_after = bootstrap.read_text(encoding="utf-8").strip()
+        assert bootstrap_contents_after == bootstrap_contents_before, (
+            f"slow path clobbered the bootstrap: before={bootstrap_contents_before!r} "
+            f"after={bootstrap_contents_after!r}"
+        )
+        # And the mtime must be unchanged
+        assert os.path.getmtime(bootstrap) == bootstrap_mtime_before
 
 
 def test_get_session_id_fast_slow_path_returns_without_writing(tmp_path, monkeypatch):
-    """When no bootstrap exists, slow path returns newest sid but creates no bootstrap file."""
-    import obsidian_utils
-    import os
-    import time
+    with using_runtime_context(None):
+        """When no bootstrap exists, slow path returns newest sid but creates no bootstrap file."""
+        import obsidian_utils
+        import os
+        import time
 
-    project_basename = "nobootstrap-proj"
-    cc_projects = tmp_path / ".claude" / "projects" / f"-foo-{project_basename}"
-    cc_projects.mkdir(parents=True)
+        project_basename = "nobootstrap-proj"
+        cc_projects = tmp_path / ".claude" / "projects" / f"-foo-{project_basename}"
+        cc_projects.mkdir(parents=True)
 
-    only_jsonl = cc_projects / "only-sid-abcd.jsonl"
-    only_jsonl.write_text("{}", encoding="utf-8")
-    os.utime(only_jsonl, (time.time() - 60, time.time() - 60))
+        only_jsonl = cc_projects / "only-sid-abcd.jsonl"
+        only_jsonl.write_text("{}", encoding="utf-8")
+        os.utime(only_jsonl, (time.time() - 60, time.time() - 60))
 
-    proj_dir = tmp_path / project_basename
-    proj_dir.mkdir()
-    monkeypatch.chdir(proj_dir)
-    monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.setattr(obsidian_utils, "_BOOTSTRAP_PREFIX", str(tmp_path / ".obsidian-brain-sid-"))
+        proj_dir = tmp_path / project_basename
+        proj_dir.mkdir()
+        monkeypatch.chdir(proj_dir)
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setattr(obsidian_utils, "_BOOTSTRAP_PREFIX", str(tmp_path / ".obsidian-brain-sid-"))
 
-    bootstrap = tmp_path / f".obsidian-brain-sid-{project_basename}"
-    assert not bootstrap.exists()
+        bootstrap = tmp_path / f".obsidian-brain-sid-{project_basename}"
+        assert not bootstrap.exists()
 
-    result = obsidian_utils._get_session_id_fast()
-    assert result == "only-sid-abcd"
+        result = obsidian_utils._get_session_id_fast()
+        assert result == "only-sid-abcd"
 
-    # Slow path must NOT have created a bootstrap file
-    assert not bootstrap.exists(), (
-        "slow path should be read-only and not create the bootstrap file"
-    )
+        # Slow path must NOT have created a bootstrap file
+        assert not bootstrap.exists(), (
+            "slow path should be read-only and not create the bootstrap file"
+        )
 
 
 # ===========================================================================
@@ -3977,10 +3999,16 @@ def test_get_session_context_cache_key_isolates_distinct_worktrees(tmp_path, sel
             assert result["session_id"] == sid
             assert result["hash"] == actor.session_key[:16]
             assert result["cwd"] == str(path)
-            assert result["session_note_name"] == ""
+            from capture import planned_note_path
+            import time
+            planned = planned_note_path(actor, time.monotonic() + 1)
+            assert result["session_note_name"] == planned.stem
+            assert planned.parent == actor.vault_path / actor.config.get("sessions_folder", "claude-sessions")
+            assert not planned.exists()
             assert "poison" not in result
             results.append(result)
     assert results[0]["hash"] != results[1]["hash"]
+    assert results[0]["session_note_name"] != results[1]["session_note_name"]
     assert results[0]["cwd"] != results[1]["cwd"]
     assert results[0]["project"] == results[1]["project"] == "obsidian-brain"
 
@@ -4585,19 +4613,19 @@ class TestEscalationModels:
     that passing summary_model="sonnet" does not produce ["sonnet", "haiku", "opus"].
     """
 
-    def test_haiku_escalates_through_full_chain(self):
+    def test_haiku_escalates_through_full_chain(self, selected_host_context):
         """haiku -> [haiku, sonnet, opus]: all models tried in capability order."""
         import obsidian_utils
         result = obsidian_utils._escalation_models("haiku")
-        assert result == ["haiku", "sonnet", "opus"], (
+        assert result == (["haiku", "sonnet", "opus"] if selected_host_context.host == "claude" else ["haiku"]), (
             f"haiku should escalate through full chain; got: {result!r}"
         )
 
-    def test_sonnet_escalates_only_to_opus(self):
+    def test_sonnet_escalates_only_to_opus(self, selected_host_context):
         """sonnet -> [sonnet, opus]: haiku (less capable) is excluded."""
         import obsidian_utils
         result = obsidian_utils._escalation_models("sonnet")
-        assert result == ["sonnet", "opus"], (
+        assert result == (["sonnet", "opus"] if selected_host_context.host == "claude" else ["sonnet"]), (
             f"sonnet should only escalate to opus; got: {result!r}"
         )
 
@@ -5143,3 +5171,7 @@ def test_resolve_source_session_note_blocks_path_traversal(tmp_path):
         "a traversing session_note_name resolved to a file outside the "
         "vault and was vouched for as a session note"
     )
+
+pytestmark = pytest.mark.usefixtures("selected_host_context")
+
+from runtime_context import using_runtime_context

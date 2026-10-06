@@ -107,8 +107,9 @@ def test_edit_records_invoking_actor_without_changing_origin(context, monkeypatc
     text = note.read_text()
     assert 'agent_provider: claude' in text
     assert 'agent_session_id: original-session' in text
-    assert 'author_host: ' + json.dumps(context.host) in text
-    assert 'operation_id: ' + json.dumps(identity) in text
+    from obsidian_utils import parse_frontmatter_field
+    assert parse_frontmatter_field(text.split('---')[1], 'author_host') == context.host
+    assert parse_frontmatter_field(text.split('---')[1], 'operation_id') == identity
     assert '- [x] First.' in text
 
 
@@ -121,3 +122,104 @@ def test_unregistered_or_tampered_source_manifest_cannot_authorize_edits(context
     with pytest.raises(ValueError, match='content changed'):
         edit(context, monkeypatch, [[str(note), '- [ ] Task.', '- [x] Task.']], revisions, identity)
     assert note.read_text() == '- [ ] Task.\n'
+
+
+@pytest.mark.parametrize('unsafe', ['public_mode', 'hardlink'])
+def test_unsafe_acted_cache_does_not_hide_published_edit(context, monkeypatch, capsys, unsafe):
+    from pathlib import Path
+    note = context.vault_path / 'cache-failure.md'
+    note.write_text('- [ ] Task.\n')
+    identity, revisions = prepared(context, [note])
+    with using_runtime_context(context):
+        cache = Path(deep_cli._acted_items_path())
+        cache.write_text('[]')
+        cache.chmod(0o600)
+        if unsafe == 'public_mode':
+            cache.chmod(0o644)
+        else:
+            import os
+            os.link(cache, cache.with_name('second-link.json'))
+        assert deep_cli._load_acted_items() == set()
+        assert edit(context, monkeypatch, [[str(note), '- [ ] Task.', '- [x] Task.']], revisions, identity) == 0
+    assert note.read_text() == '- [x] Task.\n'
+    output = capsys.readouterr()
+    assert 'Applied 1/1 edits' in output.out
+    assert 'warning: could not' in output.err
+    assert cache.read_text() == '[]'
+
+
+@pytest.mark.parametrize('value', [[1, ['private-cache-secret']], [1, 'private-cache-secret'],
+                                  {'private-cache-secret': 1}, None, 'private-cache-secret'])
+def test_wrong_shape_acted_cache_does_not_hide_published_edit(context, monkeypatch, capsys, value):
+    from pathlib import Path
+    note = context.vault_path / 'cache-shape.md'
+    note.write_text('- [ ] Task.\n')
+    identity, revisions = prepared(context, [note])
+    with using_runtime_context(context):
+        cache = Path(deep_cli._acted_items_path())
+        cache.write_text(json.dumps(value))
+        cache.chmod(0o600)
+        assert deep_cli._load_acted_items() == set()
+        assert edit(context, monkeypatch, [[str(note), '- [ ] Task.', '- [x] Task.']], revisions, identity) == 0
+        retained = json.loads(cache.read_text())
+        assert isinstance(retained, list) and all(isinstance(item, str) for item in retained)
+        assert 'private-cache-secret' not in retained
+    assert note.read_text() == '- [x] Task.\n'
+    output = capsys.readouterr()
+    assert 'Applied 1/1 edits' in output.out
+    assert 'warning: could not load acted items' in output.err
+    assert 'private-cache-secret' not in output.out + output.err
+
+
+def test_invalid_new_acted_items_warn_without_changing_private_cache(context, capsys):
+    from pathlib import Path
+    with using_runtime_context(context):
+        cache = Path(deep_cli._acted_items_path())
+        cache.write_text('["Existing task"]')
+        cache.chmod(0o600)
+        before = cache.read_bytes()
+        deep_cli._save_acted_items({1, 'private-cache-secret'})
+        assert cache.read_bytes() == before
+    output = capsys.readouterr()
+    assert 'warning: could not save acted items' in output.err
+    assert 'private-cache-secret' not in output.err
+
+
+@pytest.mark.parametrize('form', ['basename', 'vault_relative', 'absolute'])
+def test_deep_checkoffs_resolves_selected_vault_paths_without_writing(context, monkeypatch, capsys, form):
+    note = context.vault_path / 'claude-sessions' / 'path-target.md'
+    note.parent.mkdir(parents=True, exist_ok=True)
+    note.write_text('- [ ] Selected task.\n')
+    requested = {'basename': note.name, 'vault_relative': 'claude-sessions/' + note.name,
+                 'absolute': str(note)}[form]
+    monkeypatch.chdir(context.worktree)
+    monkeypatch.setattr(deep_cli.sys, 'stdin', io.StringIO(json.dumps([
+        {'file': requested, 'line': 99, 'text': 'Selected task.'}])))
+    with using_runtime_context(context):
+        deep_cli.run_build_checkoffs()
+    result = json.loads(capsys.readouterr().out)
+    assert result == {'edits': [[str(note), '- [ ] Selected task.', '- [x] Selected task.']], 'skipped': []}
+    assert note.read_text() == '- [ ] Selected task.\n'
+
+
+@pytest.mark.parametrize('form', ['outside_absolute', 'escaping_relative', 'internal_traversal', 'symlink_escape'])
+def test_deep_checkoffs_refuses_unapproved_paths(context, tmp_path, monkeypatch, capsys, form):
+    outside = tmp_path / 'outside.md'
+    outside.write_text('- [ ] Private outside task.\n')
+    folder = context.vault_path / 'claude-sessions'
+    folder.mkdir(parents=True, exist_ok=True)
+    inside = folder / 'inside.md'
+    inside.write_text('- [ ] Private outside task.\n')
+    symlink = folder / 'linked.md'
+    symlink.symlink_to(outside)
+    requested = {'outside_absolute': str(outside), 'escaping_relative': '../outside.md',
+                 'internal_traversal': 'claude-sessions/../claude-sessions/inside.md',
+                 'symlink_escape': 'claude-sessions/linked.md'}[form]
+    monkeypatch.setattr(deep_cli.sys, 'stdin', io.StringIO(json.dumps([
+        {'file': requested, 'line': 1, 'text': 'Private outside task.'}])))
+    with using_runtime_context(context):
+        deep_cli.run_build_checkoffs()
+    result = json.loads(capsys.readouterr().out)
+    assert result['edits'] == []
+    assert result['skipped'][0]['reason'] == 'containment'
+    assert outside.read_text() == inside.read_text() == '- [ ] Private outside task.\n'

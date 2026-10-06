@@ -3536,45 +3536,30 @@ def test_append_update_detects_a_concurrent_writer_end_to_end(selected_host_cont
 
 # --- C-008: the note lock ---------------------------------------------------
 
-def test_append_update_refuses_while_another_process_holds_the_lock(tmp_path):
-    """The stat re-check alone was measured to be insufficient: two
-    simultaneous append-updates both read the original, both re-checked while
-    it was still original, and both renamed — 5/5 trials lost one writer's
-    update at rc 0. The O_EXCL lock closes that window."""
+def test_append_update_refuses_while_another_process_holds_the_lock(selected_host_context, tmp_path):
+    """The shared flock excludes a child writer and preserves the note."""
+    from note_transactions import ownership_lock
     vault = tmp_path / "vault"
     note = _make_note(vault, "claude-insights", "insight.md", BASIC_NOTE)
     before = note.read_bytes()
-    lock = note.parent / f".{note.name}.ob-lock"
-    lock.write_text("99999\n", encoding="utf-8")  # a live holder
-
-    result = _run_append_update(vault, note, UPDATE_SECTION, add_tags="claude/topic/x")
-
+    with ownership_lock(selected_host_context):
+        result = _run_append_update(vault, note, UPDATE_SECTION, add_tags="claude/topic/x")
     assert result.returncode == 1
     assert "lock held" in result.stderr
     assert note.read_bytes() == before
-    assert lock.exists()  # someone else's lock must not be removed
 
 
-def test_append_update_takes_over_a_stale_lock(tmp_path):
-    """A crashed process must not wedge a note forever."""
+def test_append_update_ignores_obsolete_pid_lock(tmp_path):
+    """A stale or reused PID cannot override the shared ownership lock."""
     vault = tmp_path / "vault"
     note = _make_note(vault, "claude-insights", "insight.md", BASIC_NOTE)
     lock = note.parent / f".{note.name}.ob-lock"
-    import subprocess
-    import sys
-    ended = subprocess.run(
-        [sys.executable, "-c", "import os; print(os.getpid())"],
-        stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=5, check=True,
-    )
-    lock.write_text(ended.stdout, encoding="utf-8")
-    stale = time.time() - (note_writer._STALE_LOCK_SECONDS + 5)
-    os.utime(lock, (stale, stale))
-
+    lock.write_text(str(os.getpid()) + "\n", encoding="utf-8")
+    before = lock.read_bytes()
     result = _run_append_update(vault, note, UPDATE_SECTION)
-
     assert result.returncode == 0, result.stderr
     assert "## Update (2026-07-25)" in note.read_text(encoding="utf-8")
-    assert not lock.exists()  # taken over, then released
+    assert lock.read_bytes() == before  # Compatibility artifacts are untouched.
 
 
 def test_append_update_releases_the_lock_on_success_and_on_failure(tmp_path):
@@ -3648,18 +3633,22 @@ def test_acquire_lock_reports_unwritable_directory(tmp_path, monkeypatch):
     def _boom(path, flags, *a, **kw):
         raise PermissionError(13, "read-only")
 
-    monkeypatch.setattr(os, "open", _boom)
-    lock, err = note_writer._acquire_lock(dest)
+    with monkeypatch.context() as permission_failure:
+        permission_failure.setattr(os, "open", _boom)
+        lock, err = note_writer._acquire_lock(dest)
 
-    assert lock is None
-    assert "cannot create lock file" in err
+        assert lock is None
+        assert "cannot create lock file" in err
 
 
-def test_run_append_update_in_process_reports_lock_contention(selected_host_context, tmp_path, capsys):
+def test_run_append_update_in_process_reports_lock_contention(selected_host_context, tmp_path, capsys, monkeypatch):
     vault = tmp_path / "vault"
     note = _make_note(vault, "claude-insights", "n.md", BASIC_NOTE)
     before = note.read_bytes()
-    (note.parent / f".{note.name}.ob-lock").write_text("1\n", encoding="utf-8")
+    import note_transactions
+    def busy(*args):
+        raise note_transactions.LockBusy("Held by another writer")
+    monkeypatch.setattr(note_transactions, "ownership_lock", busy)
 
     rc = note_writer.run_append_update(str(vault), str(note), UPDATE_SECTION)
 

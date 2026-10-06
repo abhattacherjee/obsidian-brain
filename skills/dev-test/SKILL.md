@@ -47,23 +47,12 @@ procedure variables `VAULT_PATH`/`VAULT`, `SESSIONS_FOLDER`/`SESS`, and
 `INSIGHTS_FOLDER`/`INS`. Use the canonical project returned in config JSON (and native `session` when available),
 not the basename of an unrelated shell working directory.
 
-Before preparing edits or requesting a summary of an existing note, call
-`note-read` and retain its exact `expected_revision`. Apply the proposed note
-with `note-apply` and that revision. A conflict leaves the current note intact;
-show the pending result and do not count the note as saved. New curated notes
-use `note-create`; they never overwrite a collision. Native memory discovery
-is unsupported for Codex because it has no equivalent native memory-file API; shared vault retrieval
-and wiki filing continue without borrowing another host's memory.
-
-Read `references/host-claude.md` or `references/host-codex.md` when present.
-All note writes described below use `note-create` or revision-bound `note-apply`,
-including bidirectional related links. Content is a JSON string, never shell code.
-Every later save or edit follows this revision-bound publication rule.
+Use only the operations documented for this skill. Their writes bind the source revisions before analysis and preserve manual edits on conflict. Content is JSON data, never shell code. Read `references/host-claude.md` or `references/host-codex.md` when present. Codex has no native memory-file API; shared vault retrieval and wiki filing continue without borrowing another host's memory.
 
 
 # Dev Test — Install/Restore Dev Plugin for Testing
 
-Swaps the installed plugin cache with the current repo working copy for local testing. After install, start a new Claude Code session to pick up the changes.
+Swap the invoking host's installed plugin cache with the working copy for local testing. After install, start a new session in that host. Use Claude Code for a Claude installation or the selected Codex client for a Codex installation; cache distribution checks do not certify native hook dispatch.
 
 Use the absolute loaded SKILL.md to select the installed resource root.
 
@@ -79,23 +68,28 @@ Check the argument passed to `/dev-test`:
 - `restore` → go to Step 3
 - No argument or `status` → go to Step 4
 
+For Codex, obtain the explicit installed cache path from native plugin metadata
+or the operator. It must select one verified obsidian-brain marketplace/version
+under the frozen native home's plugin cache. Pass it as `cache_path`
+for install, status and restore. Refuse a missing or unverified selection;
+never choose the highest version or infer the current frontend from the path.
+Omit `cache_path` for Claude.
+
+On Python 3.9, Codex config validation accepts tables, dotted keys, strings,
+booleans, finite numbers, and one-line arrays or inline tables. Unsupported
+multiline values, dates, and arrays of tables leave config and cache unchanged.
+Use Python 3.11 or later for those TOML forms. No extra package is required.
+
 ### Step 2 — Install dev version
 
 This works from any directory — it locates the obsidian-brain checkout itself, it does not require the cwd to be inside it. Run:
-
-Request for `dev-install` (substitute the values as data):
-
-```json
-{
-  "mode": "install"
-}
-```
 
 Request for `dev-install`:
 
 ```json
 {
-  "mode": "install"
+  "mode": "install",
+  "cache_path": "<explicit verified Codex installed cache path; omit for Claude>"
 }
 ```
 
@@ -107,7 +101,7 @@ Report the output, then **branch on the command's exit status** — the fenced b
 
 - **Exit 0 — installed.** Tell the user:
 
-  > Dev version installed. **Start a new Claude Code session** to pick up the changes. When done testing, run `/dev-test restore`.
+  > Dev version installed. **Start a new session in the invoking host** to pick up the changes. When done testing, run `/dev-test restore`.
 
 - **Exit 2 — installed, but the security tests failed.** The dev version *was* copied into the cache, so the install is not simply undone by ignoring it. Relay the script's error output and tell the user:
 
@@ -129,15 +123,8 @@ Request for `dev-install` (substitute the values as data):
 
 ```json
 {
-  "mode": "restore"
-}
-```
-
-Request for `dev-install`:
-
-```json
-{
-  "mode": "install"
+  "mode": "restore",
+  "cache_path": "<same explicit verified Codex cache path; omit for Claude>"
 }
 ```
 
@@ -167,15 +154,8 @@ Request for `dev-install` (substitute the values as data):
 
 ```json
 {
-  "mode": "status"
-}
-```
-
-Request for `dev-install`:
-
-```json
-{
-  "mode": "install"
+  "mode": "status",
+  "cache_path": "<explicit verified Codex installed cache path; omit for Claude>"
 }
 ```
 

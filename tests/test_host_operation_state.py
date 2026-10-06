@@ -7,10 +7,8 @@ from runtime_context import RuntimeContext
 from operation_state import operation_directory, store_artifact, read_artifact
 
 @pytest.fixture
-def context(tmp_path):
-    return RuntimeContext('codex', 'cli', 'operation-native', tmp_path, tmp_path, None,
-                          tmp_path / 'vault', tmp_path / 'config', MappingProxyType({}),
-                          tmp_path, tmp_path / 'index', tmp_path / 'state')
+def context(selected_host_context):
+    return selected_host_context
 
 def test_identity_hash_and_semantic_scope(context):
     identity, directory = operation_directory(context)
@@ -37,14 +35,14 @@ def test_explicit_identity_and_nofollow(context, tmp_path):
 def test_other_host_and_session_cannot_reuse(context):
     identity, _ = operation_directory(context)
     store_artifact(context, identity, 'pipeline.json', '{}')
-    for changed in (replace(context, host='claude'), replace(context, native_session_id='another')):
+    for changed in (replace(context, host='codex' if context.host == 'claude' else 'claude', client='codex-cli' if context.host == 'claude' else 'claude-code'), replace(context, native_session_id='another')):
         with pytest.raises(FileNotFoundError):
             read_artifact(changed, identity, 'pipeline.json')
 
 def test_changed_project_and_backend_model_reject_manifest(context):
     identity, _ = operation_directory(context)
     store_artifact(context, identity, 'pipeline.json', '{}')
-    changed = replace(context, config=MappingProxyType({'codex_ai_model': 'different'}))
+    changed = replace(context, config=MappingProxyType({'codex_ai_model': 'different'} if context.host == 'codex' else {'summary_model': 'different'}))
     with pytest.raises(ValueError, match='scope changed'):
         read_artifact(changed, identity, 'pipeline.json')
 
@@ -76,7 +74,7 @@ def test_private_artifacts_cannot_be_configured_into_vault(context):
 
 def test_low_level_private_writer_rejects_arbitrary_vault_path(context):
     from operation_state import _write_private
-    context.vault_path.mkdir()
+    context.vault_path.mkdir(exist_ok=True)
     note = context.vault_path / 'analysis.md'
     with pytest.raises(ValueError, match='outside the vault'):
         _write_private(note, b'unsafe', context)
@@ -90,14 +88,18 @@ def test_bound_deep_pipeline_registers_output(context, monkeypatch, cached):
     identity, directory = operation_directory(context)
     monkeypatch.setattr(pipeline, '_cache_key', lambda *args: 'synthetic')
     monkeypatch.setattr(pipeline, '_evidence_cache_get', lambda *args: ('OK:0:0:0:0', '{}') if cached else None)
-    if not cached:
-        import vault_index
-        monkeypatch.setattr(vault_index, 'ensure_index', lambda *args, **kwargs: context.index_path)
-        monkeypatch.setattr(pipeline, '_evidence_cache_put', lambda *args: None)
+    import vault_index
+    index_calls = []
+    def fresh_index(*args, **kwargs):
+        index_calls.append(kwargs['db_path'])
+        return context.index_path
+    monkeypatch.setattr(vault_index, 'ensure_index', fresh_index)
+    monkeypatch.setattr(pipeline, '_evidence_cache_put', lambda *args: pytest.fail('Native pipeline saved age-only evidence'))
     with using_runtime_context(context):
         status = pipeline.deep_analysis_pipeline([], '[]', str(directory / 'deep-pipeline.json'),
             str(context.vault_path), 'claude-sessions', 'claude-insights', db_path=str(context.index_path), operation_id=identity)
     assert status.startswith('OK:')
+    assert index_calls == [str(context.index_path)]
     assert isinstance(json.loads(read_artifact(context, identity, 'deep-pipeline.json')), dict)
 
 
@@ -123,3 +125,6 @@ def test_unbound_pipeline_cannot_publish_any_output(tmp_path):
             pipeline.deep_analysis_pipeline([], '[]', str(output), str(tmp_path / 'vault'),
                 'sessions', 'insights', db_path=str(tmp_path / 'index.db'))
     assert output.read_text() == 'Existing private result'
+
+from parity_test_helpers import host, selected_host_context
+pytestmark = pytest.mark.usefixtures("selected_host_context")

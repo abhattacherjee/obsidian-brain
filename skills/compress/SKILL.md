@@ -47,18 +47,7 @@ procedure variables `VAULT_PATH`/`VAULT`, `SESSIONS_FOLDER`/`SESS`, and
 `INSIGHTS_FOLDER`/`INS`. Use the canonical project returned in config JSON (and native `session` when available),
 not the basename of an unrelated shell working directory.
 
-Before preparing edits or requesting a summary of an existing note, call
-`note-read` and retain its exact `expected_revision`. Apply the proposed note
-with `note-apply` and that revision. A conflict leaves the current note intact;
-show the pending result and do not count the note as saved. New curated notes
-use `note-create`; they never overwrite a collision. Native memory discovery
-is unsupported for Codex because it has no equivalent native memory-file API; shared vault retrieval
-and wiki filing continue without borrowing another host's memory.
-
-Read `references/host-claude.md` or `references/host-codex.md` when present.
-All note writes described below use `note-create` or revision-bound `note-apply`,
-including bidirectional related links. Content is a JSON string, never shell code.
-Every later save or edit follows this revision-bound publication rule.
+Before drafting an edit or summary, call `note-read` and retain its exact `expected_revision`. Use `note-apply` with that revision for the reviewed edit. A conflict preserves the current note; show the pending result and do not count it as saved. Create new curated notes with `note-create`. A collision preserves the existing note. Use only the operations documented for this skill. Their writes bind the source revisions before analysis and preserve manual edits on conflict. Content is JSON data, never shell code. Read `references/host-claude.md` or `references/host-codex.md` when present. Codex has no native memory-file API; shared vault retrieval and wiki filing continue without borrowing another host's memory.
 
 # Compress — Save Session Insights to Obsidian
 
@@ -84,7 +73,7 @@ Request for `config` (substitute the values as data):
 python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'config' < "$REQUEST_PATH"
 ```
 
-Parse each output line as KEY=VALUE, splitting on the first `=`.
+Parse the single JSON object. Read its named fields; do not split output on `=`.
 
 If the output is empty or errors, tell the user:
 
@@ -459,3 +448,28 @@ If processing multiple insights from Step 4B, repeat Steps 5-9 for each remainin
 After all insights are saved, ask:
 
 > Anything else to capture from this session? You can run `/compress` again or `/compress <topic>` to extract a specific topic (will offer to update if an existing note matches).
+
+## Fixed request shapes
+
+Pass these objects through the installed launcher for the named operation. Keep
+one operation ID across source reads, analysis and reviewed publication.
+
+Request for `note-read`:
+
+```json
+{
+  "operation_id": "<prepared id>",
+  "path": "<vault-relative note.md>"
+}
+```
+
+Request for `note-apply`:
+
+```json
+{
+  "operation_id": "<same prepared id>",
+  "path": "<same vault-relative note.md>",
+  "expected_revision": "<note-read SHA256>",
+  "content": "<complete reviewed note>"
+}
+```

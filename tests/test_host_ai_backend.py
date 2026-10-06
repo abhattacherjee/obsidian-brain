@@ -285,3 +285,15 @@ def test_native_ai_without_frozen_home_defers_before_transport(selected_host_con
     assert result.status == "unavailable"
     assert result.error_code == "native_home_missing"
     assert calls == []
+
+
+@pytest.mark.host_only('claude',reason='claude-record-format',capability='claude_native_format')
+@pytest.mark.parametrize('code',[0,1])
+def test_claude_login_error_result_envelope_is_auth_error(claude_context,monkeypatch,code):
+    from ai_adapters import claude
+    envelope={'is_error':True,'result':'Not logged in · Please run /login confidential-account-marker'}
+    monkeypatch.setattr(backend,'_run_bounded',lambda *args,**kwargs:(code,json.dumps(envelope).encode(),b''))
+    with pytest.raises(backend._BackendFailure) as failure:
+        claude.execute(claude_context,'Input',{},None,time.monotonic()+5,{})
+    assert (failure.value.status,failure.value.code)==('auth_error','native_auth_error')
+    assert 'confidential-account-marker' not in repr(failure.value)

@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import pytest
+from selected_legacy_vault import selected_host_context
+pytestmark = pytest.mark.usefixtures("selected_host_context")
+
 from pathlib import Path
 
 from scripts.vault_doctor_checks import Issue, snapshot_integrity

@@ -1094,102 +1094,102 @@
     {
       "source": "hooks/ai_backend.py",
       "expression": "subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=cwd, env=env, start_new_session=True, umask=63)",
-      "source_sha256": "b7b57215203967f674778f810ae0b6330618db5034bb6b1185f00a032ecb6c98",
+      "source_sha256": "283581712f348a22b633488af460011d408c60f264419e1aa24885fc4f256036",
       "scope": "support",
       "reason": "Bounded transport for the already-selected native adapter. Shared execute_ai selection is required separately; native protocol adapter tests may test one host."
     },
     {
       "source": "hooks/obsidian_utils.py",
       "expression": "subprocess.run(['git', 'rev-parse', '--git-common-dir'], capture_output=True, text=True, timeout=5, cwd=cwd or None)",
-      "source_sha256": "9d36f294e28f18068a24d0fcbdf9552f203d6443e077a3fff7ecd82e9bd4261a",
+      "source_sha256": "6b37f7932556620af153ed31e40fd0d43dc599405b3319b546de007bd55b8fb4",
       "scope": "support",
       "reason": "Bounded or disposable-repository Git metadata/setup. The enclosing native operation keeps its separate host contract."
     },
     {
       "source": "hooks/obsidian_utils.py",
       "expression": "subprocess.run(['find', str(projects_dir), '-name', target, '-type', 'f', '-print', '-quit'], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=5)",
-      "source_sha256": "9d36f294e28f18068a24d0fcbdf9552f203d6443e077a3fff7ecd82e9bd4261a",
+      "source_sha256": "6b37f7932556620af153ed31e40fd0d43dc599405b3319b546de007bd55b8fb4",
       "scope": "support",
       "reason": "Legacy Claude transcript location compatibility. Bound native contexts return only their selected transcript before this call."
     },
     {
       "source": "hooks/obsidian_utils.py",
       "expression": "subprocess.run(['git', 'rev-parse', '--abbrev-ref', 'HEAD'], capture_output=True, text=True, timeout=5, cwd=cwd or None)",
-      "source_sha256": "9d36f294e28f18068a24d0fcbdf9552f203d6443e077a3fff7ecd82e9bd4261a",
+      "source_sha256": "6b37f7932556620af153ed31e40fd0d43dc599405b3319b546de007bd55b8fb4",
       "scope": "support",
       "reason": "Bounded or disposable-repository Git metadata/setup. The enclosing native operation keeps its separate host contract."
     },
     {
       "source": "hooks/open_item_dedup.py",
       "expression": "subprocess.run(['git', 'log', '--oneline', '-40'], cwd=repo_path, capture_output=True, text=True, timeout=10)",
-      "source_sha256": "31900362bd29206598679fdfd880010b786869afd8d4fa59ca7e5867cf585147",
+      "source_sha256": "fa52143ee7afab8cbf4b0fddc61ce0f526993fc9d356ae0b6e05318bb2cbe0dc",
       "scope": "support",
       "reason": "Bounded or disposable-repository Git metadata/setup. The enclosing native operation keeps its separate host contract."
     },
     {
       "source": "hooks/open_item_dedup.py",
       "expression": "subprocess.run(['git', 'tag', '--list', '--sort=-creatordate'], cwd=repo_path, capture_output=True, text=True, timeout=10)",
-      "source_sha256": "31900362bd29206598679fdfd880010b786869afd8d4fa59ca7e5867cf585147",
+      "source_sha256": "fa52143ee7afab8cbf4b0fddc61ce0f526993fc9d356ae0b6e05318bb2cbe0dc",
       "scope": "support",
       "reason": "Bounded or disposable-repository Git metadata/setup. The enclosing native operation keeps its separate host contract."
     },
     {
       "source": "hooks/open_item_dedup.py",
       "expression": "subprocess.run(['git', 'log', '--name-only', '--pretty=format:', '-40'], cwd=repo_path, capture_output=True, text=True, timeout=10)",
-      "source_sha256": "31900362bd29206598679fdfd880010b786869afd8d4fa59ca7e5867cf585147",
+      "source_sha256": "fa52143ee7afab8cbf4b0fddc61ce0f526993fc9d356ae0b6e05318bb2cbe0dc",
       "scope": "support",
       "reason": "Bounded or disposable-repository Git metadata/setup. The enclosing native operation keeps its separate host contract."
     },
     {
       "source": "hooks/open_item_dedup.py",
       "expression": "subprocess.run(['gh', 'release', 'list', '--limit', '5'], cwd=repo_path, capture_output=True, text=True, timeout=10)",
-      "source_sha256": "31900362bd29206598679fdfd880010b786869afd8d4fa59ca7e5867cf585147",
+      "source_sha256": "fa52143ee7afab8cbf4b0fddc61ce0f526993fc9d356ae0b6e05318bb2cbe0dc",
       "scope": "support",
       "reason": "Read-only release, PR, or issue metadata for the explicit repository. No native session or model is selected here."
     },
     {
       "source": "hooks/open_item_dedup.py",
       "expression": "subprocess.run(['gh', 'pr', 'list', '--state', 'merged', '--limit', '20', '--json', 'number,title,mergedAt,url'], cwd=repo_path, capture_output=True, text=True, timeout=10)",
-      "source_sha256": "31900362bd29206598679fdfd880010b786869afd8d4fa59ca7e5867cf585147",
+      "source_sha256": "fa52143ee7afab8cbf4b0fddc61ce0f526993fc9d356ae0b6e05318bb2cbe0dc",
       "scope": "support",
       "reason": "Read-only release, PR, or issue metadata for the explicit repository. No native session or model is selected here."
     },
     {
       "source": "hooks/open_item_dedup.py",
       "expression": "subprocess.run(['gh', 'issue', 'list', '--state', 'closed', '--limit', '20', '--json', 'number,title,closedAt,body,url'], cwd=repo_path, capture_output=True, text=True, timeout=10)",
-      "source_sha256": "31900362bd29206598679fdfd880010b786869afd8d4fa59ca7e5867cf585147",
+      "source_sha256": "fa52143ee7afab8cbf4b0fddc61ce0f526993fc9d356ae0b6e05318bb2cbe0dc",
       "scope": "support",
       "reason": "Read-only release, PR, or issue metadata for the explicit repository. No native session or model is selected here."
     },
     {
       "source": "hooks/open_item_dedup.py",
       "expression": "subprocess.run(['python3', cli_path, 'semantic_merge', str(out_path)], input=in_path.read_text(), capture_output=True, text=True, timeout=_outer_subagent_timeout())",
-      "source_sha256": "31900362bd29206598679fdfd880010b786869afd8d4fa59ca7e5867cf585147",
+      "source_sha256": "fa52143ee7afab8cbf4b0fddc61ce0f526993fc9d356ae0b6e05318bb2cbe0dc",
       "capability": "ai.native_selection"
     },
     {
       "source": "hooks/open_item_dedup.py",
       "expression": "subprocess.run(['python3', cli_path, 'classifier', str(out_path)], input=in_path.read_text(), capture_output=True, text=True, timeout=_outer_subagent_timeout())",
-      "source_sha256": "31900362bd29206598679fdfd880010b786869afd8d4fa59ca7e5867cf585147",
+      "source_sha256": "fa52143ee7afab8cbf4b0fddc61ce0f526993fc9d356ae0b6e05318bb2cbe0dc",
       "capability": "ai.native_selection"
     },
     {
       "source": "hooks/skill_procedures.py",
       "expression": "subprocess.run(['git', '-C', repo_path, 'rev-parse', 'HEAD'], capture_output=True, text=True, timeout=10)",
-      "source_sha256": "273ad0c7082da14211b52746c31d6f9089104ae399a4c2bb3ebad30bd3b5d7fe",
+      "source_sha256": "d0ed43d6448eea99839576b71c8dc69eab34328e11278528e60734dc90e9b3ce",
       "scope": "support",
       "reason": "Bounded or disposable-repository Git metadata/setup. The enclosing native operation keeps its separate host contract."
     },
     {
       "source": "hooks/skill_procedures.py",
-      "expression": "subprocess.run(['bash', str(script), operation, '--host', context.host, '--source', str(context.resource_root)], stdin=subprocess.DEVNULL, timeout=120)",
-      "source_sha256": "273ad0c7082da14211b52746c31d6f9089104ae399a4c2bb3ebad30bd3b5d7fe",
+      "expression": "subprocess.run(command, env=environment, stdin=subprocess.DEVNULL, timeout=120)",
+      "source_sha256": "d0ed43d6448eea99839576b71c8dc69eab34328e11278528e60734dc90e9b3ce",
       "capability": "installation.fresh_upgrade"
     },
     {
       "source": "hooks/vault_index.py",
       "expression": "subprocess.run(['git', 'rev-parse', '--abbrev-ref', 'HEAD'], capture_output=True, text=True, timeout=5)",
-      "source_sha256": "d535fa4f6af8718c6b7da0de9bbed961bab487eee9e28af550e7f217eabc6864",
+      "source_sha256": "d74f0b2942c5448525c3b712b4930e67922db98c409fee6ca17ccc6c32d0f51f",
       "scope": "support",
       "reason": "Bounded or disposable-repository Git metadata/setup. The enclosing native operation keeps its separate host contract."
     },
@@ -1202,7 +1202,7 @@
     {
       "source": "scripts/vault_doctor_checks/session_coverage.py",
       "expression": "subprocess.run(cmd, capture_output=True, text=True, timeout=120)",
-      "source_sha256": "e57765c613d7812552dcfb65b35170e804ec49ced34708a761b92257110e1b23",
+      "source_sha256": "500cf6bbd61cf3dbb53f186b29bd969deec357b0c89fb4a36d23d9231983639e",
       "capability": "doctor.session_coverage"
     },
     {
@@ -1220,14 +1220,14 @@
     {
       "source": "tests/test_check_items_cache.py",
       "expression": "subprocess.Popen([sys.executable, '-c', code, os.path.abspath(HOOKS_DIR), str(lock)], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)",
-      "source_sha256": "7858e6746b293a953e3cfe2daae653ea6df20bcdb6b8822aa475ee565d95049a",
+      "source_sha256": "288b0a33bf2765a2a411dadbd47250872d7d40860ad36b9ddef0310f0567df9c",
       "scope": "support",
       "reason": "Disposable child tests OS lock release/bounded lock acquisition. Native cache identity is covered by separate required calls."
     },
     {
       "source": "tests/test_check_items_cache.py",
       "expression": "subprocess.run([sys.executable, '-c', prog, hooks, str(tmp_path / 'cache.lock')], capture_output=True, text=True, timeout=20)",
-      "source_sha256": "7858e6746b293a953e3cfe2daae653ea6df20bcdb6b8822aa475ee565d95049a",
+      "source_sha256": "288b0a33bf2765a2a411dadbd47250872d7d40860ad36b9ddef0310f0567df9c",
       "scope": "support",
       "reason": "Disposable child tests OS lock release/bounded lock acquisition. Native cache identity is covered by separate required calls."
     },
@@ -1241,30 +1241,30 @@
       "source": "tests/test_dev_skill_install.py",
       "expression": "subprocess.run(['bash', str(repo / 'scripts' / 'test-dev-skill.sh'), 'install', '--host', context.host, '--source', str(repo), '--cache-path', str(home / native_folder() / 'plugins/cache/claude-code-skills/obsidian-brain/2.3.0')], env=env, capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL)",
       "capability": "installation.fresh_upgrade",
-      "source_sha256": "4c91d88b62e746fb89ee59f8753e8b9a9f71c380bd6329049f9bec25bd3e55bb"
+      "source_sha256": "83ef322a026631e8f010a2bf41189819dc61337f8135b33ed8b3d8ee7394338a"
     },
     {
       "source": "tests/test_dev_skill_install.py",
       "expression": "subprocess.run(['bash', str(repo / 'scripts' / 'test-dev-skill.sh'), 'install', '--host', context.host, '--source', str(repo), '--cache-path', str(home / native_folder() / 'plugins/cache/claude-code-skills/obsidian-brain/2.3.0')], env=env, capture_output=True, text=True, timeout=10, stdin=subprocess.DEVNULL)",
       "capability": "installation.fresh_upgrade",
-      "source_sha256": "4c91d88b62e746fb89ee59f8753e8b9a9f71c380bd6329049f9bec25bd3e55bb"
+      "source_sha256": "83ef322a026631e8f010a2bf41189819dc61337f8135b33ed8b3d8ee7394338a"
     },
     {
       "source": "tests/test_dev_test_script_guards.py",
       "expression": "subprocess.run([_BASH, str(script), cmd, '--host', context.host, '--source', str(script.parent.parent)], env=env, capture_output=True, text=True, timeout=10, stdin=subprocess.DEVNULL)",
       "capability": "installation.rollback",
-      "source_sha256": "81998d3a1a1c3e44e42b77d0975d7cdf5bf8f274f89f99acbd9aebd514f60c14"
+      "source_sha256": "05163d8fe9ed83939cbc46eeaa9f57cddd273275c121f17b12693650b7b0d2dd"
     },
     {
       "source": "tests/test_dev_test_script_guards.py",
       "expression": "subprocess.run([_BASH, str(SCRIPT_PATH), mode, '--host', context.host, '--source', str(source), '--cache-path', str(cache)], env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)",
       "capability": "installation.rollback",
-      "source_sha256": "81998d3a1a1c3e44e42b77d0975d7cdf5bf8f274f89f99acbd9aebd514f60c14"
+      "source_sha256": "05163d8fe9ed83939cbc46eeaa9f57cddd273275c121f17b12693650b7b0d2dd"
     },
     {
       "source": "tests/test_hook_dedup_guard.py",
       "expression": "subprocess.run(command, input=payload, capture_output=True, text=True, cwd=context.worktree, env=dict(os.environ, CLAUDE_CODE_SESSION_ID='foreign-inherited-id', CODEX_THREAD_ID='foreign-inherited-thread'), timeout=10)",
-      "source_sha256": "6218f6ce08b7fa48c55c78c81ecf0556dcb058dfccff7cc71f7f07e0daff550b",
+      "source_sha256": "864590a5736829b58e39fb0a657783d3730cc5f9eda075282e79044461009811",
       "capability": "capture.normalization"
     },
     {
@@ -1276,32 +1276,32 @@
     {
       "source": "tests/test_hooks_resolver_drift.py",
       "expression": "subprocess.run([sys.executable, '-c', _root_code(skill), str(loaded)], cwd=cwd, env=env, capture_output=True, text=True, timeout=10)",
-      "source_sha256": "3167c6c4c9ad2296c7f60ab571e68cf9b19c04fc967c9b4be0fdfa128f9ad7ec",
+      "source_sha256": "5e996ef66dd7974c823456f9d7067e888d3e1ae812bcf3f64e22c77bd4002b2d",
       "scope": "structural",
       "reason": "Resource-root resolution expression in a fresh interpreter; this call does not execute the skill operation."
     },
     {
       "source": "tests/test_hooks_resolver_drift.py",
       "expression": "subprocess.run(['bash', '-c', _context_command(skill)], cwd=cwd, env=env, capture_output=True, text=True, timeout=10)",
-      "source_sha256": "3167c6c4c9ad2296c7f60ab571e68cf9b19c04fc967c9b4be0fdfa128f9ad7ec",
+      "source_sha256": "5e996ef66dd7974c823456f9d7067e888d3e1ae812bcf3f64e22c77bd4002b2d",
       "capability": "skill.dispatch"
     },
     {
       "source": "tests/test_hooks_resolver_drift.py",
       "expression": "subprocess.run([sys.executable, str(root / 'hooks/brain_cli.py'), '--host', selected_host_context.host, '--client', selected_host_context.client, '--resource-root', str(root), '--session-id', 'synthetic-loaded-skill', '--cwd', str(cwd), 'run', '--skill-path', str(REPO / 'skills/recall/SKILL.md'), '--operation', 'config'], input='{}', cwd=cwd, env=env, capture_output=True, text=True, timeout=10)",
       "capability": "skill.dispatch",
-      "source_sha256": "3167c6c4c9ad2296c7f60ab571e68cf9b19c04fc967c9b4be0fdfa128f9ad7ec"
+      "source_sha256": "5e996ef66dd7974c823456f9d7067e888d3e1ae812bcf3f64e22c77bd4002b2d"
     },
     {
       "source": "tests/test_hooks_resolver_drift.py",
       "expression": "subprocess.run(['bash', '-c', commands[0]], cwd=cwd, env=env, capture_output=True, text=True, timeout=10)",
-      "source_sha256": "3167c6c4c9ad2296c7f60ab571e68cf9b19c04fc967c9b4be0fdfa128f9ad7ec",
+      "source_sha256": "5e996ef66dd7974c823456f9d7067e888d3e1ae812bcf3f64e22c77bd4002b2d",
       "capability": "skill.dispatch"
     },
     {
       "source": "tests/test_host_collection_contract.py",
       "expression": "subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60, cwd=tmp_path, env=env)",
-      "source_sha256": "a80a033d0c7a9c029c273837ca32167d367df4ef23029810cee795574dbda0c5",
+      "source_sha256": "ddec0467729b8fa76a7d429524b740f7f631017b80b58cf8461735af3c702936",
       "scope": "structural",
       "reason": "Isolated pytest collection negative controls; validates the contract gate itself without a native plugin invocation."
     },
@@ -1356,10 +1356,10 @@
     },
     {
       "source": "tests/test_host_note_transactions.py",
-      "expression": "subprocess.Popen([sys.executable, '-c', script, str(Path(__file__).resolve().parents[1] / 'hooks'), str(context.index_path)], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)",
-      "source_sha256": "97fab370509e3037e34f1edcd534e034f57fef9c0143707f72b093e6ea666161",
+      "expression": "subprocess.Popen([sys.executable, '-c', script, str(Path(__file__).resolve().parents[1] / 'hooks'), json.dumps(descriptor)], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)",
+      "source_sha256": "c5e4efa7668848a891b1325be15385ea0b0f1e623d4424637fa0a632606b933f",
       "scope": "support",
-      "reason": "Disposable SQLite lock holder for the selected private index. The paired transaction API call remains required."
+      "reason": "Disposable physical-vault lock holder uses the full selected RuntimeContext. The paired transaction API call remains required."
     },
     {
       "source": "tests/test_host_runtime_contracts.py",
@@ -1371,7 +1371,7 @@
     {
       "source": "tests/test_host_skill_contracts.py",
       "expression": "subprocess.run(['bash', '-c', block], env=environment, cwd=selected_host_context.worktree, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=5)",
-      "source_sha256": "f14e495f2353b8382afd6080afe015b648ed99acbe4bbb29b6ef1c1b20a8c7d0",
+      "source_sha256": "e82ca46b7074ad74775ee443cad0faec3f1633076fb78ec6238438063c638a58",
       "capability": "skill.dispatch"
     },
     {
@@ -1390,15 +1390,15 @@
     {
       "source": "tests/test_native_lifecycle_integration.py",
       "expression": "subprocess.run(command, input=json.dumps({'session_id': native_id, 'cwd': str(context.worktree), 'transcript_path': str(source)}), text=True, capture_output=True, timeout=5)",
-      "source_sha256": "1a0c76af1025be1930be0596a16d3527ef6fa83cc98b33c159ee11d39a7ff2ed",
+      "source_sha256": "4b3da83f8fc79e96a84be8a260bbfeb0d8af7a9321886dc25d78b9a037810508",
       "capability": "capture.normalization"
     },
     {
       "source": "tests/test_native_lifecycle_integration.py",
       "expression": "subprocess.run([sys.executable, str(wrapper), '--host', 'codex'], stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=5)",
-      "source_sha256": "1a0c76af1025be1930be0596a16d3527ef6fa83cc98b33c159ee11d39a7ff2ed",
+      "source_sha256": "4b3da83f8fc79e96a84be8a260bbfeb0d8af7a9321886dc25d78b9a037810508",
       "scope": "structural",
-      "reason": "Codex wrapper with missing current-client binding must defer before runtime/capture; no successful lifecycle claim."
+      "reason": "Codex wrapper without verified current-client binding skips before runtime/capture and retains no source. This is a negative control, not successful lifecycle evidence."
     },
     {
       "source": "tests/test_no_default_db_check.py",
@@ -1410,62 +1410,55 @@
     {
       "source": "tests/test_note_writer.py",
       "expression": "subprocess.run(command, input=input, capture_output=capture_output, text=text, timeout=timeout, cwd=cwd)",
-      "source_sha256": "aae1451394c98b14f2076ce6f0ada52ed159987820d8dfee571b669c855e2ce5",
+      "source_sha256": "7ec2288cf04f1ce54881b454ead34dd8001aa9e0fddb159eef0dbf428c7942f9",
       "capability": "writer.atomic_revision"
-    },
-    {
-      "source": "tests/test_note_writer.py",
-      "expression": "subprocess.run([sys.executable, '-c', 'import os; print(os.getpid())'], stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=5, check=True)",
-      "source_sha256": "aae1451394c98b14f2076ce6f0ada52ed159987820d8dfee571b669c855e2ce5",
-      "scope": "support",
-      "reason": "Bounded stdin-closed PID probe creates a demonstrably stale lock owner. It does not run a writer."
     },
     {
       "source": "tests/test_obsidian_utils.py",
       "expression": "subprocess.run(['git', 'init', '-q'], cwd=path, check=True)",
-      "source_sha256": "efd9227bb4bbb8020a610896fee028b4f64e715f964f6b9866385005d2ffe14f",
+      "source_sha256": "76f48ae8bee95038dc507af5baf75d0e8638633e3a68738c9ad0f9f1b26fd5e7",
       "scope": "support",
       "reason": "Disposable Git repository/worktree setup for selected-context lookup or repository policy tests."
     },
     {
       "source": "tests/test_obsidian_utils.py",
       "expression": "subprocess.run(['git', 'config', 'user.email', 'test@example.com'], cwd=path, check=True)",
-      "source_sha256": "efd9227bb4bbb8020a610896fee028b4f64e715f964f6b9866385005d2ffe14f",
+      "source_sha256": "76f48ae8bee95038dc507af5baf75d0e8638633e3a68738c9ad0f9f1b26fd5e7",
       "scope": "support",
       "reason": "Disposable Git repository/worktree setup for selected-context lookup or repository policy tests."
     },
     {
       "source": "tests/test_obsidian_utils.py",
       "expression": "subprocess.run(['git', 'config', 'user.name', 'test'], cwd=path, check=True)",
-      "source_sha256": "efd9227bb4bbb8020a610896fee028b4f64e715f964f6b9866385005d2ffe14f",
+      "source_sha256": "76f48ae8bee95038dc507af5baf75d0e8638633e3a68738c9ad0f9f1b26fd5e7",
       "scope": "support",
       "reason": "Disposable Git repository/worktree setup for selected-context lookup or repository policy tests."
     },
     {
       "source": "tests/test_obsidian_utils.py",
       "expression": "subprocess.run(['git', 'add', '.'], cwd=path, check=True)",
-      "source_sha256": "efd9227bb4bbb8020a610896fee028b4f64e715f964f6b9866385005d2ffe14f",
+      "source_sha256": "76f48ae8bee95038dc507af5baf75d0e8638633e3a68738c9ad0f9f1b26fd5e7",
       "scope": "support",
       "reason": "Disposable Git repository/worktree setup for selected-context lookup or repository policy tests."
     },
     {
       "source": "tests/test_obsidian_utils.py",
       "expression": "subprocess.run(['git', 'commit', '-q', '-m', 'init'], cwd=path, check=True)",
-      "source_sha256": "efd9227bb4bbb8020a610896fee028b4f64e715f964f6b9866385005d2ffe14f",
+      "source_sha256": "76f48ae8bee95038dc507af5baf75d0e8638633e3a68738c9ad0f9f1b26fd5e7",
       "scope": "support",
       "reason": "Disposable Git repository/worktree setup for selected-context lookup or repository policy tests."
     },
     {
       "source": "tests/test_obsidian_utils.py",
       "expression": "subprocess.run(['git', 'worktree', 'add', '-b', 'feature/x', str(worktree)], cwd=repo, check=True, capture_output=True)",
-      "source_sha256": "efd9227bb4bbb8020a610896fee028b4f64e715f964f6b9866385005d2ffe14f",
+      "source_sha256": "76f48ae8bee95038dc507af5baf75d0e8638633e3a68738c9ad0f9f1b26fd5e7",
       "scope": "support",
       "reason": "Disposable Git repository/worktree setup for selected-context lookup or repository policy tests."
     },
     {
       "source": "tests/test_obsidian_utils.py",
       "expression": "subprocess.run(['git', 'worktree', 'add', '-b', 'feature/issue-93', str(worktree)], cwd=repo, check=True, capture_output=True)",
-      "source_sha256": "efd9227bb4bbb8020a610896fee028b4f64e715f964f6b9866385005d2ffe14f",
+      "source_sha256": "76f48ae8bee95038dc507af5baf75d0e8638633e3a68738c9ad0f9f1b26fd5e7",
       "scope": "support",
       "reason": "Disposable Git repository/worktree setup for selected-context lookup or repository policy tests."
     },
@@ -1479,18 +1472,18 @@
       "source": "tests/test_retro_gate.py",
       "expression": "subprocess.run(_native_command(context), input=json.dumps(payload), capture_output=True, text=True, env=dict(os.environ), timeout=5)",
       "capability": "skill.retro",
-      "source_sha256": "dc8a02e136b7304a741f117e7a711fa1e48c9b879682c95f1c21e8b94fbb9ca0"
+      "source_sha256": "e51c296974d145c3739c255f2d18266cc935d719bd59690ac7b6497f672bd34a"
     },
     {
       "source": "tests/test_retro_gate.py",
       "expression": "subprocess.run(_native_command(__import__('runtime_context').current_runtime_context()), input='not valid json {{{{', capture_output=True, text=True, env=env, timeout=5)",
       "capability": "skill.retro",
-      "source_sha256": "dc8a02e136b7304a741f117e7a711fa1e48c9b879682c95f1c21e8b94fbb9ca0"
+      "source_sha256": "e51c296974d145c3739c255f2d18266cc935d719bd59690ac7b6497f672bd34a"
     },
     {
       "source": "tests/test_retro_gate.py",
       "expression": "subprocess.run(command, input=json.dumps({'session_id': selected.native_session_id, 'cwd': str(selected.worktree), 'stop_hook_active': active}), capture_output=True, text=True, env=env, timeout=5)",
-      "source_sha256": "dc8a02e136b7304a741f117e7a711fa1e48c9b879682c95f1c21e8b94fbb9ca0",
+      "source_sha256": "e51c296974d145c3739c255f2d18266cc935d719bd59690ac7b6497f672bd34a",
       "capability": "skill.retro"
     },
     {
@@ -1609,7 +1602,7 @@
       "source": "tests/test_session_end_telemetry.py",
       "expression": "subprocess.run(command, input=raw, capture_output=True, text=True, cwd=context.worktree, env=dict(os.environ, CLAUDE_CODE_SESSION_ID='foreign-id', CODEX_THREAD_ID='foreign-thread'), timeout=5)",
       "capability": "capture.normalization",
-      "source_sha256": "1bfc6fe9b36b73123ab9ada7c99b6252ee63d18e72f3799e178245db218a6bbb"
+      "source_sha256": "718d332b2324c6a5eb8f50b31a4d88fe4630af641d1f80782d13b97cee586c87"
     },
     {
       "source": "tests/test_session_hint_bootstrap.py",
@@ -1620,7 +1613,7 @@
     {
       "source": "tests/test_skill_shell_blocks.py",
       "expression": "subprocess.run([BASH, '-c', command], cwd=tmp_path, env=environment, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)",
-      "source_sha256": "c8c5017f77b42ac4fa07062b203f9783fc264db836d8e74bc533c75ee2002f04",
+      "source_sha256": "7fc715ece4e6f79bd4ea0d23cc734e109c431e577f2e595ee4308e85171a5df1",
       "capability": "skill.dispatch"
     },
     {
@@ -1632,43 +1625,43 @@
     {
       "source": "tests/test_vault_doctor_audit_historic_repairs.py",
       "expression": "subprocess.run([sys.executable, str(script), '--check', 'audit-historic-repairs', '--json', '--vault', str(vault), '--sessions-folder', 'claude-sessions', '--insights-folder', 'claude-insights'], capture_output=True, text=True, env=env)",
-      "source_sha256": "885545dd7724c55f59bb36437d710cb0f75014d603cb0986f4d608a649786d2d",
+      "source_sha256": "5af7dcfd34adc203b66e74e452b7288c76b4af903dee3cb7b7dab2ddd355dd7b",
       "capability": "cli.doctor"
     },
     {
       "source": "tests/test_vault_doctor_audit_historic_repairs.py",
       "expression": "subprocess.run([sys.executable, str(script), '--json', '--vault', str(vault), '--sessions-folder', 'claude-sessions', '--insights-folder', 'claude-insights'], capture_output=True, text=True, env=env)",
-      "source_sha256": "885545dd7724c55f59bb36437d710cb0f75014d603cb0986f4d608a649786d2d",
+      "source_sha256": "5af7dcfd34adc203b66e74e452b7288c76b4af903dee3cb7b7dab2ddd355dd7b",
       "capability": "cli.doctor"
     },
     {
       "source": "tests/test_vault_doctor_audit_historic_repairs.py",
       "expression": "subprocess.run([sys.executable, str(script), '--check', 'audit-historic-repairs', '--apply', '--yes', '--vault', str(vault), '--sessions-folder', 'claude-sessions', '--insights-folder', 'claude-insights'], capture_output=True, text=True, env=env)",
-      "source_sha256": "885545dd7724c55f59bb36437d710cb0f75014d603cb0986f4d608a649786d2d",
+      "source_sha256": "5af7dcfd34adc203b66e74e452b7288c76b4af903dee3cb7b7dab2ddd355dd7b",
       "capability": "cli.doctor"
     },
     {
       "source": "tests/test_vault_doctor_audit_historic_repairs.py",
       "expression": "subprocess.run([sys.executable, str(_SCRIPT), '--check', 'audit-historic-repairs', '--json'], capture_output=True, text=True, env=env)",
-      "source_sha256": "885545dd7724c55f59bb36437d710cb0f75014d603cb0986f4d608a649786d2d",
+      "source_sha256": "5af7dcfd34adc203b66e74e452b7288c76b4af903dee3cb7b7dab2ddd355dd7b",
       "capability": "cli.doctor"
     },
     {
       "source": "tests/test_vault_doctor_audit_historic_repairs.py",
       "expression": "subprocess.run([sys.executable, str(_SCRIPT), '--check', 'audit-historic-repairs', '--min-confidence', '0.5', '--apply', '--yes', '--json'], capture_output=True, text=True, env=env)",
-      "source_sha256": "885545dd7724c55f59bb36437d710cb0f75014d603cb0986f4d608a649786d2d",
+      "source_sha256": "5af7dcfd34adc203b66e74e452b7288c76b4af903dee3cb7b7dab2ddd355dd7b",
       "capability": "cli.doctor"
     },
     {
       "source": "tests/test_vault_doctor_audit_historic_repairs.py",
       "expression": "subprocess.run([sys.executable, str(_SCRIPT), '--check', 'audit-historic-repairs', '--min-confidence', '0.5', '--json'], capture_output=True, text=True, env=env)",
-      "source_sha256": "885545dd7724c55f59bb36437d710cb0f75014d603cb0986f4d608a649786d2d",
+      "source_sha256": "5af7dcfd34adc203b66e74e452b7288c76b4af903dee3cb7b7dab2ddd355dd7b",
       "capability": "cli.doctor"
     },
     {
       "source": "tests/test_vault_doctor_audit_historic_repairs.py",
       "expression": "subprocess.run([sys.executable, str(_SCRIPT), '--check', 'audit-historic-repairs', '--min-confidence', '0.5'], capture_output=True, text=True, env=env)",
-      "source_sha256": "885545dd7724c55f59bb36437d710cb0f75014d603cb0986f4d608a649786d2d",
+      "source_sha256": "5af7dcfd34adc203b66e74e452b7288c76b4af903dee3cb7b7dab2ddd355dd7b",
       "capability": "cli.doctor"
     },
     {
@@ -1881,7 +1874,7 @@
     {
       "source": "tests/test_vault_doctor_transactions.py",
       "expression": "subprocess.run([sys.executable, str(script), '--vault', str(tmp_path), '--sessions-folder', 'claude-sessions', '--insights-folder', 'claude-insights', '--check', 'encoding-corruption', '--apply', '--yes'], env=environment, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=20)",
-      "source_sha256": "6b82beae7ec519c279ebaf0324204f40b9350f679841720126c497de5b9b6d68",
+      "source_sha256": "808c8b5e02da809aaf0763a4161ceb844746572346e276333e7caf5449c4062a",
       "capability": "cli.doctor"
     },
     {
@@ -1957,6 +1950,54 @@
       "source_sha256": "d53ea4fe28baa10c541fe2b894749248bd3b0c08e9c3d5e60ef5c5aaf063d89a",
       "scope": "support",
       "reason": "Disposable Git fixture setup for exact repository preflight-token HEAD tests; no vault paths or lifecycle calls."
+    },
+    {
+      "source": "tests/conftest.py",
+      "expression": "original(args, *positional, **kwargs)",
+      "source_sha256": "53e7a930fe709a86ab4fe9df5e1db213f12a3b485bd2bc9ee0a844a6931903b3",
+      "scope": "support",
+      "reason": "Autouse test transport guard rejects unmocked claude/codex commands before forwarding non-native subprocesses. This guard proves no client capability; actual process callers retain their own actor contracts."
+    },
+    {
+      "source": "tests/test_check_items_cache.py",
+      "expression": "original_popen(command, *args, **kwargs)",
+      "source_sha256": "288b0a33bf2765a2a411dadbd47250872d7d40860ad36b9ddef0310f0567df9c",
+      "scope": "support",
+      "reason": "Autouse cache-test transport guard forwards only named disposable Python lock-holder tests and rejects every live native AI launch. Cache actor contracts remain required."
+    },
+    {
+      "source": "tests/test_host_ai_backend.py",
+      "expression": "real_popen(*args, **kwargs)",
+      "source_sha256": "577ae70065792ca0a23cf02cbf1f116bb35f049f9b166b21a73314fae76cd693",
+      "scope": "support",
+      "reason": "Paired deadline test records and terminates a disposable Python sleep child. The actual backend invocation remains actor-scoped."
+    },
+    {
+      "source": "tests/test_standup_deep.py",
+      "expression": "original_run(cmd, **kwargs)",
+      "source_sha256": "6b22e1060f8d47e50fb721f8272f812b1f201083c0cec00f455c6964622dc8d0",
+      "scope": "support",
+      "reason": "Paired standup test intercepts git-log and gh failures, forwarding remaining fixture repository commands. The real native pipeline remains actor-scoped."
+    },
+    {
+      "source": "tests/test_review_coordination_recovery.py",
+      "expression": "subprocess.run([sys.executable, '-c', 'raise SystemExit(99)'], env=environment, stdin=subprocess.DEVNULL, capture_output=True, timeout=5)",
+      "source_sha256": "e670a3aa583ce487f59dbccfbeeff21e84edde9ca40bb90c25f28d8ed00f3af4",
+      "scope": "support",
+      "reason": "Scratch transport refusal control requests a disposable Python child with missing private coordination state and asserts the autouse guard rejects it before process creation. It exercises no native client capability."
+    },
+    {
+      "source": "tests/test_review_native_classifier_retry.py",
+      "expression": "_NATIVE_POPEN(command, *args, **kwargs)",
+      "source_sha256": "0bc49b6250b9f3cecc808c9870dfb2cca6a83427ab75294a368e60eb2d9b2527",
+      "capability": "ai.native_selection"
+    },
+    {
+      "source": "tests/test_host_package_install.py",
+      "expression": "subprocess.run([sys.executable, '-S', '-c', driver, str(public_script), mode, str(source), str(cache)], env=environment, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)",
+      "source_sha256": "f3936bab0adde04b6bcf20e202f2605c0c758590ca51f75db7d6f270ad04b93b",
+      "scope": "support",
+      "reason": "Runs only the copied installer in disposable home/cache/config with metadata-only native inventory. No installed client, AI, source capture or live vault runs; validates Python 3.9 stdlib packaging and exact backup restoration."
     }
   ]
 }

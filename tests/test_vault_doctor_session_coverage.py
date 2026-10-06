@@ -1850,3 +1850,130 @@ def test_session_coverage_reachable_via_get_check():
     assert mod is sc
 
 from doctor_cli_test_helpers import run_doctor
+
+
+def _native_coverage_fixture(context, sid, *, partial=False):
+    root = context.native_home / ('projects/synthetic' if context.host == 'claude' else 'sessions')
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / (sid + '.jsonl')
+    if context.host == 'claude':
+        rows = [{'type':'user','sessionId':sid,'cwd':str(context.worktree), 'uuid':sid+'-'+str(i),
+                 'message':{'role':'user','content':'Owned visible question.'}} for i in range(3)]
+    else:
+        rows = [{'type':'session_meta','payload':{'id':sid,'cwd':str(context.worktree)}}]
+        rows.extend({'type':'event_msg','payload':{'type':'item_completed','thread_id':sid,
+                     'turn_id':sid+'-turn','item':{'type':'UserMessage','id':sid+'-'+str(i),
+                     'content':[{'type':'text','text':'Owned visible question.'}]}}} for i in range(3))
+    if partial:
+        rows.insert(1, {'type':'future_record','payload':{'private':'do-not-copy'}})
+    path.write_text(''.join(json.dumps(row)+'\n' for row in rows))
+    return path
+
+
+def test_native_coverage_reports_bounded_window_without_aborting(selected_host_context, monkeypatch):
+    import transcripts
+    context = selected_host_context
+    for i in range(1100):
+        _native_coverage_fixture(context, 'window-'+str(i).zfill(4))
+    calls = []
+    def normalized(actor, cursor, deadline):
+        calls.append(actor.native_session_id)
+        return transcripts.TranscriptBatch('ok', tuple(transcripts.SourceRecord(str(i),'user','Owned',i)
+            for i in range(3)), 'synthetic-generation', actor.transcript_path.stat().st_size,
+            metadata={'native_session_id':actor.native_session_id,
+                'cwd':str(actor.worktree), 'recorded_worktree':str(actor.worktree)},
+            source_complete=True,source_size=actor.transcript_path.stat().st_size)
+    monkeypatch.setattr(transcripts, 'read_records', normalized)
+    rows = sc.scan(str(context.vault_path), 'claude-sessions', 'claude-insights', 30)
+    gaps = [row for row in rows if row.extra['signal_class'] == 'session-coverage-gap']
+    [incomplete] = [row for row in rows if row.extra['signal_class'] == 'session-coverage-incomplete']
+    assert len(calls) == len(gaps) == 1024
+    assert calls == ['window-'+str(i).zfill(4) for i in range(1024)]
+    assert incomplete.extra['unscanned_sources'] == 76
+    assert incomplete.extra['audit_complete'] is False and incomplete.extra['unresolved'] is True
+
+
+def test_native_coverage_keeps_valid_gap_when_another_source_is_partial(selected_host_context):
+    context = selected_host_context
+    partial = _native_coverage_fixture(context, 'a-partial', partial=True)
+    _native_coverage_fixture(context, 'b-valid')
+    rows = sc.scan(str(context.vault_path), 'claude-sessions', 'claude-insights', 30)
+    assert any(row.extra['signal_class'] == 'session-coverage-gap' and row.extra['sid'] == 'b-valid' for row in rows)
+    [incomplete] = [row for row in rows if row.extra['signal_class'] == 'session-coverage-incomplete']
+    assert incomplete.current_source == str(partial) and incomplete.extra['capture_status'] == 'partial'
+    assert incomplete.extra['audit_complete'] is False and incomplete.extra['unresolved'] is True
+    assert 'do-not-copy' not in str(rows)
+
+
+@pytest.mark.parametrize('invalid', [False, True])
+def test_native_coverage_delegates_verified_fork_identity_to_parser(selected_host_context, invalid):
+    context = selected_host_context
+    path = _native_coverage_fixture(context, 'child-session')
+    _native_coverage_fixture(context, 'other-valid')
+    if context.host == 'codex':
+        parent = 'parent-session'
+        header = {'type':'session_meta','ordinal':0,'payload':{'id':'child-session',
+            'cwd':str(context.worktree),'session_id':parent,'forked_from_id':parent,
+            'parent_thread_id':parent,'subagent_history_start_ordinal':4,
+            'source':{'subagent':{'thread_spawn':{'parent_thread_id':parent,'depth':1,
+            'agent_path':'/root/child','agent_nickname':'Synthetic child','agent_role':None}}}}}
+        if invalid:
+            header['payload']['parent_thread_id'] = 'wrong-parent'
+        def start(turn):
+            return {'type':'event_msg','payload':{'type':'task_started','turn_id':turn,
+                'started_at':1,'collaboration_mode_kind':'default','model_context_window':None}}
+        rows = [header, {'type':'session_meta','payload':{'id':parent,'cwd':str(context.worktree)}},
+                start('parent-turn'),
+                {'type':'response_item','payload':{'type':'message','id':'parent-question','role':'user',
+                    'content':[{'type':'input_text','text':'Inherited parent question'}],
+                    'internal_chat_message_metadata_passthrough':{'turn_id':'parent-turn'}}},
+                {'type':'event_msg','payload':{'type':'thread_settings_applied','thread_id':'child-session','thread_settings':{}}},
+                start('child-turn')]
+        rows.extend({'type':'event_msg','payload':{'type':'item_completed','thread_id':'child-session',
+            'turn_id':'child-turn','item':{'type':'UserMessage','id':'child-'+str(i),
+            'content':[{'type':'text','text':'Own child question'}]}}} for i in range(3))
+        for ordinal,row in enumerate(rows):
+            row['ordinal'] = ordinal
+        path.write_text(''.join(json.dumps(row)+'\n' for row in rows))
+    elif invalid:
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        rows[0]['sessionId'] = 'wrong-session'
+        path.write_text(''.join(json.dumps(row)+'\n' for row in rows))
+    issues = sc.scan(str(context.vault_path), 'claude-sessions', 'claude-insights', 30)
+    assert any(row.extra.get('sid') == 'other-valid' for row in issues)
+    if invalid:
+        assert any(row.extra['signal_class'] == 'session-coverage-incomplete' and row.current_source == str(path)
+                   for row in issues)
+        assert not any(row.extra.get('sid') == 'child-session' for row in issues)
+    else:
+        assert any(row.extra.get('sid') == 'child-session' for row in issues)
+        assert not any(row.extra['signal_class'] == 'session-coverage-incomplete' for row in issues)
+
+
+
+def test_native_coverage_deadline_reports_one_unscanned_window(selected_host_context, monkeypatch):
+    import transcripts
+    import time
+    context = selected_host_context
+    for i in range(4):
+        _native_coverage_fixture(context, 'deadline-'+str(i))
+    clock = [100.0]
+    visited = []
+    def bounded_read(actor, cursor, deadline):
+        visited.append(actor.native_session_id)
+        clock[0] += 11
+        return transcripts.TranscriptBatch('ok', tuple(transcripts.SourceRecord(str(i),'user','Owned',i)
+            for i in range(3)), 'synthetic-generation', actor.transcript_path.stat().st_size,
+            metadata={'native_session_id':actor.native_session_id,
+                'cwd':str(actor.worktree), 'recorded_worktree':str(actor.worktree)},
+            source_complete=True,source_size=actor.transcript_path.stat().st_size)
+    monkeypatch.setattr(time, 'monotonic', lambda: clock[0])
+    monkeypatch.setattr(transcripts, 'read_records', bounded_read)
+    rows = sc.scan(str(context.vault_path), 'claude-sessions', 'claude-insights', 30)
+    windows = [row for row in rows if 'unscanned_sources' in row.extra]
+    per_source = [row for row in rows if row.reason == 'Native source audit is incomplete: ValueError']
+    assert len(windows) == 1 and windows[0].extra['unscanned_sources'] == 3
+    assert windows[0].extra['audit_complete'] is False
+    assert len(visited) == len(per_source) == 1
+    assert all(row.extra['unresolved'] for row in rows)
+    assert not any(row.extra['signal_class'] == 'session-coverage-gap' for row in rows)

@@ -47,18 +47,7 @@ procedure variables `VAULT_PATH`/`VAULT`, `SESSIONS_FOLDER`/`SESS`, and
 `INSIGHTS_FOLDER`/`INS`. Use the canonical project returned in config JSON (and native `session` when available),
 not the basename of an unrelated shell working directory.
 
-Before preparing edits or requesting a summary of an existing note, call
-`note-read` and retain its exact `expected_revision`. Apply the proposed note
-with `note-apply` and that revision. A conflict leaves the current note intact;
-show the pending result and do not count the note as saved. New curated notes
-use `note-create`; they never overwrite a collision. Native memory discovery
-is unsupported for Codex because it has no equivalent native memory-file API; shared vault retrieval
-and wiki filing continue without borrowing another host's memory.
-
-Read `references/host-claude.md` or `references/host-codex.md` when present.
-All note writes described below use `note-create` or revision-bound `note-apply`,
-including bidirectional related links. Content is a JSON string, never shell code.
-Every later save or edit follows this revision-bound publication rule.
+Use only the operations documented for this skill. Their writes bind the source revisions before analysis and preserve manual edits on conflict. Content is JSON data, never shell code. Read `references/host-claude.md` or `references/host-codex.md` when present. Codex has no native memory-file API; shared vault retrieval and wiki filing continue without borrowing another host's memory.
 
 # Consolidate — Batch Theme Clustering
 
@@ -79,14 +68,13 @@ seeder over unassigned notes; `--full` wipes and reclusters everything.
 
 ### Step 2 — Consolidate (seed or full)
 
+Set `full` to `true` only for `--full`. Pass numeric theme IDs as JSON numbers in split and merge requests.
+
 Request for `consolidate` (substitute the values as data):
 
 ```json
 {
-  "operation_id": "<prepared id>",
-  "argv": [
-    "<arguments from this step>"
-  ]
+  "full": false
 }
 ```
 
@@ -104,10 +92,6 @@ Request for `theme-stats` (substitute the values as data):
 
 ```json
 {
-  "operation_id": "<prepared id>",
-  "argv": [
-    "<arguments from this step>"
-  ]
 }
 ```
 
@@ -123,10 +107,7 @@ Request for `theme-split` (substitute the values as data):
 
 ```json
 {
-  "operation_id": "<prepared id>",
-  "argv": [
-    "<arguments from this step>"
-  ]
+  "theme_id": 3
 }
 ```
 
@@ -142,10 +123,8 @@ Request for `theme-merge` (substitute the values as data):
 
 ```json
 {
-  "operation_id": "<prepared id>",
-  "argv": [
-    "<arguments from this step>"
-  ]
+  "a": 3,
+  "b": 4
 }
 ```
 

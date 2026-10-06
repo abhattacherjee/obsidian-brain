@@ -99,7 +99,11 @@ def lint_repository(root, adapters):
                 raise ValueError('Declared function does not exist.')
         except (OSError, SyntaxError, ValueError) as error:
             errors.append(('docs/parity/host-adapters.json', 0, 'adapter_function_invalid', key + ': ' + str(error)))
-    sources = sorted((root / 'hooks').rglob('*.py')) + sorted((root / 'skills').glob('*/SKILL.md'))
+    sources = (sorted((root / 'hooks').rglob('*.py')) + sorted((root / 'skills').glob('*/SKILL.md'))
+               + sorted((root / 'scripts/vault_doctor_checks').rglob('*.py'))
+               + [path for path in (root / 'scripts/vault_doctor.py', root / 'scripts/doctor_repair_state.py') if path.is_file()]
+               + sorted((root / 'skills').glob('*/references/*.md')))
+    sources = [path for path in sources if path.name not in {'host-claude.md', 'host-codex.md'}]
     for source in sources:
         relative = source.relative_to(root).as_posix()
         try:

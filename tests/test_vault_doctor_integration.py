@@ -77,6 +77,8 @@ def test_end_to_end_scan_apply_verify(tmp_path):
 
     env = os.environ.copy()
     env["HOME"] = str(home)
+    from runtime_context import current_runtime_context
+    env["OBSIDIAN_BRAIN_STATE_DIR"] = str(current_runtime_context().state_path)
     env["OBSIDIAN_BRAIN_VAULT"] = str(vault)
     env["OBSIDIAN_BRAIN_SESSIONS_FOLDER"] = "claude-sessions"
     env["OBSIDIAN_BRAIN_INSIGHTS_FOLDER"] = "claude-insights"
@@ -114,8 +116,12 @@ def test_end_to_end_scan_apply_verify(tmp_path):
     patched_body = patched.split("---\n", 2)[-1]
     assert patched_body == original_body, "body must be byte-identical after apply"
 
-    # Backup must exist under ~/.claude/obsidian-brain-doctor-backup/<timestamp>/proj1/
-    backup_root = home / ".claude" / "obsidian-brain-doctor-backup"
+    # The real child writes backups under its selected, versioned private state.
+    from dataclasses import replace
+    from runtime_context import current_runtime_context
+    from note_transactions import session_state_path
+    actor = current_runtime_context()
+    backup_root = session_state_path(replace(actor, vault_path=vault.resolve())) / "doctor-backups"
     assert backup_root.exists(), f"backup root not created at {backup_root}"
     backups = list(backup_root.rglob("2026-04-10-stale-e2e.md"))
     assert backups, f"no backup found for the patched note under {backup_root}"

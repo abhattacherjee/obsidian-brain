@@ -37,7 +37,11 @@ def metadata_only_transport(monkeypatch):
 @pytest.fixture
 def package(tmp_path):
     source = tmp_path / 'source with spaces'
-    files = {'hooks/obsidian_utils.py': '# synthetic source', 'hooks/brain_cli.py': '# launcher',
+    files = {'scripts/vault_doctor.py': '# synthetic doctor',
+             'scripts/doctor_repair_state.py': '# synthetic repair state',
+             'scripts/test-dev-skill.sh': '# synthetic dev command',
+             'scripts/vault_doctor_checks/__init__.py': '# synthetic check package',
+             'hooks/obsidian_utils.py': '# synthetic source', 'hooks/brain_cli.py': '# launcher',
              'hooks/transcripts/codex.py': '# recursive parser', 'hooks/ai_adapters/codex.py': '# recursive backend',
              'skills/recall/SKILL.md': '# synthetic skill', 'skills/recall/references/host-codex.md': '# native reference',
              '.codex-plugin/plugin.json': json.dumps({'name': 'obsidian-brain', 'version': '3.8.0', 'hooks': './.codex/hooks.json'}),
@@ -201,12 +205,15 @@ def test_native_inventory_closes_transport_on_discovery_error(package, monkeypat
     assert closed == [True]
 
 
-def test_missing_toml_parser_refuses(package, monkeypatch):
+def test_stdlib_toml_fallback_installs_and_restores(package, monkeypatch):
     source, home, cache, config = package
+    original=config.read_bytes()
     monkeypatch.setattr(installer, 'tomllib', None)
-    with pytest.raises(ValueError, match='tomllib or tomli'):
-        installer.run('install', source, home, cache_path=cache)
-    assert (cache / 'released.txt').is_file()
+    assert installer.run('status',source,home,cache_path=cache)==0
+    assert installer.run('install',source,home,cache_path=cache)==0
+    assert (cache/'hooks/obsidian_utils.py').read_text()=='# synthetic source'
+    assert installer.run('restore',source,home,cache_path=cache)==0
+    assert config.read_bytes()==original and (cache/'released.txt').read_text()=='original exact bytes'
 
 
 def test_backup_only_interrupted_swap_can_restore(package):
@@ -364,3 +371,157 @@ def test_recursive_snapshot_retains_current_runtime_packages(package):
         path = source / name; path.parent.mkdir(parents=True, exist_ok=True); path.write_text('# synthetic runtime')
     assert installer.run('install', source, home, cache_path=cache) == 0
     assert all((cache / name).read_text() == '# synthetic runtime' for name in additions)
+
+
+@pytest.mark.parametrize('missing', ['scripts/doctor_repair_state.py', 'scripts/vault_doctor.py',
+                                     'scripts/vault_doctor_checks/__init__.py'])
+def test_native_install_refuses_missing_doctor_dependency_before_cache_swap(package, missing):
+    source, home, cache, config = package
+    (source / missing).unlink()
+    before_config = config.read_bytes()
+    before_cache = {str(p.relative_to(cache)): p.read_bytes() for p in cache.rglob('*') if p.is_file()}
+    with pytest.raises(ValueError, match='Runtime package is incomplete'):
+        installer.run('install', source, home, cache_path=cache)
+    assert config.read_bytes() == before_config
+    assert {str(p.relative_to(cache)): p.read_bytes() for p in cache.rglob('*') if p.is_file()} == before_cache
+
+
+def test_version_bump_keeps_embedded_architecture_and_framework_in_sync(package):
+    import re
+    source, _, _, _ = package
+    architecture = source / 'docs/architecture/architecture.json'
+    architecture.parent.mkdir(parents=True)
+    value = {'version': '3.8.0', 'lastUpdated': '2000-01-01', 'name': 'UTF8 → α',
+             'techStack': {'framework': {'version': '3.8.0'}}}
+    architecture.write_text(json.dumps(value, ensure_ascii=False))
+    html = architecture.with_suffix('.html')
+    html.write_text('before<script id="arch-data" type="application/json">' + json.dumps(value, ensure_ascii=False) + '</script>after')
+    assert version.run(source, 'patch') == '3.8.1'
+    updated = json.loads(architecture.read_text())
+    embedded = json.loads(re.search(r'<script id="arch-data" type="application/json">(.*?)</script>', html.read_text()).group(1))
+    assert updated['techStack']['framework']['version'] == updated['version'] == '3.8.1'
+    assert updated['lastUpdated'] == version.datetime.date.today().isoformat()
+    assert embedded == updated
+    assert html.read_text().startswith('before<script') and html.read_text().endswith('</script>after')
+
+
+def test_architecture_html_mismatch_refuses_before_any_version_publication(package):
+    source, _, _, _ = package
+    architecture = source / 'docs/architecture/architecture.json'
+    architecture.parent.mkdir(parents=True)
+    architecture.write_text('{"version":"3.8.0"}')
+    architecture.with_suffix('.html').write_text('<script id="arch-data" type="application/json">{"version":"wrong"}</script>')
+    originals = {path: path.read_bytes() for path in source.rglob('*') if path.is_file()}
+    with pytest.raises(ValueError, match='differs from its source'):
+        version.run(source, 'patch')
+    assert all(path.read_bytes() == value for path, value in originals.items())
+    assert not (source / '.version-sync.pending.json').exists()
+
+
+def test_architecture_html_publication_failure_rolls_back_all_metadata(package):
+    source, _, _, _ = package
+    architecture = source / 'docs/architecture/architecture.json'
+    architecture.parent.mkdir(parents=True)
+    value = {'version': '3.8.0', 'techStack': {'framework': {'version': '3.8.0'}}}
+    architecture.write_text(json.dumps(value))
+    html = architecture.with_suffix('.html')
+    html.write_text('<script id="arch-data" type="application/json">' + json.dumps(value) + '</script>')
+    originals = {path: path.read_bytes() for path in source.rglob('*') if path.is_file()}
+    def fail_html(source_path, destination):
+        if destination == html:
+            raise OSError('synthetic HTML publication failure')
+        version.os.replace(source_path, destination)
+    with pytest.raises(OSError, match='synthetic HTML'):
+        version.run(source, 'patch', replace=fail_html)
+    assert all(path.read_bytes() == value for path, value in originals.items())
+    assert not (source / '.version-sync.pending.json').exists()
+
+
+def test_architecture_test_file_count_matches_repository_modules():
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[1]
+    architecture = json.loads((root / 'docs/architecture/architecture.json').read_text())
+    assert architecture['testing']['unitSuite']['fileCount'] == len(list((root / 'tests').glob('test_*.py')))
+
+
+def test_repository_architecture_html_embeds_current_json():
+    import re
+    root = Path(__file__).resolve().parents[1]
+    architecture = root / 'docs/architecture/architecture.json'
+    html = architecture.with_suffix('.html').read_text(encoding='utf-8')
+    embedded = re.search(r'<script[^>]*id=["\']arch-data["\'][^>]*>(.*?)</script>', html, re.S)
+    assert embedded is not None
+    assert json.loads(embedded.group(1)) == json.loads(architecture.read_text(encoding='utf-8'))
+
+
+@pytest.mark.parametrize('content',[
+    b'a=1\na=2\n',b'a=1\n[a]\nx=2\n',b'[a]\n[a]\n',
+    b'a={x=1}\na.y=2\n',b'a.b=1\n[a]\nx=2\n',
+    b'a=1979-05-27T07:32:00Z\n',b'[[plugins]]\nx=1\n',
+    b'a="""multiline"""\n',b'a=[1,\n2]\n',
+    b'a="invalid\\/escape"\n', b'a={x={y=1},x.z=2}\n',
+    b'a="\x7f"\n',
+    b'a="\\ud800"\n', b'a=' + b'[' * 65 + b'0' + b']' * 65 + b'\n',
+])
+def test_stdlib_toml_fallback_rejects_ambiguous_or_unsupported_before_write(package,monkeypatch,content):
+    source,home,cache,config=package;config.write_bytes(content)
+    monkeypatch.setattr(installer,'tomllib',None)
+    with pytest.raises(ValueError):installer.run('install',source,home,cache_path=cache)
+    assert config.read_bytes()==content and (cache/'released.txt').read_text()=='original exact bytes'
+    assert not cache.with_name(cache.name+'.bak').exists()
+
+
+def test_stdlib_toml_fallback_parses_ordinary_native_config(monkeypatch):
+    monkeypatch.setattr(installer,'tomllib',None)
+    content=b'model="synthetic#model" # comment\n[projects."/tmp/a.b"]\ntrust_level="trusted"\n[mcp_servers.demo]\ncommand="node"\nargs=["a#b", "c", 3, true]\nenv={TOKEN="private#synthetic", COUNT=2}\n[features]\nflags.enabled=true\n'
+    assert installer._toml(content)=={'model':'synthetic#model','projects':{'/tmp/a.b':{'trust_level':'trusted'}},
+        'mcp_servers':{'demo':{'command':'node','args':['a#b','c',3,True],
+            'env':{'TOKEN':'private#synthetic','COUNT':2}}},'features':{'flags':{'enabled':True}}}
+
+
+def test_public_installer_without_site_packages_preserves_config_and_backup(package):
+    import subprocess
+    import sys
+
+    source, home, cache, config = package
+    original = config.read_bytes()
+    installer_path = source / 'scripts/dev-test/codex_install.py'
+    installer_path.parent.mkdir(parents=True)
+    installer_path.write_bytes((ROOT / 'scripts/dev-test/codex_install.py').read_bytes())
+    driver = '''
+import importlib.util, json, pathlib, sys
+spec = importlib.util.spec_from_file_location('installer', sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+if sys.version_info[:2] == (3, 9):
+    assert importlib.util.find_spec('tomli') is None
+module.tomllib = None
+selected_cache = pathlib.Path(sys.argv[4])
+def inventory(source, home):
+    return {'data': [{'errors': [], 'hooks': [{
+        'pluginId': 'obsidian-brain@synthetic-market',
+        'sourcePath': str(module._selected_hooks(selected_cache)[0])}]}]}
+module.native_hooks_inventory = inventory
+sys.argv = [sys.argv[1], sys.argv[2], '--source', sys.argv[3], '--cache-path', sys.argv[4]]
+raise SystemExit(module.main())
+'''
+    environment = dict(os.environ, CODEX_HOME=str(home), HOME=str(home))
+    installed = False
+    for mode in ('status', 'install', 'status', 'restore', 'status'):
+        public_script = cache / 'scripts/dev-test/codex_install.py' if installed else installer_path
+        result = subprocess.run(
+            [sys.executable, '-S', '-c', driver,
+             str(public_script), mode, str(source), str(cache)],
+            env=environment, stdin=subprocess.DEVNULL, capture_output=True,
+            text=True, timeout=30,
+        )
+        assert result.returncode == 0, result.stderr
+        if mode == 'install':
+            installed = True
+            assert cache.with_name(cache.name + '.bak').is_dir()
+            assert installer._toml(config.read_bytes())['plugins']['obsidian-brain@synthetic-market']['enabled'] is True
+        elif mode == 'restore':
+            installed = False
+    assert config.read_bytes() == original
+    assert (cache / 'released.txt').read_text() == 'original exact bytes'
+    assert not cache.with_name(cache.name + '.bak').exists()

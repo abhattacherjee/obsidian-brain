@@ -51,6 +51,7 @@ def _stage_repo(tmp_path: Path) -> Path:
 
     shutil.copytree(REPO_ROOT / "scripts/vault_doctor_checks", repo / "scripts/vault_doctor_checks")
     (repo / "scripts" / "vault_doctor.py").write_text("# fake dispatcher\n")
+    shutil.copy2(REPO_ROOT / "scripts/doctor_repair_state.py", repo / "scripts/doctor_repair_state.py")
     (repo / "scripts" / "vault_doctor_checks" / "__init__.py").write_text("")
     (repo / "scripts" / "vault_doctor_checks" / "snapshot_integrity.py").write_text(
         "# new check module from feature branch\n"
@@ -99,9 +100,9 @@ def _stage_cache(tmp_path: Path) -> Path:
     return home
 
 
-def _run_install(tmp_path: Path) -> subprocess.CompletedProcess:
+def _run_install(tmp_path: Path, home=None) -> subprocess.CompletedProcess:
     repo = _stage_repo(tmp_path)
-    home = _stage_cache(tmp_path)
+    home = _stage_cache(tmp_path) if home is None else home
     from runtime_context import current_runtime_context
     context = current_runtime_context()
     env = metadata_environment(home)
@@ -214,3 +215,23 @@ def test_install_copies_hooks_json(tmp_path: Path) -> None:
     import json
     cached = json.loads(cache_hooks_json.read_text(encoding="utf-8"))
     assert cached == {"hooks": {"SessionEnd": []}}
+
+
+def test_install_copies_required_repair_state(tmp_path):
+    proc = _run_install(tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    installed = tmp_path / "home" / native_folder() / "plugins/cache/claude-code-skills/obsidian-brain/2.3.0/scripts/doctor_repair_state.py"
+    assert installed.read_bytes() == (REPO_ROOT / "scripts/doctor_repair_state.py").read_bytes()
+
+
+def test_incomplete_source_leaves_cache_and_backup_unchanged(tmp_path):
+    repo = _stage_repo(tmp_path)
+    home = _stage_cache(tmp_path)
+    cache = home / native_folder() / "plugins/cache/claude-code-skills/obsidian-brain/2.3.0"
+    original = {str(p.relative_to(cache)): p.read_bytes() for p in cache.rglob('*') if p.is_file()}
+    (repo / "scripts/doctor_repair_state.py").unlink()
+    proc = _run_install(tmp_path, home=home)
+    assert proc.returncode != 0
+    assert 'Runtime package is incomplete' in proc.stderr
+    assert {str(p.relative_to(cache)): p.read_bytes() for p in cache.rglob('*') if p.is_file()} == original
+    assert not cache.with_name(cache.name + '.bak').exists()

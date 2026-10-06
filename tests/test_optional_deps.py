@@ -107,3 +107,6 @@ class TestConfigDefaults:
         assert obsidian_utils._DEFAULTS["optional_deps_declined"] == [], (
             "mutation from load_config return value leaked into _DEFAULTS"
         )
+
+from selected_legacy_vault import selected_host_context
+pytestmark = pytest.mark.usefixtures("selected_host_context")

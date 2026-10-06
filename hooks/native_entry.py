@@ -18,17 +18,17 @@ def run(argv=None, *, started_at=None):
         print("[obsidian-brain] native resource root must be adjacent to the entry point.",
               file=sys.stderr)
         return 0
-    selection = argparse.ArgumentParser(add_help=False)
+    selection = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
     selection.add_argument("--host")
     selection.add_argument("--client")
     try:
         selected, _ = selection.parse_known_args(arguments)
     except SystemExit:
-        print("[obsidian-brain] native lifecycle arguments are invalid; capture is deferred.",
+        print("[obsidian-brain] native lifecycle arguments are invalid; capture was skipped; no source was retained.",
               file=sys.stderr)
         return 0
     if selected.host == "codex" and not selected.client:
-        print("[obsidian-brain] native client identity is unavailable; capture is deferred. "
+        print("[obsidian-brain] native client identity is unavailable; capture was skipped; no source was retained. "
               "CLI/Desktop handoff requires a current-client binding.", file=sys.stderr)
         return 0
     sys.path.insert(0, str(RESOURCE_ROOT / "hooks"))
@@ -37,7 +37,7 @@ def run(argv=None, *, started_at=None):
         main(["--resource-root", str(RESOURCE_ROOT), *arguments, "hook"],
              started_at=STARTED_AT if started_at is None else started_at)
     except (Exception, SystemExit):
-        print("[obsidian-brain] native lifecycle failed; capture is deferred.", file=sys.stderr)
+        print("[obsidian-brain] native lifecycle failed; capture was skipped; no source was retained.", file=sys.stderr)
     return 0
 
 

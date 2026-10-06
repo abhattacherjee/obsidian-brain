@@ -1234,6 +1234,10 @@ def _resolve_project_paths() -> dict[str, str]:
                     result[entry] = full
         except OSError:
             continue
+    from runtime_context import current_runtime_context
+    context = current_runtime_context()
+    if context is not None and (context.canonical_project_root / '.git').exists():
+        result[context.canonical_project_root.name] = str(context.canonical_project_root)
     return result
 
 
@@ -1260,14 +1264,9 @@ def deep_analysis_pipeline(
     Registers structured JSON in the selected native operation directory.
     Requires an explicit invoking context and operation_id.
 
-    15-minute module-level cache keyed on (projects_json, vault_path,
-    sessions_folder): when /check-items and /standup deep both invoke
-    this in the same process back-to-back, the second call skips all
-    git/gh subprocess calls and returns the cached result string.
-    Cache helpers _evidence_cache_get/_evidence_cache_put expose the
-    cache for targeted unit tests without mocking the full pipeline.
-    Spec § Open questions / Cache coupling (line 699);
-    Testing test 12 (line 658). Refs #87.
+    Bound calls collect fresh evidence. Reuse belongs to the registered
+    operation artifact with verified source revisions and repository HEAD.
+    Legacy cache helpers remain available to explicit compatibility callers.
     """
     from runtime_context import current_runtime_context
     context = current_runtime_context()
@@ -1290,7 +1289,7 @@ def deep_analysis_pipeline(
     _ck = _cache_key(basenames, projects_json, vault_path, sessions_folder,
                      insights_folder, db_path)
     _now = time.time()
-    _cached = _evidence_cache_get(_ck, _now)
+    _cached = _evidence_cache_get(_ck, _now) if context is None else None
     if _cached is not None:
         # Warm-cache hit: skip all subprocess calls; re-write output_path so the
         # caller always finds a valid file regardless of which path was used on
@@ -1676,7 +1675,8 @@ def deep_analysis_pipeline(
         print(f"[obsidian-brain] cache skip: couldn't serialise output_data ({exc})",
               file=sys.stderr)
         return _result
-    _evidence_cache_put(_ck, (_result, _output_json_str), _now)
+    if context is None:
+        _evidence_cache_put(_ck, (_result, _output_json_str), _now)
     return _result
 
 
@@ -2294,8 +2294,6 @@ def classify_groups_with_agent(merged_groups, evidence):
                     text=True,
                     timeout=_outer_subagent_timeout(),
                 )
-            if context is not None and cp.returncode in {7, 8}:
-                break
             if cp.returncode != 0 or not out_path.exists():
                 _tail = (cp.stderr or "").strip()[-800:]
                 print(
@@ -2304,6 +2302,10 @@ def classify_groups_with_agent(merged_groups, evidence):
                     + (f"; child stderr: {_tail}" if _tail else ""),
                     file=sys.stderr,
                 )
+                # The bound CLI has already used its per-chunk retry budget.
+                # Retry only a successful output rejected locally below.
+                if context is not None and cp.returncode != 0:
+                    break
                 continue
             candidate = json.loads(out_path.read_text())
             # I4: warn early (pre-validation) so the diagnostic is always
@@ -2339,29 +2341,34 @@ def classify_groups_with_agent(merged_groups, evidence):
             pass
 
     if parsed is None:
-        print(
-            f"[check-items] classifier FAILED after {attempt} attempt(s); "
-            f"falling back to the token-overlap heuristic for all "
-            f"{len(merged_groups)} group(s). Heuristic citations are token "
-            f"co-occurrence, not evidence — verify before accepting any DONE.",
-            file=sys.stderr,
-        )
+        if context is not None:
+            print(
+                f"[check-items] classifier FAILED after {attempt} attempt(s); "
+                "operation remains pending; no classification was published "
+                f"for {len(merged_groups)} group(s).",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"[check-items] classifier FAILED after {attempt} attempt(s); "
+                f"falling back to the token-overlap heuristic for all "
+                f"{len(merged_groups)} group(s). Heuristic citations are token "
+                f"co-occurrence, not evidence — verify before accepting any DONE.",
+                file=sys.stderr,
+            )
         _LAST_CLASSIFIER_MODE = "heuristic-fallback"
         return []
 
     _returned_ids = [record.get("group_id") for record in parsed]
     _expected_ids = {group.get("group_id") for group in merged_groups}
-    if context is not None and (len(_returned_ids) != len(_expected_ids)
-                                or set(_returned_ids) != _expected_ids):
+    if len(_returned_ids) != len(set(_returned_ids)) or not set(_returned_ids).issubset(_expected_ids):
         _LAST_CLASSIFIER_MODE = "heuristic-fallback"
         return []
-
-    # Only the named unbound compatibility path retains partial telemetry.
     missing_ids = _expected_ids - set(_returned_ids)
-    if context is None and missing_ids:
+    if missing_ids:
         _LAST_CLASSIFIER_MODE = "partial"
         print(f"[check-items] classifier PARTIAL: {len(missing_ids)} of "
-              f"{len(merged_groups)} group(s) were not classified by the agent.",
+              f"{len(merged_groups)} group(s) remain unclassified and will not be applied.",
               file=sys.stderr)
 
     # #297: stamp provenance on every record the agent path actually

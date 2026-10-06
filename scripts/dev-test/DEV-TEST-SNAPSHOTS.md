@@ -18,8 +18,13 @@ validated without an actual `/compact` or `/recall` firing.
 If you haven't run the automated checks yet:
 
 ```bash
-bash scripts/dev-test/test-snapshots-manual.sh
+OB_CACHE_PATH=/absolute/package/root bash scripts/dev-test/test-snapshots-manual.sh
 ```
+
+The automated script sets scratch `HOME`, native config homes, and
+`XDG_STATE_HOME`. Its coordination journal stays in that scratch state; it
+does not use the account state directory. The exit trap removes only directories
+created by that script.
 
 All automated checks should pass before starting the live flow below.
 
@@ -188,7 +193,7 @@ this section is your signal that the PR is dev-test-clean._
 
 1. **Check the log:** `tail -50 ~/.claude/obsidian-brain.log` — hook
    errors surface here.
-2. **Re-run the automated script:** `bash scripts/dev-test/test-snapshots-manual.sh`
+2. **Re-run the automated script:** `OB_CACHE_PATH=/absolute/package/root bash scripts/dev-test/test-snapshots-manual.sh`
    — it catches code-level drift that live flows mask.
 3. **File-level inspection:** the fixtures left behind by `/compact` are
    regular markdown. `cat` them and compare against the Phase 2

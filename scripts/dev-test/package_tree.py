@@ -4,10 +4,22 @@ import sys
 from pathlib import Path
 
 
+def validate_runtime_source(source):
+    """Reject missing required runtime dependencies before cache or backup writes."""
+    source = Path(source).resolve()
+    required = ('hooks/brain_cli.py', 'scripts/vault_doctor.py',
+                'scripts/doctor_repair_state.py', 'scripts/test-dev-skill.sh',
+                'scripts/vault_doctor_checks/__init__.py')
+    if not all((source / name).is_file() and not (source / name).is_symlink()
+               for name in required):
+        raise ValueError('Runtime package is incomplete')
+
+
 def copy_runtime(source, cache):
     source, cache = Path(source).resolve(), Path(cache).resolve()
     if source == cache or source in cache.parents or cache in source.parents:
         raise ValueError('Runtime source and target cannot contain each other')
+    validate_runtime_source(source)
     ignored = shutil.ignore_patterns('__pycache__', '*.pyc', '.git', 'tests', 'state',
         '.pytest_cache', '.coverage', '.coverage.*', 'coverage', '.superpowers', '*.bak')
     for relative in ('hooks', 'skills', '.claude-plugin', '.codex-plugin', '.codex',
@@ -19,7 +31,7 @@ def copy_runtime(source, cache):
                     raise ValueError('Runtime source contains a symlink')
             shutil.copytree(origin, cache / relative, dirs_exist_ok=True, ignore=ignored)
     (cache / 'scripts').mkdir(exist_ok=True)
-    for name in ('vault_doctor.py', 'test-dev-skill.sh'):
+    for name in ('vault_doctor.py', 'doctor_repair_state.py', 'test-dev-skill.sh'):
         origin = source / 'scripts' / name
         if origin.is_file():
             if origin.is_symlink():
@@ -28,4 +40,7 @@ def copy_runtime(source, cache):
 
 
 if __name__ == '__main__':
-    copy_runtime(*sys.argv[1:])
+    if len(sys.argv) == 3 and sys.argv[1] == '--validate-only':
+        validate_runtime_source(sys.argv[2])
+    else:
+        copy_runtime(*sys.argv[1:])

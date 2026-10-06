@@ -48,7 +48,7 @@ _EXTRA_INSIGHT_FOLDERS = [
 ]
 
 # Regex helpers for minimal frontmatter parsing (stdlib only — no yaml dep)
-_FRONT_RE = re.compile(r"^---\n(.*?)\n---\n", re.DOTALL)
+_FRONT_RE = re.compile(r"^---\r?\n(.*?)\r?\n---\r?\n", re.DOTALL)
 _WIKI_RE = re.compile(r"\[\[([^\]]+)\]\]")
 
 # Character class used to sanitize a project name into a filesystem-safe
@@ -360,7 +360,7 @@ def _source_window(path, provider, sid):
 
 
 def _jsonl_dir_for_project(project: str, provider='claude') -> Path | None:
-    """Find ~/.claude/projects/*<project>/ directory for this project name.
+    """Find the selected native projects root/*<project>/ directory for this project name.
 
     Wraps os.path.getmtime in a try/except so a transient filesystem race
     (a matched directory being deleted between glob and stat) cannot crash
@@ -370,7 +370,7 @@ def _jsonl_dir_for_project(project: str, provider='claude') -> Path | None:
         return None  # Codex lookup uses full native IDs, not directory slugs.
     # glob.escape() neutralizes '*', '?', and '[' inside the project name so a
     # project called e.g. "foo[bar]" cannot cause the glob to match unintended
-    # directories under ~/.claude/projects/. The leading '*' before the
+    # directories under the selected native projects root/. The leading '*' before the
     # (escaped) project remains a real wildcard — that's how we match the
     # path-encoded prefix Claude Code adds to the directory name.
     safe_project = glob.escape(project)
@@ -415,7 +415,7 @@ def _jsonl_dir_for_project(project: str, provider='claude') -> Path | None:
 def _find_jsonl_anywhere(
     sid: str, cache: dict[str, Path | None] | None = None, provider='claude'
 ) -> Path | None:
-    """Locate ~/.claude/projects/*/<sid>.jsonl across all CC project dirs.
+    """Locate the selected native projects root/*/<sid>.jsonl across all CC project dirs.
 
     UUIDs are globally unique, so this is safe even though it ignores the
     project-name index. Returns the first match (deterministic via sorted)
@@ -1103,7 +1103,8 @@ def _rewrite_frontmatter(text: str, new_sid: str, new_basename: str) -> str:
     if not saw_src_note:
         new_lines.append(f'source_session_note: "[[{new_basename}]]"')
 
-    return "---\n" + "\n".join(new_lines) + "\n---\n" + body
+    newline = "\r\n" if text.startswith("---\r\n") else "\n"
+    return "---" + newline + newline.join(new_lines) + newline + "---" + newline + body
 
 
 @repair_batch

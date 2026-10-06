@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # Manual smoke test for Snapshot Summary Integration (PR #43, Phase A + D)
 # Run AFTER: /dev-test install + start a new Claude Code session
-# Usage: bash scripts/dev-test/test-snapshots-manual.sh
+# Usage: OB_CACHE_PATH=/absolute/package/root bash scripts/dev-test/test-snapshots-manual.sh
 #
 # Validates what can be checked without live /compact or /recall:
 #   - Plugin cache contains expected code and skill markers
 #   - Python helpers (_snapshot_stats, fetch_snapshot_summaries,
-#     find_snapshots_for_session, collect_vault_corpus default,
+#     find_snapshots_for_session, explicit session/snapshot search filters,
 #     collect_open_items type filter, log_access cascade) behave correctly
 #   - DB schema untouched (no new tables/columns required by this PR)
 #
@@ -16,7 +16,7 @@
 
 set -euo pipefail
 
-DB="$HOME/.claude/obsidian-brain-vault.db"
+DB=""
 PASS=0
 FAIL=0
 SKIP=0
@@ -25,17 +25,14 @@ pass() { echo "  ✅ $1"; PASS=$((PASS + 1)); }
 fail() { echo "  ❌ $1"; FAIL=$((FAIL + 1)); }
 skip() { echo "  ⏭️  $1"; SKIP=$((SKIP + 1)); }
 
-# Locate the currently-installed plugin cache (the `dev-test install` target)
-CACHE_DIR=$(find ~/.claude/plugins/cache -type d -path "*/obsidian-brain/*" \
-    -not -path "*.bak*" 2>/dev/null | sort -V | tail -1 | xargs dirname 2>/dev/null || true)
-if [ -z "$CACHE_DIR" ] || [ ! -d "$CACHE_DIR" ]; then
-    echo "❌ Could not locate obsidian-brain plugin cache."
-    echo "   Run /dev-test install first."
-    exit 1
-fi
-
-HOOK_DIR=$(find "$CACHE_DIR" -maxdepth 2 -type d -name hooks | sort -V | tail -1)
-SKILL_ROOT=$(find "$CACHE_DIR" -maxdepth 2 -type d -name skills | sort -V | tail -1)
+# This checks only the explicitly selected distribution, not current client binding.
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+CACHE_DIR=$(python3 "$SCRIPT_DIR/loaded_resource_root.py" --cache-path "${OB_CACHE_PATH:-}")
+HOOK_DIR="$CACHE_DIR/hooks"
+SKILL_ROOT="$CACHE_DIR/skills"
+SCRIPTS_ROOT="$CACHE_DIR/scripts"
+export HOOK_DIR SCRIPTS_ROOT SKILL_ROOT
+export PYTHONPATH="$CACHE_DIR:$HOOK_DIR:$SCRIPTS_ROOT"
 
 echo "═══════════════════════════════════════════════════════════════"
 echo "Snapshot Summary Integration — Automated Validation"
@@ -84,11 +81,6 @@ else
     fail "log_access cascade helper missing"
 fi
 
-if grep -q "exclude_types.*claude-snapshot" "$HOOK_DIR/obsidian_utils.py"; then
-    pass "collect_vault_corpus excludes claude-snapshot by default"
-else
-    fail "collect_vault_corpus default exclusion missing"
-fi
 
 echo ""
 
@@ -124,17 +116,17 @@ else
 fi
 
 EMERGE_SKILL="$SKILL_ROOT/emerge/SKILL.md"
-if [ -f "$EMERGE_SKILL" ] && grep -q "include-snapshots" "$EMERGE_SKILL"; then
-    pass "/emerge SKILL.md documents --include-snapshots"
+if [ -f "$EMERGE_SKILL" ] && grep -q 'Request for `themes`' "$EMERGE_SKILL"; then
+    pass "/emerge SKILL.md documents the registered themes operation"
 else
-    fail "/emerge SKILL.md missing --include-snapshots flag"
+    fail "/emerge SKILL.md missing the themes operation"
 fi
 
 CHECKITEMS_SKILL="$SKILL_ROOT/check-items/SKILL.md"
-if [ -f "$CHECKITEMS_SKILL" ] && grep -q "claude-session\|Scope:" "$CHECKITEMS_SKILL"; then
-    pass "/check-items SKILL.md scope note present"
+if [ -f "$CHECKITEMS_SKILL" ] && grep -q 'Request for `scope`' "$CHECKITEMS_SKILL"; then
+    pass "/check-items SKILL.md documents the registered scope operation"
 else
-    fail "/check-items SKILL.md missing scope note"
+    fail "/check-items SKILL.md missing the scope operation"
 fi
 
 VAULTCFG_SKILL="$SKILL_ROOT/vault-config/SKILL.md"
@@ -151,7 +143,15 @@ echo "Test 3: Python behavior against a fresh fixture vault"
 
 # Build a throwaway vault in /tmp, exercise the helpers, clean up.
 FIXTURE=$(mktemp -d -t ob-snapshot-test.XXXXXX)
-trap "rm -rf '$FIXTURE'" EXIT
+FIXTURE="$(cd "$FIXTURE" && pwd -P)"
+trap 'rm -rf "$FIXTURE"' EXIT
+export FIXTURE
+export HOME="$FIXTURE/home"
+export CLAUDE_CONFIG_DIR="$HOME/.claude" CODEX_HOME="$HOME/.codex"
+export XDG_STATE_HOME="$HOME/.local/state"
+mkdir -p "$CLAUDE_CONFIG_DIR" "$CODEX_HOME" "$XDG_STATE_HOME"
+# These are isolated legacy-format distribution checks, not native invoker proof.
+unset CODEX_THREAD_ID CODEX_WORKER_ID CODEX_SANDBOX CODEX_SANDBOX_NETWORK_DISABLED CLAUDE_SESSION_ID CLAUDE_CODE_SESSION_ID
 
 mkdir -p "$FIXTURE/v/claude-sessions" "$FIXTURE/v/claude-insights"
 
@@ -205,19 +205,17 @@ source_session_note: "[[does-not-exist]]"
 EOF
 
 FIXTURE_DB="$FIXTURE/fixture.db"
+export FIXTURE_DB
+DB="$FIXTURE_DB"
 
 # --- 3a: find_snapshots_for_session picks up the snapshot by id ---
-RESULT=$(python3 - <<PY 2>&1 || true
+RESULT=$(python3 - <<'PY' 2>&1 || true
+import os
 import sys, os
-sys.path.insert(0, "$HOOK_DIR")
+sys.path.insert(0, os.environ['HOOK_DIR'])
 from pathlib import Path
 from obsidian_utils import find_snapshots_for_session
-snaps = find_snapshots_for_session(
-    Path("$FIXTURE/v/claude-sessions"),
-    "s-abcd-1111",
-    "2026-04-18",
-    "demo",
-)
+snaps = find_snapshots_for_session(Path(os.environ['FIXTURE'] + '/v/claude-sessions'), 's-abcd-1111', '2026-04-18', 'demo')
 print(len(snaps))
 PY
 )
@@ -228,22 +226,14 @@ else
 fi
 
 # --- 3b: fetch_snapshot_summaries returns enriched dicts ---
-RESULT=$(python3 - <<PY 2>&1 || true
+RESULT=$(python3 - <<'PY' 2>&1 || true
+import os
 import sys, os, json
-sys.path.insert(0, "$HOOK_DIR")
+sys.path.insert(0, os.environ['HOOK_DIR'])
 from pathlib import Path
 from obsidian_utils import fetch_snapshot_summaries
-snaps = fetch_snapshot_summaries(
-    Path("$FIXTURE/v/claude-sessions"),
-    "s-abcd-1111",
-    "2026-04-18",
-    "demo",
-)
-print(json.dumps([{
-    "hhmmss": s["hhmmss"],
-    "trigger": s["trigger"],
-    "has_summary": bool(s.get("summary")),
-} for s in snaps]))
+snaps = fetch_snapshot_summaries(Path(os.environ['FIXTURE'] + '/v/claude-sessions'), 's-abcd-1111', '2026-04-18', 'demo')
+print(json.dumps([{'hhmmss': s['hhmmss'], 'trigger': s['trigger'], 'has_summary': bool(s.get('summary'))} for s in snaps]))
 PY
 )
 if echo "$RESULT" | grep -q '"hhmmss": "140000"' && echo "$RESULT" | grep -q '"trigger": "compact"'; then
@@ -252,37 +242,22 @@ else
     fail "fetch_snapshot_summaries result unexpected: $RESULT"
 fi
 
-# --- 3c: collect_vault_corpus default excludes snapshots ---
-RESULT=$(python3 - <<PY 2>&1 || true
-import sys, os, json
-sys.path.insert(0, "$HOOK_DIR")
-from obsidian_utils import collect_vault_corpus
-raw = collect_vault_corpus("$FIXTURE/v", "claude-sessions", "claude-insights", days=30)
-types = sorted({n["type"] for n in json.loads(raw)["notes"]})
-print(",".join(types))
+# --- 3c: shared search keeps explicit session/snapshot filters ---
+RESULT=$(python3 - <<'PY' 2>&1 || true
+import os
+from vault_index import ensure_index, search_vault
+db = ensure_index(os.environ['FIXTURE'] + '/v', ['claude-sessions', 'claude-insights'], db_path=os.environ['FIXTURE_DB'])
+sessions = search_vault(db, 'session', note_type='claude-session')
+snapshots = search_vault(db, 'snapshot', note_type='claude-snapshot')
+assert sessions and all(row['type'] == 'claude-session' for row in sessions)
+assert snapshots and all(row['type'] == 'claude-snapshot' for row in snapshots)
+print('filtered session and snapshot search')
 PY
 )
-if [ "$RESULT" = "claude-session" ]; then
-    pass "collect_vault_corpus default excludes claude-snapshot"
+if [ "$RESULT" = "filtered session and snapshot search" ]; then
+    pass "Shared search keeps native-compatible note type filters"
 else
-    fail "collect_vault_corpus emitted types '$RESULT' (expected 'claude-session')"
-fi
-
-# --- 3d: exclude_types=() opts back in ---
-RESULT=$(python3 - <<PY 2>&1 || true
-import sys, os, json
-sys.path.insert(0, "$HOOK_DIR")
-from obsidian_utils import collect_vault_corpus
-raw = collect_vault_corpus("$FIXTURE/v", "claude-sessions", "claude-insights",
-                           days=30, exclude_types=())
-types = sorted({n["type"] for n in json.loads(raw)["notes"]})
-print(",".join(types))
-PY
-)
-if echo "$RESULT" | grep -q "claude-snapshot" && echo "$RESULT" | grep -q "claude-session"; then
-    pass "collect_vault_corpus with exclude_types=() includes snapshots"
-else
-    fail "collect_vault_corpus opt-in returned '$RESULT'"
+    fail "Filtered search failed: $RESULT"
 fi
 
 # --- 3e: collect_open_items filters to claude-session ---
@@ -314,15 +289,16 @@ status: auto-logged
 ## Open Questions / Next Steps
 - [ ] Snapshot bullet that MUST be ignored
 EOF
-RESULT=$(python3 - <<PY 2>&1 || true
+RESULT=$(python3 - <<'PY' 2>&1 || true
+import os
 import sys, os
-sys.path.insert(0, "$HOOK_DIR")
+sys.path.insert(0, os.environ['HOOK_DIR'])
 from open_item_dedup import collect_open_items
-items = collect_open_items("$FIXTURE/v", "claude-sessions", "demo")
+items = collect_open_items(os.environ['FIXTURE'] + '/v', 'claude-sessions', 'demo')
 texts = [t for _, _, t in items]
-has_session = any("should appear" in t for t in texts)
-has_snap = any("MUST be ignored" in t for t in texts)
-print(f"session={has_session} snap={has_snap}")
+has_session = any(('should appear' in t for t in texts))
+has_snap = any(('MUST be ignored' in t for t in texts))
+print(f'session={has_session} snap={has_snap}')
 PY
 )
 if [ "$RESULT" = "session=True snap=False" ]; then
@@ -332,22 +308,20 @@ else
 fi
 
 # --- 3f: log_access cascade — snapshot access writes 2 rows ---
-RESULT=$(python3 - <<PY 2>&1 || true
+RESULT=$(python3 - <<'PY' 2>&1 || true
+import os
 import sqlite3, sys, os
-sys.path.insert(0, "$HOOK_DIR")
+sys.path.insert(0, os.environ['HOOK_DIR'])
 from vault_index import ensure_index, log_access, _PARENT_CACHE
-
-db = ensure_index("$FIXTURE/v", ["claude-sessions", "claude-insights"],
-                  db_path="$FIXTURE_DB")
+db = ensure_index(os.environ['FIXTURE'] + '/v', ['claude-sessions', 'claude-insights'], db_path=os.environ['FIXTURE_DB'])
 _PARENT_CACHE.clear()
-snap_path = "$FIXTURE/v/claude-sessions/2026-04-18-demo-abcd-snapshot-140000.md"
-log_access(db, snap_path, "search", "demo")
-
-conn = sqlite3.connect(db)  # noqa: vault-db-connect — manual dev test: read on the isolated $FIXTURE_DB tmp index, not the prod DB
-rows = conn.execute("SELECT note_path FROM access_log").fetchall()
+snap_path = os.environ['FIXTURE'] + '/v/claude-sessions/2026-04-18-demo-abcd-snapshot-140000.md'
+log_access(db, snap_path, 'search', 'demo')
+conn = sqlite3.connect(db)  # noqa: vault-db-connect — explicit disposable fixture index
+rows = conn.execute('SELECT note_path FROM access_log').fetchall()
 conn.close()
 paths = sorted({r[0] for r in rows})
-print(f"count={len(paths)} session_present={any(p.endswith('2026-04-18-demo-abcd.md') for p in paths)}")
+print(f"count={len(paths)} session_present={any((p.endswith('2026-04-18-demo-abcd.md') for p in paths))}")
 PY
 )
 if echo "$RESULT" | grep -q "count=2" && echo "$RESULT" | grep -q "session_present=True"; then
@@ -357,18 +331,17 @@ else
 fi
 
 # --- 3g: _snapshot_stats computes the 8-field dict ---
-RESULT=$(python3 - <<PY 2>&1 || true
+RESULT=$(python3 - <<'PY' 2>&1 || true
+import os
 import sys, os, json
-sys.path.insert(0, "$HOOK_DIR")
+sys.path.insert(0, os.environ['HOOK_DIR'])
 from vault_index import ensure_index
 from vault_stats import compute_stats
-
-db = ensure_index("$FIXTURE/v", ["claude-sessions", "claude-insights"],
-                  db_path="$FIXTURE_DB")
-payload = json.loads(compute_stats(db, "demo"))
-snap = payload["vault_wide"].get("snapshots", {})
+db = ensure_index(os.environ['FIXTURE'] + '/v', ['claude-sessions', 'claude-insights'], db_path=os.environ['FIXTURE_DB'])
+payload = json.loads(compute_stats(db, 'demo'))
+snap = payload['vault_wide'].get('snapshots', {})
 keys = sorted(snap.keys())
-print(",".join(keys))
+print(','.join(keys))
 print(f"orphaned={snap.get('orphaned_snapshots')} broken={snap.get('broken_backlinks')} read_errors={snap.get('read_errors')}")
 PY
 )
@@ -397,7 +370,7 @@ if [ -f "$DB" ]; then
         pass "notes table shape preserved (no snapshot_* columns)"
     fi
 else
-    skip "Live vault DB not yet created — skip schema-drift check"
+    skip "Fixture index not created — schema check unavailable"
 fi
 
 echo ""

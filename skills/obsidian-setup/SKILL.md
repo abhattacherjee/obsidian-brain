@@ -7,9 +7,7 @@ metadata:
 
 ## Native runtime and installed resources
 
-For fresh setup, ask for the vault path FIRST and validate that it exists. Set
-`OB_VAULT` to that explicit path before any command below. For upgrades, select
-the already configured vault. No temporary or fake vault is used for bootstrap.
+Check existing configuration first with Step 1, without `--vault`. For upgrades, retain that configured vault. Only a `vault_missing` result starts fresh setup: ask for the path, validate it, then set `OB_VAULT` before the commands that require it. Do not create a temporary or fake vault.
 
 Use the absolute path of this loaded `SKILL.md` as `OB_SKILL_PATH`. Read the
 reference for the invoking host when this skill has paired host references.
@@ -24,14 +22,17 @@ separate from `agent_provider` and `agent_session_id` provenance.
 : "${OB_CLIENT:?Current native client binding is unavailable; stop without choosing a frontend.}"
 OB_SKILL_PATH='<absolute path of this loaded SKILL.md>'
 OB_RESOURCE_ROOT=$(python3 -c 'import pathlib,sys; p=pathlib.Path(sys.argv[1]); assert p.is_absolute(); p=p.resolve(); assert p.name == "SKILL.md" and p.parent.parent.name == "skills"; print(p.parents[2])' "$OB_SKILL_PATH")
-python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --vault "$OB_VAULT" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" context < /dev/null
+python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" context < /dev/null
 ```
 
 Use the returned `config_path`, `vault_path`, `index_path`, and `state_path`.
+If initial context or prepare reports `vault_missing`, stop this bootstrap and
+complete Steps 2–3, then run the explicit fresh-vault bootstrap below. For an
+existing configured vault, keep the initial lookup and prepare without `--vault`.
 Create the operation with this fixed literal request:
 
 ```bash
-printf '{}' | python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --vault "$OB_VAULT" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'prepare'
+printf '{}' | python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'prepare'
 ```
 
 Call `prepare` to create a private operation under native state. Retain its
@@ -51,18 +52,7 @@ procedure variables `VAULT_PATH`/`VAULT`, `SESSIONS_FOLDER`/`SESS`, and
 `INSIGHTS_FOLDER`/`INS`. Use the canonical project returned in config JSON (and native `session` when available),
 not the basename of an unrelated shell working directory.
 
-Before preparing edits or requesting a summary of an existing note, call
-`note-read` and retain its exact `expected_revision`. Apply the proposed note
-with `note-apply` and that revision. A conflict leaves the current note intact;
-show the pending result and do not count the note as saved. New curated notes
-use `note-create`; they never overwrite a collision. Native memory discovery
-is unsupported for Codex because it has no equivalent native memory-file API; shared vault retrieval
-and wiki filing continue without borrowing another host's memory.
-
-Read `references/host-claude.md` or `references/host-codex.md` when present.
-All note writes described below use `note-create` or revision-bound `note-apply`,
-including bidirectional related links. Content is a JSON string, never shell code.
-Every later save or edit follows this revision-bound publication rule.
+Before drafting an edit or summary, call `note-read` and retain its exact `expected_revision`. Use `note-apply` with that revision for the reviewed edit. A conflict preserves the current note; show the pending result and do not count it as saved. Create new curated notes with `note-create`. A collision preserves the existing note. Use only the operations documented for this skill. Their writes bind the source revisions before analysis and preserve manual edits on conflict. Content is JSON data, never shell code. Read `references/host-claude.md` or `references/host-codex.md` when present. Codex has no native memory-file API; shared vault retrieval and wiki filing continue without borrowing another host's memory.
 
 # Obsidian Brain Setup
 
@@ -80,6 +70,8 @@ Follow these steps exactly. Do not skip steps or reorder them.
 
 Check for existing config:
 
+Read the stored configuration before choosing a vault. Do not pass `--vault` for this first lookup. A `vault_missing` result selects fresh setup; ask for the vault path before later operations.
+
 Request for `config` (substitute the values as data):
 
 ```json
@@ -87,7 +79,7 @@ Request for `config` (substitute the values as data):
 ```
 
 ```bash
-python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --vault "$OB_VAULT" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'config' < "$REQUEST_PATH"
+python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'config' < "$REQUEST_PATH"
 ```
 
 **If the config JSON names an existing vault**, read fields from the returned JSON. Extract `VAULT_PATH` and present:
@@ -140,19 +132,34 @@ test -d "$VAULT_PATH" && test -w "$VAULT_PATH" && echo "OK" || echo "FAIL"
 
 If FAIL, tell the user the path does not exist or is not writable and ask them to correct it. Repeat until OK.
 
-### Step 4 — Check claude CLI availability
-
-Run:
+For fresh setup only, after validation set `OB_VAULT="$VAULT_PATH"` and rerun
+context and prepare with this explicit selected vault. Retain the newly returned
+operation ID. This does not override an existing configured vault during upgrade.
 
 ```bash
-which claude && echo "OK" || echo "FAIL"
+OB_VAULT="$VAULT_PATH"
+python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --vault "$OB_VAULT" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" context < /dev/null
+printf '{}' | python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --vault "$OB_VAULT" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'prepare'
 ```
 
-If FAIL, warn the user:
+### Step 4 — Check the invoking native CLI
 
-> The `claude` CLI was not found on PATH. Hook-based AI summarization will not work until it is installed. You can continue setup, but session notes will be raw (unsummarized) until `claude` is available.
+Run the check for `OB_HOST` only:
 
-Continue regardless — this is a warning, not a blocker.
+```bash
+case "$OB_HOST" in
+  claude) command -v claude && echo "OK" || echo "FAIL" ;;
+  codex) command -v codex && echo "OK" || echo "FAIL" ;;
+  *) echo "FAIL: invoking host is unknown" ;;
+esac
+```
+
+If that CLI is missing, warn that deferred skill summaries and classification
+cannot run through the invoking native backend. Raw capture does not call AI.
+Continue setup without switching hosts. For Codex, automatic capture remains
+blocked until the current frontend binding is verified; installing its CLI does
+not certify Desktop or lifecycle dispatch. Use the returned native `config_path`
+for either host; do not read or change the other host's configuration.
 
 ### Step 5 — Create vault folders
 
@@ -190,6 +197,10 @@ Otherwise (MISSING, or `MODE=fresh`, or `MODE=reconfigure`), publish the approve
 **File: `$VAULT_PATH/claude-dashboards/sessions-overview.md`**
 
 ```markdown
+---
+type: claude-dashboard
+---
+
 # Claude Sessions Overview
 
 ## Recent Sessions
@@ -222,6 +233,10 @@ SORT date DESC
 **File: `$VAULT_PATH/claude-dashboards/project-index.md`**
 
 ```markdown
+---
+type: claude-dashboard
+---
+
 # Project Index
 
 ## Sessions by Project
@@ -245,6 +260,10 @@ SORT date DESC
 **File: `$VAULT_PATH/claude-dashboards/weekly-review.md`**
 
 ```markdown
+---
+type: claude-dashboard
+---
+
 # This Week in Claude
 
 \```dataview
@@ -258,6 +277,10 @@ SORT date DESC
 **File: `$VAULT_PATH/claude-dashboards/learning-velocity.md`**
 
 ```markdown
+---
+type: claude-dashboard
+---
+
 # Learning Velocity
 
 ## Topics by Frequency
@@ -324,6 +347,10 @@ dv.table(
 **File: `$VAULT_PATH/claude-dashboards/decision-timeline.md`**
 
 ```markdown
+---
+type: claude-dashboard
+---
+
 # Decision Timeline
 
 ## Active Decisions
@@ -363,6 +390,10 @@ SORT length(rows) DESC
 **File: `$VAULT_PATH/claude-dashboards/open-items.md`**
 
 ```markdown
+---
+type: claude-dashboard
+---
+
 # Open Items — All Projects
 
 Cross-project view of all unchecked `- [ ]` items from session notes' `## Open Questions / Next Steps` sections, scoped to the last 90 days. Items older than 90 days fall off this view — use `/check-items` (unbounded) or `/vault-search` to find them.
@@ -485,30 +516,44 @@ if (Object.keys(statsByProject).length > 0) {
 **If `MODE=fresh` or `MODE=reconfigure`:**
 
 Call `config-read` to retain the exact configuration revision. Submit the
-following settings through `configure` with that revision:
+following request through `configure` with that revision:
+
+Request for `configure`:
 
 ```json
 {
-  "vault_path": "<VAULT_PATH value from Step 2>",
-  "sessions_folder": "claude-sessions",
-  "insights_folder": "claude-insights",
-  "dashboards_folder": "claude-dashboards",
-  "check_items_folder": "claude-check-items",
-  "wiki_folder": "claude-wiki",
-  "min_messages": 3,
-  "min_duration_minutes": 2,
-  "summary_model": "haiku",
-  "auto_log_enabled": true,
-  "snapshot_on_compact": true,
-  "snapshot_on_clear": true
+  "expected_revision": "<config-read SHA256>",
+  "settings": {
+    "vault_path": "<VAULT_PATH value from Step 2>",
+    "sessions_folder": "claude-sessions",
+    "insights_folder": "claude-insights",
+    "dashboards_folder": "claude-dashboards",
+    "check_items_folder": "claude-check-items",
+    "wiki_folder": "claude-wiki",
+    "min_messages": 3,
+    "min_duration_minutes": 2,
+    "auto_log_enabled": true,
+    "snapshot_on_compact": true,
+    "snapshot_on_clear": true
+  }
 }
 ```
 
+```bash
+python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --vault "$OB_VAULT" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'configure' < "$REQUEST_PATH"
+```
+
 Replace `<VAULT_PATH value from Step 2>` with the actual vault path. Ensure the file is valid JSON.
+For Claude, `summary_model: "haiku"` may be added to these settings. For Codex,
+omit that Claude alias and use the invoking native configured model, or an
+explicit valid `codex_summary_model` chosen by the user.
+Classification replay caches require a pinned model identity. Optionally save an
+explicit full Claude model ID as `classifier_model`, or the chosen Codex model
+as `codex_ai_model`/`codex_summary_model`. Keep native defaults when the user
+does not choose a model; then report cache replay as disabled instead of
+claiming a cache update. Never treat a previous observed model as current.
 
 The trusted configuration operation creates its native private directory.
-
-After writing the config file, restrict permissions so only the current user can read it:
 
 The trusted configuration operation publishes at mode `0o600`.
 
@@ -518,6 +563,8 @@ After writing the config, inspect the final `snapshot_on_clear` and `snapshot_on
 > Recommended: True. (This is on by default; only change if you have a specific reason.)
 
 Both flags ship `true` by default, so the warning only fires when a prior config, manual edit, or migration set them `false`. Ask the user whether to flip them back to `true` via `/vault-config` before continuing.
+For Codex, explain that these flags do not enable automatic capture while
+current frontend binding is unverified; do not promise pre-clear preservation.
 
 ### Step 8 — Verify vault access
 
@@ -568,7 +615,7 @@ Request for `dependencies` (substitute the values as data):
 python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --vault "$OB_VAULT" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'dependencies' < "$REQUEST_PATH"
 ```
 
-Parse each line as `KEY=VALUE`.
+Parse the single JSON object and read its named fields.
 
 **Decision tree:**
 
@@ -669,3 +716,34 @@ native nudge adapter is verified; no Claude global rule is written for Codex.
 > 4. The dashboards in `claude-dashboards/` will start rendering automatically
 >
 > Hooks are already registered via `hooks.json` — session logging will begin on your next Claude Code session.
+
+## Fixed request shapes
+
+Pass these objects through the installed launcher for the named operation. Keep
+one operation ID across source reads, analysis and reviewed publication.
+
+Request for `note-read`:
+
+```json
+{
+  "operation_id": "<prepared id>",
+  "path": "<vault-relative note.md>"
+}
+```
+
+Request for `note-apply`:
+
+```json
+{
+  "operation_id": "<same prepared id>",
+  "path": "<same vault-relative note.md>",
+  "expected_revision": "<note-read SHA256>",
+  "content": "<complete reviewed note>"
+}
+```
+
+Request for `config-read`:
+
+```json
+{}
+```

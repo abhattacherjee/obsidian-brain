@@ -10,6 +10,20 @@ from pathlib import Path
 
 import pytest
 
+import pwd
+_ACCOUNT_COORDINATION_ROOT = (Path(pwd.getpwuid(os.getuid()).pw_dir) / '.local' / 'state').resolve()
+_SYSTEM_COORDINATION_ROOT = (Path('/var/tmp') / ('obsidian-brain-state-' + str(os.getuid()))).resolve()
+
+
+def _assert_test_coordination_root(value):
+    """Refuse actual account and UID fallback state before a test can write."""
+    if not isinstance(value, (str, Path)) or not Path(value).is_absolute():
+        raise AssertionError('Test coordination requires an explicit private XDG_STATE_HOME')
+    path = Path(value).resolve()
+    if any(path == live or path.is_relative_to(live)
+           for live in (_ACCOUNT_COORDINATION_ROOT, _SYSTEM_COORDINATION_ROOT)):
+        raise AssertionError('Tests cannot use actual account or UID fallback coordination state')
+
 # Add hooks/ to sys.path so test modules can import obsidian_utils etc.
 _HOOKS_DIR = os.path.join(os.path.dirname(__file__), "..", "hooks")
 if _HOOKS_DIR not in sys.path:
@@ -20,6 +34,25 @@ if _HOOKS_DIR not in sys.path:
 _REPO_ROOT = os.path.join(os.path.dirname(__file__), "..")
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, os.path.abspath(_REPO_ROOT))
+
+
+@pytest.fixture(autouse=True)
+def _private_coordination_state(tmp_path_factory, monkeypatch):
+    """Never let transaction tests use the account's real durable state."""
+    import shutil
+    root = tmp_path_factory.mktemp('private-coordination-state')
+    root.chmod(0o700)
+    monkeypatch.setenv('XDG_STATE_HOME', str(root))
+    import importlib
+    for name in ('note_transactions', 'hooks.note_transactions'):
+        module = importlib.import_module(name)
+        original = module.coordination_path
+        def guarded(context, original=original):
+            _assert_test_coordination_root(context.coordination_root)
+            return original(context)
+        monkeypatch.setattr(module, 'coordination_path', guarded)
+    yield root
+    shutil.rmtree(root)
 
 
 @pytest.fixture(autouse=True)
@@ -349,13 +382,16 @@ def _doctor_tests_do_not_read_live_config(request, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def _block_unmocked_native_ai_processes(monkeypatch):
+def _block_unmocked_native_ai_processes(monkeypatch, _private_coordination_state):
     """Tests must replace native AI transport before dispatching model jobs."""
     import shlex
     import subprocess
     original = subprocess.Popen
 
     def guarded(args, *positional, **kwargs):
+        environment = kwargs.get('env')
+        environment = os.environ if environment is None else environment
+        _assert_test_coordination_root(environment.get('XDG_STATE_HOME'))
         values = shlex.split(args) if isinstance(args, str) else list(args)
         commands = [Path(str(value)).name for value in values]
         if commands and (commands[0] in {"claude", "codex"} or

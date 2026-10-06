@@ -4,7 +4,7 @@ from contextlib import closing
 import sqlite3
 import time
 from pathlib import Path
-from types import SimpleNamespace
+from dataclasses import replace
 import pytest
 from session_lookup import find_existing_session, SessionLookupPending
 
@@ -17,8 +17,7 @@ def lookup(selected_host_context):
     database.parent.mkdir(parents=True, exist_ok=True)
     with closing(sqlite3.connect(database)) as connection, connection:
         connection.execute('CREATE TABLE notes(path TEXT PRIMARY KEY,type TEXT)')
-    context = SimpleNamespace(host=selected_host_context.host, native_session_id='full-native-id',
-                              vault_path=vault, index_path=database, config={})
+    context = replace(selected_host_context, native_session_id='full-native-id')
     suffix = (hashlib.sha256(context.native_session_id.encode()).hexdigest()[:4]
               if context.host == 'claude' else context.host + '-' +
               hashlib.sha256((context.host + '\0' + context.native_session_id).encode()).hexdigest()[:16])
@@ -52,8 +51,6 @@ def test_cross_host_same_native_id_excluded(lookup):
     context, add = lookup
     foreign = 'codex' if context.host == 'claude' else 'claude'
     add('foreign', provider=foreign)
-    assert find_existing_session(context, time.monotonic() + 1) is None
-    context.host = foreign
     assert find_existing_session(context, time.monotonic() + 1) is None
 
 
@@ -161,7 +158,7 @@ def test_unverified_frontmatter_cannot_adopt(lookup, body):
 
 def test_invalid_sessions_folder_remains_pending(lookup):
     context, add = lookup
-    context.config = {'sessions_folder': '../outside'}
+    context = replace(context, config={'sessions_folder': '../outside'})
     with pytest.raises(SessionLookupPending, match='Invalid selected'):
         find_existing_session(context, time.monotonic() + 1)
 
@@ -171,6 +168,112 @@ def test_sessions_folder_symlink_escape_remains_pending(lookup, tmp_path):
     target = tmp_path / 'outside'
     target.mkdir()
     (context.vault_path / 'elsewhere').symlink_to(target)
-    context.config = {'sessions_folder': 'elsewhere'}
+    context = replace(context, config={'sessions_folder': 'elsewhere'})
     with pytest.raises(SessionLookupPending, match='escapes vault'):
         find_existing_session(context, time.monotonic() + 1)
+
+
+def _cantopen_once(monkeypatch, database, *, error_code=14):
+    original = sqlite3.connect
+    calls = []
+    def connect(path, *args, **kwargs):
+        if str(path).startswith(database.resolve().as_uri()):
+            calls.append(str(path))
+            if len(calls) == 1:
+                error = sqlite3.OperationalError('unable to open database file')
+                error.sqlite_errorcode = error_code
+                raise error
+        return original(path, *args, **kwargs)
+    monkeypatch.setattr(sqlite3, 'connect', connect)
+    return calls
+
+
+def test_closed_wal_cantopen_uses_immutable_lookup_without_file_changes(lookup, monkeypatch):
+    context, add = lookup
+    path = add('legacy')
+    before = context.index_path.read_bytes()
+    calls = _cantopen_once(monkeypatch, context.index_path)
+    assert find_existing_session(context, time.monotonic() + 1) == path
+    assert calls == [context.index_path.resolve().as_uri() + '?mode=ro',
+                     context.index_path.resolve().as_uri() + '?mode=ro&immutable=1']
+    assert context.index_path.read_bytes() == before
+    assert not Path(str(context.index_path) + '-wal').exists()
+    assert not Path(str(context.index_path) + '-shm').exists()
+
+
+@pytest.mark.parametrize('sidecar', ['-wal', '-shm'])
+def test_cantopen_with_existing_sidecar_never_uses_immutable(lookup, monkeypatch, sidecar):
+    context, add = lookup
+    add('legacy')
+    Path(str(context.index_path) + sidecar).write_bytes(b'private-sidecar')
+    calls = _cantopen_once(monkeypatch, context.index_path)
+    with pytest.raises(SessionLookupPending, match='index lookup is pending'):
+        find_existing_session(context, time.monotonic() + 1)
+    assert len(calls) == 1
+
+
+def test_non_cantopen_code_never_uses_immutable_even_if_message_matches(lookup, monkeypatch):
+    context, add = lookup
+    add('legacy')
+    calls = _cantopen_once(monkeypatch, context.index_path, error_code=11)
+    with pytest.raises(SessionLookupPending, match='index lookup is pending'):
+        find_existing_session(context, time.monotonic() + 1)
+    assert len(calls) == 1
+
+
+def test_immutable_lookup_rejects_index_changed_during_read(lookup, monkeypatch):
+    context, add = lookup
+    add('legacy')
+    _cantopen_once(monkeypatch, context.index_path)
+    from session_lookup import _readonly_index
+    with pytest.raises(SessionLookupPending, match='changed during read-only lookup'):
+        with _readonly_index(context.index_path, time.monotonic() + 1) as connection:
+            assert connection.execute('SELECT COUNT(*) FROM notes').fetchone() == (1,)
+            context.index_path.touch()
+
+
+def test_immutable_fallback_does_not_choose_between_duplicate_origins(lookup, monkeypatch):
+    context, add = lookup
+    add('one'); add('two')
+    _cantopen_once(monkeypatch, context.index_path)
+    with pytest.raises(SessionLookupPending, match='multiple full-identity'):
+        find_existing_session(context, time.monotonic() + 1)
+
+
+def _indexed_hint_fixture(context):
+    from note_transactions import ownership_lock, connect_coordination
+    with ownership_lock(context), closing(connect_coordination(context)):
+        pass
+    with closing(sqlite3.connect(context.index_path)) as connection, connection:
+        for name in ('project', 'date', 'body'):
+            connection.execute('ALTER TABLE notes ADD COLUMN '+name+' TEXT')
+        connection.execute('UPDATE notes SET project=?,date=?,body=?',
+            (context.canonical_project_root.name, '2026-10-06', '## Summary\nPrevious fixture summary\n'))
+
+
+def test_legacy_index_hint_uses_guarded_immutable_fallback(lookup, monkeypatch):
+    from native_lifecycle import _context_hint
+    context, add = lookup
+    add('legacy')
+    _indexed_hint_fixture(context)
+    before = context.index_path.read_bytes()
+    calls = _cantopen_once(monkeypatch, context.index_path)
+    output = _context_hint(context, time.monotonic() + 1)
+    assert 'Previous fixture summary' in output['hookSpecificOutput']['additionalContext']
+    assert len(calls) == 2 and calls[-1].endswith('?mode=ro&immutable=1')
+    assert context.index_path.read_bytes() == before
+    assert not Path(str(context.index_path)+'-wal').exists()
+    assert not Path(str(context.index_path)+'-shm').exists()
+
+
+def test_legacy_index_hint_refuses_wrong_coordination_identity(lookup, monkeypatch):
+    from native_lifecycle import _context_hint
+    from note_transactions import coordination_location
+    context, add = lookup
+    add('legacy')
+    _indexed_hint_fixture(context)
+    with closing(sqlite3.connect(coordination_location(context)/'state.sqlite3')) as connection, connection:
+        connection.execute('UPDATE identity SET vault=?', ('/unrelated-vault',))
+    calls = _cantopen_once(monkeypatch, context.index_path)
+    assert _context_hint(context, time.monotonic() + 1) is None
+    assert not calls

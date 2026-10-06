@@ -67,8 +67,11 @@ class HostIdentityScenario:
             self.actors.append(context)
 
     def permits(self, api, context):
-        return (api.startswith(('note_transactions.', 'session_auxiliary_state.'))
-                and any(context is actor for actor in self.actors))
+        return ((api.startswith(('note_transactions.', 'session_auxiliary_state.'))
+                 or api in {'capture.publish_events', 'capture.read_cursor',
+                            'capture.capture_checkpoint', 'capture.recover_registered',
+                            'capture.recover_pending'})
+                and any(context == actor for actor in self.actors))
 
 
 @pytest.fixture

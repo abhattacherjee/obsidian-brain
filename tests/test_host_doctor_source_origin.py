@@ -184,8 +184,223 @@ def test_session_coverage_incomplete_source_is_not_clean(selected_host_context, 
         other = roots / 'other' / source.name
         other.parent.mkdir()
         other.write_bytes(source.read_bytes())
-    before = source.read_bytes()
-    with pytest.raises(ValueError, match='incomplete|duplicated'):
-        session_coverage.scan(str(actor.vault_path), 'claude-sessions', 'claude-insights', 9999)
-    assert source.read_bytes() == before
+    sources = [source] if suffix == 'partial' else [source, other]
+    originals = {path: path.read_bytes() for path in sources}
+    issues = session_coverage.scan(str(actor.vault_path), 'claude-sessions', 'claude-insights', 9999,
+                                   reconstruct=True)
+    assert len(issues) == len(sources)
+    assert all(issue.extra['signal_class'] == 'session-coverage-incomplete' for issue in issues)
+    assert all(issue.extra['unresolved'] and issue.confidence == 0 for issue in issues)
+    assert all(issue.extra['audit_complete'] is False for issue in issues)
+    assert not any(issue.extra['signal_class'] == 'session-coverage-gap' for issue in issues)
+    results = session_coverage.apply(issues, str(actor.state_path / 'backup'))
+    assert [result.status for result in results] == ['unresolved'] * len(sources)
+    assert all(path.read_bytes() == before for path, before in originals.items())
     assert not list((actor.vault_path / 'claude-sessions').iterdir())
+
+
+def test_incomplete_identity_window_cannot_offer_reconstruction(selected_host_context, monkeypatch):
+    import time
+    from vault_doctor_checks import session_coverage
+    from test_vault_doctor_session_coverage import _write_jsonl
+    actor = selected_host_context
+    roots = actor.native_home / ('projects' if actor.host == 'claude' else 'sessions')
+    first = _write_jsonl(roots, 'demo', 'a-unique-source', str(actor.canonical_project_root), n_user=5)
+    second = _write_jsonl(roots, 'demo', 'b-unscanned-source', str(actor.canonical_project_root), n_user=5)
+    (actor.vault_path / 'claude-sessions').mkdir()
+    originals = {path:path.read_bytes() for path in [first, second]}
+    clock = [100.0]
+    first_hashes = []
+    original = session_coverage._source_sha
+    def expire_after_verified_first_source(path, deadline):
+        result = original(path, deadline)
+        if path == first:
+            first_hashes.append(path)
+            if len(first_hashes) == 2:
+                clock[0] += 11
+        return result
+    monkeypatch.setattr(time, 'monotonic', lambda: clock[0])
+    monkeypatch.setattr(session_coverage, '_source_sha', expire_after_verified_first_source)
+    issues = session_coverage.scan(str(actor.vault_path), 'claude-sessions', 'claude-insights', 9999,
+                                  reconstruct=True)
+    [gap] = [issue for issue in issues if issue.extra['signal_class'] == 'session-coverage-gap']
+    [window] = [issue for issue in issues if 'unscanned_sources' in issue.extra]
+    assert window.extra['unscanned_sources'] == 1
+    assert gap.extra['unresolved'] and gap.extra['audit_complete'] is False and gap.confidence == 0
+    assert all(result.status == 'unresolved' for result in session_coverage.apply(issues, str(actor.state_path/'backup')))
+    assert all(path.read_bytes() == before for path,before in originals.items())
+    assert not list((actor.vault_path/'claude-sessions').iterdir())
+
+
+@pytest.mark.parametrize('shape', ['large-header', 'late-cwd', 'missing-cwd'])
+def test_coverage_uses_recorded_project_beyond_old_prefix(selected_host_context, shape):
+    import copy
+    from vault_doctor_checks import session_coverage
+    actor = selected_host_context
+    sid = 'coverage-large-native-header'
+    recorded = actor.canonical_project_root.parent / 'recorded-project'
+    recorded.mkdir()
+    rows = native_rows(actor.host, sid)
+    user = next(row for row in rows if row.get('type') == 'user'
+                or row.get('payload', {}).get('role') == 'user')
+    for index in (2, 3):
+        extra = copy.deepcopy(user)
+        if actor.host == 'claude':
+            extra['uuid'] = f'coverage-user-{index}'
+        else:
+            extra['payload']['id'] = f'coverage-user-{index}'
+        rows.append(extra)
+    for row in rows:
+        if actor.host == 'claude':
+            row.pop('cwd', None)
+            if shape != 'missing-cwd':
+                row['cwd'] = str(recorded)
+        elif row.get('type') == 'session_meta':
+            row['payload'].pop('cwd', None)
+            row['payload']['base_instructions'] = {'text': 'x' * (96 * 1024)}
+            if shape != 'missing-cwd':
+                row['payload']['cwd'] = str(recorded)
+    if actor.host == 'claude':
+        if shape == 'late-cwd':
+            rows.insert(0, {'type': 'queue-operation', 'operation': 'enqueue',
+                            'content': 'x' * (96 * 1024)})
+        else:
+            rows[0]['padding'] = 'x' * (96 * 1024)
+    folder = actor.native_home / ('projects/demo' if actor.host == 'claude' else 'sessions')
+    folder.mkdir(parents=True)
+    source = folder / (sid + '.jsonl' if actor.host == 'claude' else 'rollout-large.jsonl')
+    source.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+    before = source.read_bytes()
+    (actor.vault_path / 'claude-sessions').mkdir()
+    issues = session_coverage.scan(str(actor.vault_path), 'claude-sessions', 'claude-insights',
+                                  9999, reconstruct=True)
+    assert source.read_bytes() == before
+    assert len(issues) == 1
+    if shape == 'missing-cwd':
+        assert issues[0].extra['signal_class'] == 'session-coverage-incomplete'
+        assert issues[0].extra['unresolved']
+        assert not list((actor.vault_path / 'claude-sessions').iterdir())
+    else:
+        assert issues[0].extra['signal_class'] == 'session-coverage-gap'
+        assert issues[0].extra['cwd'] == str(recorded)
+        assert issues[0].project == 'recorded-project'
+        result = session_coverage.apply(issues, str(actor.state_path / 'backup'))[0]
+        assert result.status == 'applied', result.error
+        metadata = source_sessions._parse_frontmatter(Path(result.note_path).read_text())
+        assert metadata['agent_session_id'] == sid
+        assert metadata['agent_provider'] == actor.host
+
+
+def test_native_coverage_prioritizes_missing_notes_without_parsing_covered_sources(selected_host_context, monkeypatch):
+    from vault_doctor_checks import session_coverage
+    from test_vault_doctor_session_coverage import _write_jsonl
+    from transcripts import read_records as real_read
+    import transcripts
+    actor=selected_host_context
+    roots=actor.native_home/('projects' if actor.host=='claude' else 'sessions')
+    sessions=actor.vault_path/'claude-sessions';sessions.mkdir()
+    for i in range(1030):
+        sid='a-covered-'+str(i).zfill(4)
+        _write_jsonl(roots,'demo',sid,str(actor.canonical_project_root),n_user=5)
+        (sessions/(sid+'.md')).write_text('---\ntype: claude-session\nagent_provider: '+actor.host+'\nagent_session_id: '+sid+'\n---\n')
+    missing=_write_jsonl(roots,'demo','z-missing-source',str(actor.canonical_project_root),n_user=5)
+    original=missing.read_bytes();calls=[]
+    def read(ctx,cursor,deadline):
+        calls.append(ctx.native_session_id)
+        assert ctx.native_session_id=='z-missing-source','Covered source body was unnecessarily audited'
+        return real_read(ctx,cursor,deadline)
+    monkeypatch.setattr(transcripts,'read_records',read)
+    issues=session_coverage.scan(str(actor.vault_path),'claude-sessions','claude-insights',9999,reconstruct=True)
+    [gap]=[row for row in issues if row.extra['signal_class']=='session-coverage-gap']
+    assert gap.extra['sid']=='z-missing-source' and calls==['z-missing-source']
+    assert gap.extra['unresolved'] and gap.confidence==0 and gap.extra['audit_complete'] is False
+    [window]=[row for row in issues if 'unscanned_sources' in row.extra]
+    assert window.extra['unscanned_sources']==7
+    assert missing.read_bytes()==original and len(list(sessions.iterdir()))==1030
+
+
+def test_native_coverage_reads_known_large_source_to_verified_eof(selected_host_context, monkeypatch):
+    from vault_doctor_checks import session_coverage
+    from test_vault_doctor_session_coverage import _write_jsonl
+    from transcripts import read_records as real_read
+    import transcripts
+    actor=selected_host_context;roots=actor.native_home/('projects' if actor.host=='claude' else 'sessions')
+    source=_write_jsonl(roots,'demo','large-uncaptured-source',str(actor.canonical_project_root),n_user=5)
+    rows=[json.loads(line) for line in source.read_text().splitlines()]
+    header=rows[0]
+    padding=({'type':'mode','mode':'x'*600000,'sessionId':'large-uncaptured-source'}
+             if actor.host=='claude' else {'type':'session_meta','payload':{**header['payload'],'padding':'x'*600000}})
+    source.write_text('\n'.join(map(json.dumps,[header]+[padding]*11+rows[1:]))+'\n')
+    original=source.read_bytes();assert len(original)>6400000
+    (actor.vault_path/'claude-sessions').mkdir();offsets=[]
+    def read(ctx,cursor,deadline):
+        offsets.append(cursor.offset)
+        return real_read(ctx,cursor,deadline)
+    monkeypatch.setattr(transcripts,'read_records',read)
+    issues=session_coverage.scan(str(actor.vault_path),'claude-sessions','claude-insights',9999,reconstruct=True)
+    [gap]=issues
+    assert gap.extra['signal_class']=='session-coverage-gap' and gap.extra['sid']=='large-uncaptured-source'
+    assert not gap.extra['unresolved'] and gap.confidence==.9
+    assert len(offsets)>=2 and offsets[0]==0 and all(a<b for a,b in zip(offsets,offsets[1:]))
+    assert source.read_bytes()==original and not list((actor.vault_path/'claude-sessions').iterdir())
+
+
+def test_covered_identity_duplicates_are_still_unverified(selected_host_context, monkeypatch):
+    from vault_doctor_checks import session_coverage
+    from test_vault_doctor_session_coverage import _write_jsonl
+    import transcripts
+    actor=selected_host_context;roots=actor.native_home/('projects' if actor.host=='claude' else 'sessions')
+    first=_write_jsonl(roots,'one','covered-duplicate',str(actor.canonical_project_root),n_user=5)
+    second=_write_jsonl(roots,'two','covered-duplicate',str(actor.canonical_project_root),n_user=5)
+    originals={p:p.read_bytes() for p in (first,second)}
+    sessions=actor.vault_path/'claude-sessions';sessions.mkdir()
+    note=sessions/'existing.md';note.write_text('---\ntype: claude-session\nagent_provider: '+actor.host+'\nagent_session_id: covered-duplicate\n---\nManual note.\n')
+    before=note.read_bytes()
+    monkeypatch.setattr(transcripts,'read_records',lambda *a:pytest.fail('Covered content must not be certified'))
+    issues=session_coverage.scan(str(actor.vault_path),'claude-sessions','claude-insights',9999,reconstruct=True)
+    assert len(issues)==2 and all(row.extra['signal_class']=='session-coverage-incomplete' for row in issues)
+    assert all('duplicated' in row.reason and row.extra['unresolved'] for row in issues)
+    assert note.read_bytes()==before and all(p.read_bytes()==raw for p,raw in originals.items())
+
+
+def test_native_coverage_loss_cannot_become_a_verified_gap(selected_host_context, monkeypatch):
+    from vault_doctor_checks import session_coverage
+    from test_vault_doctor_session_coverage import _write_jsonl
+    from transcripts import read_records as real_read
+    from dataclasses import replace
+    import transcripts
+    actor=selected_host_context;roots=actor.native_home/('projects' if actor.host=='claude' else 'sessions')
+    source=_write_jsonl(roots,'demo','lost-input-source',str(actor.canonical_project_root),n_user=5)
+    raw=source.read_bytes();(actor.vault_path/'claude-sessions').mkdir()
+    monkeypatch.setattr(transcripts,'read_records',lambda ctx,cursor,deadline:replace(real_read(ctx,cursor,deadline),loss_of_input=True))
+    [issue]=session_coverage.scan(str(actor.vault_path),'claude-sessions','claude-insights',9999,reconstruct=True)
+    assert issue.extra['signal_class']=='session-coverage-incomplete' and issue.extra['loss_of_input'] is True
+    assert issue.extra['unresolved'] and issue.confidence==0 and issue.extra['audit_complete'] is False
+    assert source.read_bytes()==raw and not list((actor.vault_path/'claude-sessions').iterdir())
+
+
+def test_native_coverage_prioritizes_requested_project_within_missing_window(selected_host_context):
+    from vault_doctor_checks import session_coverage
+    from test_vault_doctor_session_coverage import _write_jsonl
+    actor=selected_host_context;roots=actor.native_home/('projects' if actor.host=='claude' else 'sessions')
+    for i in range(1030):
+        _write_jsonl(roots,'a-other','a-other-'+str(i).zfill(4),'/historical/other',n_user=1)
+    source=_write_jsonl(roots,actor.canonical_project_root.name,'z-selected-project',str(actor.canonical_project_root),n_user=5)
+    raw=source.read_bytes();(actor.vault_path/'claude-sessions').mkdir()
+    rows=session_coverage.scan(str(actor.vault_path),'claude-sessions','claude-insights',9999,reconstruct=True)
+    [gap]=[row for row in rows if row.extra['signal_class']=='session-coverage-gap']
+    assert gap.extra['sid']=='z-selected-project' and gap.project==actor.canonical_project_root.name
+    assert gap.extra['unresolved'] and gap.extra['audit_complete'] is False and gap.confidence==0
+    assert source.read_bytes()==raw and not list((actor.vault_path/'claude-sessions').iterdir())
+
+
+def test_native_project_scheduling_hint_cannot_certify_or_change_project(selected_host_context, monkeypatch):
+    from vault_doctor_checks import session_coverage
+    from test_vault_doctor_session_coverage import _write_jsonl
+    actor=selected_host_context;roots=actor.native_home/('projects' if actor.host=='claude' else 'sessions')
+    source=_write_jsonl(roots,actor.canonical_project_root.name,'false-project-label','/historical/elsewhere',n_user=5)
+    raw=source.read_bytes();(actor.vault_path/'claude-sessions').mkdir()
+    monkeypatch.setattr(session_coverage,'_native_project_hint',lambda *a:True)
+    assert session_coverage.scan(str(actor.vault_path),'claude-sessions','claude-insights',9999,
+        project=actor.canonical_project_root.name,reconstruct=True)==[]
+    assert source.read_bytes()==raw and not list((actor.vault_path/'claude-sessions').iterdir())

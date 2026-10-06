@@ -1103,3 +1103,6 @@ def test_missing_backlink_mixed_collision_and_unique_sids(tmp_path):
     )
     assert iu.extra.get("parent_stem") == unique_stem
     assert iu.confidence == 0.95
+
+from selected_legacy_vault import selected_host_context  # noqa: F401,E402
+pytestmark = __import__("pytest").mark.usefixtures("selected_host_context")

@@ -35,6 +35,14 @@ def _native_result(context):
     return obsidian_utils.get_session_context(str(context.vault_path), "claude-sessions")
 
 
+
+def _assert_planned_note_without_file(context, result):
+    from capture import planned_note_path
+    planned = planned_note_path(context)
+    assert result["session_note_name"] == planned.stem
+    assert context.vault_path in planned.parents
+    assert not planned.exists()
+
 def _unique_sid() -> str:
     return f"test-sid-{uuid.uuid4().hex}"
 
@@ -49,116 +57,123 @@ def isolated_home(tmp_path, monkeypatch):
 
 
 def test_first_seen_date_lazy_writes_and_returns_today(isolated_home):
-    sid = _unique_sid()
-    today = datetime.date.today().isoformat()
+    with using_runtime_context(None):
+        sid = _unique_sid()
+        today = datetime.date.today().isoformat()
 
-    result = obsidian_utils._first_seen_date(sid)
+        result = obsidian_utils._first_seen_date(sid)
 
-    assert result == today
-    marker = isolated_home / ".claude" / "obsidian-brain" / "sessions" / f"{sid}.json"
-    assert marker.exists()
-    assert oct(marker.stat().st_mode)[-3:] == "600"
-    payload = json.loads(marker.read_text(encoding="utf-8"))
-    assert payload["first_seen_date"] == today
-    assert "first_seen_iso" in payload
+        assert result == today
+        marker = isolated_home / ".claude" / "obsidian-brain" / "sessions" / f"{sid}.json"
+        assert marker.exists()
+        assert oct(marker.stat().st_mode)[-3:] == "600"
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+        assert payload["first_seen_date"] == today
+        assert "first_seen_iso" in payload
 
 
 def test_first_seen_date_idempotent_across_calls(isolated_home):
-    sid = _unique_sid()
-    first = obsidian_utils._first_seen_date(sid)
-    second = obsidian_utils._first_seen_date(sid)
-    third = obsidian_utils._first_seen_date(sid)
-    assert first == second == third
+    with using_runtime_context(None):
+        sid = _unique_sid()
+        first = obsidian_utils._first_seen_date(sid)
+        second = obsidian_utils._first_seen_date(sid)
+        third = obsidian_utils._first_seen_date(sid)
+        assert first == second == third
 
 
 def test_first_seen_date_survives_today_advance(isolated_home):
-    """Cross-midnight invariant: once the marker exists, advancing
-    date.today() must not change the returned value."""
-    sid = _unique_sid()
-    day_n = datetime.date(2026, 4, 25)
-    day_n_plus_1 = datetime.date(2026, 4, 26)
+    with using_runtime_context(None):
+        """Cross-midnight invariant: once the marker exists, advancing
+        date.today() must not change the returned value."""
+        sid = _unique_sid()
+        day_n = datetime.date(2026, 4, 25)
+        day_n_plus_1 = datetime.date(2026, 4, 26)
 
-    class _FrozenDate:
-        @staticmethod
-        def today():
-            return _FrozenDate._now
+        class _FrozenDate:
+            @staticmethod
+            def today():
+                return _FrozenDate._now
 
-    _FrozenDate._now = day_n
-    with patch.object(obsidian_utils.datetime, "date", _FrozenDate):
-        first = obsidian_utils._first_seen_date(sid)
-        assert first == day_n.isoformat()
+        _FrozenDate._now = day_n
+        with patch.object(obsidian_utils.datetime, "date", _FrozenDate):
+            first = obsidian_utils._first_seen_date(sid)
+            assert first == day_n.isoformat()
 
-    _FrozenDate._now = day_n_plus_1
-    with patch.object(obsidian_utils.datetime, "date", _FrozenDate):
-        second = obsidian_utils._first_seen_date(sid)
-        assert second == day_n.isoformat()  # still day-N, not day-N+1
+        _FrozenDate._now = day_n_plus_1
+        with patch.object(obsidian_utils.datetime, "date", _FrozenDate):
+            second = obsidian_utils._first_seen_date(sid)
+            assert second == day_n.isoformat()  # still day-N, not day-N+1
 
 
 def test_first_seen_date_corruption_self_heals(isolated_home):
-    sid = _unique_sid()
-    marker_dir = isolated_home / ".claude" / "obsidian-brain" / "sessions"
-    marker_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-    marker = marker_dir / f"{sid}.json"
-    marker.write_text("not valid json {", encoding="utf-8")
+    with using_runtime_context(None):
+        sid = _unique_sid()
+        marker_dir = isolated_home / ".claude" / "obsidian-brain" / "sessions"
+        marker_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        marker = marker_dir / f"{sid}.json"
+        marker.write_text("not valid json {", encoding="utf-8")
 
-    today = datetime.date.today().isoformat()
-    result = obsidian_utils._first_seen_date(sid)
-    assert result == today
-    payload = json.loads(marker.read_text(encoding="utf-8"))
-    assert payload["first_seen_date"] == today
+        today = datetime.date.today().isoformat()
+        result = obsidian_utils._first_seen_date(sid)
+        assert result == today
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+        assert payload["first_seen_date"] == today
 
-    # Subsequent call returns the rewritten value, no further mutation
-    result2 = obsidian_utils._first_seen_date(sid)
-    assert result2 == today
+        # Subsequent call returns the rewritten value, no further mutation
+        result2 = obsidian_utils._first_seen_date(sid)
+        assert result2 == today
 
 
 def test_first_seen_date_rejects_path_traversal_sid(isolated_home, capsys):
-    """A sid shaped like a path-traversal attempt must NOT escape the
-    marker directory; helper falls back to today's date and warns."""
-    today = datetime.date.today().isoformat()
-    result = obsidian_utils._first_seen_date("../../../etc/passwd")
-    assert result == today
-    # No marker file should have been created anywhere outside sessions/
-    sessions_dir = isolated_home / ".claude" / "obsidian-brain" / "sessions"
-    if sessions_dir.exists():
-        assert list(sessions_dir.glob("*passwd*")) == []
-    captured = capsys.readouterr()
-    assert "unsafe sid" in captured.err.lower() or "refusing" in captured.err.lower()
+    with using_runtime_context(None):
+        """A sid shaped like a path-traversal attempt must NOT escape the
+        marker directory; helper falls back to today's date and warns."""
+        today = datetime.date.today().isoformat()
+        result = obsidian_utils._first_seen_date("../../../etc/passwd")
+        assert result == today
+        # No marker file should have been created anywhere outside sessions/
+        sessions_dir = isolated_home / ".claude" / "obsidian-brain" / "sessions"
+        if sessions_dir.exists():
+            assert list(sessions_dir.glob("*passwd*")) == []
+        captured = capsys.readouterr()
+        assert "unsafe sid" in captured.err.lower() or "refusing" in captured.err.lower()
 
 
 def test_first_seen_date_chmods_existing_loose_mode_dir(isolated_home):
-    """mkdir(mode=0o700, exist_ok=True) is a no-op on a pre-existing dir;
-    helper must explicitly chmod 0o700 if mode is too permissive."""
-    sessions = isolated_home / ".claude" / "obsidian-brain" / "sessions"
-    sessions.mkdir(parents=True, exist_ok=True)
-    os.chmod(sessions, 0o755)  # simulate a previously-buggy permission
-    sid = _unique_sid()
-    obsidian_utils._first_seen_date(sid)
-    assert oct(sessions.stat().st_mode)[-3:] == "700"
+    with using_runtime_context(None):
+        """mkdir(mode=0o700, exist_ok=True) is a no-op on a pre-existing dir;
+        helper must explicitly chmod 0o700 if mode is too permissive."""
+        sessions = isolated_home / ".claude" / "obsidian-brain" / "sessions"
+        sessions.mkdir(parents=True, exist_ok=True)
+        os.chmod(sessions, 0o755)  # simulate a previously-buggy permission
+        sid = _unique_sid()
+        obsidian_utils._first_seen_date(sid)
+        assert oct(sessions.stat().st_mode)[-3:] == "700"
 
 
 def test_first_seen_date_chmods_existing_loose_mode_marker(isolated_home):
-    """If a marker file exists with overly-permissive mode (e.g., from a
-    previous bug or manual edit), the helper must self-heal it to 0o600."""
-    sessions = isolated_home / ".claude" / "obsidian-brain" / "sessions"
-    sessions.mkdir(parents=True, exist_ok=True, mode=0o700)
-    sid = _unique_sid()
-    marker = sessions / f"{sid}.json"
-    marker.write_text(
-        json.dumps({"first_seen_date": "2026-04-20", "first_seen_iso": "x"}),
-        encoding="utf-8",
-    )
-    os.chmod(marker, 0o644)  # simulate a previously-buggy permission
+    with using_runtime_context(None):
+        """If a marker file exists with overly-permissive mode (e.g., from a
+        previous bug or manual edit), the helper must self-heal it to 0o600."""
+        sessions = isolated_home / ".claude" / "obsidian-brain" / "sessions"
+        sessions.mkdir(parents=True, exist_ok=True, mode=0o700)
+        sid = _unique_sid()
+        marker = sessions / f"{sid}.json"
+        marker.write_text(
+            json.dumps({"first_seen_date": "2026-04-20", "first_seen_iso": "x"}),
+            encoding="utf-8",
+        )
+        os.chmod(marker, 0o644)  # simulate a previously-buggy permission
 
-    obsidian_utils._first_seen_date(sid)
-    assert oct(marker.stat().st_mode)[-3:] == "600"
+        obsidian_utils._first_seen_date(sid)
+        assert oct(marker.stat().st_mode)[-3:] == "600"
 
 
 def test_get_session_context_never_invents_a_note_from_marker_date(selected_host_context):
     context = selected_host_context
     obsidian_utils._first_seen_date(context.native_session_id)
     before = list(context.vault_path.rglob("*.md"))
-    assert _native_result(context)["session_note_name"] == ""
+    _assert_planned_note_without_file(context, _native_result(context))
     assert list(context.vault_path.rglob("*.md")) == before
 
 
@@ -172,24 +187,25 @@ def test_helper_returns_the_exact_existing_session_basename(selected_host_contex
 
 
 def test_session_end_filename_uses_marker_date(isolated_home, monkeypatch):
-    """SessionEnd reads _first_seen_date(sid), not date.today()."""
-    sid = _unique_sid()
-    # Pre-write a marker pointing at day-N (yesterday relative to "today")
-    marker_dir = isolated_home / ".claude" / "obsidian-brain" / "sessions"
-    marker_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-    (marker_dir / f"{sid}.json").write_text(
-        json.dumps({"first_seen_date": "2026-04-25", "first_seen_iso": "x"}),
-        encoding="utf-8",
-    )
+    with using_runtime_context(None):
+        """SessionEnd reads _first_seen_date(sid), not date.today()."""
+        sid = _unique_sid()
+        # Pre-write a marker pointing at day-N (yesterday relative to "today")
+        marker_dir = isolated_home / ".claude" / "obsidian-brain" / "sessions"
+        marker_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        (marker_dir / f"{sid}.json").write_text(
+            json.dumps({"first_seen_date": "2026-04-25", "first_seen_iso": "x"}),
+            encoding="utf-8",
+        )
 
-    # Direct exercise of the helper SessionEnd uses
-    date_str = obsidian_utils._first_seen_date(sid)
-    assert date_str == "2026-04-25"
+        # Direct exercise of the helper SessionEnd uses
+        date_str = obsidian_utils._first_seen_date(sid)
+        assert date_str == "2026-04-25"
 
-    project_slug = obsidian_utils.slugify("obsidian-brain")
-    filename = obsidian_utils.make_filename(date_str, project_slug, sid)
-    assert filename.startswith("2026-04-25-obsidian-brain-")
-    assert filename.endswith(".md")
+        project_slug = obsidian_utils.slugify("obsidian-brain")
+        filename = obsidian_utils.make_filename(date_str, project_slug, sid)
+        assert filename.startswith("2026-04-25-obsidian-brain-")
+        assert filename.endswith(".md")
 
 
 def _write_note(path: Path, frontmatter: dict, body: str = "body\n") -> None:
@@ -203,106 +219,115 @@ def _write_note(path: Path, frontmatter: dict, body: str = "body\n") -> None:
 
 
 def test_peek_frontmatter_type_reads_session(tmp_path):
-    note = tmp_path / "n.md"
-    _write_note(note, {"type": "claude-session", "session_id": "abc"})
-    assert obsidian_utils._peek_frontmatter_type(note) == "claude-session"
+    with using_runtime_context(None):
+        note = tmp_path / "n.md"
+        _write_note(note, {"type": "claude-session", "session_id": "abc"})
+        assert obsidian_utils._peek_frontmatter_type(note) == "claude-session"
 
 
 def test_peek_frontmatter_type_reads_snapshot(tmp_path):
-    note = tmp_path / "n.md"
-    _write_note(note, {"type": "claude-snapshot", "session_id": "abc"})
-    assert obsidian_utils._peek_frontmatter_type(note) == "claude-snapshot"
+    with using_runtime_context(None):
+        note = tmp_path / "n.md"
+        _write_note(note, {"type": "claude-snapshot", "session_id": "abc"})
+        assert obsidian_utils._peek_frontmatter_type(note) == "claude-snapshot"
 
 
 def test_peek_frontmatter_type_returns_none_when_missing(tmp_path):
-    note = tmp_path / "n.md"
-    _write_note(note, {"session_id": "abc"})
-    assert obsidian_utils._peek_frontmatter_type(note) is None
+    with using_runtime_context(None):
+        note = tmp_path / "n.md"
+        _write_note(note, {"session_id": "abc"})
+        assert obsidian_utils._peek_frontmatter_type(note) is None
 
 
 def test_peek_frontmatter_project_path_strips_quotes(tmp_path):
-    note = tmp_path / "n.md"
-    _write_note(note, {
-        "type": "claude-session",
-        "project_path": '"/Users/a/dev/obsidian-brain"',
-    })
-    assert obsidian_utils._peek_frontmatter_project_path(note) == "/Users/a/dev/obsidian-brain"
+    with using_runtime_context(None):
+        note = tmp_path / "n.md"
+        _write_note(note, {
+            "type": "claude-session",
+            "project_path": '"/Users/a/dev/obsidian-brain"',
+        })
+        assert obsidian_utils._peek_frontmatter_project_path(note) == "/Users/a/dev/obsidian-brain"
 
 
 def test_peek_frontmatter_field_empty_value_returns_none(tmp_path):
-    """An empty scalar (`field:` with no value) returns None, not ''.
-    Lets resolver call sites use truthy checks safely."""
-    note = tmp_path / "n.md"
-    _write_note(note, {"type": "", "session_id": "abc"})
-    assert obsidian_utils._peek_frontmatter_type(note) is None
+    with using_runtime_context(None):
+        """An empty scalar (`field:` with no value) returns None, not ''.
+        Lets resolver call sites use truthy checks safely."""
+        note = tmp_path / "n.md"
+        _write_note(note, {"type": "", "session_id": "abc"})
+        assert obsidian_utils._peek_frontmatter_type(note) is None
 
 
 def test_resolve_filters_snapshot_type(tmp_path):
-    """Defense-in-depth: even if a snapshot ever ends up with a session-shaped
-    filename (matching the resolver glob ``*-{h}.md``), the type filter must
-    exclude it. We deliberately give the snapshot a session-shaped name here
-    so the glob matches and the type filter is the only thing keeping it out."""
-    sessions_dir = tmp_path
-    h = "abcd"
-    _write_note(sessions_dir / f"2026-04-20-foo-{h}.md",
-                {"type": "claude-session", "session_id": "real",
-                 "project_path": '"/cwd/foo"'})
-    _write_note(sessions_dir / f"2026-04-20-snap-{h}.md",
-                {"type": "claude-snapshot", "session_id": "real"})
+    with using_runtime_context(None):
+        """Defense-in-depth: even if a snapshot ever ends up with a session-shaped
+        filename (matching the resolver glob ``*-{h}.md``), the type filter must
+        exclude it. We deliberately give the snapshot a session-shaped name here
+        so the glob matches and the type filter is the only thing keeping it out."""
+        sessions_dir = tmp_path
+        h = "abcd"
+        _write_note(sessions_dir / f"2026-04-20-foo-{h}.md",
+                    {"type": "claude-session", "session_id": "real",
+                     "project_path": '"/cwd/foo"'})
+        _write_note(sessions_dir / f"2026-04-20-snap-{h}.md",
+                    {"type": "claude-snapshot", "session_id": "real"})
 
-    basename, collisions = obsidian_utils._resolve_session_note_by_hash(
-        sessions_dir, h, cwd="/cwd/foo"
-    )
-    assert basename == f"2026-04-20-foo-{h}"
-    assert collisions == []
+        basename, collisions = obsidian_utils._resolve_session_note_by_hash(
+            sessions_dir, h, cwd="/cwd/foo"
+        )
+        assert basename == f"2026-04-20-foo-{h}"
+        assert collisions == []
 
 
 def test_resolve_disambiguates_by_project_path(tmp_path):
-    sessions_dir = tmp_path
-    h = "abcd"
-    _write_note(sessions_dir / f"2026-04-20-proj-a-{h}.md",
-                {"type": "claude-session", "session_id": "a",
-                 "project_path": '"/cwd/a"'})
-    _write_note(sessions_dir / f"2026-04-20-proj-b-{h}.md",
-                {"type": "claude-session", "session_id": "b",
-                 "project_path": '"/cwd/b"'})
+    with using_runtime_context(None):
+        sessions_dir = tmp_path
+        h = "abcd"
+        _write_note(sessions_dir / f"2026-04-20-proj-a-{h}.md",
+                    {"type": "claude-session", "session_id": "a",
+                     "project_path": '"/cwd/a"'})
+        _write_note(sessions_dir / f"2026-04-20-proj-b-{h}.md",
+                    {"type": "claude-session", "session_id": "b",
+                     "project_path": '"/cwd/b"'})
 
-    basename, collisions = obsidian_utils._resolve_session_note_by_hash(
-        sessions_dir, h, cwd="/cwd/a"
-    )
-    assert basename == f"2026-04-20-proj-a-{h}"
-    assert collisions == [f"2026-04-20-proj-b-{h}.md"]
+        basename, collisions = obsidian_utils._resolve_session_note_by_hash(
+            sessions_dir, h, cwd="/cwd/a"
+        )
+        assert basename == f"2026-04-20-proj-a-{h}"
+        assert collisions == [f"2026-04-20-proj-b-{h}.md"]
 
 
 def test_resolve_double_collision_returns_none(tmp_path):
-    """Two session-type notes with same hash AND same project_path → ambiguous,
-    caller falls back to composed name."""
-    sessions_dir = tmp_path
-    h = "abcd"
-    _write_note(sessions_dir / f"2026-04-20-proj-a-{h}.md",
-                {"type": "claude-session", "session_id": "a1",
-                 "project_path": '"/cwd/a"'})
-    _write_note(sessions_dir / f"2026-04-21-proj-a-{h}.md",
-                {"type": "claude-session", "session_id": "a2",
-                 "project_path": '"/cwd/a"'})
+    with using_runtime_context(None):
+        """Two session-type notes with same hash AND same project_path → ambiguous,
+        caller falls back to composed name."""
+        sessions_dir = tmp_path
+        h = "abcd"
+        _write_note(sessions_dir / f"2026-04-20-proj-a-{h}.md",
+                    {"type": "claude-session", "session_id": "a1",
+                     "project_path": '"/cwd/a"'})
+        _write_note(sessions_dir / f"2026-04-21-proj-a-{h}.md",
+                    {"type": "claude-session", "session_id": "a2",
+                     "project_path": '"/cwd/a"'})
 
-    basename, collisions = obsidian_utils._resolve_session_note_by_hash(
-        sessions_dir, h, cwd="/cwd/a"
-    )
-    assert basename is None
-    assert sorted(collisions) == sorted([
-        f"2026-04-20-proj-a-{h}.md",
-        f"2026-04-21-proj-a-{h}.md",
-    ])
+        basename, collisions = obsidian_utils._resolve_session_note_by_hash(
+            sessions_dir, h, cwd="/cwd/a"
+        )
+        assert basename is None
+        assert sorted(collisions) == sorted([
+            f"2026-04-20-proj-a-{h}.md",
+            f"2026-04-21-proj-a-{h}.md",
+        ])
 
 
 def test_resolve_no_match_returns_empty(tmp_path):
-    """Sanity: empty directory → (None, [])."""
-    basename, collisions = obsidian_utils._resolve_session_note_by_hash(
-        tmp_path, "abcd", cwd="/cwd/x"
-    )
-    assert basename is None
-    assert collisions == []
+    with using_runtime_context(None):
+        """Sanity: empty directory → (None, [])."""
+        basename, collisions = obsidian_utils._resolve_session_note_by_hash(
+            tmp_path, "abcd", cwd="/cwd/x"
+        )
+        assert basename is None
+        assert collisions == []
 
 
 def test_get_session_context_uses_type_aware_resolver(selected_host_context):
@@ -323,87 +348,92 @@ def test_get_session_context_rejects_colliding_short_hashes(selected_host_contex
 
 
 def test_is_resumed_session_filters_snapshot_type(tmp_path, monkeypatch):
-    """is_resumed_session must NOT return True when only a snapshot
-    exists with this hash (subsumes #86). Snapshot is given a session-shaped
-    filename so the resolver glob matches and the type filter is exercised."""
-    sid = "fresh-session-id"
-    h = obsidian_utils.hashlib.sha256(sid.encode()).hexdigest()[:4]
-    vault = tmp_path / "vault"
-    sessions = vault / "claude-sessions"
-    sessions.mkdir(parents=True)
-    monkeypatch.chdir(tmp_path)
+    with using_runtime_context(None):
+        """is_resumed_session must NOT return True when only a snapshot
+        exists with this hash (subsumes #86). Snapshot is given a session-shaped
+        filename so the resolver glob matches and the type filter is exercised."""
+        sid = "fresh-session-id"
+        h = obsidian_utils.hashlib.sha256(sid.encode()).hexdigest()[:4]
+        vault = tmp_path / "vault"
+        sessions = vault / "claude-sessions"
+        sessions.mkdir(parents=True)
+        monkeypatch.chdir(tmp_path)
 
-    # Snapshot with a session-shaped filename — only the type filter excludes it
-    _write_note(sessions / f"2026-04-20-foo-{h}.md",
-                {"type": "claude-snapshot", "session_id": "different"})
+        # Snapshot with a session-shaped filename — only the type filter excludes it
+        _write_note(sessions / f"2026-04-20-foo-{h}.md",
+                    {"type": "claude-snapshot", "session_id": "different"})
 
-    assert obsidian_utils.is_resumed_session(str(vault), "claude-sessions", sid) is False
+        assert obsidian_utils.is_resumed_session(str(vault), "claude-sessions", sid) is False
 
 
 def test_is_resumed_session_returns_true_for_real_session(tmp_path, monkeypatch):
-    sid = "fresh-session-id"
-    h = obsidian_utils.hashlib.sha256(sid.encode()).hexdigest()[:4]
-    vault = tmp_path / "vault"
-    sessions = vault / "claude-sessions"
-    sessions.mkdir(parents=True)
-    cwd = str(tmp_path)
-    monkeypatch.chdir(tmp_path)
+    with using_runtime_context(None):
+        sid = "fresh-session-id"
+        h = obsidian_utils.hashlib.sha256(sid.encode()).hexdigest()[:4]
+        vault = tmp_path / "vault"
+        sessions = vault / "claude-sessions"
+        sessions.mkdir(parents=True)
+        cwd = str(tmp_path)
+        monkeypatch.chdir(tmp_path)
 
-    _write_note(sessions / f"2026-04-20-foo-{h}.md",
-                {"type": "claude-session", "session_id": sid,
-                 "project_path": f'"{cwd}"'})
+        _write_note(sessions / f"2026-04-20-foo-{h}.md",
+                    {"type": "claude-session", "session_id": sid,
+                     "project_path": f'"{cwd}"'})
 
-    assert obsidian_utils.is_resumed_session(str(vault), "claude-sessions", sid) is True
+        assert obsidian_utils.is_resumed_session(str(vault), "claude-sessions", sid) is True
 
 
 def test_is_resumed_session_handles_collision_pair(tmp_path, monkeypatch, capsys):
-    """Same-project two-session ambiguity (the original #86 scope):
-    is_resumed_session returns False (no unambiguous prior session for
-    THIS sid in THIS project), warns, and does not crash. Operator should
-    investigate the duplicates manually."""
-    sid = "fresh-session-id"
-    h = obsidian_utils.hashlib.sha256(sid.encode()).hexdigest()[:4]
-    vault = tmp_path / "vault"
-    sessions = vault / "claude-sessions"
-    sessions.mkdir(parents=True)
-    cwd = str(tmp_path)
-    monkeypatch.chdir(tmp_path)
+    with using_runtime_context(None):
+        """Same-project two-session ambiguity (the original #86 scope):
+        is_resumed_session returns False (no unambiguous prior session for
+        THIS sid in THIS project), warns, and does not crash. Operator should
+        investigate the duplicates manually."""
+        sid = "fresh-session-id"
+        h = obsidian_utils.hashlib.sha256(sid.encode()).hexdigest()[:4]
+        vault = tmp_path / "vault"
+        sessions = vault / "claude-sessions"
+        sessions.mkdir(parents=True)
+        cwd = str(tmp_path)
+        monkeypatch.chdir(tmp_path)
 
-    _write_note(sessions / f"2026-04-20-foo-{h}.md",
-                {"type": "claude-session", "session_id": "old",
-                 "project_path": f'"{cwd}"'})
-    _write_note(sessions / f"2026-04-21-foo-{h}.md",
-                {"type": "claude-session", "session_id": "newer",
-                 "project_path": f'"{cwd}"'})
+        _write_note(sessions / f"2026-04-20-foo-{h}.md",
+                    {"type": "claude-session", "session_id": "old",
+                     "project_path": f'"{cwd}"'})
+        _write_note(sessions / f"2026-04-21-foo-{h}.md",
+                    {"type": "claude-session", "session_id": "newer",
+                     "project_path": f'"{cwd}"'})
 
-    result = obsidian_utils.is_resumed_session(str(vault), "claude-sessions", sid)
-    assert result is False  # ← changed from True
-    captured = capsys.readouterr()
-    assert "WARN" in captured.err or "collide" in captured.err.lower()  # 'collide' (singular)
+        result = obsidian_utils.is_resumed_session(str(vault), "claude-sessions", sid)
+        assert result is False  # ← changed from True
+        captured = capsys.readouterr()
+        assert "WARN" in captured.err or "collide" in captured.err.lower()  # 'collide' (singular)
 
 
 def test_peek_frontmatter_field_handles_invalid_utf8(tmp_path):
-    """Invalid UTF-8 bytes in one field must not take out the whole file.
+    with using_runtime_context(None):
+        """Invalid UTF-8 bytes in one field must not take out the whole file.
 
-    Before #283 this decoded strictly, raised UnicodeDecodeError, and the
-    note was dropped from resolver filtering entirely. The shared reader
-    decodes with errors="replace" (same as the index's parser), so the
-    corrupt bytes become U+FFFD in *that* field and every other field still
-    resolves. The unreadable-file diagnostic still exists — see
-    test_peek_frontmatter_field_unreadable_file_logs — it just no longer
-    fires for a byte-level decode problem, which is recoverable."""
-    note = tmp_path / "n.md"
-    note.write_bytes(b"---\ntype: claude-session\nbad: \xff\xfe\n---\n")
-    assert obsidian_utils._peek_frontmatter_type(note) == "claude-session"
+        Before #283 this decoded strictly, raised UnicodeDecodeError, and the
+        note was dropped from resolver filtering entirely. The shared reader
+        decodes with errors="replace" (same as the index's parser), so the
+        corrupt bytes become U+FFFD in *that* field and every other field still
+        resolves. The unreadable-file diagnostic still exists — see
+        test_peek_frontmatter_field_unreadable_file_logs — it just no longer
+        fires for a byte-level decode problem, which is recoverable."""
+        note = tmp_path / "n.md"
+        note.write_bytes(b"---\ntype: claude-session\nbad: \xff\xfe\n---\n")
+        assert obsidian_utils._peek_frontmatter_type(note) == "claude-session"
 
 
 def test_peek_frontmatter_field_unreadable_file_logs(tmp_path, capsys):
-    """An unreadable file returns None and says so on stderr, so a note
-    silently dropped from filtering stays observable."""
-    missing = tmp_path / "does-not-exist.md"
-    assert obsidian_utils._peek_frontmatter_type(missing) is None
-    captured = capsys.readouterr()
-    assert "cannot read" in captured.err.lower()
+    with using_runtime_context(None):
+        """An unreadable file returns None and says so on stderr, so a note
+        silently dropped from filtering stays observable."""
+        missing = tmp_path / "does-not-exist.md"
+        assert obsidian_utils._peek_frontmatter_type(missing) is None
+        captured = capsys.readouterr()
+        assert "cannot read" in captured.err.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -413,58 +443,62 @@ def test_peek_frontmatter_field_unreadable_file_logs(tmp_path, capsys):
 
 
 def test_peek_frontmatter_field_reads_field_past_line_30(tmp_path):
-    """A field below the old 30-line bound must still be found.
+    with using_runtime_context(None):
+        """A field below the old 30-line bound must still be found.
 
-    Restoring `if i >= 30: break` makes this fail."""
-    note = tmp_path / "deep.md"
-    filler = "\n".join(f"field_{i:02d}: v{i}" for i in range(60))
-    note.write_text(
-        f"---\n{filler}\nproject_path: \"/Users/a/dev/deep\"\n---\n\n# Body\n",
-        encoding="utf-8",
-    )
-    assert obsidian_utils._peek_frontmatter_project_path(note) == "/Users/a/dev/deep"
+        Restoring `if i >= 30: break` makes this fail."""
+        note = tmp_path / "deep.md"
+        filler = "\n".join(f"field_{i:02d}: v{i}" for i in range(60))
+        note.write_text(
+            f"---\n{filler}\nproject_path: \"/Users/a/dev/deep\"\n---\n\n# Body\n",
+            encoding="utf-8",
+        )
+        assert obsidian_utils._peek_frontmatter_project_path(note) == "/Users/a/dev/deep"
 
 
 def test_peek_frontmatter_field_unclosed_fence_returns_none(tmp_path):
-    """The issue's fixture: no closing fence, so `status:` in the body is
-    prose, not a field. Returning it would be reading a value out of the
-    note's text."""
-    note = tmp_path / "unclosed.md"
-    note.write_text(
-        "---\n"
-        "type: session\n"
-        "# My Note\n"
-        "\n"
-        "Note: this is body prose\n"
-        "status: NOT REALLY A FIELD\n",
-        encoding="utf-8",
-    )
-    assert obsidian_utils._peek_frontmatter_field(note, "status") is None
-    # …and the fields *above* the break are refused too: the file has no
-    # valid frontmatter region at all, so nothing in it can be trusted.
-    assert obsidian_utils._peek_frontmatter_type(note) is None
+    with using_runtime_context(None):
+        """The issue's fixture: no closing fence, so `status:` in the body is
+        prose, not a field. Returning it would be reading a value out of the
+        note's text."""
+        note = tmp_path / "unclosed.md"
+        note.write_text(
+            "---\n"
+            "type: session\n"
+            "# My Note\n"
+            "\n"
+            "Note: this is body prose\n"
+            "status: NOT REALLY A FIELD\n",
+            encoding="utf-8",
+        )
+        assert obsidian_utils._peek_frontmatter_field(note, "status") is None
+        # …and the fields *above* the break are refused too: the file has no
+        # valid frontmatter region at all, so nothing in it can be trusted.
+        assert obsidian_utils._peek_frontmatter_type(note) is None
 
 
 def test_peek_frontmatter_field_bare_cr_is_not_a_line_terminator(tmp_path):
-    """`newline=""` guarantee, in a form that changes the parse result:
-    under universal-newline translation the bare \\r splits the `title:`
-    line and a bogus `status` field appears."""
-    note = tmp_path / "bare-cr.md"
-    note.write_bytes(
-        b'---\ntype: claude-session\ntitle: "before\rstatus: forged"\n---\n\nbody\n'
-    )
-    assert obsidian_utils._peek_frontmatter_field(note, "status") is None
-    assert obsidian_utils._peek_frontmatter_type(note) == "claude-session"
+    with using_runtime_context(None):
+        """`newline=""` guarantee, in a form that changes the parse result:
+        under universal-newline translation the bare \\r splits the `title:`
+        line and a bogus `status` field appears."""
+        note = tmp_path / "bare-cr.md"
+        note.write_bytes(
+            b'---\ntype: claude-session\ntitle: "before\rstatus: forged"\n---\n\nbody\n'
+        )
+        assert obsidian_utils._peek_frontmatter_field(note, "status") is None
+        assert obsidian_utils._peek_frontmatter_type(note) == "claude-session"
 
 
 def test_peek_frontmatter_field_oversized_frontmatter_returns_none(tmp_path):
-    """Past MAX_FRONTMATTER_LINES the block is rejected rather than
-    half-parsed."""
-    note = tmp_path / "oversized.md"
-    limit = obsidian_utils.MAX_FRONTMATTER_LINES
-    bulk = "\n".join(f"field_{i:05d}: v{i}" for i in range(limit + 100))
-    note.write_text(f"---\ntype: claude-session\n{bulk}\n---\n\n# Body\n", encoding="utf-8")
-    assert obsidian_utils._peek_frontmatter_type(note) is None
+    with using_runtime_context(None):
+        """Past MAX_FRONTMATTER_LINES the block is rejected rather than
+        half-parsed."""
+        note = tmp_path / "oversized.md"
+        limit = obsidian_utils.MAX_FRONTMATTER_LINES
+        bulk = "\n".join(f"field_{i:05d}: v{i}" for i in range(limit + 100))
+        note.write_text(f"---\ntype: claude-session\n{bulk}\n---\n\n# Body\n", encoding="utf-8")
+        assert obsidian_utils._peek_frontmatter_type(note) is None
 
 
 # ---------------------------------------------------------------------------
@@ -476,166 +510,177 @@ def test_peek_frontmatter_field_oversized_frontmatter_returns_none(tmp_path):
 
 
 def test_peek_frontmatter_fields_reads_the_file_once(tmp_path, monkeypatch):
-    """N fields, one open. Three single-field peeks meant three reads."""
-    import builtins
+    with using_runtime_context(None):
+        """N fields, one open. Three single-field peeks meant three reads."""
+        import builtins
 
-    note = tmp_path / "n.md"
-    _write_note(note, {
-        "type": "claude-session",
-        "project": "obsidian-brain",
-        "session_id": "SID-XYZ",
-    })
+        note = tmp_path / "n.md"
+        _write_note(note, {
+            "type": "claude-session",
+            "project": "obsidian-brain",
+            "session_id": "SID-XYZ",
+        })
 
-    opens = []
-    real_open = builtins.open
+        opens = []
+        real_open = builtins.open
 
-    def counting_open(file, *args, **kwargs):
-        if str(file) == str(note):
-            opens.append(str(file))
-        return real_open(file, *args, **kwargs)
+        def counting_open(file, *args, **kwargs):
+            if str(file) == str(note):
+                opens.append(str(file))
+            return real_open(file, *args, **kwargs)
 
-    monkeypatch.setattr(builtins, "open", counting_open)
+        monkeypatch.setattr(builtins, "open", counting_open)
 
-    result = obsidian_utils._peek_frontmatter_fields(
-        note, ("type", "project", "session_id")
-    )
+        result = obsidian_utils._peek_frontmatter_fields(
+            note, ("type", "project", "session_id")
+        )
 
-    assert result == {
-        "type": "claude-session",
-        "project": "obsidian-brain",
-        "session_id": "SID-XYZ",
-    }
-    assert len(opens) == 1, f"expected one read, got {len(opens)}"
+        assert result == {
+            "type": "claude-session",
+            "project": "obsidian-brain",
+            "session_id": "SID-XYZ",
+        }
+        assert len(opens) == 1, f"expected one read, got {len(opens)}"
 
 
 def test_peek_frontmatter_fields_missing_field_is_none(tmp_path):
-    """A field the note does not have comes back None, not absent."""
-    note = tmp_path / "n.md"
-    _write_note(note, {"type": "claude-session"})
+    with using_runtime_context(None):
+        """A field the note does not have comes back None, not absent."""
+        note = tmp_path / "n.md"
+        _write_note(note, {"type": "claude-session"})
 
-    result = obsidian_utils._peek_frontmatter_fields(note, ("type", "nope"))
+        result = obsidian_utils._peek_frontmatter_fields(note, ("type", "nope"))
 
-    assert result == {"type": "claude-session", "nope": None}
+        assert result == {"type": "claude-session", "nope": None}
 
 
 def test_peek_frontmatter_fields_empty_value_is_none_and_warns(tmp_path, capsys):
-    """Per-field behaviour is preserved exactly: an empty scalar warns and
-    normalizes to None, and the OTHER fields still resolve."""
-    note = tmp_path / "n.md"
-    _write_note(note, {"type": "", "project": "obsidian-brain"})
+    with using_runtime_context(None):
+        """Per-field behaviour is preserved exactly: an empty scalar warns and
+        normalizes to None, and the OTHER fields still resolve."""
+        note = tmp_path / "n.md"
+        _write_note(note, {"type": "", "project": "obsidian-brain"})
 
-    result = obsidian_utils._peek_frontmatter_fields(note, ("type", "project"))
+        result = obsidian_utils._peek_frontmatter_fields(note, ("type", "project"))
 
-    assert result == {"type": None, "project": "obsidian-brain"}
-    err = capsys.readouterr().err
-    assert "empty" in err.lower(), err
-    assert "'type'" in err, err
+        assert result == {"type": None, "project": "obsidian-brain"}
+        err = capsys.readouterr().err
+        assert "empty" in err.lower(), err
+        assert "'type'" in err, err
 
 
 def test_peek_frontmatter_fields_first_match_wins(tmp_path):
-    """Duplicate keys: the first one inside the fence pair wins, as in the
-    single-field scan (which returned on its first match)."""
-    note = tmp_path / "dup.md"
-    note.write_text(
-        "---\ntype: claude-session\ntype: claude-snapshot\n---\n\nbody\n",
-        encoding="utf-8",
-    )
+    with using_runtime_context(None):
+        """Duplicate keys: the first one inside the fence pair wins, as in the
+        single-field scan (which returned on its first match)."""
+        note = tmp_path / "dup.md"
+        note.write_text(
+            "---\ntype: claude-session\ntype: claude-snapshot\n---\n\nbody\n",
+            encoding="utf-8",
+        )
 
-    assert obsidian_utils._peek_frontmatter_fields(note, ("type",)) == {
-        "type": "claude-session"
-    }
+        assert obsidian_utils._peek_frontmatter_fields(note, ("type",)) == {
+            "type": "claude-session"
+        }
 
 
 def test_peek_frontmatter_fields_unclosed_fence_returns_all_none(tmp_path):
-    """No frontmatter region means no field may be harvested — for every
-    requested field, not just the one that happened to be below the break."""
-    note = tmp_path / "unclosed.md"
-    note.write_text(
-        "---\ntype: claude-session\nproject: real\n# My Note\n\nstatus: prose\n",
-        encoding="utf-8",
-    )
+    with using_runtime_context(None):
+        """No frontmatter region means no field may be harvested — for every
+        requested field, not just the one that happened to be below the break."""
+        note = tmp_path / "unclosed.md"
+        note.write_text(
+            "---\ntype: claude-session\nproject: real\n# My Note\n\nstatus: prose\n",
+            encoding="utf-8",
+        )
 
-    assert obsidian_utils._peek_frontmatter_fields(
-        note, ("type", "project", "status")
-    ) == {"type": None, "project": None, "status": None}
+        assert obsidian_utils._peek_frontmatter_fields(
+            note, ("type", "project", "status")
+        ) == {"type": None, "project": None, "status": None}
 
 
 def test_peek_frontmatter_fields_unreadable_names_the_cause(tmp_path, capsys):
-    """The "cannot read" diagnostic must name the errno cause again — but via
-    exc.strerror, so the absolute vault path never reaches stderr."""
-    missing = tmp_path / "does-not-exist.md"
+    with using_runtime_context(None):
+        """The "cannot read" diagnostic must name the errno cause again — but via
+        exc.strerror, so the absolute vault path never reaches stderr."""
+        missing = tmp_path / "does-not-exist.md"
 
-    result = obsidian_utils._peek_frontmatter_fields(missing, ("type", "project"))
+        result = obsidian_utils._peek_frontmatter_fields(missing, ("type", "project"))
 
-    assert result == {"type": None, "project": None}
-    err = capsys.readouterr().err
-    assert "cannot read" in err.lower(), err
-    assert "No such file" in err, err
-    assert str(missing) not in err, f"leaked the absolute path: {err!r}"
+        assert result == {"type": None, "project": None}
+        err = capsys.readouterr().err
+        assert "cannot read" in err.lower(), err
+        assert "No such file" in err, err
+        assert str(missing) not in err, f"leaked the absolute path: {err!r}"
 
 
 def test_peek_frontmatter_field_logs_empty_value(tmp_path, capsys):
-    """Empty-but-present field is logged as a possible corruption signal."""
-    note = tmp_path / "n.md"
-    _write_note(note, {"type": "", "session_id": "abc"})
-    result = obsidian_utils._peek_frontmatter_type(note)
-    assert result is None
-    captured = capsys.readouterr()
-    assert "empty" in captured.err.lower()
+    with using_runtime_context(None):
+        """Empty-but-present field is logged as a possible corruption signal."""
+        note = tmp_path / "n.md"
+        _write_note(note, {"type": "", "session_id": "abc"})
+        result = obsidian_utils._peek_frontmatter_type(note)
+        assert result is None
+        captured = capsys.readouterr()
+        assert "empty" in captured.err.lower()
 
 
 def test_resolve_logs_when_sessions_dir_missing(tmp_path, capsys):
-    """When sessions_dir doesn't exist, resolver logs to stderr (so a
-    misconfigured vault path is observable), then returns no-match."""
-    missing = tmp_path / "nonexistent"
-    basename, collisions = obsidian_utils._resolve_session_note_by_hash(
-        missing, "abcd", cwd="/cwd/x"
-    )
-    assert basename is None
-    assert collisions == []
-    captured = capsys.readouterr()
-    assert "does not exist" in captured.err.lower() or "no-match" in captured.err.lower()
+    with using_runtime_context(None):
+        """When sessions_dir doesn't exist, resolver logs to stderr (so a
+        misconfigured vault path is observable), then returns no-match."""
+        missing = tmp_path / "nonexistent"
+        basename, collisions = obsidian_utils._resolve_session_note_by_hash(
+            missing, "abcd", cwd="/cwd/x"
+        )
+        assert basename is None
+        assert collisions == []
+        captured = capsys.readouterr()
+        assert "does not exist" in captured.err.lower() or "no-match" in captured.err.lower()
 
 
 def test_is_resumed_session_returns_false_on_cross_project_collision(tmp_path, monkeypatch, capsys):
-    """Cross-project hash collision: a session-type note exists with the
-    matching hash but project_path != cwd. Function returns False (this
-    is NOT our resumed session) and warns."""
-    sid = "fresh-session-id"
-    h = obsidian_utils.hashlib.sha256(sid.encode()).hexdigest()[:4]
-    vault = tmp_path / "vault"
-    sessions = vault / "claude-sessions"
-    sessions.mkdir(parents=True)
-    monkeypatch.chdir(tmp_path)
+    with using_runtime_context(None):
+        """Cross-project hash collision: a session-type note exists with the
+        matching hash but project_path != cwd. Function returns False (this
+        is NOT our resumed session) and warns."""
+        sid = "fresh-session-id"
+        h = obsidian_utils.hashlib.sha256(sid.encode()).hexdigest()[:4]
+        vault = tmp_path / "vault"
+        sessions = vault / "claude-sessions"
+        sessions.mkdir(parents=True)
+        monkeypatch.chdir(tmp_path)
 
-    # Single session-type note belonging to a DIFFERENT project
-    _write_note(sessions / f"2026-04-20-foo-{h}.md",
-                {"type": "claude-session", "session_id": "other-project-sid",
-                 "project_path": '"/some/other/project"'})
+        # Single session-type note belonging to a DIFFERENT project
+        _write_note(sessions / f"2026-04-20-foo-{h}.md",
+                    {"type": "claude-session", "session_id": "other-project-sid",
+                     "project_path": '"/some/other/project"'})
 
-    result = obsidian_utils.is_resumed_session(str(vault), "claude-sessions", sid)
-    assert result is False, (
-        "Cross-project hash collision should NOT mark this session as resumed; "
-        "the colliding note belongs to a different project."
-    )
+        result = obsidian_utils.is_resumed_session(str(vault), "claude-sessions", sid)
+        assert result is False, (
+            "Cross-project hash collision should NOT mark this session as resumed; "
+            "the colliding note belongs to a different project."
+        )
 
 
 def test_safe_getcwd_returns_empty_on_cwd_gone(monkeypatch):
-    """When os.getcwd() raises (cwd deleted/unmounted — issue #105 territory),
-    _safe_getcwd returns empty string so callers fall back gracefully instead
-    of crashing SessionEnd."""
-    def _raise(*a, **kw):
-        raise FileNotFoundError("cwd deleted")
-    monkeypatch.setattr(os, "getcwd", _raise)
-    assert obsidian_utils._safe_getcwd() == ""
+    with using_runtime_context(None):
+        """When os.getcwd() raises (cwd deleted/unmounted — issue #105 territory),
+        _safe_getcwd returns empty string so callers fall back gracefully instead
+        of crashing SessionEnd."""
+        def _raise(*a, **kw):
+            raise FileNotFoundError("cwd deleted")
+        monkeypatch.setattr(os, "getcwd", _raise)
+        assert obsidian_utils._safe_getcwd() == ""
 
 
 def test_safe_getcwd_returns_empty_on_oserror(monkeypatch):
-    """OSError (permission, EIO) on os.getcwd() must also degrade gracefully."""
-    def _raise(*a, **kw):
-        raise OSError("EIO on cwd")
-    monkeypatch.setattr(os, "getcwd", _raise)
-    assert obsidian_utils._safe_getcwd() == ""
+    with using_runtime_context(None):
+        """OSError (permission, EIO) on os.getcwd() must also degrade gracefully."""
+        def _raise(*a, **kw):
+            raise OSError("EIO on cwd")
+        monkeypatch.setattr(os, "getcwd", _raise)
+        assert obsidian_utils._safe_getcwd() == ""
 
 
 @pytest.mark.skipif(
@@ -643,133 +688,142 @@ def test_safe_getcwd_returns_empty_on_oserror(monkeypatch):
     reason="root can read a 0o000 directory, so the listing never fails",
 )
 def test_resolver_unreadable_sessions_dir_returns_none_and_logs(tmp_path, capsys):
-    """An unreadable sessions dir returns (None, []) and says why on stderr
-    (#336). Uses a real 0o000 directory rather than a patched Path.glob: the
-    real glob() swallows the scandir error and returns [], so a patched one
-    that raises tested a failure the code could never see. A matching note is
-    present, so a listing that silently came back empty is caught too."""
-    sessions = tmp_path / "sessions"
-    sessions.mkdir()
-    (sessions / "2026-01-01-proj-abcd.md").write_text("---\ntype: claude-session\n---\n")
-    sessions.chmod(0o000)
-    try:
-        basename, collisions = obsidian_utils._resolve_session_note_by_hash(
-            sessions, "abcd", cwd="/cwd/x"
-        )
-    finally:
-        sessions.chmod(0o700)
-    assert basename is None
-    assert collisions == []
-    err = capsys.readouterr().err
-    assert "cannot list" in err
-    assert str(sessions) in err
+    with using_runtime_context(None):
+        """An unreadable sessions dir returns (None, []) and says why on stderr
+        (#336). Uses a real 0o000 directory rather than a patched Path.glob: the
+        real glob() swallows the scandir error and returns [], so a patched one
+        that raises tested a failure the code could never see. A matching note is
+        present, so a listing that silently came back empty is caught too."""
+        sessions = tmp_path / "sessions"
+        sessions.mkdir()
+        (sessions / "2026-01-01-proj-abcd.md").write_text("---\ntype: claude-session\n---\n")
+        sessions.chmod(0o000)
+        try:
+            basename, collisions = obsidian_utils._resolve_session_note_by_hash(
+                sessions, "abcd", cwd="/cwd/x"
+            )
+        finally:
+            sessions.chmod(0o700)
+        assert basename is None
+        assert collisions == []
+        err = capsys.readouterr().err
+        assert "cannot list" in err
+        assert str(sessions) in err
 
 
 def test_resolve_treats_type_missing_as_session(tmp_path):
-    """Legacy notes without an explicit `type:` frontmatter field still count
-    as session notes so resumed-session detection doesn't regress on
-    pre-existing vaults — matches the convention used by collect_open_items()
-    in hooks/open_item_dedup.py.
-    """
-    sessions = tmp_path
-    h = "abcd"
-    _write_note(sessions / f"2026-04-20-foo-{h}.md",
-                {"session_id": "abc", "project_path": '"/cwd/foo"'})  # NO type
-    basename, collisions = obsidian_utils._resolve_session_note_by_hash(
-        sessions, h, cwd="/cwd/foo"
-    )
-    assert basename == f"2026-04-20-foo-{h}"
-    assert collisions == []
+    with using_runtime_context(None):
+        """Legacy notes without an explicit `type:` frontmatter field still count
+        as session notes so resumed-session detection doesn't regress on
+        pre-existing vaults — matches the convention used by collect_open_items()
+        in hooks/open_item_dedup.py.
+        """
+        sessions = tmp_path
+        h = "abcd"
+        _write_note(sessions / f"2026-04-20-foo-{h}.md",
+                    {"session_id": "abc", "project_path": '"/cwd/foo"'})  # NO type
+        basename, collisions = obsidian_utils._resolve_session_note_by_hash(
+            sessions, h, cwd="/cwd/foo"
+        )
+        assert basename == f"2026-04-20-foo-{h}"
+        assert collisions == []
 
 
 def test_is_resumed_session_uses_provided_cwd_over_getcwd(tmp_path, monkeypatch):
-    """When ``cwd`` is passed explicitly, is_resumed_session uses it instead
-    of os.getcwd(). SessionEnd passes hook_input["cwd"] (Claude Code's
-    authoritative project path) so a hook process that chdir'd elsewhere
-    still classifies the session against the right project.
-    """
-    sid = "real-session-id"
-    h = obsidian_utils.hashlib.sha256(sid.encode()).hexdigest()[:4]
-    vault = tmp_path / "vault"
-    sessions = vault / "claude-sessions"
-    sessions.mkdir(parents=True)
+    with using_runtime_context(None):
+        """When ``cwd`` is passed explicitly, is_resumed_session uses it instead
+        of os.getcwd(). SessionEnd passes hook_input["cwd"] (Claude Code's
+        authoritative project path) so a hook process that chdir'd elsewhere
+        still classifies the session against the right project.
+        """
+        sid = "real-session-id"
+        h = obsidian_utils.hashlib.sha256(sid.encode()).hexdigest()[:4]
+        vault = tmp_path / "vault"
+        sessions = vault / "claude-sessions"
+        sessions.mkdir(parents=True)
 
-    project_a = tmp_path / "real-project"
-    project_a.mkdir()
-    cwd_a = str(project_a)
-    _write_note(sessions / f"2026-04-20-foo-{h}.md",
-                {"type": "claude-session", "session_id": sid,
-                 "project_path": f'"{cwd_a}"'})
+        project_a = tmp_path / "real-project"
+        project_a.mkdir()
+        cwd_a = str(project_a)
+        _write_note(sessions / f"2026-04-20-foo-{h}.md",
+                    {"type": "claude-session", "session_id": sid,
+                     "project_path": f'"{cwd_a}"'})
 
-    # Force os.getcwd() into a DIFFERENT directory; the provided cwd must win.
-    other = tmp_path / "other"
-    other.mkdir()
-    monkeypatch.chdir(other)
+        # Force os.getcwd() into a DIFFERENT directory; the provided cwd must win.
+        other = tmp_path / "other"
+        other.mkdir()
+        monkeypatch.chdir(other)
 
-    # Without cwd param: returns False (os.getcwd() doesn't match note).
-    assert obsidian_utils.is_resumed_session(str(vault), "claude-sessions", sid) is False
+        # Without cwd param: returns False (os.getcwd() doesn't match note).
+        assert obsidian_utils.is_resumed_session(str(vault), "claude-sessions", sid) is False
 
-    # With cwd param: returns True (provided cwd matches note).
-    assert obsidian_utils.is_resumed_session(
-        str(vault), "claude-sessions", sid, cwd=cwd_a
-    ) is True
+        # With cwd param: returns True (provided cwd matches note).
+        assert obsidian_utils.is_resumed_session(
+            str(vault), "claude-sessions", sid, cwd=cwd_a
+        ) is True
 
 
 # ─── Issue #105: _resolve_project_basename ───────────────────────────
 
 def test_resolve_project_basename_happy_path(monkeypatch, tmp_path):
-    """Happy path: os.getcwd works → returns its basename."""
-    target = tmp_path / "some-project"
-    target.mkdir()
-    monkeypatch.chdir(target)
-    assert obsidian_utils._resolve_project_basename() == "some-project"
+    with using_runtime_context(None):
+        """Happy path: os.getcwd works → returns its basename."""
+        target = tmp_path / "some-project"
+        target.mkdir()
+        monkeypatch.chdir(target)
+        assert obsidian_utils._resolve_project_basename() == "some-project"
 
 
 def test_resolve_project_basename_falls_back_to_env(monkeypatch):
-    """When os.getcwd raises, returns basename of CLAUDE_PROJECT_DIR."""
-    def _raise(*a, **kw):
-        raise FileNotFoundError("cwd deleted")
-    monkeypatch.setattr(os, "getcwd", _raise)
-    monkeypatch.setenv("CLAUDE_PROJECT_DIR", "/tmp/fake-project-dir/my-proj")
-    assert obsidian_utils._resolve_project_basename() == "my-proj"
+    with using_runtime_context(None):
+        """When os.getcwd raises, returns basename of CLAUDE_PROJECT_DIR."""
+        def _raise(*a, **kw):
+            raise FileNotFoundError("cwd deleted")
+        monkeypatch.setattr(os, "getcwd", _raise)
+        monkeypatch.setenv("CLAUDE_PROJECT_DIR", "/tmp/fake-project-dir/my-proj")
+        assert obsidian_utils._resolve_project_basename() == "my-proj"
 
 
 def test_resolve_project_basename_returns_none_when_both_unavailable(monkeypatch):
-    """When both cwd and CLAUDE_PROJECT_DIR fail, returns None for caller
-    to treat as 'cannot determine project'."""
-    def _raise(*a, **kw):
-        raise FileNotFoundError("cwd deleted")
-    monkeypatch.setattr(os, "getcwd", _raise)
-    monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
-    assert obsidian_utils._resolve_project_basename() is None
+    with using_runtime_context(None):
+        """When both cwd and CLAUDE_PROJECT_DIR fail, returns None for caller
+        to treat as 'cannot determine project'."""
+        def _raise(*a, **kw):
+            raise FileNotFoundError("cwd deleted")
+        monkeypatch.setattr(os, "getcwd", _raise)
+        monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+        assert obsidian_utils._resolve_project_basename() is None
 
 
 def test_resolve_project_basename_normalizes_root_cwd_to_none(monkeypatch):
-    """cwd='/' has basename '' which would unsafely become a cross-project
-    glob ('~/.claude/projects/*/*.jsonl') downstream. Normalize to None per
-    Copilot R2 PR #113 so caller falls through to the strict layer-4 scan."""
-    monkeypatch.setattr(os, "getcwd", lambda: "/")
-    assert obsidian_utils._resolve_project_basename() is None
+    with using_runtime_context(None):
+        """cwd='/' has basename '' which would unsafely become a cross-project
+        glob ('~/.claude/projects/*/*.jsonl') downstream. Normalize to None per
+        Copilot R2 PR #113 so caller falls through to the strict layer-4 scan."""
+        monkeypatch.setattr(os, "getcwd", lambda: "/")
+        assert obsidian_utils._resolve_project_basename() is None
 
 
 def test_resolve_project_basename_normalizes_env_trailing_slash(monkeypatch):
-    """CLAUDE_PROJECT_DIR ending with '/' has basename '' which would unsafely
-    become a cross-project glob downstream. Strip trailing slash before
-    basename, then normalize empty to None per Copilot R2 PR #113."""
-    def _raise(*a, **kw):
-        raise FileNotFoundError("cwd deleted")
-    monkeypatch.setattr(os, "getcwd", _raise)
-    monkeypatch.setenv("CLAUDE_PROJECT_DIR", "/path/to/myproj/")
-    assert obsidian_utils._resolve_project_basename() == "myproj"
+    with using_runtime_context(None):
+        """CLAUDE_PROJECT_DIR ending with '/' has basename '' which would unsafely
+        become a cross-project glob downstream. Strip trailing slash before
+        basename, then normalize empty to None per Copilot R2 PR #113."""
+        def _raise(*a, **kw):
+            raise FileNotFoundError("cwd deleted")
+        monkeypatch.setattr(os, "getcwd", _raise)
+        monkeypatch.setenv("CLAUDE_PROJECT_DIR", "/path/to/myproj/")
+        assert obsidian_utils._resolve_project_basename() == "myproj"
 
 
 def test_resolve_project_basename_env_root_normalizes_to_none(monkeypatch):
-    """CLAUDE_PROJECT_DIR='/' normalizes to None (root path is not a project)."""
-    def _raise(*a, **kw):
-        raise FileNotFoundError("cwd deleted")
-    monkeypatch.setattr(os, "getcwd", _raise)
-    monkeypatch.setenv("CLAUDE_PROJECT_DIR", "/")
-    assert obsidian_utils._resolve_project_basename() is None
+    with using_runtime_context(None):
+        """CLAUDE_PROJECT_DIR='/' normalizes to None (root path is not a project)."""
+        def _raise(*a, **kw):
+            raise FileNotFoundError("cwd deleted")
+        monkeypatch.setattr(os, "getcwd", _raise)
+        monkeypatch.setenv("CLAUDE_PROJECT_DIR", "/")
+        assert obsidian_utils._resolve_project_basename() is None
 
 
 # ─── Issue #105: _recent_bootstrap_sid ────────────────────────────────
@@ -790,196 +844,209 @@ def _seed_bootstrap(home: Path, project: str, sid: str, mtime_offset: float = 0.
 
 
 def test_recent_bootstrap_sid_zero_recent_returns_none(isolated_home):
-    """Empty bootstrap dir → None."""
-    assert obsidian_utils._recent_bootstrap_sid() is None
+    with using_runtime_context(None):
+        """Empty bootstrap dir → None."""
+        assert obsidian_utils._recent_bootstrap_sid() is None
 
 
 def test_recent_bootstrap_sid_exactly_one_recent_returns_sid(isolated_home):
-    """Single recent bootstrap → returns its content."""
-    sid = _unique_sid()
-    _seed_bootstrap(isolated_home, "myproj", sid)
-    assert obsidian_utils._recent_bootstrap_sid() == sid
+    with using_runtime_context(None):
+        """Single recent bootstrap → returns its content."""
+        sid = _unique_sid()
+        _seed_bootstrap(isolated_home, "myproj", sid)
+        assert obsidian_utils._recent_bootstrap_sid() == sid
 
 
 def test_recent_bootstrap_sid_two_recent_returns_none(isolated_home):
-    """Two recent bootstraps → None (strict; never silently mis-attributes)."""
-    _seed_bootstrap(isolated_home, "proj-a", _unique_sid())
-    _seed_bootstrap(isolated_home, "proj-b", _unique_sid())
-    assert obsidian_utils._recent_bootstrap_sid() is None
+    with using_runtime_context(None):
+        """Two recent bootstraps → None (strict; never silently mis-attributes)."""
+        _seed_bootstrap(isolated_home, "proj-a", _unique_sid())
+        _seed_bootstrap(isolated_home, "proj-b", _unique_sid())
+        assert obsidian_utils._recent_bootstrap_sid() is None
 
 
 def test_recent_bootstrap_sid_skips_tmp_partials(isolated_home):
-    """sid-*.tmp atomic-write residue is not counted as a bootstrap."""
-    sid = _unique_sid()
-    # One real recent bootstrap + one .tmp partial → still exactly-one
-    _seed_bootstrap(isolated_home, "myproj", sid)
-    tmp = isolated_home / ".claude" / "obsidian-brain" / ".ob-sid-abc.tmp"
-    tmp.write_text("garbage")
-    assert obsidian_utils._recent_bootstrap_sid() == sid
+    with using_runtime_context(None):
+        """sid-*.tmp atomic-write residue is not counted as a bootstrap."""
+        sid = _unique_sid()
+        # One real recent bootstrap + one .tmp partial → still exactly-one
+        _seed_bootstrap(isolated_home, "myproj", sid)
+        tmp = isolated_home / ".claude" / "obsidian-brain" / ".ob-sid-abc.tmp"
+        tmp.write_text("garbage")
+        assert obsidian_utils._recent_bootstrap_sid() == sid
 
 
 def test_recent_bootstrap_sid_skips_stale(isolated_home):
-    """Bootstrap file outside recency window → None."""
-    # Set mtime 700s in the past (window default is 600s)
-    _seed_bootstrap(isolated_home, "myproj", _unique_sid(), mtime_offset=-700.0)
-    assert obsidian_utils._recent_bootstrap_sid() is None
+    with using_runtime_context(None):
+        """Bootstrap file outside recency window → None."""
+        # Set mtime 700s in the past (window default is 600s)
+        _seed_bootstrap(isolated_home, "myproj", _unique_sid(), mtime_offset=-700.0)
+        assert obsidian_utils._recent_bootstrap_sid() is None
 
 
 def test_recent_bootstrap_sid_skips_empty_content(isolated_home):
-    """Recent bootstrap with empty/whitespace content → None (corrupted write)."""
-    bdir = isolated_home / ".claude" / "obsidian-brain"
-    bdir.mkdir(parents=True, exist_ok=True)
-    bdir.chmod(0o700)
-    (bdir / "sid-myproj").write_text("   \n  ")
-    assert obsidian_utils._recent_bootstrap_sid() is None
+    with using_runtime_context(None):
+        """Recent bootstrap with empty/whitespace content → None (corrupted write)."""
+        bdir = isolated_home / ".claude" / "obsidian-brain"
+        bdir.mkdir(parents=True, exist_ok=True)
+        bdir.chmod(0o700)
+        (bdir / "sid-myproj").write_text("   \n  ")
+        assert obsidian_utils._recent_bootstrap_sid() is None
 
 
 def test_recent_bootstrap_sid_rejects_unsafe_sid_format(isolated_home):
-    """Bootstrap content failing _SID_FILENAME_SAFE regex → None.
+    with using_runtime_context(None):
+        """Bootstrap content failing _SID_FILENAME_SAFE regex → None.
 
-    Without this validation, a corrupted or attacker-controlled bootstrap file
-    with content like '../../../tmp/foo' could propagate path-traversal strings
-    into cache_get/cache_set composition. Per Copilot R1 PR #113.
-    """
-    bdir = isolated_home / ".claude" / "obsidian-brain"
-    bdir.mkdir(parents=True, exist_ok=True)
-    bdir.chmod(0o700)
-    # Attacker-controlled / corrupted SIDs that should all be rejected
-    for unsafe in [
-        "../../../tmp/escape",        # path traversal
-        "/absolute/path",             # absolute path
-        "sid with spaces",            # whitespace
-        "sid\nwith-newline",          # newline
-        "sid\twith-tab",              # tab
-        "sid*glob",                   # glob char
-        "sid/with-slash",             # path separator
-        "sid\\with-backslash",        # backslash
-        "x" * 200,                    # exceeds 128-char limit
-    ]:
-        # Reset dir for each iteration so this is exactly-one
-        for f in bdir.glob("sid-*"):
-            f.unlink()
-        (bdir / "sid-myproj").write_text(unsafe)
-        assert obsidian_utils._recent_bootstrap_sid() is None, \
-            f"Unsafe SID format should be rejected: {unsafe!r}"
+        Without this validation, a corrupted or attacker-controlled bootstrap file
+        with content like '../../../tmp/foo' could propagate path-traversal strings
+        into cache_get/cache_set composition. Per Copilot R1 PR #113.
+        """
+        bdir = isolated_home / ".claude" / "obsidian-brain"
+        bdir.mkdir(parents=True, exist_ok=True)
+        bdir.chmod(0o700)
+        # Attacker-controlled / corrupted SIDs that should all be rejected
+        for unsafe in [
+            "../../../tmp/escape",        # path traversal
+            "/absolute/path",             # absolute path
+            "sid with spaces",            # whitespace
+            "sid\nwith-newline",          # newline
+            "sid\twith-tab",              # tab
+            "sid*glob",                   # glob char
+            "sid/with-slash",             # path separator
+            "sid\\with-backslash",        # backslash
+            "x" * 200,                    # exceeds 128-char limit
+        ]:
+            # Reset dir for each iteration so this is exactly-one
+            for f in bdir.glob("sid-*"):
+                f.unlink()
+            (bdir / "sid-myproj").write_text(unsafe)
+            assert obsidian_utils._recent_bootstrap_sid() is None, \
+                f"Unsafe SID format should be rejected: {unsafe!r}"
 
 
 # ─── Issue #105: _resolve_session_id integration ──────────────────────
 
 def test_resolve_session_id_cwd_gone_uses_recent_bootstrap(isolated_home, monkeypatch):
-    """Headline regression: cwd-gone + valid recent bootstrap → returns the SID
-    via layer 4. This is the scenario from 2026-04-24 retros that motivated #105."""
-    sid = _unique_sid()
-    _seed_bootstrap(isolated_home, "myworktree", sid)
+    with using_runtime_context(None):
+        """Headline regression: cwd-gone + valid recent bootstrap → returns the SID
+        via layer 4. This is the scenario from 2026-04-24 retros that motivated #105."""
+        sid = _unique_sid()
+        _seed_bootstrap(isolated_home, "myworktree", sid)
 
-    def _raise(*a, **kw):
-        raise FileNotFoundError("cwd deleted")
-    monkeypatch.setattr(os, "getcwd", _raise)
-    monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+        def _raise(*a, **kw):
+            raise FileNotFoundError("cwd deleted")
+        monkeypatch.setattr(os, "getcwd", _raise)
+        monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
 
-    assert obsidian_utils._resolve_session_id() == sid
+        assert obsidian_utils._resolve_session_id() == sid
 
 
 def test_resolve_session_id_cwd_gone_no_bootstrap_returns_unknown(isolated_home, monkeypatch):
-    """Cwd-gone + no recent bootstrap → 'unknown' sentinel (graceful, never raises)."""
-    def _raise(*a, **kw):
-        raise FileNotFoundError("cwd deleted")
-    monkeypatch.setattr(os, "getcwd", _raise)
-    monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+    with using_runtime_context(None):
+        """Cwd-gone + no recent bootstrap → 'unknown' sentinel (graceful, never raises)."""
+        def _raise(*a, **kw):
+            raise FileNotFoundError("cwd deleted")
+        monkeypatch.setattr(os, "getcwd", _raise)
+        monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
 
-    assert obsidian_utils._resolve_session_id() == "unknown"
+        assert obsidian_utils._resolve_session_id() == "unknown"
 
 
 def test_resolve_session_id_happy_path_uses_existing_layers(isolated_home, monkeypatch, tmp_path):
-    """Cwd valid + bootstrap valid → resolves via layer 2 (no behavior change)."""
-    sid = _unique_sid()
-    project = "happypath-proj"
+    with using_runtime_context(None):
+        """Cwd valid + bootstrap valid → resolves via layer 2 (no behavior change)."""
+        sid = _unique_sid()
+        project = "happypath-proj"
 
-    # Seed the existing bootstrap fast path machinery: write sid-<project> AND
-    # a JSONL the fast path can stat.
-    _seed_bootstrap(isolated_home, project, sid)
-    cc_dir = isolated_home / ".claude" / "projects" / f"-Users-test-{project}"
-    cc_dir.mkdir(parents=True, exist_ok=True)
-    (cc_dir / f"{sid}.jsonl").write_text("{}\n")
+        # Seed the existing bootstrap fast path machinery: write sid-<project> AND
+        # a JSONL the fast path can stat.
+        _seed_bootstrap(isolated_home, project, sid)
+        cc_dir = isolated_home / ".claude" / "projects" / f"-Users-test-{project}"
+        cc_dir.mkdir(parents=True, exist_ok=True)
+        (cc_dir / f"{sid}.jsonl").write_text("{}\n")
 
-    target = tmp_path / project
-    target.mkdir()
-    monkeypatch.chdir(target)
+        target = tmp_path / project
+        target.mkdir()
+        monkeypatch.chdir(target)
 
-    # _bootstrap_prefix() reads the module-level _BOOTSTRAP_PREFIX which is
-    # frozen at import time to the real $HOME. Redirect it for this test so
-    # the fast path actually finds the seeded bootstrap.
-    bdir = isolated_home / ".claude" / "obsidian-brain"
-    monkeypatch.setattr(
-        obsidian_utils, "_BOOTSTRAP_PREFIX", str(bdir) + "/sid-"
-    )
+        # _bootstrap_prefix() reads the module-level _BOOTSTRAP_PREFIX which is
+        # frozen at import time to the real $HOME. Redirect it for this test so
+        # the fast path actually finds the seeded bootstrap.
+        bdir = isolated_home / ".claude" / "obsidian-brain"
+        monkeypatch.setattr(
+            obsidian_utils, "_BOOTSTRAP_PREFIX", str(bdir) + "/sid-"
+        )
 
-    assert obsidian_utils._resolve_session_id(allow_bootstrap=True) == sid
+        assert obsidian_utils._resolve_session_id(allow_bootstrap=True) == sid
 
 
 def test_resolve_session_id_slow_path_skips_layer_2(isolated_home, monkeypatch, tmp_path):
-    """allow_bootstrap=False (used by _slow_path_newest_sid) skips layer 2
-    even when bootstrap exists. Preserves the existing 'health-check is
-    bootstrap-blind' contract."""
-    project = "slowpath-proj"
-    bootstrap_sid = _unique_sid()
-    jsonl_sid = _unique_sid()
+    with using_runtime_context(None):
+        """allow_bootstrap=False (used by _slow_path_newest_sid) skips layer 2
+        even when bootstrap exists. Preserves the existing 'health-check is
+        bootstrap-blind' contract."""
+        project = "slowpath-proj"
+        bootstrap_sid = _unique_sid()
+        jsonl_sid = _unique_sid()
 
-    # Seed bootstrap with one SID, JSONL with a different one — slow path must
-    # return the JSONL's SID, ignoring the bootstrap file entirely.
-    _seed_bootstrap(isolated_home, project, bootstrap_sid)
-    cc_dir = isolated_home / ".claude" / "projects" / f"-Users-test-{project}"
-    cc_dir.mkdir(parents=True, exist_ok=True)
-    (cc_dir / f"{jsonl_sid}.jsonl").write_text("{}\n")
+        # Seed bootstrap with one SID, JSONL with a different one — slow path must
+        # return the JSONL's SID, ignoring the bootstrap file entirely.
+        _seed_bootstrap(isolated_home, project, bootstrap_sid)
+        cc_dir = isolated_home / ".claude" / "projects" / f"-Users-test-{project}"
+        cc_dir.mkdir(parents=True, exist_ok=True)
+        (cc_dir / f"{jsonl_sid}.jsonl").write_text("{}\n")
 
-    target = tmp_path / project
-    target.mkdir()
-    monkeypatch.chdir(target)
+        target = tmp_path / project
+        target.mkdir()
+        monkeypatch.chdir(target)
 
-    # Layer 2 is skipped here, so _BOOTSTRAP_PREFIX redirect is unnecessary;
-    # but the slow-path uses _glob_project_jsonls which uses expanduser at
-    # call time → HOME monkeypatch (already done by isolated_home) is enough.
-    assert obsidian_utils._resolve_session_id(allow_bootstrap=False) == jsonl_sid
+        # Layer 2 is skipped here, so _BOOTSTRAP_PREFIX redirect is unnecessary;
+        # but the slow-path uses _glob_project_jsonls which uses expanduser at
+        # call time → HOME monkeypatch (already done by isolated_home) is enough.
+        assert obsidian_utils._resolve_session_id(allow_bootstrap=False) == jsonl_sid
 
 
 def test_try_bootstrap_fast_path_rejects_unsafe_cached_sid(isolated_home, monkeypatch):
-    """_try_bootstrap_fast_path validates cached_sid against _SID_FILENAME_SAFE
-    before trusting it. Symmetric to the validation in _recent_bootstrap_sid.
-    Without this, a corrupted sid-<project> file with content like '../foo'
-    could propagate path-traversal strings into cache_get/cache_set composition.
-    Per Copilot R2 PR #113."""
-    project = "fastpath-proj"
-    bdir = isolated_home / ".claude" / "obsidian-brain"
-    bdir.mkdir(parents=True, exist_ok=True)
-    bdir.chmod(0o700)
-    # Write an unsafe (path-traversal) value into the bootstrap.
-    (bdir / f"sid-{project}").write_text("../../../tmp/escape")
-    monkeypatch.setattr(obsidian_utils, "_BOOTSTRAP_PREFIX", str(bdir) + "/sid-")
+    with using_runtime_context(None):
+        """_try_bootstrap_fast_path validates cached_sid against _SID_FILENAME_SAFE
+        before trusting it. Symmetric to the validation in _recent_bootstrap_sid.
+        Without this, a corrupted sid-<project> file with content like '../foo'
+        could propagate path-traversal strings into cache_get/cache_set composition.
+        Per Copilot R2 PR #113."""
+        project = "fastpath-proj"
+        bdir = isolated_home / ".claude" / "obsidian-brain"
+        bdir.mkdir(parents=True, exist_ok=True)
+        bdir.chmod(0o700)
+        # Write an unsafe (path-traversal) value into the bootstrap.
+        (bdir / f"sid-{project}").write_text("../../../tmp/escape")
+        monkeypatch.setattr(obsidian_utils, "_BOOTSTRAP_PREFIX", str(bdir) + "/sid-")
 
-    # No JSONL setup is needed here: this test asserts that the fast path
-    # rejects unsafe bootstrap content before trusting or composing with it.
-    assert obsidian_utils._try_bootstrap_fast_path(project) is None
+        # No JSONL setup is needed here: this test asserts that the fast path
+        # rejects unsafe bootstrap content before trusting or composing with it.
+        assert obsidian_utils._try_bootstrap_fast_path(project) is None
 
 
 def test_resolve_session_id_slow_path_skips_layer_4_recent_bootstrap(isolated_home, monkeypatch):
-    """allow_bootstrap=False (used by _slow_path_newest_sid) skips BOTH layer 2
-    AND layer 4 — does not trust the cross-project recent-bootstrap scan either.
-    Preserves the bootstrap-blind health-check contract that check_hook_status
-    relies on at obsidian_utils.py:827."""
-    project = "healthcheck-proj"
-    bootstrap_sid = _unique_sid()
+    with using_runtime_context(None):
+        """allow_bootstrap=False (used by _slow_path_newest_sid) skips BOTH layer 2
+        AND layer 4 — does not trust the cross-project recent-bootstrap scan either.
+        Preserves the bootstrap-blind health-check contract that check_hook_status
+        relies on at obsidian_utils.py:827."""
+        project = "healthcheck-proj"
+        bootstrap_sid = _unique_sid()
 
-    # Seed a recent bootstrap (would normally be picked up by layer 4)
-    _seed_bootstrap(isolated_home, project, bootstrap_sid)
+        # Seed a recent bootstrap (would normally be picked up by layer 4)
+        _seed_bootstrap(isolated_home, project, bootstrap_sid)
 
-    # cwd valid, but NO matching JSONL exists for this project — slow path
-    # returns "unknown" → without the fix, layer 4 would find bootstrap_sid
-    # and return it. With the fix, layer 4 is gated off → returns "unknown".
-    target = isolated_home / project
-    target.mkdir(parents=True, exist_ok=True)
-    monkeypatch.chdir(target)
+        # cwd valid, but NO matching JSONL exists for this project — slow path
+        # returns "unknown" → without the fix, layer 4 would find bootstrap_sid
+        # and return it. With the fix, layer 4 is gated off → returns "unknown".
+        target = isolated_home / project
+        target.mkdir(parents=True, exist_ok=True)
+        monkeypatch.chdir(target)
 
-    assert obsidian_utils._resolve_session_id(allow_bootstrap=False) == "unknown"
+        assert obsidian_utils._resolve_session_id(allow_bootstrap=False) == "unknown"
 
 
 # ─── Issue #260: cross-project session-id / cached-context mis-resolution ──
@@ -1023,68 +1090,71 @@ def test_get_session_context_never_borrows_other_project_session(selected_host_c
     _native_index_notes(context, [("wealth-management.md", context.host, "foreign-session", "claude-session")])
     result = _native_result(context)
     assert result["session_id"] == context.native_session_id
-    assert result["session_note_name"] == ""
+    _assert_planned_note_without_file(context, result)
     assert "wealth-management" not in json.dumps(result)
 
 
 def test_resolve_session_id_readable_cwd_without_jsonl_refuses_bootstrap_scan(
     isolated_home, tmp_path, monkeypatch
 ):
-    """Fix 1 in isolation: cwd readable + no JSONL for it + exactly one recent
-    cross-project bootstrap → 'unknown', NOT the other project's sid."""
-    _redirect_secure_paths(monkeypatch, isolated_home)
-    other_sid = _unique_sid()
-    _seed_bootstrap(isolated_home, "some-other-project", other_sid)
+    with using_runtime_context(None):
+        """Fix 1 in isolation: cwd readable + no JSONL for it + exactly one recent
+        cross-project bootstrap → 'unknown', NOT the other project's sid."""
+        _redirect_secure_paths(monkeypatch, isolated_home)
+        other_sid = _unique_sid()
+        _seed_bootstrap(isolated_home, "some-other-project", other_sid)
 
-    here = tmp_path / "pitch" / "docs"
-    here.mkdir(parents=True)
-    monkeypatch.chdir(here)
+        here = tmp_path / "pitch" / "docs"
+        here.mkdir(parents=True)
+        monkeypatch.chdir(here)
 
-    assert obsidian_utils._resolve_session_id() == "unknown"
+        assert obsidian_utils._resolve_session_id() == "unknown"
 
 
 def test_resolve_session_id_cwd_gone_still_uses_recent_bootstrap_after_260(
     isolated_home, monkeypatch
 ):
-    """#105 regression guard restated for #260: the gate keys on 'cwd produced
-    no basename at all', so the cwd-gone path layer 4 exists for still works."""
-    _redirect_secure_paths(monkeypatch, isolated_home)
-    sid = _unique_sid()
-    _seed_bootstrap(isolated_home, "deleted-worktree", sid)
+    with using_runtime_context(None):
+        """#105 regression guard restated for #260: the gate keys on 'cwd produced
+        no basename at all', so the cwd-gone path layer 4 exists for still works."""
+        _redirect_secure_paths(monkeypatch, isolated_home)
+        sid = _unique_sid()
+        _seed_bootstrap(isolated_home, "deleted-worktree", sid)
 
-    def _raise(*a, **kw):
-        raise FileNotFoundError("cwd deleted")
+        def _raise(*a, **kw):
+            raise FileNotFoundError("cwd deleted")
 
-    monkeypatch.setattr(os, "getcwd", _raise)
-    monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+        monkeypatch.setattr(os, "getcwd", _raise)
+        monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
 
-    assert obsidian_utils._resolve_session_id() == sid
+        assert obsidian_utils._resolve_session_id() == sid
 
 
 def test_resolve_session_id_cwd_gone_with_env_dir_resolves_via_jsonl(
     isolated_home, monkeypatch
 ):
-    """The other half of the #105 path: cwd gone but CLAUDE_PROJECT_DIR names a
-    project whose JSONL still exists → layer 3 resolves it. The #260 gate must
-    not need layer 4 here (and must not consult it, since the env var IS a
-    readable answer)."""
-    _redirect_secure_paths(monkeypatch, isolated_home)
-    real_sid = _unique_sid()
-    decoy_sid = _unique_sid()
-    _seed_bootstrap(isolated_home, "unrelated-project", decoy_sid)
+    with using_runtime_context(None):
+        """The other half of the #105 path: cwd gone but CLAUDE_PROJECT_DIR names a
+        project whose JSONL still exists → layer 3 resolves it. The #260 gate must
+        not need layer 4 here (and must not consult it, since the env var IS a
+        readable answer)."""
+        _redirect_secure_paths(monkeypatch, isolated_home)
+        real_sid = _unique_sid()
+        decoy_sid = _unique_sid()
+        _seed_bootstrap(isolated_home, "unrelated-project", decoy_sid)
 
-    worktree = "/Users/x/dev/repo--feature-branch"
-    cc_dir = _encoded_project_dir(isolated_home, worktree)
-    cc_dir.mkdir(parents=True)
-    (cc_dir / f"{real_sid}.jsonl").write_text("{}\n", encoding="utf-8")
+        worktree = "/Users/x/dev/repo--feature-branch"
+        cc_dir = _encoded_project_dir(isolated_home, worktree)
+        cc_dir.mkdir(parents=True)
+        (cc_dir / f"{real_sid}.jsonl").write_text("{}\n", encoding="utf-8")
 
-    def _raise(*a, **kw):
-        raise FileNotFoundError("cwd deleted")
+        def _raise(*a, **kw):
+            raise FileNotFoundError("cwd deleted")
 
-    monkeypatch.setattr(os, "getcwd", _raise)
-    monkeypatch.setenv("CLAUDE_PROJECT_DIR", worktree)
+        monkeypatch.setattr(os, "getcwd", _raise)
+        monkeypatch.setenv("CLAUDE_PROJECT_DIR", worktree)
 
-    assert obsidian_utils._resolve_session_id() == real_sid
+        assert obsidian_utils._resolve_session_id() == real_sid
 
 
 def test_get_session_context_rejects_cached_context_from_a_different_cwd(selected_host_context):
@@ -1097,7 +1167,8 @@ def test_get_session_context_rejects_cached_context_from_a_different_cwd(selecte
     assert result["cwd"] == str(context.worktree)
     assert result["hash"] != "dead"
     assert result["project"] == context.canonical_project_root.name
-    assert result["session_note_name"] == ""
+    _assert_planned_note_without_file(context, result)
+    assert result["session_note_name"] != "foreign-note"
 
 
 def test_get_session_context_ignores_legacy_cache_entry_without_cwd(selected_host_context, capsys):
@@ -1108,7 +1179,8 @@ def test_get_session_context_ignores_legacy_cache_entry_without_cwd(selected_hos
          "session_note_name": "legacy-note"})
     first = _native_result(context)
     assert first["project"] == context.canonical_project_root.name
-    assert first["session_note_name"] == ""
+    _assert_planned_note_without_file(context, first)
+    assert first["session_note_name"] != "legacy-note"
     assert _native_result(context) == first
     assert "WARN" not in capsys.readouterr().err
 
@@ -1117,8 +1189,9 @@ def test_get_session_context_missing_index_returns_bound_identity_without_creati
     context = selected_host_context
     assert not context.index_path.exists()
     result = _native_result(context)
+    _assert_planned_note_without_file(context, result)
     assert result == {"session_id": context.native_session_id, "hash": context.session_key[:16],
-        "project": context.canonical_project_root.name, "session_note_name": "", "cwd": str(context.worktree)}
+        "project": context.canonical_project_root.name, "session_note_name": result["session_note_name"], "cwd": str(context.worktree)}
     assert not context.index_path.exists()
     assert not context.state_path.exists()
 
@@ -1126,79 +1199,82 @@ def test_get_session_context_missing_index_returns_bound_identity_without_creati
 def test_glob_project_jsonls_prefers_the_dir_encoding_this_cwd(
     isolated_home, tmp_path, monkeypatch
 ):
-    """Fix 3: two project dirs end in '-docs'; only the one encoding this cwd
-    counts, even though the unrelated one holds a strictly newer session."""
-    import time
+    with using_runtime_context(None):
+        """Fix 3: two project dirs end in '-docs'; only the one encoding this cwd
+        counts, even though the unrelated one holds a strictly newer session."""
+        import time
 
-    here = tmp_path / "sonno-tiny-homes-pitch" / "docs"
-    here.mkdir(parents=True)
-    monkeypatch.chdir(here)
+        here = tmp_path / "sonno-tiny-homes-pitch" / "docs"
+        here.mkdir(parents=True)
+        monkeypatch.chdir(here)
 
-    mine = _encoded_project_dir(isolated_home, os.getcwd())
-    theirs = isolated_home / ".claude" / "projects" / "-Users-x-dev-claude-workspace-docs"
-    mine.mkdir(parents=True)
-    theirs.mkdir(parents=True)
+        mine = _encoded_project_dir(isolated_home, os.getcwd())
+        theirs = isolated_home / ".claude" / "projects" / "-Users-x-dev-claude-workspace-docs"
+        mine.mkdir(parents=True)
+        theirs.mkdir(parents=True)
 
-    my_sid = "aaaaaaaa-0000-0000-0000-000000000001"
-    their_sid = "bbbbbbbb-0000-0000-0000-000000000002"
-    (mine / f"{my_sid}.jsonl").write_text("{}\n", encoding="utf-8")
-    (theirs / f"{their_sid}.jsonl").write_text("{}\n", encoding="utf-8")
-    now = time.time()
-    os.utime(mine / f"{my_sid}.jsonl", (now - 3600, now - 3600))
-    os.utime(theirs / f"{their_sid}.jsonl", (now, now))  # newest overall
+        my_sid = "aaaaaaaa-0000-0000-0000-000000000001"
+        their_sid = "bbbbbbbb-0000-0000-0000-000000000002"
+        (mine / f"{my_sid}.jsonl").write_text("{}\n", encoding="utf-8")
+        (theirs / f"{their_sid}.jsonl").write_text("{}\n", encoding="utf-8")
+        now = time.time()
+        os.utime(mine / f"{my_sid}.jsonl", (now - 3600, now - 3600))
+        os.utime(theirs / f"{their_sid}.jsonl", (now, now))  # newest overall
 
-    matches = obsidian_utils._glob_project_jsonls("docs")
-    assert [os.path.basename(m) for m in matches] == [f"{my_sid}.jsonl"]
-    assert obsidian_utils._try_slow_jsonl_glob("docs") == my_sid
+        matches = obsidian_utils._glob_project_jsonls("docs")
+        assert [os.path.basename(m) for m in matches] == [f"{my_sid}.jsonl"]
+        assert obsidian_utils._try_slow_jsonl_glob("docs") == my_sid
 
 
 def test_glob_project_jsonls_refuses_when_no_dir_encodes_cwd(
     isolated_home, tmp_path, monkeypatch, capsys
 ):
-    """Ambiguous → refuse: several dirs match the suffix, none is ours. Return
-    nothing (caller reports 'unknown') and say so on stderr."""
-    here = tmp_path / "elsewhere" / "docs"
-    here.mkdir(parents=True)
-    monkeypatch.chdir(here)
+    with using_runtime_context(None):
+        """Ambiguous → refuse: several dirs match the suffix, none is ours. Return
+        nothing (caller reports 'unknown') and say so on stderr."""
+        here = tmp_path / "elsewhere" / "docs"
+        here.mkdir(parents=True)
+        monkeypatch.chdir(here)
 
-    projects = isolated_home / ".claude" / "projects"
-    for name, sid in (
-        ("-Users-x-dev-claude_workspace-docs", "cccccccc-0000-0000-0000-000000000003"),
-        ("-Users-x-dev-other-workspace-docs", "dddddddd-0000-0000-0000-000000000004"),
-    ):
-        d = projects / name
-        d.mkdir(parents=True)
-        (d / f"{sid}.jsonl").write_text("{}\n", encoding="utf-8")
+        projects = isolated_home / ".claude" / "projects"
+        for name, sid in (
+            ("-Users-x-dev-claude_workspace-docs", "cccccccc-0000-0000-0000-000000000003"),
+            ("-Users-x-dev-other-workspace-docs", "dddddddd-0000-0000-0000-000000000004"),
+        ):
+            d = projects / name
+            d.mkdir(parents=True)
+            (d / f"{sid}.jsonl").write_text("{}\n", encoding="utf-8")
 
-    assert obsidian_utils._glob_project_jsonls("docs") == []
-    assert obsidian_utils._try_slow_jsonl_glob("docs") == "unknown"
-    err = capsys.readouterr().err
-    assert "WARN" in err and "refusing to guess" in err, err
+        assert obsidian_utils._glob_project_jsonls("docs") == []
+        assert obsidian_utils._try_slow_jsonl_glob("docs") == "unknown"
+        err = capsys.readouterr().err
+        assert "WARN" in err and "refusing to guess" in err, err
 
 
 def test_glob_project_jsonls_keeps_every_encoding_variant_of_this_cwd(
     isolated_home, tmp_path, monkeypatch
 ):
-    """A single checkout legitimately owns more than one project dir: CC has
-    changed how it folds '_' in the encoded name, and both survive on disk
-    (verified on this machine for claude_workspace/obsidian-brain). Both must
-    be kept — refusing them would strand the live session."""
-    here = tmp_path / "claude_workspace" / "obsidian-brain"
-    here.mkdir(parents=True)
-    monkeypatch.chdir(here)
-    cwd = os.getcwd()
+    with using_runtime_context(None):
+        """A single checkout legitimately owns more than one project dir: CC has
+        changed how it folds '_' in the encoded name, and both survive on disk
+        (verified on this machine for claude_workspace/obsidian-brain). Both must
+        be kept — refusing them would strand the live session."""
+        here = tmp_path / "claude_workspace" / "obsidian-brain"
+        here.mkdir(parents=True)
+        monkeypatch.chdir(here)
+        cwd = os.getcwd()
 
-    projects = isolated_home / ".claude" / "projects"
-    kept_underscore = projects / cwd.replace("/", "-")
-    folded = projects / cwd.replace("/", "-").replace("_", "-")
-    assert kept_underscore != folded
-    kept_underscore.mkdir(parents=True)
-    folded.mkdir(parents=True)
-    (kept_underscore / "sid-old.jsonl").write_text("{}\n", encoding="utf-8")
-    (folded / "sid-new.jsonl").write_text("{}\n", encoding="utf-8")
+        projects = isolated_home / ".claude" / "projects"
+        kept_underscore = projects / cwd.replace("/", "-")
+        folded = projects / cwd.replace("/", "-").replace("_", "-")
+        assert kept_underscore != folded
+        kept_underscore.mkdir(parents=True)
+        folded.mkdir(parents=True)
+        (kept_underscore / "sid-old.jsonl").write_text("{}\n", encoding="utf-8")
+        (folded / "sid-new.jsonl").write_text("{}\n", encoding="utf-8")
 
-    matches = obsidian_utils._glob_project_jsonls("obsidian-brain")
-    assert sorted(os.path.basename(m) for m in matches) == ["sid-new.jsonl", "sid-old.jsonl"]
+        matches = obsidian_utils._glob_project_jsonls("obsidian-brain")
+        assert sorted(os.path.basename(m) for m in matches) == ["sid-new.jsonl", "sid-old.jsonl"]
 
 
 # ─── #260 review round 2: the mis-resolution was still reachable ──────────
@@ -1222,345 +1298,358 @@ def _jsonl_line(cwd: str) -> str:
 def test_bootstrap_under_current_basename_never_borrows_another_project(
     isolated_home, tmp_path, monkeypatch
 ):
-    """C1: SessionStart writes sid-<cwd basename>, so the bootstrap file collides
-    on a generic basename exactly as easily as the suffix glob does.
+    with using_runtime_context(None):
+        """C1: SessionStart writes sid-<cwd basename>, so the bootstrap file collides
+        on a generic basename exactly as easily as the suffix glob does.
 
-    cwd is `.../sonno-tiny-homes-pitch/docs`; two unrelated project dirs end in
-    `-docs`; `sid-docs` holds the sid of one of them. The cached-sid glob lands
-    in ONE directory and takes the sole-match leniency, while the all-JSONLs
-    glob sees both and refuses — and the fast path used to resolve that
-    disagreement in favour of the stale bootstrap, printing "refusing to guess"
-    and then guessing through the other branch.
-    """
-    _redirect_secure_paths(monkeypatch, isolated_home)
-    decoy_sid = "aaaaaaa-1111-2222-3333-444444444444"
-    other_sid = "bbbbbbb-2222-3333-4444-555555555555"
+        cwd is `.../sonno-tiny-homes-pitch/docs`; two unrelated project dirs end in
+        `-docs`; `sid-docs` holds the sid of one of them. The cached-sid glob lands
+        in ONE directory and takes the sole-match leniency, while the all-JSONLs
+        glob sees both and refuses — and the fast path used to resolve that
+        disagreement in favour of the stale bootstrap, printing "refusing to guess"
+        and then guessing through the other branch.
+        """
+        _redirect_secure_paths(monkeypatch, isolated_home)
+        decoy_sid = "aaaaaaa-1111-2222-3333-444444444444"
+        other_sid = "bbbbbbb-2222-3333-4444-555555555555"
 
-    projects = isolated_home / ".claude" / "projects"
-    decoy = projects / "-Users-x-dev-vendor-pitch-docs"
-    other = projects / "-Users-x-dev-other-workspace-docs"
-    decoy.mkdir(parents=True)
-    other.mkdir(parents=True)
-    (decoy / f"{decoy_sid}.jsonl").write_text("{}\n", encoding="utf-8")
-    (other / f"{other_sid}.jsonl").write_text("{}\n", encoding="utf-8")
+        projects = isolated_home / ".claude" / "projects"
+        decoy = projects / "-Users-x-dev-vendor-pitch-docs"
+        other = projects / "-Users-x-dev-other-workspace-docs"
+        decoy.mkdir(parents=True)
+        other.mkdir(parents=True)
+        (decoy / f"{decoy_sid}.jsonl").write_text("{}\n", encoding="utf-8")
+        (other / f"{other_sid}.jsonl").write_text("{}\n", encoding="utf-8")
 
-    # SessionStart's bootstrap for THIS cwd basename names the decoy's session.
-    _seed_bootstrap(isolated_home, "docs", decoy_sid)
+        # SessionStart's bootstrap for THIS cwd basename names the decoy's session.
+        _seed_bootstrap(isolated_home, "docs", decoy_sid)
 
-    here = tmp_path / "sonno-tiny-homes-pitch" / "docs"
-    here.mkdir(parents=True)
-    monkeypatch.chdir(here)
+        here = tmp_path / "sonno-tiny-homes-pitch" / "docs"
+        here.mkdir(parents=True)
+        monkeypatch.chdir(here)
 
-    assert obsidian_utils._resolve_session_id() == "unknown", (
-        "the refusal was read as 'no other JSONLs exist' and the stale "
-        "cross-project bootstrap was returned"
-    )
+        assert obsidian_utils._resolve_session_id() == "unknown", (
+            "the refusal was read as 'no other JSONLs exist' and the stale "
+            "cross-project bootstrap was returned"
+        )
 
 
 def test_bootstrap_fast_path_returns_none_when_the_glob_refused(
     isolated_home, tmp_path, monkeypatch
 ):
-    """C1 in isolation, at the function that owned the defect."""
-    _redirect_secure_paths(monkeypatch, isolated_home)
-    decoy_sid = "ccccccc-1111-2222-3333-444444444444"
+    with using_runtime_context(None):
+        """C1 in isolation, at the function that owned the defect."""
+        _redirect_secure_paths(monkeypatch, isolated_home)
+        decoy_sid = "ccccccc-1111-2222-3333-444444444444"
 
-    projects = isolated_home / ".claude" / "projects"
-    for name, sid in (
-        ("-Users-x-dev-vendor-pitch-docs", decoy_sid),
-        ("-Users-x-dev-other-workspace-docs", "ddddddd-2222-3333-4444-555555555555"),
-    ):
-        d = projects / name
-        d.mkdir(parents=True)
-        (d / f"{sid}.jsonl").write_text("{}\n", encoding="utf-8")
+        projects = isolated_home / ".claude" / "projects"
+        for name, sid in (
+            ("-Users-x-dev-vendor-pitch-docs", decoy_sid),
+            ("-Users-x-dev-other-workspace-docs", "ddddddd-2222-3333-4444-555555555555"),
+        ):
+            d = projects / name
+            d.mkdir(parents=True)
+            (d / f"{sid}.jsonl").write_text("{}\n", encoding="utf-8")
 
-    _seed_bootstrap(isolated_home, "docs", decoy_sid)
-    here = tmp_path / "pitch" / "docs"
-    here.mkdir(parents=True)
-    monkeypatch.chdir(here)
+        _seed_bootstrap(isolated_home, "docs", decoy_sid)
+        here = tmp_path / "pitch" / "docs"
+        here.mkdir(parents=True)
+        monkeypatch.chdir(here)
 
-    assert obsidian_utils._try_bootstrap_fast_path("docs") is None
+        assert obsidian_utils._try_bootstrap_fast_path("docs") is None
 
 
 def test_glob_project_jsonls_folds_a_dot_in_the_cwd_basename(
     isolated_home, tmp_path, monkeypatch, capsys
 ):
-    """C2: Claude Code folds '.' to '-' when it encodes a cwd, so a dot-named
-    directory's transcripts are on disk under a name the literal glob cannot
-    see. Verified live from /Users/<me>/.openclaw: 17 JSONLs exist, the literal
-    glob found 0, and the resolver answered 'unknown' for an active session.
-    """
-    here = tmp_path / ".openclaw"
-    here.mkdir()
-    monkeypatch.chdir(here)
-    cwd = os.getcwd()
+    with using_runtime_context(None):
+        """C2: Claude Code folds '.' to '-' when it encodes a cwd, so a dot-named
+        directory's transcripts are on disk under a name the literal glob cannot
+        see. Verified live from /Users/<me>/.openclaw: 17 JSONLs exist, the literal
+        glob found 0, and the resolver answered 'unknown' for an active session.
+        """
+        here = tmp_path / ".openclaw"
+        here.mkdir()
+        monkeypatch.chdir(here)
+        cwd = os.getcwd()
 
-    sid = "eeeeeee-1111-2222-3333-444444444444"
-    encoded = cwd.replace("/", "-").replace(".", "-").replace("_", "-")
-    d = isolated_home / ".claude" / "projects" / encoded
-    d.mkdir(parents=True)
-    (d / f"{sid}.jsonl").write_text(_jsonl_line(cwd), encoding="utf-8")
+        sid = "eeeeeee-1111-2222-3333-444444444444"
+        encoded = cwd.replace("/", "-").replace(".", "-").replace("_", "-")
+        d = isolated_home / ".claude" / "projects" / encoded
+        d.mkdir(parents=True)
+        (d / f"{sid}.jsonl").write_text(_jsonl_line(cwd), encoding="utf-8")
 
-    assert obsidian_utils._resolve_session_id() == sid
-    # The directory IS one of this cwd's encodings, so nothing is announced.
-    assert "WARN" not in capsys.readouterr().err
+        assert obsidian_utils._resolve_session_id() == sid
+        # The directory IS one of this cwd's encodings, so nothing is announced.
+        assert "WARN" not in capsys.readouterr().err
 
 
 def test_glob_project_jsonls_unions_the_folded_variant_instead_of_falling_back(
     isolated_home, tmp_path, monkeypatch
 ):
-    """S9: the folded glob used to run only when the literal one came up EMPTY.
+    with using_runtime_context(None):
+        """S9: the folded glob used to run only when the literal one came up EMPTY.
 
-    Here the literal glob matches exactly ONE directory — an unrelated repo —
-    so the fallback never fired and the sole-match leniency returned that
-    stranger as fact. Both globs must run and their results be UNIONed.
-    """
-    here = tmp_path / "ws" / "a_b"
-    here.mkdir(parents=True)
-    monkeypatch.chdir(here)
-    cwd = os.getcwd()
+        Here the literal glob matches exactly ONE directory — an unrelated repo —
+        so the fallback never fired and the sole-match leniency returned that
+        stranger as fact. Both globs must run and their results be UNIONed.
+        """
+        here = tmp_path / "ws" / "a_b"
+        here.mkdir(parents=True)
+        monkeypatch.chdir(here)
+        cwd = os.getcwd()
 
-    projects = isolated_home / ".claude" / "projects"
-    stranger = projects / "-Users-x-dev-vendor-a_b"       # literal glob only
-    mine = projects / cwd.replace("/", "-").replace("_", "-")  # folded glob only
-    stranger.mkdir(parents=True)
-    mine.mkdir(parents=True)
-    stranger_sid = "fffffff-1111-2222-3333-444444444444"
-    my_sid = "9999999-1111-2222-3333-444444444444"
-    (stranger / f"{stranger_sid}.jsonl").write_text("{}\n", encoding="utf-8")
-    (mine / f"{my_sid}.jsonl").write_text("{}\n", encoding="utf-8")
+        projects = isolated_home / ".claude" / "projects"
+        stranger = projects / "-Users-x-dev-vendor-a_b"       # literal glob only
+        mine = projects / cwd.replace("/", "-").replace("_", "-")  # folded glob only
+        stranger.mkdir(parents=True)
+        mine.mkdir(parents=True)
+        stranger_sid = "fffffff-1111-2222-3333-444444444444"
+        my_sid = "9999999-1111-2222-3333-444444444444"
+        (stranger / f"{stranger_sid}.jsonl").write_text("{}\n", encoding="utf-8")
+        (mine / f"{my_sid}.jsonl").write_text("{}\n", encoding="utf-8")
 
-    assert obsidian_utils._try_slow_jsonl_glob("a_b") == my_sid
+        assert obsidian_utils._try_slow_jsonl_glob("a_b") == my_sid
 
 
 def test_transcript_cwd_wins_over_the_encoding_guess_on_a_fold_collision(
     isolated_home, monkeypatch
 ):
-    """S7: over-generating encodings is NOT free.
+    with using_runtime_context(None):
+        """S7: over-generating encodings is NOT free.
 
-    cwd `/Users/x/dev/a_b` and an unrelated repo at `/Users/x/dev/a-b` collide:
-    the stranger's real project-dir name is byte-identical to one of our
-    generated fold variants, so the encoding pre-filter keeps it and its newer
-    session wins the mtime max. The transcripts' own `cwd` field — which Claude
-    Code records on every line — settles it as fact rather than inference.
+        cwd `/Users/x/dev/a_b` and an unrelated repo at `/Users/x/dev/a-b` collide:
+        the stranger's real project-dir name is byte-identical to one of our
+        generated fold variants, so the encoding pre-filter keeps it and its newer
+        session wins the mtime max. The transcripts' own `cwd` field — which Claude
+        Code records on every line — settles it as fact rather than inference.
 
-    cwd is synthesized rather than taken from tmp_path because pytest's tmp
-    directories carry the test name, underscores and all, and folding those
-    would destroy the very collision under test.
-    """
-    import time
+        cwd is synthesized rather than taken from tmp_path because pytest's tmp
+        directories carry the test name, underscores and all, and folding those
+        would destroy the very collision under test.
+        """
+        import time
 
-    our_cwd = "/Users/x/dev/a_b"
-    their_cwd = "/Users/x/dev/a-b"
-    monkeypatch.setattr(os, "getcwd", lambda: our_cwd)
+        our_cwd = "/Users/x/dev/a_b"
+        their_cwd = "/Users/x/dev/a-b"
+        monkeypatch.setattr(os, "getcwd", lambda: our_cwd)
 
-    projects = isolated_home / ".claude" / "projects"
-    dir_ours = projects / our_cwd.replace("/", "-")
-    dir_theirs = projects / their_cwd.replace("/", "-")
-    assert dir_theirs.name == our_cwd.replace("/", "-").replace("_", "-"), (
-        "fixture premise: their real dir name equals one of our fold variants"
-    )
-    dir_ours.mkdir(parents=True)
-    dir_theirs.mkdir(parents=True)
+        projects = isolated_home / ".claude" / "projects"
+        dir_ours = projects / our_cwd.replace("/", "-")
+        dir_theirs = projects / their_cwd.replace("/", "-")
+        assert dir_theirs.name == our_cwd.replace("/", "-").replace("_", "-"), (
+            "fixture premise: their real dir name equals one of our fold variants"
+        )
+        dir_ours.mkdir(parents=True)
+        dir_theirs.mkdir(parents=True)
 
-    my_sid = "1212121-1111-2222-3333-444444444444"
-    their_sid = "3434343-1111-2222-3333-444444444444"
-    mine = dir_ours / f"{my_sid}.jsonl"
-    stranger = dir_theirs / f"{their_sid}.jsonl"
-    mine.write_text(_jsonl_line(our_cwd), encoding="utf-8")
-    stranger.write_text(_jsonl_line(their_cwd), encoding="utf-8")
-    now = time.time()
-    os.utime(mine, (now - 3600, now - 3600))
-    os.utime(stranger, (now, now))  # strictly newer, and kept by the pre-filter
+        my_sid = "1212121-1111-2222-3333-444444444444"
+        their_sid = "3434343-1111-2222-3333-444444444444"
+        mine = dir_ours / f"{my_sid}.jsonl"
+        stranger = dir_theirs / f"{their_sid}.jsonl"
+        mine.write_text(_jsonl_line(our_cwd), encoding="utf-8")
+        stranger.write_text(_jsonl_line(their_cwd), encoding="utf-8")
+        now = time.time()
+        os.utime(mine, (now - 3600, now - 3600))
+        os.utime(stranger, (now, now))  # strictly newer, and kept by the pre-filter
 
-    assert obsidian_utils._try_slow_jsonl_glob("a_b") == my_sid
+        assert obsidian_utils._try_slow_jsonl_glob("a_b") == my_sid
 
 
 def test_transcript_arbitration_ignores_a_transcript_with_no_cwd_field(
     isolated_home, tmp_path, monkeypatch
 ):
-    """"Cannot tell" must not read as "not ours": a transcript with no usable
-    cwd leaves its directory to the encoding pre-filter, which still keeps it.
-    """
-    here = tmp_path / "ws" / "docs"
-    here.mkdir(parents=True)
-    monkeypatch.chdir(here)
-    cwd = os.getcwd()
+    with using_runtime_context(None):
+        """"Cannot tell" must not read as "not ours": a transcript with no usable
+        cwd leaves its directory to the encoding pre-filter, which still keeps it.
+        """
+        here = tmp_path / "ws" / "docs"
+        here.mkdir(parents=True)
+        monkeypatch.chdir(here)
+        cwd = os.getcwd()
 
-    projects = isolated_home / ".claude" / "projects"
-    mine = projects / cwd.replace("/", "-")
-    stranger = projects / "-Users-x-dev-other-docs"
-    mine.mkdir(parents=True)
-    stranger.mkdir(parents=True)
-    my_sid = "5656565-1111-2222-3333-444444444444"
-    (mine / f"{my_sid}.jsonl").write_text("not json at all\n", encoding="utf-8")
-    (stranger / "7878787-1111-2222-3333-444444444444.jsonl").write_text(
-        "{}\n", encoding="utf-8"
-    )
+        projects = isolated_home / ".claude" / "projects"
+        mine = projects / cwd.replace("/", "-")
+        stranger = projects / "-Users-x-dev-other-docs"
+        mine.mkdir(parents=True)
+        stranger.mkdir(parents=True)
+        my_sid = "5656565-1111-2222-3333-444444444444"
+        (mine / f"{my_sid}.jsonl").write_text("not json at all\n", encoding="utf-8")
+        (stranger / "7878787-1111-2222-3333-444444444444.jsonl").write_text(
+            "{}\n", encoding="utf-8"
+        )
 
-    assert obsidian_utils._try_slow_jsonl_glob("docs") == my_sid
+        assert obsidian_utils._try_slow_jsonl_glob("docs") == my_sid
 
 
 def test_transcript_cwd_reads_only_the_head_of_a_huge_transcript(tmp_path):
-    """The S7 read is bounded: a transcript larger than the window still yields
-    its cwd from the first line, and the window never grows with the file."""
-    big = tmp_path / "huge.jsonl"
-    with open(big, "w", encoding="utf-8") as f:
-        f.write(_jsonl_line("/Users/x/dev/repo"))
-        f.write(json.dumps({"pad": "z" * 500_000}) + "\n")
-    assert obsidian_utils._transcript_cwd(str(big)) == "/Users/x/dev/repo"
-    # A cwd that only appears past the window is deliberately not found.
-    late = tmp_path / "late.jsonl"
-    with open(late, "w", encoding="utf-8") as f:
-        f.write(json.dumps({"pad": "z" * 200_000}) + "\n")
-        f.write(_jsonl_line("/Users/x/dev/repo"))
-    assert obsidian_utils._transcript_cwd(str(late)) is None
+    with using_runtime_context(None):
+        """The S7 read is bounded: a transcript larger than the window still yields
+        its cwd from the first line, and the window never grows with the file."""
+        big = tmp_path / "huge.jsonl"
+        with open(big, "w", encoding="utf-8") as f:
+            f.write(_jsonl_line("/Users/x/dev/repo"))
+            f.write(json.dumps({"pad": "z" * 500_000}) + "\n")
+        assert obsidian_utils._transcript_cwd(str(big)) == "/Users/x/dev/repo"
+        # A cwd that only appears past the window is deliberately not found.
+        late = tmp_path / "late.jsonl"
+        with open(late, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"pad": "z" * 200_000}) + "\n")
+            f.write(_jsonl_line("/Users/x/dev/repo"))
+        assert obsidian_utils._transcript_cwd(str(late)) is None
 
 
 def test_ambiguous_glob_warns_once_not_once_per_note(
     isolated_home, tmp_path, monkeypatch, capsys
 ):
-    """I3: the refusal WARN sits on a path _get_session_id_fast() re-runs once
-    per NOTE (read_note_metadata calls it before its own cache lookup), so a
-    /check-items sweep over a few hundred notes emitted a few hundred copies,
-    all of them into the model's context. One per distinct ambiguity.
-    """
-    here = tmp_path / "elsewhere" / "docs"
-    here.mkdir(parents=True)
-    monkeypatch.chdir(here)
+    with using_runtime_context(None):
+        """I3: the refusal WARN sits on a path _get_session_id_fast() re-runs once
+        per NOTE (read_note_metadata calls it before its own cache lookup), so a
+        /check-items sweep over a few hundred notes emitted a few hundred copies,
+        all of them into the model's context. One per distinct ambiguity.
+        """
+        here = tmp_path / "elsewhere" / "docs"
+        here.mkdir(parents=True)
+        monkeypatch.chdir(here)
 
-    projects = isolated_home / ".claude" / "projects"
-    for name, sid in (
-        ("-Users-x-dev-one-workspace-docs", "1111111-aaaa-bbbb-cccc-dddddddddddd"),
-        ("-Users-x-dev-two-workspace-docs", "2222222-aaaa-bbbb-cccc-dddddddddddd"),
-    ):
-        d = projects / name
-        d.mkdir(parents=True)
-        (d / f"{sid}.jsonl").write_text("{}\n", encoding="utf-8")
+        projects = isolated_home / ".claude" / "projects"
+        for name, sid in (
+            ("-Users-x-dev-one-workspace-docs", "1111111-aaaa-bbbb-cccc-dddddddddddd"),
+            ("-Users-x-dev-two-workspace-docs", "2222222-aaaa-bbbb-cccc-dddddddddddd"),
+        ):
+            d = projects / name
+            d.mkdir(parents=True)
+            (d / f"{sid}.jsonl").write_text("{}\n", encoding="utf-8")
 
-    for _ in range(200):
-        assert obsidian_utils._resolve_session_id() == "unknown"
+        for _ in range(200):
+            assert obsidian_utils._resolve_session_id() == "unknown"
 
-    err = capsys.readouterr().err
-    assert err.count("refusing to guess") == 1, (
-        f"expected exactly one refusal WARN, got {err.count('refusing to guess')}"
-    )
+        err = capsys.readouterr().err
+        assert err.count("refusing to guess") == 1, (
+            f"expected exactly one refusal WARN, got {err.count('refusing to guess')}"
+        )
 
 
 def test_sole_matching_dir_that_is_not_this_cwd_is_used_but_announced(
     isolated_home, tmp_path, monkeypatch, capsys
 ):
-    """S6: the sole-match leniency stays (restricting it broke 11 pre-existing
-    tests, and an unobserved encoding would strand a correct match) — but with
-    a known, encodable cwd that the sole directory does not match, the code has
-    positive evidence of a probable mis-match and must not stay silent.
-    """
-    here = tmp_path / "cc-token-router"
-    here.mkdir()
-    monkeypatch.chdir(here)
+    with using_runtime_context(None):
+        """S6: the sole-match leniency stays (restricting it broke 11 pre-existing
+        tests, and an unobserved encoding would strand a correct match) — but with
+        a known, encodable cwd that the sole directory does not match, the code has
+        positive evidence of a probable mis-match and must not stay silent.
+        """
+        here = tmp_path / "cc-token-router"
+        here.mkdir()
+        monkeypatch.chdir(here)
 
-    sid = "8888888-aaaa-bbbb-cccc-dddddddddddd"
-    d = (isolated_home / ".claude" / "projects"
-         / "-Users-x-dev-claude-workspace-cc-token-router")
-    d.mkdir(parents=True)
-    (d / f"{sid}.jsonl").write_text("{}\n", encoding="utf-8")
+        sid = "8888888-aaaa-bbbb-cccc-dddddddddddd"
+        d = (isolated_home / ".claude" / "projects"
+             / "-Users-x-dev-claude-workspace-cc-token-router")
+        d.mkdir(parents=True)
+        (d / f"{sid}.jsonl").write_text("{}\n", encoding="utf-8")
 
-    assert obsidian_utils._try_slow_jsonl_glob("cc-token-router") == sid
-    assert obsidian_utils._try_slow_jsonl_glob("cc-token-router") == sid
-    err = capsys.readouterr().err
-    assert err.count("does not encode the current cwd") == 1, err
+        assert obsidian_utils._try_slow_jsonl_glob("cc-token-router") == sid
+        assert obsidian_utils._try_slow_jsonl_glob("cc-token-router") == sid
+        err = capsys.readouterr().err
+        assert err.count("does not encode the current cwd") == 1, err
 
 
 def test_sole_matching_dir_contradicted_by_its_transcripts_is_refused(
     isolated_home, tmp_path, monkeypatch, capsys
 ):
-    """The live ~/.openclaw case, and the reason the '.' fold needs a backstop.
+    with using_runtime_context(None):
+        """The live ~/.openclaw case, and the reason the '.' fold needs a backstop.
 
-    Folding '.' is correct — Claude Code really does fold it — but it turns the
-    basename of `/Users/me/.openclaw` into the suffix `-openclaw`, which the
-    glob then matches against `-Users-me-dev-claude-workspace-openclaw`: a
-    DIFFERENT repo that happens to end in the same segment, and the only match,
-    so the sole-match leniency would hand back its session as fact. Verified on
-    this machine: the dot-encoded dir for ~/.openclaw exists with 0 transcripts,
-    while those 17 transcripts say `cwd: /Users/me/dev/claude_workspace/openclaw`
-    on every line. Proof beats leniency — refuse, and say why.
-    """
-    here = tmp_path / ".openclaw"
-    here.mkdir()
-    monkeypatch.chdir(here)
+        Folding '.' is correct — Claude Code really does fold it — but it turns the
+        basename of `/Users/me/.openclaw` into the suffix `-openclaw`, which the
+        glob then matches against `-Users-me-dev-claude-workspace-openclaw`: a
+        DIFFERENT repo that happens to end in the same segment, and the only match,
+        so the sole-match leniency would hand back its session as fact. Verified on
+        this machine: the dot-encoded dir for ~/.openclaw exists with 0 transcripts,
+        while those 17 transcripts say `cwd: /Users/me/dev/claude_workspace/openclaw`
+        on every line. Proof beats leniency — refuse, and say why.
+        """
+        here = tmp_path / ".openclaw"
+        here.mkdir()
+        monkeypatch.chdir(here)
 
-    stranger = (isolated_home / ".claude" / "projects"
-                / "-Users-x-dev-claude-workspace-openclaw")
-    stranger.mkdir(parents=True)
-    (stranger / "7171717-1111-2222-3333-444444444444.jsonl").write_text(
-        _jsonl_line("/Users/x/dev/claude_workspace/openclaw"), encoding="utf-8"
-    )
+        stranger = (isolated_home / ".claude" / "projects"
+                    / "-Users-x-dev-claude-workspace-openclaw")
+        stranger.mkdir(parents=True)
+        (stranger / "7171717-1111-2222-3333-444444444444.jsonl").write_text(
+            _jsonl_line("/Users/x/dev/claude_workspace/openclaw"), encoding="utf-8"
+        )
 
-    assert obsidian_utils._resolve_session_id() == "unknown"
-    err = capsys.readouterr().err
-    assert "refusing to use it" in err, err
-    assert "/Users/x/dev/claude_workspace/openclaw" in err
+        assert obsidian_utils._resolve_session_id() == "unknown"
+        err = capsys.readouterr().err
+        assert "refusing to use it" in err, err
+        assert "/Users/x/dev/claude_workspace/openclaw" in err
 
 
 def test_sole_matching_dir_confirmed_by_its_transcripts_is_kept_silently(
     isolated_home, tmp_path, monkeypatch, capsys
 ):
-    """The mirror image: a directory whose name is none of the encodings we
-    generate (a symlinked checkout, a future CC scheme) but whose transcripts
-    name this exact cwd. Proof keeps it, and there is nothing to warn about.
-    """
-    here = tmp_path / "weird-project"
-    here.mkdir()
-    monkeypatch.chdir(here)
-    cwd = os.getcwd()
+    with using_runtime_context(None):
+        """The mirror image: a directory whose name is none of the encodings we
+        generate (a symlinked checkout, a future CC scheme) but whose transcripts
+        name this exact cwd. Proof keeps it, and there is nothing to warn about.
+        """
+        here = tmp_path / "weird-project"
+        here.mkdir()
+        monkeypatch.chdir(here)
+        cwd = os.getcwd()
 
-    sid = "6262626-1111-2222-3333-444444444444"
-    d = (isolated_home / ".claude" / "projects"
-         / "-some-entirely-unguessable-encoding-of-weird-project")
-    d.mkdir(parents=True)
-    (d / f"{sid}.jsonl").write_text(_jsonl_line(cwd), encoding="utf-8")
+        sid = "6262626-1111-2222-3333-444444444444"
+        d = (isolated_home / ".claude" / "projects"
+             / "-some-entirely-unguessable-encoding-of-weird-project")
+        d.mkdir(parents=True)
+        (d / f"{sid}.jsonl").write_text(_jsonl_line(cwd), encoding="utf-8")
 
-    assert obsidian_utils._try_slow_jsonl_glob("weird-project") == sid
-    assert "WARN" not in capsys.readouterr().err
+        assert obsidian_utils._try_slow_jsonl_glob("weird-project") == sid
+        assert "WARN" not in capsys.readouterr().err
 
 
 def test_resolve_session_id_cwd_gone_with_env_dir_still_reaches_recent_bootstrap(
     isolated_home, monkeypatch
 ):
-    """I5: gating layer 4 on 'basename is None' narrowed #105 more than the
-    docs claimed. CLAUDE_PROJECT_DIR is only consulted AFTER os.getcwd() raised
-    — so a basename from it already means cwd is gone, which is #105's case —
-    and hooks are exactly where Claude Code sets that variable. With layer 3
-    missing (a dot-named worktree with no transcripts of its own), develop
-    recovered the sid here and the first fix returned 'unknown'.
-    """
-    _redirect_secure_paths(monkeypatch, isolated_home)
-    sid = _unique_sid()
-    _seed_bootstrap(isolated_home, "deleted-worktree", sid)
+    with using_runtime_context(None):
+        """I5: gating layer 4 on 'basename is None' narrowed #105 more than the
+        docs claimed. CLAUDE_PROJECT_DIR is only consulted AFTER os.getcwd() raised
+        — so a basename from it already means cwd is gone, which is #105's case —
+        and hooks are exactly where Claude Code sets that variable. With layer 3
+        missing (a dot-named worktree with no transcripts of its own), develop
+        recovered the sid here and the first fix returned 'unknown'.
+        """
+        _redirect_secure_paths(monkeypatch, isolated_home)
+        sid = _unique_sid()
+        _seed_bootstrap(isolated_home, "deleted-worktree", sid)
 
-    def _raise(*a, **kw):
-        raise FileNotFoundError("cwd deleted")
+        def _raise(*a, **kw):
+            raise FileNotFoundError("cwd deleted")
 
-    monkeypatch.setattr(os, "getcwd", _raise)
-    monkeypatch.setenv("CLAUDE_PROJECT_DIR", "/Users/x/dev/.hidden-worktree")
+        monkeypatch.setattr(os, "getcwd", _raise)
+        monkeypatch.setenv("CLAUDE_PROJECT_DIR", "/Users/x/dev/.hidden-worktree")
 
-    assert obsidian_utils._resolve_session_id() == sid
+        assert obsidian_utils._resolve_session_id() == sid
 
 
 def test_resolve_session_id_readable_cwd_still_refuses_the_recent_bootstrap(
     isolated_home, tmp_path, monkeypatch
 ):
-    """The other side of I5's gate: a READABLE cwd (the actual #260 bug) must
-    still never reach the cross-project scan, however the basename was spelled.
-    """
-    _redirect_secure_paths(monkeypatch, isolated_home)
-    _seed_bootstrap(isolated_home, "some-other-project", _unique_sid())
-    monkeypatch.setenv("CLAUDE_PROJECT_DIR", "/Users/x/dev/whatever")
+    with using_runtime_context(None):
+        """The other side of I5's gate: a READABLE cwd (the actual #260 bug) must
+        still never reach the cross-project scan, however the basename was spelled.
+        """
+        _redirect_secure_paths(monkeypatch, isolated_home)
+        _seed_bootstrap(isolated_home, "some-other-project", _unique_sid())
+        monkeypatch.setenv("CLAUDE_PROJECT_DIR", "/Users/x/dev/whatever")
 
-    here = tmp_path / "pitch" / "docs"
-    here.mkdir(parents=True)
-    monkeypatch.chdir(here)
+        here = tmp_path / "pitch" / "docs"
+        here.mkdir(parents=True)
+        monkeypatch.chdir(here)
 
-    assert obsidian_utils._resolve_session_id() == "unknown"
+        assert obsidian_utils._resolve_session_id() == "unknown"
 
 
 def test_get_session_context_rejects_invalid_identity_before_lookup(selected_host_context):
@@ -1575,71 +1664,74 @@ def test_get_session_context_rejects_invalid_identity_before_lookup(selected_hos
 # ─── #330 task 1: allow_env plumbing (no behavior yet) ─────────────────
 
 def test_isolate_harness_session_id_globally_clears_the_real_value():
-    """Proves the autouse fixture in conftest.py works: the suite runs inside
-    a live Claude Code session, so CLAUDE_CODE_SESSION_ID is set in pytest's
-    own environment unless something clears it per test (#330)."""
-    assert "CLAUDE_CODE_SESSION_ID" not in os.environ
+    with using_runtime_context(None):
+        """Proves the autouse fixture in conftest.py works: the suite runs inside
+        a live Claude Code session, so CLAUDE_CODE_SESSION_ID is set in pytest's
+        own environment unless something clears it per test (#330)."""
+        assert "CLAUDE_CODE_SESSION_ID" not in os.environ
 
 
 def test_resolve_session_id_allow_env_false_ignores_env_allow_env_true_uses_it(
     isolated_home, monkeypatch, tmp_path
 ):
-    """#330 task 1 landed this as an inertness test ("allow_env has no effect
-    yet"). Task 2 wires the actual read, which makes that premise false by
-    design — updated here to assert the now-live split instead: allow_env=False
-    must still ignore a well-formed env var and resolve via the scan (used by
-    _slow_path_newest_sid / check_hook_status, which must not validate the env
-    var against itself), while allow_env=True must now return it."""
-    sid = _unique_sid()
-    project = "allow-env-inert-proj"
+    with using_runtime_context(None):
+        """#330 task 1 landed this as an inertness test ("allow_env has no effect
+        yet"). Task 2 wires the actual read, which makes that premise false by
+        design — updated here to assert the now-live split instead: allow_env=False
+        must still ignore a well-formed env var and resolve via the scan (used by
+        _slow_path_newest_sid / check_hook_status, which must not validate the env
+        var against itself), while allow_env=True must now return it."""
+        sid = _unique_sid()
+        project = "allow-env-inert-proj"
 
-    _seed_bootstrap(isolated_home, project, sid)
-    cc_dir = isolated_home / ".claude" / "projects" / f"-Users-test-{project}"
-    cc_dir.mkdir(parents=True, exist_ok=True)
-    (cc_dir / f"{sid}.jsonl").write_text("{}\n")
+        _seed_bootstrap(isolated_home, project, sid)
+        cc_dir = isolated_home / ".claude" / "projects" / f"-Users-test-{project}"
+        cc_dir.mkdir(parents=True, exist_ok=True)
+        (cc_dir / f"{sid}.jsonl").write_text("{}\n")
 
-    target = tmp_path / project
-    target.mkdir()
-    monkeypatch.chdir(target)
+        target = tmp_path / project
+        target.mkdir()
+        monkeypatch.chdir(target)
 
-    bdir = isolated_home / ".claude" / "obsidian-brain"
-    monkeypatch.setattr(
-        obsidian_utils, "_BOOTSTRAP_PREFIX", str(bdir) + "/sid-"
-    )
+        bdir = isolated_home / ".claude" / "obsidian-brain"
+        monkeypatch.setattr(
+            obsidian_utils, "_BOOTSTRAP_PREFIX", str(bdir) + "/sid-"
+        )
 
-    # The env var must hold a DIFFERENT, well-formed sid than the one the
-    # scan layers resolve — otherwise neither assertion below could tell a
-    # live layer from a dead one. Verified by mutation (see #330 task 2
-    # verification): deleting the layer-0 block turns result_true == sid
-    # (RED against the assertion below), proving this isn't vacuous.
-    env_sid = _unique_sid()
-    assert env_sid != sid
-    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", env_sid)
+        # The env var must hold a DIFFERENT, well-formed sid than the one the
+        # scan layers resolve — otherwise neither assertion below could tell a
+        # live layer from a dead one. Verified by mutation (see #330 task 2
+        # verification): deleting the layer-0 block turns result_true == sid
+        # (RED against the assertion below), proving this isn't vacuous.
+        env_sid = _unique_sid()
+        assert env_sid != sid
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", env_sid)
 
-    result_false = obsidian_utils._resolve_session_id(allow_env=False)
-    result_true = obsidian_utils._resolve_session_id(allow_env=True)
+        result_false = obsidian_utils._resolve_session_id(allow_env=False)
+        result_true = obsidian_utils._resolve_session_id(allow_env=True)
 
-    assert result_false == sid
-    assert result_true == env_sid
+        assert result_false == sid
+        assert result_true == env_sid
 
 
 def test_slow_path_newest_sid_passes_allow_env_false(isolated_home, monkeypatch):
-    """_slow_path_newest_sid must call _resolve_session_id with
-    allow_env=False, mirroring allow_bootstrap=False — otherwise
-    check_hook_status becomes circular once the env layer is wired (#330)."""
-    captured = {}
+    with using_runtime_context(None):
+        """_slow_path_newest_sid must call _resolve_session_id with
+        allow_env=False, mirroring allow_bootstrap=False — otherwise
+        check_hook_status becomes circular once the env layer is wired (#330)."""
+        captured = {}
 
-    def _fake_resolve(*args, **kwargs):
-        captured["args"] = args
-        captured["kwargs"] = kwargs
-        return "unknown"
+        def _fake_resolve(*args, **kwargs):
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+            return "unknown"
 
-    monkeypatch.setattr(obsidian_utils, "_resolve_session_id", _fake_resolve)
+        monkeypatch.setattr(obsidian_utils, "_resolve_session_id", _fake_resolve)
 
-    obsidian_utils._slow_path_newest_sid()
+        obsidian_utils._slow_path_newest_sid()
 
-    assert captured["kwargs"].get("allow_bootstrap") is False
-    assert captured["kwargs"].get("allow_env") is False
+        assert captured["kwargs"].get("allow_bootstrap") is False
+        assert captured["kwargs"].get("allow_env") is False
 
 
 # ─── #330 task 2: env-var layer 0 is live ──────────────────────────────
@@ -1654,62 +1746,65 @@ def test_slow_path_newest_sid_passes_allow_env_false(isolated_home, monkeypatch)
 def test_resolve_session_id_env_layer_wins_over_a_real_resolvable_transcript(
     isolated_home, monkeypatch, tmp_path
 ):
-    """Layer 0: a well-formed env var wins over the mtime-scan layers, even
-    when a real, resolvable transcript exists on disk for a DIFFERENT sid."""
-    project = "env-layer-wins-proj"
-    scan_sid = _unique_sid()
-    cc_dir = isolated_home / ".claude" / "projects" / f"-Users-test-{project}"
-    cc_dir.mkdir(parents=True, exist_ok=True)
-    (cc_dir / f"{scan_sid}.jsonl").write_text("{}\n")
+    with using_runtime_context(None):
+        """Layer 0: a well-formed env var wins over the mtime-scan layers, even
+        when a real, resolvable transcript exists on disk for a DIFFERENT sid."""
+        project = "env-layer-wins-proj"
+        scan_sid = _unique_sid()
+        cc_dir = isolated_home / ".claude" / "projects" / f"-Users-test-{project}"
+        cc_dir.mkdir(parents=True, exist_ok=True)
+        (cc_dir / f"{scan_sid}.jsonl").write_text("{}\n")
 
-    target = tmp_path / project
-    target.mkdir()
-    monkeypatch.chdir(target)
+        target = tmp_path / project
+        target.mkdir()
+        monkeypatch.chdir(target)
 
-    env_sid = _unique_sid()
-    assert env_sid != scan_sid
-    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", env_sid)
+        env_sid = _unique_sid()
+        assert env_sid != scan_sid
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", env_sid)
 
-    assert obsidian_utils._resolve_session_id() == env_sid
+        assert obsidian_utils._resolve_session_id() == env_sid
 
 
 def test_resolve_session_id_env_layer_short_circuits_before_any_scan(
     isolated_home, monkeypatch
 ):
-    """No mtime scan runs when the env layer resolves: both scan entry
-    points are monkeypatched to raise, and resolution must still succeed by
-    returning the env value untouched."""
-    def _boom(*a, **kw):
-        raise AssertionError("scan layer ran despite a valid env var")
+    with using_runtime_context(None):
+        """No mtime scan runs when the env layer resolves: both scan entry
+        points are monkeypatched to raise, and resolution must still succeed by
+        returning the env value untouched."""
+        def _boom(*a, **kw):
+            raise AssertionError("scan layer ran despite a valid env var")
 
-    monkeypatch.setattr(obsidian_utils, "_try_bootstrap_fast_path", _boom)
-    monkeypatch.setattr(obsidian_utils, "_try_slow_jsonl_glob", _boom)
+        monkeypatch.setattr(obsidian_utils, "_try_bootstrap_fast_path", _boom)
+        monkeypatch.setattr(obsidian_utils, "_try_slow_jsonl_glob", _boom)
 
-    env_sid = _unique_sid()
-    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", env_sid)
+        env_sid = _unique_sid()
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", env_sid)
 
-    assert obsidian_utils._resolve_session_id() == env_sid
+        assert obsidian_utils._resolve_session_id() == env_sid
 
 
 def test_resolve_session_id_env_wins_when_project_basename_unresolvable(
     monkeypatch,
 ):
-    """#330 review item 12b: layer 0 (env var) must run AHEAD of, and
-    independently of, project-basename resolution. When cwd is entirely
-    gone (os.getcwd() raises) AND CLAUDE_PROJECT_DIR is also unset — the
-    exact precondition the #105 layer-4 cross-project recovery exists for —
-    a well-formed env var must still resolve directly rather than falling
-    through toward that recovery path or 'unknown'."""
-    def _raise(*a, **kw):
-        raise FileNotFoundError("cwd deleted")
+    with using_runtime_context(None):
+        """#330 review item 12b: layer 0 (env var) must run AHEAD of, and
+        independently of, project-basename resolution. When cwd is entirely
+        gone (os.getcwd() raises) AND CLAUDE_PROJECT_DIR is also unset — the
+        exact precondition the #105 layer-4 cross-project recovery exists for —
+        a well-formed env var must still resolve directly rather than falling
+        through toward that recovery path or 'unknown'."""
+        def _raise(*a, **kw):
+            raise FileNotFoundError("cwd deleted")
 
-    monkeypatch.setattr(os, "getcwd", _raise)
-    monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+        monkeypatch.setattr(os, "getcwd", _raise)
+        monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
 
-    env_sid = _unique_sid()
-    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", env_sid)
+        env_sid = _unique_sid()
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", env_sid)
 
-    assert obsidian_utils._resolve_session_id() == env_sid
+        assert obsidian_utils._resolve_session_id() == env_sid
 
 
 @pytest.mark.parametrize(
@@ -1718,101 +1813,105 @@ def test_resolve_session_id_env_wins_when_project_basename_unresolvable(
 def test_resolve_session_id_malformed_env_falls_through_to_scan(
     isolated_home, monkeypatch, tmp_path, bad_env_sid
 ):
-    """A malformed CLAUDE_CODE_SESSION_ID is never trusted — resolution falls
-    through to the existing scan layers and returns their answer, never
-    raising."""
-    project = "malformed-env-proj"
-    scan_sid = _unique_sid()
-    cc_dir = isolated_home / ".claude" / "projects" / f"-Users-test-{project}"
-    cc_dir.mkdir(parents=True, exist_ok=True)
-    (cc_dir / f"{scan_sid}.jsonl").write_text("{}\n")
+    with using_runtime_context(None):
+        """A malformed CLAUDE_CODE_SESSION_ID is never trusted — resolution falls
+        through to the existing scan layers and returns their answer, never
+        raising."""
+        project = "malformed-env-proj"
+        scan_sid = _unique_sid()
+        cc_dir = isolated_home / ".claude" / "projects" / f"-Users-test-{project}"
+        cc_dir.mkdir(parents=True, exist_ok=True)
+        (cc_dir / f"{scan_sid}.jsonl").write_text("{}\n")
 
-    target = tmp_path / project
-    target.mkdir()
-    monkeypatch.chdir(target)
+        target = tmp_path / project
+        target.mkdir()
+        monkeypatch.chdir(target)
 
-    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", bad_env_sid)
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", bad_env_sid)
 
-    assert obsidian_utils._resolve_session_id() == scan_sid
+        assert obsidian_utils._resolve_session_id() == scan_sid
 
 
 @pytest.mark.parametrize("bad_env_sid", ["../../etc/passwd", "has space"])
 def test_resolve_session_id_malformed_nonempty_env_warns_once(
     isolated_home, monkeypatch, tmp_path, capsys, bad_env_sid
 ):
-    """#330 review item 8: a NON-EMPTY but malformed CLAUDE_CODE_SESSION_ID
-    (truncated/quoted/mangled) must emit a one-time WARN before falling
-    through — silently downgrading to the mtime-scan layers with no
-    diagnostic is exactly the asymmetry the benign no-transcript-yet WARN
-    (env_sid well-formed) already gets, but the more suspicious mangled case
-    did not."""
-    project = "malformed-nonempty-env-proj"
-    scan_sid = _unique_sid()
-    cc_dir = isolated_home / ".claude" / "projects" / f"-Users-test-{project}"
-    cc_dir.mkdir(parents=True, exist_ok=True)
-    (cc_dir / f"{scan_sid}.jsonl").write_text("{}\n")
+    with using_runtime_context(None):
+        """#330 review item 8: a NON-EMPTY but malformed CLAUDE_CODE_SESSION_ID
+        (truncated/quoted/mangled) must emit a one-time WARN before falling
+        through — silently downgrading to the mtime-scan layers with no
+        diagnostic is exactly the asymmetry the benign no-transcript-yet WARN
+        (env_sid well-formed) already gets, but the more suspicious mangled case
+        did not."""
+        project = "malformed-nonempty-env-proj"
+        scan_sid = _unique_sid()
+        cc_dir = isolated_home / ".claude" / "projects" / f"-Users-test-{project}"
+        cc_dir.mkdir(parents=True, exist_ok=True)
+        (cc_dir / f"{scan_sid}.jsonl").write_text("{}\n")
 
-    target = tmp_path / project
-    target.mkdir()
-    monkeypatch.chdir(target)
+        target = tmp_path / project
+        target.mkdir()
+        monkeypatch.chdir(target)
 
-    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", bad_env_sid)
-    capsys.readouterr()  # drain
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", bad_env_sid)
+        capsys.readouterr()  # drain
 
-    assert obsidian_utils._resolve_session_id() == scan_sid
-    err = capsys.readouterr().err
-    assert "WARN" in err
-    assert bad_env_sid in err
-    assert "not a well-formed session id" in err
+        assert obsidian_utils._resolve_session_id() == scan_sid
+        err = capsys.readouterr().err
+        assert "WARN" in err
+        assert bad_env_sid in err
+        assert "not a well-formed session id" in err
 
-    # One-shot: a second call with the SAME malformed value must not warn again.
-    assert obsidian_utils._resolve_session_id() == scan_sid
-    err2 = capsys.readouterr().err
-    assert err2 == ""
+        # One-shot: a second call with the SAME malformed value must not warn again.
+        assert obsidian_utils._resolve_session_id() == scan_sid
+        err2 = capsys.readouterr().err
+        assert err2 == ""
 
 
 def test_resolve_session_id_blank_env_never_warns_malformed(
     isolated_home, monkeypatch, tmp_path, capsys
 ):
-    """Blank/whitespace-only env values are the ordinary 'no env var set'
-    case, not a malformed one — must not trip the new malformed-value WARN."""
-    project = "blank-env-proj"
-    scan_sid = _unique_sid()
-    cc_dir = isolated_home / ".claude" / "projects" / f"-Users-test-{project}"
-    cc_dir.mkdir(parents=True, exist_ok=True)
-    (cc_dir / f"{scan_sid}.jsonl").write_text("{}\n")
+    with using_runtime_context(None):
+        """Blank/whitespace-only env values are the ordinary 'no env var set'
+        case, not a malformed one — must not trip the new malformed-value WARN."""
+        project = "blank-env-proj"
+        scan_sid = _unique_sid()
+        cc_dir = isolated_home / ".claude" / "projects" / f"-Users-test-{project}"
+        cc_dir.mkdir(parents=True, exist_ok=True)
+        (cc_dir / f"{scan_sid}.jsonl").write_text("{}\n")
 
-    target = tmp_path / project
-    target.mkdir()
-    monkeypatch.chdir(target)
+        target = tmp_path / project
+        target.mkdir()
+        monkeypatch.chdir(target)
 
-    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "   ")
-    capsys.readouterr()  # drain
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "   ")
+        capsys.readouterr()  # drain
 
-    assert obsidian_utils._resolve_session_id() == scan_sid
-    err = capsys.readouterr().err
-    assert "not a well-formed session id" not in err
+        assert obsidian_utils._resolve_session_id() == scan_sid
+        err = capsys.readouterr().err
+        assert "not a well-formed session id" not in err
 
 
 def test_resolve_session_id_env_absent_matches_pre_existing_scan_behavior(
     isolated_home, monkeypatch, tmp_path
 ):
-    """No env var at all → identical to pre-#330 behavior: resolve via the
-    scan layers. The autouse fixture already deletes the var for every test;
-    this makes the contract explicit rather than relying on that side effect
-    alone."""
-    project = "env-absent-proj"
-    scan_sid = _unique_sid()
-    cc_dir = isolated_home / ".claude" / "projects" / f"-Users-test-{project}"
-    cc_dir.mkdir(parents=True, exist_ok=True)
-    (cc_dir / f"{scan_sid}.jsonl").write_text("{}\n")
+    with using_runtime_context(None):
+        """No env var at all → identical to pre-#330 behavior: resolve via the
+        scan layers. The autouse fixture already deletes the var for every test;
+        this makes the contract explicit rather than relying on that side effect
+        alone."""
+        project = "env-absent-proj"
+        scan_sid = _unique_sid()
+        cc_dir = isolated_home / ".claude" / "projects" / f"-Users-test-{project}"
+        cc_dir.mkdir(parents=True, exist_ok=True)
+        (cc_dir / f"{scan_sid}.jsonl").write_text("{}\n")
 
-    target = tmp_path / project
-    target.mkdir()
-    monkeypatch.chdir(target)
+        target = tmp_path / project
+        target.mkdir()
+        monkeypatch.chdir(target)
 
-    assert "CLAUDE_CODE_SESSION_ID" not in os.environ
-    assert obsidian_utils._resolve_session_id() == scan_sid
+        assert "CLAUDE_CODE_SESSION_ID" not in os.environ
+        assert obsidian_utils._resolve_session_id() == scan_sid
 
 
 def test_get_session_context_stays_bound_when_ambient_session_and_cwd_change(selected_host_context, tmp_path, monkeypatch):
@@ -1837,189 +1936,194 @@ def test_get_session_context_stays_bound_when_ambient_session_and_cwd_change(sel
 def test_check_hook_status_ignores_env_var_uses_jsonl_scan(
     isolated_home, monkeypatch, tmp_path
 ):
-    """check_hook_status() must stay allow_env=False end-to-end: a valid,
-    well-formed env var pointing at a sid with NO transcript must not leak
-    into the health check via _slow_path_newest_sid — it must keep reporting
-    based on the JSONL scan, exactly as if the env var were unset."""
-    project = "check-hook-status-proj"
-    bootstrap_sid = _unique_sid()
-    _seed_bootstrap(isolated_home, project, bootstrap_sid)
+    with using_runtime_context(None):
+        """check_hook_status() must stay allow_env=False end-to-end: a valid,
+        well-formed env var pointing at a sid with NO transcript must not leak
+        into the health check via _slow_path_newest_sid — it must keep reporting
+        based on the JSONL scan, exactly as if the env var were unset."""
+        project = "check-hook-status-proj"
+        bootstrap_sid = _unique_sid()
+        _seed_bootstrap(isolated_home, project, bootstrap_sid)
 
-    target = tmp_path / project
-    target.mkdir()
-    monkeypatch.chdir(target)
+        target = tmp_path / project
+        target.mkdir()
+        monkeypatch.chdir(target)
 
-    bdir = isolated_home / ".claude" / "obsidian-brain"
-    monkeypatch.setattr(obsidian_utils, "_BOOTSTRAP_PREFIX", str(bdir) + "/sid-")
+        bdir = isolated_home / ".claude" / "obsidian-brain"
+        monkeypatch.setattr(obsidian_utils, "_BOOTSTRAP_PREFIX", str(bdir) + "/sid-")
 
-    # No JSONL transcripts exist anywhere for this project — the scan must
-    # return 'unknown'. env_sid deliberately differs from bootstrap_sid so an
-    # env-var leak would flip the reported "ok" state and message, rather
-    # than accidentally reproducing the correct answer.
-    env_sid = _unique_sid()
-    assert env_sid != bootstrap_sid
-    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", env_sid)
+        # No JSONL transcripts exist anywhere for this project — the scan must
+        # return 'unknown'. env_sid deliberately differs from bootstrap_sid so an
+        # env-var leak would flip the reported "ok" state and message, rather
+        # than accidentally reproducing the correct answer.
+        env_sid = _unique_sid()
+        assert env_sid != bootstrap_sid
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", env_sid)
 
-    result = obsidian_utils.check_hook_status()
+        result = obsidian_utils.check_hook_status()
 
-    assert result["current_sid"] == "unknown"
-    assert result["ok"] is False
-    assert "No session files found" in result["message"]
+        assert result["current_sid"] == "unknown"
+        assert result["ok"] is False
+        assert "No session files found" in result["message"]
 
 
 def test_resolve_session_id_env_no_transcript_warns_once_but_still_returns_it(
     isolated_home, monkeypatch, tmp_path, capsys
 ):
-    """Well-formed env var with no matching transcript on disk yet is still
-    trusted (format-only gate — a brand-new session has no transcript yet),
-    but a one-time WARN is emitted so a genuinely stale/misdirected env var
-    is visible without being fatal. Called twice to prove the WARN fires
-    once, not once per call."""
-    project = "env-no-transcript-proj"
-    target = tmp_path / project
-    target.mkdir()
-    monkeypatch.chdir(target)
+    with using_runtime_context(None):
+        """Well-formed env var with no matching transcript on disk yet is still
+        trusted (format-only gate — a brand-new session has no transcript yet),
+        but a one-time WARN is emitted so a genuinely stale/misdirected env var
+        is visible without being fatal. Called twice to prove the WARN fires
+        once, not once per call."""
+        project = "env-no-transcript-proj"
+        target = tmp_path / project
+        target.mkdir()
+        monkeypatch.chdir(target)
 
-    env_sid = _unique_sid()
-    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", env_sid)
+        env_sid = _unique_sid()
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", env_sid)
 
-    # No ~/.claude/projects/*<project>/ directory exists at all yet.
-    result1 = obsidian_utils._resolve_session_id()
-    result2 = obsidian_utils._resolve_session_id()
+        # No ~/.claude/projects/*<project>/ directory exists at all yet.
+        result1 = obsidian_utils._resolve_session_id()
+        result2 = obsidian_utils._resolve_session_id()
 
-    assert result1 == env_sid
-    assert result2 == env_sid
+        assert result1 == env_sid
+        assert result2 == env_sid
 
-    err = capsys.readouterr().err
-    assert err.count("no Claude Code transcript") == 1, err
-    assert env_sid in err
+        err = capsys.readouterr().err
+        assert err.count("no Claude Code transcript") == 1, err
+        assert env_sid in err
 
 
 def test_resolve_session_id_env_with_transcript_present_no_warn(
     isolated_home, monkeypatch, tmp_path, capsys
 ):
-    """No WARN when the env sid's own transcript already exists — only the
-    'no transcript yet' case is diagnostic-worthy."""
-    project = "env-with-transcript-proj"
-    env_sid = _unique_sid()
-    cc_dir = isolated_home / ".claude" / "projects" / f"-Users-test-{project}"
-    cc_dir.mkdir(parents=True, exist_ok=True)
-    (cc_dir / f"{env_sid}.jsonl").write_text("{}\n")
+    with using_runtime_context(None):
+        """No WARN when the env sid's own transcript already exists — only the
+        'no transcript yet' case is diagnostic-worthy."""
+        project = "env-with-transcript-proj"
+        env_sid = _unique_sid()
+        cc_dir = isolated_home / ".claude" / "projects" / f"-Users-test-{project}"
+        cc_dir.mkdir(parents=True, exist_ok=True)
+        (cc_dir / f"{env_sid}.jsonl").write_text("{}\n")
 
-    target = tmp_path / project
-    target.mkdir()
-    monkeypatch.chdir(target)
+        target = tmp_path / project
+        target.mkdir()
+        monkeypatch.chdir(target)
 
-    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", env_sid)
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", env_sid)
 
-    assert obsidian_utils._resolve_session_id() == env_sid
-    err = capsys.readouterr().err
-    assert "no Claude Code transcript" not in err
+        assert obsidian_utils._resolve_session_id() == env_sid
+        err = capsys.readouterr().err
+        assert "no Claude Code transcript" not in err
 
 
 def test_resolve_session_id_env_transcript_check_memoized(
     isolated_home, monkeypatch, tmp_path
 ):
-    """#354 review item 5a: `_env_sid_transcript_checked` must actually cache
-    the transcript-existence glob, not just look decorative. CLAUDE_CODE_SESSION_ID
-    and the resolved project basename are both constant for the life of a
-    process (see the memo's own module comment), so a second call for the
-    SAME (project, env_sid) pair must not re-glob — that per-call cost is
-    exactly what the memo exists to avoid, since _resolve_session_id runs
-    once per note via read_note_metadata()."""
-    project = "env-memo-proj"
-    env_sid = _unique_sid()
-    cc_dir = isolated_home / ".claude" / "projects" / f"-Users-test-{project}"
-    cc_dir.mkdir(parents=True, exist_ok=True)
-    (cc_dir / f"{env_sid}.jsonl").write_text("{}\n")
+    with using_runtime_context(None):
+        """#354 review item 5a: `_env_sid_transcript_checked` must actually cache
+        the transcript-existence glob, not just look decorative. CLAUDE_CODE_SESSION_ID
+        and the resolved project basename are both constant for the life of a
+        process (see the memo's own module comment), so a second call for the
+        SAME (project, env_sid) pair must not re-glob — that per-call cost is
+        exactly what the memo exists to avoid, since _resolve_session_id runs
+        once per note via read_note_metadata()."""
+        project = "env-memo-proj"
+        env_sid = _unique_sid()
+        cc_dir = isolated_home / ".claude" / "projects" / f"-Users-test-{project}"
+        cc_dir.mkdir(parents=True, exist_ok=True)
+        (cc_dir / f"{env_sid}.jsonl").write_text("{}\n")
 
-    target = tmp_path / project
-    target.mkdir()
-    monkeypatch.chdir(target)
-    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", env_sid)
+        target = tmp_path / project
+        target.mkdir()
+        monkeypatch.chdir(target)
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", env_sid)
 
-    calls = []
-    # Layer 0's existence probe calls _glob_project_jsonls_union directly
-    # (#354 review item 4 — it deliberately bypasses the restricted
-    # _glob_project_jsonls / shared cwd-arbitration memo), so that is the
-    # function to patch here.
-    real_glob = obsidian_utils._glob_project_jsonls_union
+        calls = []
+        # Layer 0's existence probe calls _glob_project_jsonls_union directly
+        # (#354 review item 4 — it deliberately bypasses the restricted
+        # _glob_project_jsonls / shared cwd-arbitration memo), so that is the
+        # function to patch here.
+        real_glob = obsidian_utils._glob_project_jsonls_union
 
-    def counting_glob(safe_project, suffix="*.jsonl"):
-        if suffix == f"{env_sid}.jsonl":
-            calls.append(safe_project)
-        return real_glob(safe_project, suffix=suffix)
+        def counting_glob(safe_project, suffix="*.jsonl"):
+            if suffix == f"{env_sid}.jsonl":
+                calls.append(safe_project)
+            return real_glob(safe_project, suffix=suffix)
 
-    monkeypatch.setattr(obsidian_utils, "_glob_project_jsonls_union", counting_glob)
+        monkeypatch.setattr(obsidian_utils, "_glob_project_jsonls_union", counting_glob)
 
-    result1 = obsidian_utils._resolve_session_id()
-    result2 = obsidian_utils._resolve_session_id()
+        result1 = obsidian_utils._resolve_session_id()
+        result2 = obsidian_utils._resolve_session_id()
 
-    assert result1 == env_sid
-    assert result2 == env_sid
-    assert len(calls) == 1, (
-        f"expected the env-sid transcript glob to run once and be memoized "
-        f"on the second call, but it ran {len(calls)} times"
-    )
+        assert result1 == env_sid
+        assert result2 == env_sid
+        assert len(calls) == 1, (
+            f"expected the env-sid transcript glob to run once and be memoized "
+            f"on the second call, but it ran {len(calls)} times"
+        )
 
 
 def test_layer0_narrow_probe_does_not_poison_the_shared_cwd_memo(
     isolated_home, tmp_path, monkeypatch
 ):
-    """#354 review item 4: layer 0's existence probe globs with a NARROWED
-    suffix (env_sid.jsonl only). Before the fix it routed that narrow match
-    through _restrict_matches_to_cwd_project -> _dirs_by_transcript_cwd,
-    whose memo key is (here, tuple(sorted(dirs))) and deliberately excludes
-    `matches` — so the narrow probe's "cannot tell" verdict (a brand-new
-    transcript's first line typically has no `cwd` field) got memoized under
-    the exact key the LATER, BROAD glob (layers 1-3) would hit too,
-    downgrading a genuine #260 "positively contradicted -> refuse" into
-    "cannot tell -> keep anyway" for a file the narrow probe never even
-    looked at. Reproduces the ordering that broke it: layer 0 runs first
-    (as it always does inside _resolve_session_id), then the env-blind
-    broad scan must still see the contradiction and refuse.
-    """
-    here = tmp_path / ".openclaw"
-    here.mkdir()
-    monkeypatch.chdir(here)
+    with using_runtime_context(None):
+        """#354 review item 4: layer 0's existence probe globs with a NARROWED
+        suffix (env_sid.jsonl only). Before the fix it routed that narrow match
+        through _restrict_matches_to_cwd_project -> _dirs_by_transcript_cwd,
+        whose memo key is (here, tuple(sorted(dirs))) and deliberately excludes
+        `matches` — so the narrow probe's "cannot tell" verdict (a brand-new
+        transcript's first line typically has no `cwd` field) got memoized under
+        the exact key the LATER, BROAD glob (layers 1-3) would hit too,
+        downgrading a genuine #260 "positively contradicted -> refuse" into
+        "cannot tell -> keep anyway" for a file the narrow probe never even
+        looked at. Reproduces the ordering that broke it: layer 0 runs first
+        (as it always does inside _resolve_session_id), then the env-blind
+        broad scan must still see the contradiction and refuse.
+        """
+        here = tmp_path / ".openclaw"
+        here.mkdir()
+        monkeypatch.chdir(here)
 
-    # Only ONE directory matches the ".openclaw" -> "-openclaw" suffix glob,
-    # and it belongs to a DIFFERENT repo — the live #260 shape (see
-    # test_sole_matching_dir_contradicted_by_its_transcripts_is_refused).
-    stranger = (isolated_home / ".claude" / "projects"
-                / "-Users-x-dev-claude-workspace-openclaw")
-    stranger.mkdir(parents=True)
+        # Only ONE directory matches the ".openclaw" -> "-openclaw" suffix glob,
+        # and it belongs to a DIFFERENT repo — the live #260 shape (see
+        # test_sole_matching_dir_contradicted_by_its_transcripts_is_refused).
+        stranger = (isolated_home / ".claude" / "projects"
+                    / "-Users-x-dev-claude-workspace-openclaw")
+        stranger.mkdir(parents=True)
 
-    env_sid = _unique_sid()
-    # The env sid's own transcript: first line has NO cwd field (a
-    # queue-operation record, the same shape as a transcript CC has not
-    # populated a cwd for yet) -> _transcript_cwd reads it as "cannot tell".
-    (stranger / f"{env_sid}.jsonl").write_text(
-        json.dumps({"type": "queue-operation"}) + "\n", encoding="utf-8"
-    )
-    # A second, unrelated transcript in the SAME directory whose cwd field
-    # POSITIVELY CONTRADICTS ours — this is what the broad glob (layers
-    # 1-3) must see and refuse on.
-    other_sid = _unique_sid()
-    (stranger / f"{other_sid}.jsonl").write_text(
-        _jsonl_line("/Users/x/dev/claude_workspace/openclaw"), encoding="utf-8"
-    )
+        env_sid = _unique_sid()
+        # The env sid's own transcript: first line has NO cwd field (a
+        # queue-operation record, the same shape as a transcript CC has not
+        # populated a cwd for yet) -> _transcript_cwd reads it as "cannot tell".
+        (stranger / f"{env_sid}.jsonl").write_text(
+            json.dumps({"type": "queue-operation"}) + "\n", encoding="utf-8"
+        )
+        # A second, unrelated transcript in the SAME directory whose cwd field
+        # POSITIVELY CONTRADICTS ours — this is what the broad glob (layers
+        # 1-3) must see and refuse on.
+        other_sid = _unique_sid()
+        (stranger / f"{other_sid}.jsonl").write_text(
+            _jsonl_line("/Users/x/dev/claude_workspace/openclaw"), encoding="utf-8"
+        )
 
-    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", env_sid)
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", env_sid)
 
-    # Layer 0 runs first (inside the normal call) and wins on its own terms.
-    result_env = obsidian_utils._resolve_session_id(allow_env=True)
-    assert result_env == env_sid
+        # Layer 0 runs first (inside the normal call) and wins on its own terms.
+        result_env = obsidian_utils._resolve_session_id(allow_env=True)
+        assert result_env == env_sid
 
-    # The env-blind path (layers 1-3, broad glob) must still see the
-    # contradiction and refuse — not silently reuse the narrow probe's
-    # "cannot tell" verdict from a memo it must not have shared.
-    result_scan = obsidian_utils._resolve_session_id(allow_env=False)
-    assert result_scan == "unknown", (
-        f"expected the #260 contradiction refusal to still fire on the "
-        f"broad scan, got {result_scan!r} — the narrow layer-0 probe must "
-        f"not have poisoned the shared _dirs_by_transcript_cwd memo"
-    )
+        # The env-blind path (layers 1-3, broad glob) must still see the
+        # contradiction and refuse — not silently reuse the narrow probe's
+        # "cannot tell" verdict from a memo it must not have shared.
+        result_scan = obsidian_utils._resolve_session_id(allow_env=False)
+        assert result_scan == "unknown", (
+            f"expected the #260 contradiction refusal to still fire on the "
+            f"broad scan, got {result_scan!r} — the narrow layer-0 probe must "
+            f"not have poisoned the shared _dirs_by_transcript_cwd memo"
+        )
 
 
 # ─── #362: a Codex process never resolves a Claude session id ──────────
@@ -2040,106 +2144,122 @@ def _seed_live_claude_transcript(home: Path, tmp_path: Path, monkeypatch, projec
 def test_resolve_session_id_without_codex_marker_finds_the_claude_transcript(
     isolated_home, monkeypatch, tmp_path
 ):
-    """Negative control for the tests below: with no Codex marker, the same
-    fixture resolves the Claude transcript. Without it, a fixture that never
-    resolved anything would make the 'unknown' assertions vacuous."""
-    sid = _seed_live_claude_transcript(isolated_home, tmp_path, monkeypatch, "codex-ctl-proj")
-    assert obsidian_utils._resolve_session_id() == sid
+    with using_runtime_context(None):
+        """Negative control for the tests below: with no Codex marker, the same
+        fixture resolves the Claude transcript. Without it, a fixture that never
+        resolved anything would make the 'unknown' assertions vacuous."""
+        sid = _seed_live_claude_transcript(isolated_home, tmp_path, monkeypatch, "codex-ctl-proj")
+        assert obsidian_utils._resolve_session_id() == sid
 
 
 @pytest.mark.parametrize("marker", ["CODEX_THREAD_ID", "CODEX_SANDBOX", "CODEX_SANDBOX_NETWORK_DISABLED"])
 def test_resolve_session_id_under_codex_refuses_newest_claude_transcript(
     isolated_home, monkeypatch, tmp_path, marker
 ):
-    """#362: the newest Claude transcript in the repo belongs to the Claude
-    session open alongside Codex, so a Codex process must not take it."""
-    _seed_live_claude_transcript(isolated_home, tmp_path, monkeypatch, "codex-scan-proj")
-    monkeypatch.setenv(marker, "019a0000-0000-7000-8000-000000000000")
-    assert obsidian_utils._resolve_session_id() == "unknown"
-    assert obsidian_utils._slow_path_newest_sid() == "unknown"
+    with using_runtime_context(None):
+        """#362: the newest Claude transcript in the repo belongs to the Claude
+        session open alongside Codex, so a Codex process must not take it."""
+        _seed_live_claude_transcript(isolated_home, tmp_path, monkeypatch, "codex-scan-proj")
+        monkeypatch.setenv(marker, "019a0000-0000-7000-8000-000000000000")
+        assert obsidian_utils._resolve_session_id() == "unknown"
+        assert obsidian_utils._slow_path_newest_sid() == "unknown"
 
 
 def test_resolve_session_id_under_codex_ignores_inherited_claude_env(
     isolated_home, monkeypatch, tmp_path
 ):
-    """#362: Codex started from a Claude Code shell inherits
-    CLAUDE_CODE_SESSION_ID. That id is the Claude session's, not Codex's."""
-    _seed_live_claude_transcript(isolated_home, tmp_path, monkeypatch, "codex-env-proj")
-    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", _unique_sid())
-    monkeypatch.setenv("CODEX_THREAD_ID", "019a0000-0000-7000-8000-000000000001")
-    assert obsidian_utils._resolve_session_id() == "unknown"
+    with using_runtime_context(None):
+        """#362: Codex started from a Claude Code shell inherits
+        CLAUDE_CODE_SESSION_ID. That id is the Claude session's, not Codex's."""
+        _seed_live_claude_transcript(isolated_home, tmp_path, monkeypatch, "codex-env-proj")
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", _unique_sid())
+        monkeypatch.setenv("CODEX_THREAD_ID", "019a0000-0000-7000-8000-000000000001")
+        assert obsidian_utils._resolve_session_id() == "unknown"
 
 
 def test_resolve_session_id_ignores_blank_codex_marker_and_codex_home(
     isolated_home, monkeypatch, tmp_path
 ):
-    """CODEX_HOME is user config, often exported in a plain shell profile, and
-    an empty marker is not a marker. Neither may switch resolution off."""
-    sid = _seed_live_claude_transcript(isolated_home, tmp_path, monkeypatch, "codex-home-proj")
-    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex-home"))
-    monkeypatch.setenv("CODEX_THREAD_ID", "   ")
-    assert obsidian_utils._resolve_session_id() == sid
+    with using_runtime_context(None):
+        """CODEX_HOME is user config, often exported in a plain shell profile, and
+        an empty marker is not a marker. Neither may switch resolution off."""
+        sid = _seed_live_claude_transcript(isolated_home, tmp_path, monkeypatch, "codex-home-proj")
+        monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex-home"))
+        monkeypatch.setenv("CODEX_THREAD_ID", "   ")
+        assert obsidian_utils._resolve_session_id() == sid
 
 
 def test_get_session_context_rejects_foreign_provider_even_with_same_full_id(selected_host_context):
     context = selected_host_context
     foreign = "codex" if context.host == "claude" else "claude"
     _native_index_notes(context, [("foreign-provider.md", foreign, context.native_session_id, "claude-session")])
-    assert _native_result(context)["session_note_name"] == ""
+    result = _native_result(context)
+    _assert_planned_note_without_file(context, result)
+    assert result["session_id"] == context.native_session_id
+    assert result["session_note_name"] != "foreign-provider"
 
 
 @pytest.mark.parametrize("sid", ["unknown", ""])
 def test_cache_never_stores_under_an_uncacheable_sid(sid):
-    """#362: every Codex run resolves 'unknown', and SessionEnd only cleans up
-    real ids, so cache-unknown.json served frozen config and frontmatter
-    forever. The cache must refuse the id outright — no read, no write, and
-    no file on disk."""
-    obsidian_utils.cache_set(sid, "config", {"vault_path": "/stale"})
-    assert obsidian_utils.cache_get(sid, "config") is None
-    assert not os.path.exists(f"{obsidian_utils._CACHE_PREFIX}{sid}.json")
-    obsidian_utils.cache_invalidate(sid)  # must not raise
+    with using_runtime_context(None):
+        """#362: every Codex run resolves 'unknown', and SessionEnd only cleans up
+        real ids, so cache-unknown.json served frozen config and frontmatter
+        forever. The cache must refuse the id outright — no read, no write, and
+        no file on disk."""
+        obsidian_utils.cache_set(sid, "config", {"vault_path": "/stale"})
+        assert obsidian_utils.cache_get(sid, "config") is None
+        assert not os.path.exists(f"{obsidian_utils._CACHE_PREFIX}{sid}.json")
+        obsidian_utils.cache_invalidate(sid)  # must not raise
 
 
 def test_cache_ignores_a_leftover_cache_unknown_file():
-    """A cache-unknown.json written before #362 is still on disk on real
-    machines (1.5 MB, with a frozen config entry). Reads must ignore it, not
-    just stop adding to it."""
-    path = f"{obsidian_utils._CACHE_PREFIX}unknown.json"
-    with open(path, "w") as f:
-        json.dump({"config": {"vault_path": "/stale"}}, f)
-    assert obsidian_utils.cache_get("unknown", "config") is None
+    with using_runtime_context(None):
+        """A cache-unknown.json written before #362 is still on disk on real
+        machines (1.5 MB, with a frozen config entry). Reads must ignore it, not
+        just stop adding to it."""
+        path = f"{obsidian_utils._CACHE_PREFIX}unknown.json"
+        with open(path, "w") as f:
+            json.dump({"config": {"vault_path": "/stale"}}, f)
+        assert obsidian_utils.cache_get("unknown", "config") is None
 
 
 def test_cache_still_stores_under_a_real_sid():
-    """Negative control: a real id still round-trips, so the refusal above is
-    specific to the uncacheable ids and not a broken cache."""
-    sid = _unique_sid()
-    obsidian_utils.cache_set(sid, "config", {"vault_path": "/v"})
-    assert obsidian_utils.cache_get(sid, "config") == {"vault_path": "/v"}
+    with using_runtime_context(None):
+        """Negative control: a real id still round-trips, so the refusal above is
+        specific to the uncacheable ids and not a broken cache."""
+        sid = _unique_sid()
+        obsidian_utils.cache_set(sid, "config", {"vault_path": "/v"})
+        assert obsidian_utils.cache_get(sid, "config") == {"vault_path": "/v"}
 
 
 def test_load_config_under_codex_sees_a_config_edit(isolated_home, monkeypatch, tmp_path):
-    """#362 end to end: with a Codex marker set, a config edit between two
-    load_config() calls must be visible to the second."""
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("CODEX_THREAD_ID", "019a0000-0000-7000-8000-000000000003")
-    cfg = tmp_path / "obsidian-brain-config.json"
-    monkeypatch.setattr(obsidian_utils, "_CONFIG_PATH", cfg)
-    cfg.write_text(json.dumps({"vault_path": str(tmp_path / "v1")}))
-    assert obsidian_utils.load_config()["vault_path"] == str(tmp_path / "v1")
-    cfg.write_text(json.dumps({"vault_path": str(tmp_path / "v2")}))
-    assert obsidian_utils.load_config()["vault_path"] == str(tmp_path / "v2")
+    with using_runtime_context(None):
+        """#362 end to end: with a Codex marker set, a config edit between two
+        load_config() calls must be visible to the second."""
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("CODEX_THREAD_ID", "019a0000-0000-7000-8000-000000000003")
+        cfg = tmp_path / "obsidian-brain-config.json"
+        monkeypatch.setattr(obsidian_utils, "_CONFIG_PATH", cfg)
+        cfg.write_text(json.dumps({"vault_path": str(tmp_path / "v1")}))
+        assert obsidian_utils.load_config()["vault_path"] == str(tmp_path / "v1")
+        cfg.write_text(json.dumps({"vault_path": str(tmp_path / "v2")}))
+        assert obsidian_utils.load_config()["vault_path"] == str(tmp_path / "v2")
 
 
 def test_check_hook_status_under_codex_does_not_report_a_setup_failure(
     isolated_home, monkeypatch, tmp_path
 ):
-    """#362: /recall prints any [WARN] from check_hook_status verbatim. Under
-    Codex the resolver refuses Claude ids, so without a guard this told the
-    user to re-run /obsidian-setup although nothing was wrong."""
-    _seed_live_claude_transcript(isolated_home, tmp_path, monkeypatch, "codex-health-proj")
-    monkeypatch.setenv("CODEX_SANDBOX", "seatbelt")
-    status = obsidian_utils.check_hook_status()
-    assert status["ok"] is True
-    assert "obsidian-setup" not in status["message"]
-    assert "CODEX_SANDBOX" in status["message"]
+    with using_runtime_context(None):
+        """#362: /recall prints any [WARN] from check_hook_status verbatim. Under
+        Codex the resolver refuses Claude ids, so without a guard this told the
+        user to re-run /obsidian-setup although nothing was wrong."""
+        _seed_live_claude_transcript(isolated_home, tmp_path, monkeypatch, "codex-health-proj")
+        monkeypatch.setenv("CODEX_SANDBOX", "seatbelt")
+        status = obsidian_utils.check_hook_status()
+        assert status["ok"] is True
+        assert "obsidian-setup" not in status["message"]
+        assert "CODEX_SANDBOX" in status["message"]
+
+from runtime_context import using_runtime_context
+from selected_legacy_vault import selected_host_context
+pytestmark = pytest.mark.usefixtures("selected_host_context")

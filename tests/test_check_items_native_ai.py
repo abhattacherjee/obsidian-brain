@@ -82,7 +82,7 @@ def test_cancelled_classifier_preserves_previous_output(monkeypatch,tmp_path):
     assert output.read_text()=='previous'
 
 
-def test_exhausted_chunk_cannot_publish_partial_results(monkeypatch,tmp_path):
+def test_exhausted_chunk_publishes_only_covered_results(monkeypatch,tmp_path,capsys):
     output=private_output('out.json');output.write_text('previous')
     monkeypatch.setattr(cli,'CLASSIFIER_CHUNK_SIZE',1)
     monkeypatch.setattr(__import__('check_items_prefilter'),'is_prefilter_enabled',lambda:False)
@@ -93,8 +93,25 @@ def test_exhausted_chunk_cannot_publish_partial_results(monkeypatch,tmp_path):
             return 0,result([verdict('one')])
         return 4,None
     monkeypatch.setattr(cli,'_request_ai',execute)
-    assert cli.run_classifier(json.dumps({'groups':groups(),'evidence':{}}),str(output))==4
+    assert cli.run_classifier(json.dumps({'groups':groups(),'evidence':{}}),str(output))==0
     assert calls==['one','two','two']
+    covered=json.loads(output.read_text())
+    assert [row['group_id'] for row in covered]==['one']
+    assert all(row['group_id']!='two' for row in covered)
+    assert 'failed_chunks=1 unclassified=1' in capsys.readouterr().err
+
+
+def test_no_covered_chunk_preserves_previous_output(monkeypatch,tmp_path):
+    output=private_output('out.json');output.write_text('previous')
+    monkeypatch.setattr(cli,'CLASSIFIER_CHUNK_SIZE',1)
+    monkeypatch.setattr(__import__('check_items_prefilter'),'is_prefilter_enabled',lambda:False)
+    calls=[]
+    def execute(operation,prompt,payload,model,requested):
+        calls.append(requested[0]['group_id'])
+        return 4,None
+    monkeypatch.setattr(cli,'_request_ai',execute)
+    assert cli.run_classifier(json.dumps({'groups':groups(),'evidence':{}}),str(output))==4
+    assert calls==['one','one','two','two']
     assert output.read_text()=='previous'
 
 
@@ -423,3 +440,35 @@ def test_private_result_publication_failure_preserves_previous_bytes(monkeypatch
         cli._publish_private_json(output, {'next': 'validated answer'})
     assert output.read_bytes() == previous
     assert list(output.parent.glob('.check-items-*.json')) == []
+
+
+@pytest.mark.parametrize('failed_id', ['one', 'two'])
+def test_failed_chunk_order_keeps_later_covered_results(monkeypatch, capsys, failed_id):
+    output = private_output('order.json')
+    output.write_text('previous')
+    monkeypatch.setattr(cli, 'CLASSIFIER_CHUNK_SIZE', 1)
+    monkeypatch.setattr(__import__('check_items_prefilter'), 'is_prefilter_enabled', lambda: False)
+    calls = []
+    def execute(operation, prompt, payload, model, requested):
+        gid = requested[0]['group_id']
+        calls.append(gid)
+        return (4, None) if gid == failed_id else (0, result([verdict(gid)]))
+    monkeypatch.setattr(cli, '_request_ai', execute)
+    assert cli.run_classifier(json.dumps({'groups': groups(), 'evidence': {}}), str(output)) == 0
+    assert [row['group_id'] for row in json.loads(output.read_text())] == [gid for gid in ('one', 'two') if gid != failed_id]
+    assert calls.count(failed_id) == 2
+    assert 'failed_chunks=1 unclassified=1' in capsys.readouterr().err
+
+
+@pytest.mark.parametrize('pinned',[False,True])
+def test_classifier_cache_reports_current_model_replay_availability(native_ai_context,pinned):
+    import check_items_cache as cache
+    context=native_ai_context
+    for key in ('classifier_model','codex_ai_model','codex_summary_model'):
+        context.config.pop(key,None)
+    model='claude-haiku-4-5-20251001' if context.host=='claude' else 'gpt-native-pinned'
+    if pinned:
+        context.config['classifier_model' if context.host=='claude' else 'codex_ai_model']=model
+    status=cache.classifier_cache_replay_status(context)
+    assert status=={'enabled':pinned,'reason':'ready' if pinned else 'native_model_unresolved',
+                    'model':model if pinned else None}

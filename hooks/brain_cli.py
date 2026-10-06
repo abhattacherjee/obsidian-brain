@@ -39,7 +39,7 @@ def main(argv=None, stdin=None, stdout=None, stderr=None, started_at=None):
     started_at = time.monotonic() if started_at is None else started_at
     stdout = stdout if stdout is not None else sys.stdout
     stderr = stderr if stderr is not None else sys.stderr
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("--host", required=True, choices=("claude", "codex"))
     parser.add_argument("--client", required=True)
     for flag in ("config", "resource-root", "vault", "index", "state", "session-id", "cwd", "transcript"):

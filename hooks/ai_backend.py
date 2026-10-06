@@ -337,5 +337,5 @@ def execute_ai(context, operation, request):
             return result("ok", data)
     except _BackendFailure as exc:
         return result(exc.status, code=exc.code)
-    except (ValueError, TypeError, UnicodeError, OSError):
+    except (ValueError, TypeError, UnicodeError, OSError, RecursionError):
         return result("invalid_output", code="output_invalid")

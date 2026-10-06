@@ -383,6 +383,7 @@ def test_cli_end_to_end_scan_apply_rescan(tmp_path):
     script = Path(__file__).parent.parent / "scripts" / "vault_doctor.py"
     env = {
         "HOME": str(tmp_path),
+        "XDG_STATE_HOME": os.environ["XDG_STATE_HOME"],
         "OBSIDIAN_BRAIN_DOCTOR_BACKUP_ROOT": str(backup_root),
         "PATH": "/usr/bin:/bin:/usr/local/bin",
     }
@@ -727,6 +728,7 @@ def _build_min_conf_env(tmp_path, with_unreadable=False):
 
     env = {
         "HOME": str(tmp_path),
+        "XDG_STATE_HOME": os.environ["XDG_STATE_HOME"],
         "OBSIDIAN_BRAIN_DOCTOR_BACKUP_ROOT": str(backup_root),
         "PATH": "/usr/bin:/bin:/usr/local/bin",
         "OBSIDIAN_BRAIN_VAULT": str(vault),

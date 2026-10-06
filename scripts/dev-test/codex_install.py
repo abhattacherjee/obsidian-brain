@@ -18,15 +18,161 @@ from types import SimpleNamespace
 try:
     import tomllib
 except ImportError:
-    try:
-        import tomli as tomllib
-    except ImportError:
-        tomllib = None
+    tomllib = None
+
+
+def _toml_stdlib(content):
+    """Validate the installer subset on Python 3.9 without external packages.
+
+    Accept explicit tables, dotted keys, scalar values and one-line arrays or
+    inline tables. Refuse unsupported TOML rather than ignore configuration.
+    """
+    import math
+
+    def parts(text, delimiter, comments=False):
+        result, start, quote, escaped, stack = [], 0, None, False, []
+        for index, char in enumerate(text):
+            if quote:
+                if quote == '"' and escaped:
+                    escaped = False
+                elif quote == '"' and char == '\\':
+                    escaped = True
+                elif char == quote:
+                    quote = None
+                continue
+            if char in {'"', "'"}:
+                quote = char
+            elif char == '#' and comments:
+                text = text[:index]
+                break
+            elif char in '[{':
+                stack.append(char)
+                if len(stack) > 64:
+                    raise ValueError('Unsupported TOML nesting depth')
+            elif char in ']}':
+                if not stack or stack.pop() != ('[' if char == ']' else '{'):
+                    raise ValueError('Unsupported or malformed TOML framing')
+            elif char == delimiter and not stack:
+                result.append(text[start:index].strip())
+                start = index + 1
+        if quote or stack:
+            raise ValueError('Unsupported multiline TOML')
+        result.append(text[start:].strip())
+        return result
+
+    def string(text):
+        if text.startswith("'") and text.endswith("'") and len(text) >= 2:
+            body = text[1:-1]
+            if "'" in body or any(ord(char) < 32 or ord(char) == 127 for char in body):
+                raise ValueError('Unsupported TOML literal string')
+            return body
+        # JSON accepts escaped slashes; TOML does not. Keep the fallback strict.
+        if not re.fullmatch(r'"(?:[^"\\\x00-\x1f\x7f]|\\(?:["\\btnfr]|u[0-9A-Fa-f]{4}))*"', text):
+            raise ValueError('Unsupported TOML basic string')
+        value = json.loads(text)
+        if not isinstance(value, str):
+            raise ValueError('TOML quoted value must be a string')
+        if any(0xD800 <= ord(char) <= 0xDFFF for char in value):
+            raise ValueError('Invalid TOML Unicode scalar')
+        return value
+
+    def keys(text):
+        result = []
+        for item in parts(text, '.'):
+            if item.startswith(('"', "'")):
+                result.append(string(item))
+            elif re.fullmatch(r'[A-Za-z0-9_-]+', item):
+                result.append(item)
+            else:
+                raise ValueError('Unsupported TOML key')
+        return tuple(result)
+
+    def value(text):
+        if text.startswith(('"', "'")):
+            return string(text)
+        if text in {'true', 'false'}:
+            return text == 'true'
+        if text.startswith('[') and text.endswith(']'):
+            body = text[1:-1].strip()
+            entries = parts(body, ',') if body else []
+            if entries and not entries[-1]:
+                entries.pop()
+            return [value(item) for item in entries]
+        if text.startswith('{') and text.endswith('}'):
+            table = {}
+            closed = set()
+            body = text[1:-1].strip()
+            for item in parts(body, ',') if body else []:
+                fields = parts(item, '=')
+                if len(fields) != 2:
+                    raise ValueError('Unsupported TOML inline table')
+                path = keys(fields[0])
+                if any(path[:n] in closed for n in range(1, len(path))):
+                    raise ValueError('TOML inline table cannot be extended')
+                item_value = value(fields[1])
+                assign(table, path, item_value)
+                if isinstance(item_value, dict):
+                    closed.add(path)
+            return table
+        if re.fullmatch(r'[+-]?(?:0|[1-9][0-9]*(?:_[0-9]+)*)', text):
+            return int(text.replace('_', ''))
+        if re.fullmatch(r'[+-]?(?:0|[1-9][0-9]*)(?:\.[0-9]+(?:[eE][+-]?[0-9]+)?|[eE][+-]?[0-9]+)', text):
+            number = float(text)
+            if math.isfinite(number):
+                return number
+        raise ValueError('Unsupported TOML value; configuration was not changed')
+
+    def assign(table, path, item):
+        for key in path[:-1]:
+            table = table.setdefault(key, {})
+            if not isinstance(table, dict):
+                raise ValueError('TOML key changes an existing value type')
+        if path[-1] in table:
+            raise ValueError('Duplicate TOML key')
+        table[path[-1]] = item
+
+    text = content.decode('utf-8')
+    if '\"\"\"' in text or "'''" in text:
+        raise ValueError('Unsupported multiline TOML')
+    document, table, table_path = {}, None, ()
+    declared, assignment_tables, inline_tables = set(), set(), set()
+    table = document
+    for raw in text.splitlines():
+        line = parts(raw, '\0', comments=True)[0]
+        if not line:
+            continue
+        if line.startswith('['):
+            if line.startswith('[[') or not line.endswith(']'):
+                raise ValueError('Unsupported TOML table shape')
+            path = keys(line[1:-1].strip())
+            if path in declared or path in assignment_tables or any(path[:n] in inline_tables for n in range(1, len(path)+1)):
+                raise ValueError('Duplicate or closed TOML table')
+            table = document
+            for key in path:
+                table = table.setdefault(key, {})
+                if not isinstance(table, dict):
+                    raise ValueError('TOML table changes an existing value type')
+            declared.add(path)
+            table_path = path
+            continue
+        fields = parts(line, '=')
+        if len(fields) != 2:
+            raise ValueError('Unsupported TOML assignment')
+        path = keys(fields[0])
+        full_path = table_path + path
+        if any(full_path[:n] in inline_tables for n in range(1, len(full_path))):
+            raise ValueError('TOML inline table cannot be extended')
+        item = value(fields[1])
+        assign(table, path, item)
+        assignment_tables.update(table_path + path[:n] for n in range(1, len(path)))
+        if isinstance(item, dict):
+            inline_tables.add(full_path)
+    return document
 
 
 def _toml(content):
     if tomllib is None:
-        raise ValueError('Codex dev install needs tomllib or tomli to validate TOML')
+        return _toml_stdlib(content)
     return tomllib.loads(content.decode('utf-8'))
 
 
@@ -146,7 +292,7 @@ def _snapshot(source, destination):
     for directory in ('hooks', 'skills', '.claude-plugin', '.codex-plugin', '.codex', 'scripts/vault_doctor_checks', 'scripts/dev-test'):
         copy_tree(directory)
     (destination / 'scripts').mkdir(exist_ok=True)
-    for name in ('vault_doctor.py', 'test-dev-skill.sh'):
+    for name in ('vault_doctor.py', 'doctor_repair_state.py', 'test-dev-skill.sh'):
         origin = source / 'scripts' / name
         if origin.is_file():
             if origin.is_symlink():
@@ -159,7 +305,11 @@ def _snapshot(source, destination):
             or not re.fullmatch(r'\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.+-]+)?', manifest['version'])
             or claude.get('version') != manifest['version']):
         raise ValueError('Host plugin descriptors disagree')
-    if not (destination / 'hooks/brain_cli.py').is_file() or not any((destination / 'skills').glob('*/SKILL.md')):
+    required = ('hooks/brain_cli.py', 'scripts/vault_doctor.py',
+                'scripts/doctor_repair_state.py', 'scripts/test-dev-skill.sh',
+                'scripts/vault_doctor_checks/__init__.py')
+    if (not all((destination / name).is_file() for name in required)
+            or not any((destination / 'skills').glob('*/SKILL.md'))):
         raise ValueError('Runtime package is incomplete')
 
 

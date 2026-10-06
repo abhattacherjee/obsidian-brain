@@ -224,6 +224,9 @@ case "$cmd" in
             exit 1
         fi
 
+        # Missing runtime dependencies must not create backup state.
+        python3 "$SCRIPT_ROOT/scripts/dev-test/package_tree.py" --validate-only "$REPO_ROOT"
+
         # Build the backup OUT OF PLACE, then publish it by rename.
         #
         # `cp -R` is not atomic. Interrupt it (Ctrl-C on a slow copy), fill the

@@ -53,7 +53,8 @@ def test_bounded_queue_reaches_sources_after_first_eight_and_persists_position(c
         # A fresh RuntimeContext and connection must reuse the durable queue position.
         result = capture.recover_registered(replace(context), 8, time.monotonic() + 5)
         assert visited == [ctx.native_session_id for ctx in expected]
-        assert result.status == "pending"
+        assert result.status == "complete"
+        assert result.pending_sources == 0
     assert len(set(ctx.native_session_id for ctx in sources)) == 19
 
 
@@ -68,7 +69,8 @@ def test_max_sources_is_a_hard_read_bound(context, monkeypatch, bound):
     monkeypatch.setattr(transcripts, "read_records", read)
     result = capture.recover_registered(context, bound, time.monotonic() + 5)
     assert len(visited) == bound
-    assert result.status == "pending"
+    assert result.status == "complete"
+    assert result.pending_sources == 0
 
 
 def test_default_recovery_skips_active_sources_without_finalizing(context, monkeypatch):
@@ -102,15 +104,17 @@ def test_expired_deadline_does_not_read_publish_or_lose_retained_input(context, 
     cursor = source_state(context)[0]
     monkeypatch.setattr(transcripts, "read_records", lambda *args: pytest.fail("expired read"))
     result = capture.recover_registered(context, 8, time.monotonic() - 1)
-    assert result.status == "pending"
+    assert result.status == "complete"
+    assert result.pending_sources == 0
     assert not result.loss_of_input
     assert note.read_bytes() == before
     assert source_state(context)[0] == cursor
 
 
-def test_recovery_queue_does_not_cross_native_hosts(context, monkeypatch):
+def test_recovery_queue_does_not_cross_native_hosts(context, monkeypatch, host_identity_scenario):
     other_host = "claude" if context.host == "codex" else "codex"
     claude = replace(context, host=other_host, client="claude-code" if other_host == "claude" else "codex-cli")
+    host_identity_scenario.register(context, claude)
     register(context, monkeypatch)
     register(claude, monkeypatch)
     visited = []
@@ -171,3 +175,31 @@ def test_registered_source_rejects_changed_native_metadata_before_retention(cont
         assert connection.execute("SELECT COUNT(*) FROM native_events WHERE event='foreign'").fetchone()[0] == 0
     finally:
         connection.close()
+
+
+@pytest.mark.parametrize("expired", [False, True])
+@pytest.mark.parametrize("bound", [0, 1])
+def test_real_partial_input_stays_pending_under_read_bounds_and_deadline(context, monkeypatch, expired, bound):
+    register(context, monkeypatch)
+    note = next(context.vault_path.rglob("*.md"))
+    partial = replace(batch(context, offset=200), status="partial", source_complete=False,
+                      parser_state={"_deferred_source_rows": [{"reason": "unknown_schema:future_record"}]},
+                      warnings=("Deferred transcript rows remain pending",))
+    monkeypatch.setattr(transcripts, "read_records", lambda *args: partial)
+    retained = capture.capture_checkpoint(context, capture.CaptureEvent("stop", min_messages=1),
+                                          time.monotonic() + 5)
+    assert retained.status == "pending" and retained.pending_sources == 1
+    before = note.read_bytes()
+    cursor = source_state(context)[0]
+    visits = []
+    def read(ctx, current, deadline):
+        visits.append(ctx.native_session_id)
+        return partial
+    monkeypatch.setattr(transcripts, "read_records", read)
+    deadline = time.monotonic() - 1 if expired else time.monotonic() + 5
+    result = capture.recover_registered(context, bound, deadline)
+    assert result.status == "pending" and result.pending_sources == 1
+    assert not result.loss_of_input
+    assert len(visits) == (0 if expired else bound)
+    assert source_state(context)[0] == cursor
+    assert note.read_bytes() == before

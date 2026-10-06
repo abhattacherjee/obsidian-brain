@@ -194,14 +194,30 @@ def test_no_tail_c_in_skills():
                     )
 
 
-def test_hooks_future_annotations():
-    """All .py files using PEP 604/585 type hints must have 'from __future__ import annotations'.
+def _modern_annotation_nodes(content):
+    tree = ast.parse(content)
+    annotations = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.AnnAssign):
+            annotations.append(node.annotation)
+        elif isinstance(node, ast.arg) and node.annotation is not None:
+            annotations.append(node.annotation)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.returns is not None:
+            annotations.append(node.returns)
+    return [node for annotation in annotations for node in ast.walk(annotation)
+            if (isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr))
+            or (isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name)
+                and node.value.id in {'list', 'dict', 'set', 'tuple'})]
 
-    Without this import, `dict | None` and `list[str]` syntax fails on
-    Python < 3.10 (macOS system Python is 3.9.6). Scans hooks/ and scripts/.
-    """
-    pep604_re = re.compile(r':\s*\w+\s*\|\s*\w+|-> \w+\s*\|\s*\w+')
-    pep585_re = re.compile(r':\s*(?:list|dict|set|tuple)\[')
+
+def test_annotation_scan_ignores_regex_literals_but_checks_real_hints():
+    assert not _modern_annotation_nodes('pattern = r"(?:Claude|Codex)"\n')
+    assert _modern_annotation_nodes('def call(value: dict | None) -> list[str]: pass\n')
+    assert _modern_annotation_nodes('value: tuple[int, str] = (1, "x")\n')
+
+
+def test_hooks_future_annotations():
+    """Check actual annotations rather than type-like strings or comments."""
     py_files = sorted(
         glob.glob(os.path.join(_REPO_ROOT, "hooks", "*.py"))
         + glob.glob(os.path.join(_REPO_ROOT, "scripts", "**", "*.py"), recursive=True)
@@ -209,14 +225,13 @@ def test_hooks_future_annotations():
     for py_file in py_files:
         with open(py_file, encoding="utf-8") as f:
             content = f.read()
-        uses_modern = pep604_re.search(content) or pep585_re.search(content)
-        if uses_modern:
+        if _modern_annotation_nodes(content):
+            tree = ast.parse(content)
+            imports_future = any(isinstance(node, ast.ImportFrom) and node.module == '__future__'
+                                 and any(alias.name == 'annotations' for alias in node.names)
+                                 for node in tree.body)
             rel_path = os.path.relpath(py_file, _REPO_ROOT)
-            assert "from __future__ import annotations" in content, (
-                f"{rel_path} uses PEP 604/585 type hints "
-                "but is missing 'from __future__ import annotations'. "
-                "This breaks on Python < 3.10 (macOS system Python 3.9.6)."
-            )
+            assert imports_future, f"{rel_path} uses modern annotations without deferred evaluation"
 
 
 def test_snippets_import_os_before_usage():
@@ -303,7 +318,7 @@ def test_note_writer_heredoc_openers_have_matching_terminator_lines():
         content=open(path).read()
         if "--operation 'note-create'" in content or "--operation 'summary-apply'" in content:
             assert '< "$REQUEST_PATH"' in content
-            assert 'Content is a JSON string, never shell code.' in content
+            assert 'Content is JSON data, never shell code.' in content
             sites.append(path)
     assert len(sites)>=8
 
@@ -508,11 +523,16 @@ def test_every_version_key_snippet_imports_re():
                 break
 
 
-def test_check_items_skill_captures_head_only_once():
+def test_check_items_head_capture_and_reuse_revalidate_freshness():
     import inspect, skill_procedures
-    content = '\n'.join(inspect.getsource(getattr(skill_procedures, '_check_items_stage_%02d' % index)) for index in range(1,9))
-    assert len(re.findall(r"rev-parse[\s,\"']+HEAD(?![\w~^])", content)) == 1
-
+    helper = inspect.getsource(skill_procedures._project_head)
+    assert len(re.findall(r"rev-parse[\s,\"']+HEAD(?![\w~^])", helper)) == 1
+    for index in range(1, 9):
+        tree = ast.parse(inspect.getsource(getattr(skill_procedures, '_check_items_stage_%02d' % index)))
+        calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
+                 and isinstance(node.func, ast.Name) and node.func.id == '_project_head']
+        # Stage 1 captures the baseline; stage 3 verifies it before evidence reuse.
+        assert len(calls) == (1 if index in (1, 3) else 0)
 
 
 def test_check_items_heads_handoff_key_matches():
@@ -1242,3 +1262,5 @@ def test_step8_warns_when_recorded_flips_match_no_group(selected_host_context, t
     assert "cascaded_total=0" in proc.stdout
     assert "none matched a grouped item" in proc.stderr, proc.stderr
     assert (sessions / "b.md").read_text().splitlines()[0] == "- [ ] Ship the widget"
+
+pytestmark = pytest.mark.usefixtures("selected_host_context")

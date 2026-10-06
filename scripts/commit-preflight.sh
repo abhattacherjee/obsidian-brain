@@ -105,7 +105,7 @@ if [ -f "$PLUGIN_JSON_PRE" ] && [ -f "$MARKETPLACE_JSON_PRE" ]; then
     echo "🔖 Checking plugin manifest version sync..."
     VERSION_SYNC_EXIT=0
     VERSION_CHECK_TMP=$(mktemp "${TMPDIR:-/tmp}/preflight-version.XXXXXX")
-    VERSION_CHECK_STDOUT=$(python3 - "$PLUGIN_JSON_PRE" "$MARKETPLACE_JSON_PRE" 2>"$VERSION_CHECK_TMP" <<'PY'
+    VERSION_CHECK_STDOUT=$(python3 - "$PLUGIN_JSON_PRE" "$MARKETPLACE_JSON_PRE" "$PROJECT_DIR/.codex-plugin/plugin.json" 2>"$VERSION_CHECK_TMP" <<'PY'
 import json, sys, traceback
 plugin_path, market_path = sys.argv[1], sys.argv[2]
 try:
@@ -116,6 +116,20 @@ except Exception as e:
     sys.exit(2)
 plugin_v = plugin.get("version")
 plugin_name = plugin.get("name")
+from pathlib import Path
+codex_path = Path(sys.argv[3])
+if plugin_name == "obsidian-brain" and not codex_path.is_file():
+    sys.stderr.write("Codex descriptor is missing from obsidian-brain packaging\n")
+    sys.exit(2)
+if codex_path.is_file():
+    try:
+        codex = json.loads(codex_path.read_text())
+        if codex.get("name") != plugin_name or codex.get("version") != plugin_v:
+            sys.stderr.write("Codex descriptor name/version differs from Claude descriptor\n")
+            sys.exit(2)
+    except (ValueError, OSError, AttributeError) as exc:
+        sys.stderr.write(f"Codex descriptor parse error: {exc}\n")
+        sys.exit(2)
 if not plugin_v or not plugin_name:
     sys.stderr.write("plugin.json missing 'name' or 'version'\n")
     sys.exit(2)
@@ -187,6 +201,17 @@ if ! python3 "$PROJECT_DIR/scripts/ci-checks/host_neutral_lint.py" --root "$PROJ
     rm -f "$TOKEN_FILE"
     exit 1
 fi
+
+# Keep the static helper inventory current; collection enforces its actor contracts.
+HOST_INVENTORY=$(mktemp "${TMPDIR:-/tmp}/obsidian-host-inventory.XXXXXX")
+if ! python3 "$PROJECT_DIR/scripts/ci-checks/host-test-contract.py" --root "$PROJECT_DIR" --output "$HOST_INVENTORY" --parity-matrix "$PROJECT_DIR/docs/parity/capabilities.json"; then
+    rm -f "$HOST_INVENTORY" "$TOKEN_FILE"
+    exit 1
+fi
+rm -f "$HOST_INVENTORY"
+
+# The full pytest run below collects with the actor guard before executing any test.
+# Keep one guarded collection; a separate collect-only pass duplicates that work.
 
 # Handle skip tests mode
 if [ "$SKIP_TESTS" = true ]; then
@@ -266,7 +291,7 @@ echo "🧪 Running tests..."
 if [ -d "tests" ]; then
     if command -v pytest &>/dev/null; then
         echo "🧪 Running pytest with coverage..."
-        if pytest tests/ -v --tb=short --cov=hooks --cov-report=term-missing --cov-fail-under=90; then
+        if PYTHONPATH=tests:hooks:scripts pytest tests/ -v --tb=short --cov=hooks --cov-report=term-missing --cov-fail-under=90 -p parity_collection_plugin --parity-matrix docs/parity/capabilities.json; then
             CHECKS_RUN="${CHECKS_RUN}tests,"
         else
             echo "❌ Tests failed or coverage below 90%"

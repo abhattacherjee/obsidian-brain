@@ -15,6 +15,6 @@ storage and execution are selected by explicit host adapters.
   dispatch remain unverified. See [acceptance evidence](docs/parity/acceptance-evidence.md).
 - Native Codex context requires `codex-cli` or `codex-desktop` explicitly.
   Do not infer the current frontend from a thread's creation metadata or a
-  daemon's environment. Missing identity defers native hook capture.
+  daemon's environment. Missing identity skips native hook capture; no source is retained.
 - Keep host-specific instructions in this file. Put shared rules in
   `CLAUDE.md` and link to them here so the two instruction files stay in step.

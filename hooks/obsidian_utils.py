@@ -30,6 +30,7 @@ import time
 from typing import Optional
 from collections.abc import Sequence
 from pathlib import Path
+from note_transactions import LockBusy
 
 try:
     import vault_index as _vault_index
@@ -242,8 +243,12 @@ def _reap_stale_retro_sentinels() -> int:
     Best-effort: OSErrors on individual files are swallowed.  Returns the count of
     files reaped (0 when the gate dir is absent or no files qualify).
     """
-    gate_dir = _retro_gate_dir()
-    if not gate_dir.exists():
+    try:
+        gate_dir = _retro_gate_dir()
+        if not gate_dir.exists():
+            return 0
+    except OSError:
+        print("Retro gate cleanup could not access private state", file=sys.stderr)
         return 0
     cutoff = time.time() - RETRO_GATE_TTL_SECONDS
     reaped = 0
@@ -315,8 +320,8 @@ def mark_retro_classification_pending(session_id: str, retro_path: str, turn_id=
                 "to an empty string; gate NOT armed, Stop hook will not "
                 "enforce classification for this session")
 
-    gate_dir = _retro_gate_dir()
     try:
+        gate_dir = _retro_gate_dir()
         gate_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         if gate_dir.stat().st_mode & 0o077:
             os.chmod(gate_dir, 0o700)
@@ -386,7 +391,11 @@ def clear_retro_classification_pending(session_id: str) -> bool:
     if not sanitized:
         return False
 
-    gate_dir = _retro_gate_dir()
+    try:
+        gate_dir = _retro_gate_dir()
+    except OSError:
+        print("Retro gate could not be cleared: private state is unavailable", file=sys.stderr)
+        return False
     sentinel = gate_dir / f"{sanitized}.json"
 
     # Path-containment check.
@@ -417,7 +426,11 @@ def get_retro_classification_pending(session_id: str) -> dict | None:
     if not sanitized:
         return None
 
-    gate_dir = _retro_gate_dir()
+    try:
+        gate_dir = _retro_gate_dir()
+    except OSError:
+        print("Retro gate could not be checked: private state is unavailable", file=sys.stderr)
+        return None
     sentinel = gate_dir / f"{sanitized}.json"
 
     # Path-containment check.
@@ -1173,8 +1186,8 @@ def _append_sessionend_log(
 ) -> None:
     """Append a one-line SessionEnd outcome record; rotate when oversized.
 
-    Writes to ~/.claude/obsidian-brain-hook.log alongside SessionStart entries
-    and the future Reaped entries (issue #125 reaper).
+    Bound contexts write to their versioned per-session logs directory. Explicit
+    unbound Claude compatibility uses its legacy hook-log path.
 
     Best-effort: catches any exception (OSError from filesystem, TypeError
     from bad input types, etc.) and prints a stderr warning. Failure to log
@@ -2630,9 +2643,11 @@ def get_session_context(vault_path: str | None = None, sessions_folder: str | No
             raise ValueError("Session lookup cannot switch the selected sessions folder")
         from session_lookup import find_existing_session
         existing = find_existing_session(context, time.monotonic() + 0.1)
+        from capture import planned_note_path
+        planned = existing if existing is not None else planned_note_path(context)
         return {"session_id": context.native_session_id, "hash": context.session_key[:16],
                 "project": context.canonical_project_root.name,
-                "session_note_name": existing.stem if existing is not None else "",
+                "session_note_name": planned.stem,
                 "cwd": str(context.worktree)}
     sid = _get_session_id_fast()
     cwd_now = _safe_getcwd()
@@ -3179,15 +3194,16 @@ _snapshot_index_cache: dict[str, tuple[int, _SnapshotIndex]] = {}
 def _build_snapshot_index(sessions_folder_path: Path) -> _SnapshotIndex:
     """One pass over ``*-snapshot*.md``, grouped by frontmatter session_id.
 
-    Returns ``(by_session_id, malformed)``. Filenames are appended in sorted
-    order, so every per-session list inherits the same lexicographic ordering
-    ``sorted(Path.glob(...))`` gives the uncached path. ``malformed`` holds
+    Returns ``(by_session_id, malformed)``. Each session uses explicit native
+    creation time or the legacy filename time, matching the uncached path.
+    ``malformed`` holds
     ``(filename, already-rendered detail)`` pairs — rendered here (never the
     raw reason, which can embed up to 60 characters of the note's own text)
     so the caller only decides WHETHER to print, not what.
     """
     by_sid: dict[str | None, list[tuple[str, str]]] = {}
     malformed: list[tuple[str, str]] = []
+    chronology = {}
     for p in sorted(sessions_folder_path.glob("*-snapshot*.md")):
         try:
             meta, reason, _cacheable = _parse_note_metadata_uncached(str(p))
@@ -3200,6 +3216,7 @@ def _build_snapshot_index(sessions_folder_path: Path) -> _SnapshotIndex:
             # No default: a missing key must stay None so the index answers
             # exactly as the uncached `meta.get("session_id") == session_id`
             # test does. See ``_SnapshotIndex``.
+            chronology[p.name] = _snapshot_sort_key(p.name, meta)
             by_sid.setdefault(meta.get("session_id"), []).append(
                 (p.name, meta.get("project", ""))
             )
@@ -3210,6 +3227,8 @@ def _build_snapshot_index(sessions_folder_path: Path) -> _SnapshotIndex:
             detail = getattr(exc, "strerror", None) or type(exc).__name__
             malformed.append((p.name, detail))
             continue
+    for entries in by_sid.values():
+        entries.sort(key=lambda item: chronology[item[0]])
     return by_sid, malformed
 
 
@@ -3254,8 +3273,8 @@ def find_snapshots_for_session(
     - Malformed snapshots are logged to stderr and skipped — one bad file
       must not block back-reference writing.
 
-    Sorted lexicographically by filename stem; HHMMSS suffix makes this
-    chronological for post-spec snapshots. Pre-spec (no HHMMSS) sorts first.
+    Native snapshots use explicit UTC created_at. Legacy snapshots use their
+    HHMMSS filename suffix; older untimed snapshots retain deterministic order.
 
     If `date` is None, discovery is date-agnostic: globs `*-{slug}-*-snapshot*.md`
     and relies entirely on frontmatter session_id+project filtering. Use this
@@ -3268,7 +3287,7 @@ def find_snapshots_for_session(
     exactly — the same filename pattern is re-applied with ``fnmatch``, the
     same frontmatter session_id+project test runs, malformed snapshots matching
     the pattern are still logged to stderr and skipped, and the ordering is the
-    same because the memo stores filenames in ``sorted()`` order. It is opt-in
+    same because the memo stores each session in chronological order. It is opt-in
     because the memo must stay unreachable from write paths that create a
     snapshot and then read the list back; see ``_snapshot_index_cache``.
     """
@@ -3276,6 +3295,7 @@ def find_snapshots_for_session(
         return []
     slug = slugify(project)
     wikilinks: list[str] = []
+    chronology = {}
     if date is None:
         glob_pattern = f"*-{slug}-*-snapshot*.md"
     else:
@@ -3334,7 +3354,9 @@ def find_snapshots_for_session(
                 meta.get("project", "").lower() == project.lower()
                 or slugify(meta.get("project", "")) == slug
             ):
-                wikilinks.append(f"[[{p.stem}]]")
+                link = f"[[{p.stem}]]"
+                chronology[link] = _snapshot_sort_key(p.name, meta)
+                wikilinks.append(link)
         except Exception as exc:  # noqa: BLE001
             # The exception TYPE (plus strerror when there is one), never
             # str(exc): str(OSError) embeds the full path argument, which
@@ -3346,7 +3368,7 @@ def find_snapshots_for_session(
             print(f"[obsidian-brain] skipping malformed snapshot {p.name}: {detail}",
                   file=sys.stderr)
             continue
-    return wikilinks
+    return sorted(wikilinks, key=lambda link: chronology[link])
 
 
 _SECTION_RE_CACHE: dict[tuple[str, ...], re.Pattern] = {}
@@ -3375,6 +3397,33 @@ def _extract_hhmmss_from_filename(filename: str) -> str:
     """Return the HHMMSS suffix from a post-spec snapshot filename, or '??????'."""
     m = re.search(r"-snapshot-(\d{6})\.md$", filename)
     return m.group(1) if m else "??????"
+
+
+def _snapshot_created_time(meta):
+    from datetime import datetime, timezone
+    value = meta.get("created_at")
+    if not isinstance(value, str):
+        return None
+    try:
+        instant = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return instant.astimezone(timezone.utc) if instant.tzinfo is not None else None
+    except (ValueError, OverflowError):
+        return None
+
+
+def _snapshot_hhmmss(filename, meta):
+    instant = _snapshot_created_time(meta)
+    return instant.strftime("%H%M%S") if instant is not None else _extract_hhmmss_from_filename(filename)
+
+
+def _snapshot_sort_key(filename, meta):
+    instant = _snapshot_created_time(meta)
+    if instant is not None:
+        return (instant.date().isoformat(), 1, instant.isoformat(), filename)
+    hh = _extract_hhmmss_from_filename(filename)
+    day = filename[:10]
+    # Legacy snapshots without a time retain their old deterministic order.
+    return (day, int(hh != "??????"), day + "T" + hh, filename)
 
 
 def _augment_session_input_with_snapshots(
@@ -3417,8 +3466,8 @@ def _augment_session_input_with_snapshots(
             body = snap_path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
-        hh = _extract_hhmmss_from_filename(snap_path.name)
         meta = read_note_metadata(str(snap_path)) or {}
+        hh = _snapshot_hhmmss(snap_path.name, meta)
         # Default missing `trigger:` to "auto" (consistent with _snapshot_stats
         # and fetch_snapshot_summaries) so legacy/malformed notes don't get
         # mislabeled as compact. Copilot PR #43 round 2 finding.
@@ -3487,7 +3536,7 @@ def fetch_snapshot_summaries(
         except OSError:
             continue
         meta = read_note_metadata(str(path)) or {}
-        hh = _extract_hhmmss_from_filename(path.name)
+        hh = _snapshot_hhmmss(path.name, meta)
         summary = ""
         key_context = ""
 
@@ -3558,9 +3607,8 @@ def gather_session_evidence(
     /retro (see #285) — the most recent one demarcates where a previous
     retro's analysis left off — and are not themselves evidence to mine.
 
-    Snapshots are returned sorted ascending by stem (YYYY-MM-DD-... prefix),
-    which gives correct chronological order including across-midnight sessions.
-    Pre-spec snapshots (hhmmss == '??????') sort before all post-spec ones.
+    Native snapshots use explicit UTC creation time. Legacy snapshots use
+    filename dates and HHMMSS; untimed snapshots retain deterministic ordering.
     Insights/decisions/error-fixes/retros are returned sorted ascending by
     filename. File-read failures are captured in `discovery_errors` and
     never raised.
@@ -3636,14 +3684,15 @@ def gather_session_evidence(
                 snap_by_stem[stem] = {
                     "path": str(snap_path),
                     "stem": stem,
-                    "hhmmss": _extract_hhmmss_from_filename(snap_path.name),
+                    "hhmmss": _snapshot_hhmmss(snap_path.name, meta),
+                    "created_at": meta.get("created_at"),
                     "trigger": meta.get("trigger", "auto"),
                     "body": body,
                     "session_id": meta.get("session_id", ""),
                 }
         bundle["snapshots"] = sorted(
             snap_by_stem.values(),
-            key=lambda s: (0 if s["hhmmss"] == "??????" else 1, s["stem"]),
+            key=lambda s: _snapshot_sort_key(s["stem"] + ".md", s),
         )
     insights_path = Path(vault_path) / insights_folder
     if insights_path.is_dir():
@@ -4391,7 +4440,7 @@ def _execute_summary_ai(prompt, operation, model, timeout, input_revision="", ex
     if result.status == "timeout":
         raise subprocess.TimeoutExpired([context.host], timeout)
     if result.status != "ok":
-        reason = result.error_code if result.error_code in {"empty_output", "parse_error", "count_mismatch", "missing_section"} else "haiku_subprocess_error"
+        reason = result.error_code if result.error_code in {"empty_output", "parse_error", "count_mismatch", "missing_section", "native_auth_error"} else "haiku_subprocess_error"
         return SimpleNamespace(returncode=1, stdout="", stderr=result.status, failure_reason=reason)
     output = result.data
     if operation == "theme_names":
@@ -4700,6 +4749,15 @@ Rate this session 1-10. 1-3: trivial (config, interrupted). 4-6: standard work. 
 # ---------------------------------------------------------------------------
 
 _SECRET_PATTERNS = [
+    # A header alone is not enough: private key material can span many lines.
+    (re.compile(r'-----BEGIN ((?:[A-Z0-9]+ )*PRIVATE KEY)-----[\s\S]*?(?:-----END \1-----|\Z)'),
+     '[REDACTED:private-key]'),
+    # Preserve connection details while removing URI userinfo passwords.
+    (re.compile(r'([A-Za-z][A-Za-z0-9+.-]*://[^/\s:@]+:)[^/\s]+@'), r'\1[REDACTED]@'),
+    (re.compile(r'(?i)("(?:password|passwd|secret|token|api[_-]?key|client[_-]?secret)"\s*:\s*)"(?:\\.|[^"\\])*"'),
+     r'\1"[REDACTED]"'),
+    (re.compile(r"(?i)('(?:password|passwd|secret|token|api[_-]?key|client[_-]?secret)'\s*:\s*)'(?:\\.|[^'\\])*'"),
+     r"\1'[REDACTED]'"),
     (re.compile(r'gh[ps]_[A-Za-z0-9_]{36,}'), '[REDACTED:github-token]'),
     (re.compile(r'AKIA[0-9A-Z]{16}'), '[REDACTED:aws-key]'),
     (re.compile(r'(?i)(password|passwd|secret|token|api[_-]?key)\s*[=:]\s*\S+'), r'\1=[REDACTED]'),
@@ -4795,9 +4853,17 @@ def flip_note_status(path: str, old_status: str, new_status: str,
             Path(path), revision, {"document": updated}, uuid.uuid4().hex,
         )])
         return result.status in {"applied", "unchanged"}
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, LockBusy) as exc:
         print(f"[obsidian-brain] flip_note_status failed for {path}: {exc}", file=sys.stderr)
         return False
+
+
+def owned_summary_source(content: str) -> str:
+    """Read the owned summary before legacy headings elsewhere in the note."""
+    from note_transactions import _REGION
+    owned = next((match.group(2) for match in _REGION.finditer(content)
+                  if match.group(1) == "summary"), None)
+    return owned if owned is not None else content
 
 
 def find_latest_session(
@@ -4842,7 +4908,7 @@ def find_latest_session(
         # Extract summary section
         summary = ""
         summary_match = re.search(
-            r"## Summary\n(.+?)(?=\n## |\Z)", text, re.DOTALL
+            r"## Summary\n(.+?)(?=\n## |\Z)", owned_summary_source(text), re.DOTALL
         )
         if summary_match:
             summary = summary_match.group(1).strip()
@@ -4850,7 +4916,7 @@ def find_latest_session(
         # Extract next steps section
         next_steps = ""
         ns_match = re.search(
-            r"## Open Questions / Next Steps\n(.+?)(?=\n## |\Z)", text, re.DOTALL
+            r"## Open Questions / Next Steps\n(.+?)(?=\n## |\Z)", owned_summary_source(text), re.DOTALL
         )
         if ns_match:
             next_steps = ns_match.group(1).strip()
@@ -5076,7 +5142,7 @@ def find_unsummarized_notes(
                 cache_key = f"metadata:{os.path.realpath(str(f))}"
                 cache_set(sid, cache_key, None)
                 auto_fixed += 1
-            except (OSError, ValueError):
+            except (OSError, ValueError, LockBusy):
                 pass
             continue
 
@@ -6244,7 +6310,7 @@ def upgrade_note_with_summary(
         source_revision = record_read(context, Path(note_path), raw_text)
         if expected_revision is None:
             expected_revision = source_revision
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, LockBusy) as exc:
         return f"Failed: cannot read {os.path.basename(note_path)}: {exc}"
 
     if not re.match(r"\ufeff?---[ \t]*\r?\n(.*?)\r?\n---[ \t]*(?:\r?\n|\Z)", raw_text, re.DOTALL):
@@ -6252,14 +6318,17 @@ def upgrade_note_with_summary(
 
     # Publish only the owned summary and preserve capture and user prose.
     from note_transactions import connect_coordination, ownership_lock
-    with ownership_lock(context):
-        connection = connect_coordination(context)
-        try:
-            row = connection.execute("SELECT regions FROM revisions WHERE path=? AND revision=?",
-                                     (str(Path(note_path).resolve()), expected_revision)).fetchone()
-            capture_revision = json.loads(row[0]).get("capture") if row else None
-        finally:
-            connection.close()
+    try:
+        with ownership_lock(context):
+            connection = connect_coordination(context)
+            try:
+                row = connection.execute("SELECT regions FROM revisions WHERE path=? AND revision=?",
+                                         (str(Path(note_path).resolve()), expected_revision)).fetchone()
+                capture_revision = json.loads(row[0]).get("capture") if row else None
+            finally:
+                connection.close()
+    except LockBusy:
+        return f"Failed: vault ownership busy for {os.path.basename(note_path)}"
     summary_body = summary_text.rstrip() + "\n\n_(Summary source: " + source + ")_\n"
     if warnings:
         summary_body += "\n## ⚠️ Transcript re-parse warnings\n" + "".join("- " + w + "\n" for w in warnings)
@@ -6319,7 +6388,7 @@ def upgrade_note_with_summary(
         )])
         if result.status not in {"applied", "unchanged"}:
             return f"Failed: summary publication {result.status} for {os.path.basename(note_path)}"
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, LockBusy) as exc:
         return f"Failed: atomic write error for {os.path.basename(note_path)}: {exc}"
 
     # Post-write verification: re-read the target file and confirm the
@@ -6843,6 +6912,7 @@ def upgrade_unsummarized_note(
       Summarizer subprocess (set inside ``generate_summary`` / ``generate_snapshot_summary``):
         ``"haiku_timeout"``           — ``claude -p`` exceeded the per-call timeout
         ``"haiku_subprocess_error"``  — ``claude -p`` returned non-zero or unexpected I/O
+        ``"native_auth_error"``       — the selected native provider requires authentication
         ``"empty_output"``            — model returned empty / whitespace-only text
         ``"unknown_failure"``         — defensive default returned by ``generate_summary`` / ``generate_snapshot_summary`` when the retry loop exits without setting ``last_reason`` (should be unreachable)
 
@@ -6912,8 +6982,10 @@ def upgrade_unsummarized_note(
             break
 
     if not summary_text:
+        failure = ("native AI authentication required" if fallback_reason == "native_auth_error"
+                   else "AI summarization returned empty")
         return _ret(
-            f"Failed: AI summarization returned empty for {os.path.basename(note_path)}",
+            f"Failed: {failure} for {os.path.basename(note_path)}",
             model_used=None,
             fallback_reason=fallback_reason,
         )
@@ -7414,6 +7486,15 @@ def upgrade_batch(
                     else:
                         # Write-back failed — route to solo fallback.
                         solo_fallback_paths.append(p)
+                elif parse_reason == "native_auth_error":
+                    # Authentication cannot recover through a second solo call.
+                    results_by_path[p] = {
+                        "path": p,
+                        "status": f"Failed: native AI authentication required for {os.path.basename(p)}",
+                        "elapsed_s": per_note_elapsed,
+                        "model_used": None,
+                        "fallback_reason": parse_reason,
+                    }
                 else:
                     # No usable summary — route to solo fallback.
                     solo_fallback_paths.append(p)

@@ -4,7 +4,7 @@ import sqlite3
 import time
 from contextlib import closing
 from pathlib import Path
-from types import SimpleNamespace
+from dataclasses import replace
 
 import pytest
 import vault_index
@@ -25,12 +25,21 @@ def note(vault, name, fields):
     return path
 
 
-def ctx(vault, database, host='codex', identity='opaque-native-id'):
-    return SimpleNamespace(host=host, native_session_id=identity, vault_path=vault,
-                           index_path=database, config={'sessions_folder': 'sessions'})
+@pytest.fixture
+def ctx(selected_host_context):
+    def origin(vault, database, host='codex', identity='opaque-native-id'):
+        from runtime_context import historical_source_roots
+        assert vault == selected_host_context.vault_path
+        assert database == selected_host_context.index_path
+        # Origin lookup is read-only. It does not replace the invoking actor.
+        return replace(selected_host_context, host=host,
+            client='claude-code' if host == 'claude' else 'codex-cli',
+            native_session_id=identity, native_home=historical_source_roots(host)[0].parent,
+            config=dict(selected_host_context.config, sessions_folder='sessions'))
+    return origin
 
 
-def test_identity_is_indexed_and_found_across_dates_without_filename_hash(indexed):
+def test_identity_is_indexed_and_found_across_dates_without_filename_hash(indexed, ctx):
     vault, database = indexed
     path = note(vault, '2020-01-01-arbitrary-name.md', 'agent_provider: codex\nagent_session_id: opaque-native-id\nsession_id: opaque-native-id')
     vault_index.ensure_index(str(vault), ['sessions'], db_path=str(database))
@@ -39,7 +48,7 @@ def test_identity_is_indexed_and_found_across_dates_without_filename_hash(indexe
     assert find_existing_session(ctx(vault, database), time.monotonic() + 1) == path
 
 
-def test_same_id_different_hosts_and_fork_ids_are_distinct(indexed):
+def test_same_id_different_hosts_and_fork_ids_are_distinct(indexed, ctx):
     vault, database = indexed
     claude = note(vault, 'claude.md', 'session_id: same-id')
     codex = note(vault, 'codex.md', 'agent_provider: codex\nagent_session_id: same-id\nsession_id: same-id')
@@ -49,7 +58,7 @@ def test_same_id_different_hosts_and_fork_ids_are_distinct(indexed):
         assert find_existing_session(ctx(vault, database, host, identity), time.monotonic() + 1) == expected
 
 
-def test_actor_and_source_session_do_not_replace_origin(indexed):
+def test_actor_and_source_session_do_not_replace_origin(indexed, ctx):
     vault, database = indexed
     original = note(vault, 'original.md', 'session_id: claude-origin\nauthor_host: codex\nsource_session: unrelated-reference')
     reference = note(vault, 'reference.md', 'source_session: not-native-id\nauthor_host: codex')
@@ -83,7 +92,7 @@ def test_writable_schema_migrates_without_rebuilding_notes_or_fts(indexed):
         assert 'idx_notes_origin_identity' in indexes
 
 
-def test_reindex_updates_origin_without_using_current_actor(indexed):
+def test_reindex_updates_origin_without_using_current_actor(indexed, ctx):
     vault, database = indexed
     path = note(vault, 'reindexed.md', 'session_id: first-id')
     vault_index.ensure_index(str(vault), ['sessions'], db_path=str(database))
@@ -93,7 +102,7 @@ def test_reindex_updates_origin_without_using_current_actor(indexed):
     assert find_existing_session(ctx(vault, database, 'claude', 'second-id'), time.monotonic() + 1) == path
 
 
-def test_readonly_old_index_fallback_does_not_migrate(indexed):
+def test_readonly_old_index_fallback_does_not_migrate(indexed, ctx):
     vault, database = indexed
     identity = 'legacy-full-id'
     suffix = hashlib.sha256(identity.encode()).hexdigest()[:4]
@@ -109,7 +118,7 @@ def test_readonly_old_index_fallback_does_not_migrate(indexed):
         assert [row[1] for row in connection.execute('PRAGMA table_info(notes)')] == ['path', 'type']
 
 
-def test_indexed_pair_still_verifies_header_and_ambiguity(indexed):
+def test_indexed_pair_still_verifies_header_and_ambiguity(indexed, ctx):
     vault, database = indexed
     first = note(vault, 'first.md', 'agent_provider: codex\nagent_session_id: opaque-native-id')
     second = note(vault, 'second.md', 'agent_provider: codex\nagent_session_id: opaque-native-id')
@@ -119,7 +128,7 @@ def test_indexed_pair_still_verifies_header_and_ambiguity(indexed):
     second.write_text(second.read_text().replace('opaque-native-id', 'manual-different-id'))
     assert find_existing_session(ctx(vault, database), time.monotonic() + 1) == first
 
-def test_old_native_filename_fallback_keeps_index_readonly(indexed):
+def test_old_native_filename_fallback_keeps_index_readonly(indexed, ctx):
     vault, database = indexed
     identity = 'old-native-id'
     digest = hashlib.sha256(('codex\0' + identity).encode()).hexdigest()[:16]
@@ -162,7 +171,7 @@ def test_direct_upsert_migrates_only_derived_schema_for_existing_callers(indexed
         connection.commit()
         assert tuple(connection.execute('SELECT agent_provider,agent_session_id FROM notes').fetchone()) == ('claude', 'direct-origin')
 
-def test_agent_id_without_provider_or_real_legacy_id_cannot_be_adopted(indexed):
+def test_agent_id_without_provider_or_real_legacy_id_cannot_be_adopted(indexed, ctx):
     vault, database = indexed
     identity = 'ambiguous-full-id'
     suffix = hashlib.sha256(identity.encode()).hexdigest()[:4]

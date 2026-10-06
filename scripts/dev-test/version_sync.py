@@ -1,5 +1,6 @@
 """Stage synchronized release metadata, then publish with exact-byte rollback."""
 import argparse
+import datetime
 import fcntl
 import json
 import os
@@ -54,8 +55,9 @@ def _recover_pending(root):
         raise ValueError('Version recovery journal exceeds its limit')
     items = json.loads(journal.read_bytes())
     allowed = {'.claude-plugin/plugin.json', '.codex-plugin/plugin.json',
-               '.claude-plugin/marketplace.json', 'docs/architecture/architecture.json'}
-    if not isinstance(items, list) or not items or len(items) > 4:
+               '.claude-plugin/marketplace.json', 'docs/architecture/architecture.json',
+               'docs/architecture/architecture.html'}
+    if not isinstance(items, list) or not items or len(items) > 5:
         raise ValueError('Invalid version recovery journal')
     names = [item['path'] for item in items]
     if len(set(names)) != len(names) or not set(names).issubset(allowed):
@@ -113,6 +115,27 @@ def _run_owned(root, selection, replace=os.replace):
     matches[0]['version'] = next_version
     if architecture in values:
         values[architecture]['version'] = next_version
+        values[architecture]['lastUpdated'] = datetime.date.today().isoformat()
+        framework = values[architecture].get('techStack', {}).get('framework')
+        if isinstance(framework, dict):
+            framework['version'] = next_version
+    contents = {path: (json.dumps(value, indent=2, ensure_ascii=False) + '\n').encode()
+                for path, value in values.items()}
+    html = architecture.with_suffix('.html')
+    if html.exists() or html.is_symlink():
+        if architecture not in values or html.is_symlink() or not html.is_file():
+            raise ValueError('Missing or symlinked architecture render metadata')
+        originals[html] = html.read_bytes()
+        modes[html] = html.stat().st_mode & 0o777
+        text = originals[html].decode('utf-8')
+        pattern = re.compile(r'(<script id="arch-data" type="application/json">)(.*?)(</script>)', re.S)
+        matches = list(pattern.finditer(text))
+        if len(matches) != 1 or json.loads(matches[0].group(2)) != json.loads(originals[architecture]):
+            raise ValueError('Architecture HTML differs from its source before bump')
+        match = matches[0]
+        embedded = json.dumps(values[architecture], ensure_ascii=False).replace('<', '\\u003c')
+        contents[html] = (text[:match.start(2)] + embedded + text[match.end(2):]).encode('utf-8')
+        paths.append(html)
     staged = {}
     rollback = {}
     published = []
@@ -120,7 +143,7 @@ def _run_owned(root, selection, replace=os.replace):
         for path in paths:
             if path.read_bytes() != originals[path]:
                 raise ValueError('Release metadata changed during preparation')
-            staged[path] = _stage(path, (json.dumps(values[path], indent=2) + '\n').encode(), modes[path])
+            staged[path] = _stage(path, contents[path], modes[path])
             rollback[path] = _stage(path, originals[path], modes[path])
         journal = root / '.version-sync.pending.json'
         journal_data = [{'path': str(path.relative_to(root)), 'old': originals[path].hex(),

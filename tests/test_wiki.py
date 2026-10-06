@@ -429,13 +429,29 @@ def test_secrets_scrubbed_from_body_and_question(ctx):
     assert tok not in (_wiki(ctx) / "index.md").read_text()
 
 
-def test_held_lock_refuses_and_writes_nothing(ctx):
-    _wiki(ctx).mkdir(parents=True)
-    lock = _wiki(ctx) / "..wiki.ob-lock"
-    lock.write_text("held")
-    with pytest.raises(wiki.WikiRefusal, match="another process is updating"):
-        wiki.file_page(ctx, _payload(), D)
-    assert _all_files(ctx) == ["..wiki.ob-lock"]
+def test_held_lock_refuses_and_writes_nothing(ctx, selected_host_context):
+    import threading
+    import note_transactions
+    ready, release = threading.Event(), threading.Event()
+    errors = []
+    def owner():
+        try:
+            with note_transactions.ownership_lock(selected_host_context):
+                ready.set()
+                release.wait(4)
+        except BaseException as exc:
+            errors.append(exc)
+    thread = threading.Thread(target=owner)
+    thread.start()
+    try:
+        assert ready.wait(2), errors
+        with pytest.raises(wiki.WikiRefusal, match="owns the vault"):
+            wiki.file_page(ctx, _payload(), D)
+        assert _all_files(ctx) == []
+    finally:
+        release.set()
+        thread.join(3)
+    assert not thread.is_alive() and not errors
 
 
 def test_stale_refresh_below_threshold_leaves_page(ctx):
@@ -1081,21 +1097,27 @@ def test_stale_uses_a_given_memory_listing(ctx, mem, monkeypatch, host):
     assert wiki.stale(ctx["db"], page, _roots_of(ctx))["reasons"] == _memory_expected(host, []) and calls == [1]
 
 
-def test_filing_owns_vault_before_legacy_wiki_lock(ctx, monkeypatch):
+def test_filing_owns_vault_without_consulting_aged_pid_lock(ctx, monkeypatch):
+    import os
+    import time
     import note_transactions as tx
     import note_writer
-    real = note_writer._acquire_lock
+    root = _wiki(ctx)
+    root.mkdir(parents=True, exist_ok=True)
+    lock = note_writer._lock_path(root / ".wiki")
+    lock.write_text("1 old-wiki-owner")
+    os.utime(lock, (time.time()-3600, time.time()-3600))
+    monkeypatch.setattr(note_writer, "_acquire_lock", lambda *a: pytest.fail("Legacy PID lock was consulted"))
+    real = wiki._write
     seen = []
-
-    def check(path):
-        held = getattr(tx._HELD, "locks", {})
-        assert held, "vault ownership must precede the wiki lock"
-        seen.append(path)
-        return real(path)
-
-    monkeypatch.setattr(note_writer, "_acquire_lock", check)
-    wiki.file_page(ctx, _payload(), D)
-    assert len(seen) == 1
+    def write(*args, **kwargs):
+        assert getattr(tx._HELD, "locks", {}), "Wiki publication must retain OS vault ownership"
+        seen.append(args[2])
+        return real(*args, **kwargs)
+    monkeypatch.setattr(wiki, "_write", write)
+    out = wiki.file_page(ctx, _payload(), D)
+    assert Path(out["path"]).is_file() and seen
+    assert lock.read_text() == "1 old-wiki-owner"
 
 
 def test_index_render_cannot_overwrite_manual_edit(ctx, monkeypatch):
@@ -1196,3 +1218,96 @@ def test_corrupt_name_collision_is_preserved_and_gets_suffix(ctx):
     out = wiki.file_page(ctx, _payload(), D)
     assert out["path"].endswith("ranking-work-2.md")
     assert path.read_bytes() == b"user note\xff"
+
+
+def test_slow_source_preparation_does_not_block_other_note_writer(ctx, selected_host_context, monkeypatch):
+    import contextvars
+    import threading
+    import note_transactions
+    entered, release = threading.Event(), threading.Event()
+    original = vault_index.ensure_index
+    calls = []
+    def slow(*args, **kwargs):
+        calls.append(True)
+        if len(calls) == 1:
+            entered.set()
+            assert release.wait(3)
+        return original(*args, **kwargs)
+    monkeypatch.setattr(vault_index,'ensure_index',slow)
+    results, errors = [], []
+    def file_it():
+        try:
+            results.append(wiki.file_page(ctx,_payload(),D))
+        except Exception as exc:
+            errors.append(exc)
+    copied = contextvars.copy_context()
+    thread = threading.Thread(target=lambda: copied.run(file_it))
+    thread.start()
+    try:
+        assert entered.wait(2)
+        other = selected_host_context.vault_path/'independent.md'
+        with note_transactions.ownership_lock(selected_host_context, deadline=__import__("time").monotonic()+0.05):
+            result = note_transactions.apply_mutations(selected_host_context,[
+                note_transactions.NoteMutation(other,None,{'document':'Independent prose.\n'},'wiki-concurrent-independent')])
+        assert result.status == 'applied'
+    finally:
+        release.set()
+        thread.join(4)
+    assert not thread.is_alive() and not errors and results
+
+
+def test_source_changed_after_preparation_refuses_wiki_publication(ctx, monkeypatch):
+    publish = wiki._publish_file_page
+    def edit_before_publication(*args, **kwargs):
+        path = Path(ctx['vault'])/'claude-insights'/'i1.md'
+        path.write_text(path.read_text()+'\nLater manual source fact.\n')
+        return publish(*args, **kwargs)
+    monkeypatch.setattr(wiki,'_publish_file_page',edit_before_publication)
+    with pytest.raises(wiki.WikiRefusal,match='source changed'):
+        wiki.file_page(ctx,_payload(),D)
+    assert not list((_wiki(ctx)/'queries').rglob('*.md'))
+
+
+def test_index_rendering_does_not_hold_vault_publication_lock(ctx, selected_host_context, monkeypatch):
+    import contextvars
+    import threading
+    import time
+    import note_transactions
+    entered, release = threading.Event(), threading.Event()
+    render = wiki.render_wiki_index
+    def slow(context):
+        entered.set()
+        assert release.wait(3)
+        return render(context)
+    monkeypatch.setattr(wiki,'render_wiki_index',slow)
+    errors = []
+    copied = contextvars.copy_context()
+    def rebuild():
+        try:
+            wiki.rebuild_wiki_index(ctx)
+        except Exception as exc:
+            errors.append(exc)
+    thread = threading.Thread(target=lambda:copied.run(rebuild))
+    thread.start()
+    try:
+        assert entered.wait(2)
+        with note_transactions.ownership_lock(selected_host_context,deadline=time.monotonic()+0.05):
+            result = note_transactions.apply_mutations(selected_host_context,[
+                note_transactions.NoteMutation(selected_host_context.vault_path/'during-render.md',None,
+                    {'document':'Concurrent independent note.\n'},'wiki-render-concurrent-independent')])
+        assert result.status == 'applied'
+    finally:
+        release.set()
+        thread.join(4)
+    assert not errors and not thread.is_alive()
+
+
+def test_foreign_vault_is_refused_before_preparing_its_index(ctx, tmp_path, monkeypatch):
+    foreign = tmp_path/'foreign-vault'
+    foreign.mkdir()
+    foreign_ctx = {**ctx,'vault':str(foreign),'db':str(tmp_path/'foreign.db')}
+    calls = []
+    monkeypatch.setattr(vault_index,'ensure_index',lambda *args,**kwargs:calls.append(True))
+    with pytest.raises(ValueError,match='cannot switch'):
+        wiki.file_page(foreign_ctx,_payload(),D)
+    assert not calls and not (tmp_path/'foreign.db').exists()

@@ -10,6 +10,14 @@ ROOT = Path(__file__).resolve().parents[1]
 PAIRED = {'standup', 'emerge', 'recall', 'obsidian-setup', 'retro', 'vault-doctor'}
 
 
+def _claude_history_source(context,monkeypatch,filename):
+    if context.host!='claude':
+        monkeypatch.setenv('CLAUDE_CONFIG_DIR',str(context.user_home/'historical-claude-home'))
+    root=skill_procedures._approved_import_roots(context,'claude')[0]
+    root.mkdir(parents=True,exist_ok=True)
+    return root/filename
+
+
 @pytest.fixture
 def tmp_vault(selected_host_context, tmp_path, monkeypatch):
     import obsidian_utils
@@ -167,7 +175,7 @@ def test_historical_import_keeps_source_host_and_invoking_author(tmp_vault, tmp_
     import session_lookup
     monkeypatch.setattr(session_lookup, 'find_existing_session', lambda *args: None)
     context = replace(note_transactions.context_for_vault(tmp_vault), native_session_id='invoking-session')
-    transcript = tmp_path / 'historic.jsonl'
+    transcript = _claude_history_source(context,monkeypatch,'historic.jsonl')
     transcript.write_text(json.dumps({'type': 'user', 'sessionId': 'source-claude', 'uuid': 'human', 'message': {'content': 'Remember source facts'}}) + '\n' + json.dumps({'type': 'assistant', 'sessionId': 'source-claude', 'uuid': 'answer', 'message': {'content': 'Visible answer'}}) + '\n')
     prepared = io.StringIO()
     assert skill_procedures.run_operation(context, 'vault-import', 'prepare', {}, prepared, io.StringIO()) == 0
@@ -176,7 +184,7 @@ def test_historical_import_keeps_source_host_and_invoking_author(tmp_vault, tmp_
     assert skill_procedures.run_operation(context, 'vault-import', 'import-read', {'operation_id': identifier, 'source_host': 'claude', 'source_session_id': 'source-claude', 'source_path': str(transcript)}, normalized, io.StringIO()) == 0
     source = json.loads(normalized.getvalue())
     assert [row['text'] for row in source['records']] == ['Remember source facts', 'Visible answer']
-    assert skill_procedures.run_operation(context, 'vault-import', 'note-create', {'operation_id': identifier, 'filename': 'old-date-original-project.md', 'content': '---\ntype: claude-session\nagent_provider: codex\nagent_session_id: fabricated\n---\n\n## Summary\nImported facts\n'}, io.StringIO(), io.StringIO()) == 0
+    assert skill_procedures.run_operation(context, 'vault-import', 'note-create', {'operation_id': identifier, 'source_host':'claude', 'source_session_id':'source-claude', 'filename': 'old-date-original-project.md', 'content': '---\ntype: claude-session\nagent_provider: codex\nagent_session_id: fabricated\n---\n\n## Summary\nImported facts\n'}, io.StringIO(), io.StringIO()) == 0
     content = (tmp_vault / 'claude-sessions' / 'old-date-original-project.md').read_text()
     assert 'agent_provider: claude\n' in content
     assert 'agent_session_id: source-claude\n' in content
@@ -189,7 +197,7 @@ def test_historical_unknown_record_preserves_pending_and_no_import_artifact(tmp_
     import session_lookup
     monkeypatch.setattr(session_lookup, 'find_existing_session', lambda *args: None)
     context = note_transactions.context_for_vault(tmp_vault)
-    transcript = tmp_path / 'unknown.jsonl'
+    transcript = _claude_history_source(context,monkeypatch,'unknown.jsonl')
     transcript.write_text(json.dumps({'type': 'unknown-substantive', 'sessionId': 'source'}) + '\n')
     prepared = io.StringIO()
     skill_procedures.run_operation(context, 'vault-import', 'prepare', {}, prepared, io.StringIO())
@@ -197,7 +205,7 @@ def test_historical_unknown_record_preserves_pending_and_no_import_artifact(tmp_
     stderr = io.StringIO()
     assert skill_procedures.run_operation(context, 'vault-import', 'import-read', {'operation_id': operation['operation_id'], 'source_host': 'claude', 'source_session_id': 'source', 'source_path': str(transcript)}, io.StringIO(), stderr) == 1
     assert 'pending' in stderr.getvalue()
-    assert not (Path(operation['operation_dir']) / 'import-source.json').exists()
+    assert not list(Path(operation['operation_dir']).glob('import-source-*.json'))
 
 
 def test_every_authored_fixed_operation_is_registered():
@@ -271,7 +279,8 @@ def test_reviewed_checkoffs_apply_primary_and_sibling_only(tmp_vault):
         assert 'author_host: ' + context.host in content
         assert 'operation_id: ' + operation in content
     assert '- [ ] Ship feature' in (tmp_vault / 'claude-sessions' / 'deselected.md').read_text()
-    assert json.loads(output.getvalue()) == {'cascaded': 1, 'primary': 1, 'skipped': 0, 'status': 'applied'}
+    assert json.loads(output.getvalue()) == {'cascaded': 1, 'primary': 1, 'skipped': 0, 'status': 'applied',
+                                          'counts':{},'unclassified_group_ids':[],'warnings':[]}
     buckets = json.loads(read_artifact(context, operation, 'buckets.json'))
     assert buckets['review'][0]['applied'] is True
     assert 'applied' not in buckets['review'][1]
@@ -297,7 +306,7 @@ def test_historical_import_rejects_source_changed_after_analysis(tmp_vault, tmp_
     import session_lookup
     monkeypatch.setattr(session_lookup, 'find_existing_session', lambda *args: None)
     context = note_transactions.context_for_vault(tmp_vault)
-    source = tmp_path / 'historical.jsonl'
+    source = _claude_history_source(context,monkeypatch,'historical.jsonl')
     source.write_text(json.dumps({'type': 'user', 'sessionId': 'source', 'uuid': 'human', 'message': {'content': 'Before'}}) + '\n')
     output = io.StringIO()
     skill_procedures.run_operation(context, 'vault-import', 'prepare', {}, output, io.StringIO())
@@ -305,7 +314,7 @@ def test_historical_import_rejects_source_changed_after_analysis(tmp_vault, tmp_
     assert skill_procedures.run_operation(context, 'vault-import', 'import-read', {'operation_id': operation, 'source_host': 'claude', 'source_session_id': 'source', 'source_path': str(source)}, io.StringIO(), io.StringIO()) == 0
     source.write_text(source.read_text() + json.dumps({'type': 'user', 'sessionId': 'source', 'uuid': 'later', 'message': {'content': 'After'}}) + '\n')
     stderr = io.StringIO()
-    assert skill_procedures.run_operation(context, 'vault-import', 'note-create', {'operation_id': operation, 'filename': 'imported.md', 'content': '---\ntype: claude-session\n---\n\nSummary\n'}, io.StringIO(), stderr) == 1
+    assert skill_procedures.run_operation(context, 'vault-import', 'note-create', {'operation_id': operation, 'source_host':'claude', 'source_session_id':'source', 'filename': 'imported.md', 'content': '---\ntype: claude-session\n---\n\nSummary\n'}, io.StringIO(), stderr) == 1
     assert 'changed during summary generation' in stderr.getvalue()
     assert not (tmp_vault / 'claude-sessions' / 'imported.md').exists()
 

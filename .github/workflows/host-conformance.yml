@@ -2,8 +2,10 @@ name: Host conformance
 on:
   pull_request:
     branches: [develop, main]
+    types: [opened, synchronize, reopened, edited]
   push:
     branches: [develop]
+  workflow_dispatch:
 permissions:
   contents: read
   pull-requests: read
@@ -32,6 +34,14 @@ jobs:
         with:
           python-version: '3.13'
       - run: python -m pip install -r requirements-dev.txt
+      - name: Inventory shared helpers and literal launch targets
+        run: python scripts/ci-checks/host-test-contract.py --root "$GITHUB_WORKSPACE" --output "$RUNNER_TEMP/parity-helper-inventory.json" --parity-matrix docs/parity/capabilities.json
+      - name: Save helper inventory
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: parity-helper-inventory
+          path: ${{ runner.temp }}/parity-helper-inventory.json
       - name: Enforce reviewed invoking-host contracts for every test
         run: PYTHONPATH=tests:hooks:scripts python -m pytest tests --collect-only -q -p parity_collection_plugin --parity-matrix docs/parity/capabilities.json
   contracts:
@@ -49,10 +59,11 @@ jobs:
       - name: Install fixture test dependencies
         run: python -m pip install -r requirements-dev.txt
       - name: Inventory and both-host golden contracts
-        run: python -m pytest tests/test_host_capability_inventory.py tests/test_host_behavior_conformance.py tests/test_host_collection_contract.py -q
+        run: PYTHONPATH=tests:hooks:scripts python -m pytest -p parity_collection_plugin --parity-matrix docs/parity/capabilities.json tests/test_host_capability_inventory.py tests/test_host_behavior_conformance.py tests/test_host_collection_contract.py -q
       - name: Native contracts, privacy and isolated publication
         run: PYTHONPATH=tests:hooks:scripts python -m pytest -p parity_collection_plugin --parity-matrix docs/parity/capabilities.json tests/test_host_ai_backend.py tests/test_host_codex_ai_contract.py tests/test_host_session_lookup.py tests/test_host_summary_publication.py tests/test_host_operation_state.py tests/test_native_lifecycle_integration.py tests/test_host_doctor_source_origin.py tests/test_host_package_install.py tests/test_dev_skill_install.py tests/test_native_entry_binding.py -q
   acceptance:
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.base_ref == 'main')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -85,5 +96,5 @@ jobs:
         run: |
           test "$CONTRACT_RESULT" = success
           test "$COLLECTION_RESULT" = success
-          test "$ACCEPTANCE_RESULT" = success
+          test "$ACCEPTANCE_RESULT" = success || test "$ACCEPTANCE_RESULT" = skipped
           test "$IMPACT_RESULT" = success || test "$IMPACT_RESULT" = skipped

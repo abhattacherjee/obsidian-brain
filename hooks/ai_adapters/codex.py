@@ -227,8 +227,15 @@ def discover_restrictions(binary, context, env, deadline):
                                                  for value in effective.values()):
             raise _BackendFailure("unavailable", "native_mcp_restriction_failed")
         effective_plugins = restricted.get("plugins", {})
+        if not isinstance(effective_plugins, dict):
+            raise _BackendFailure("unavailable", "native_config_invalid")
         for identity, bundled in installed.items():
-            settings = effective_plugins.get(identity, {}).get("mcp_servers", {})
+            plugin_settings = effective_plugins.get(identity, {})
+            if not isinstance(plugin_settings, dict):
+                raise _BackendFailure("unavailable", "native_config_invalid")
+            settings = plugin_settings.get("mcp_servers", {})
+            if not isinstance(settings, dict) or any(not isinstance(value, dict) for value in settings.values()):
+                raise _BackendFailure("unavailable", "native_config_invalid")
             if any(settings.get(name, {}).get("enabled") is not False for name in bundled):
                 raise _BackendFailure("unavailable", "native_mcp_restriction_failed")
         cursor = None

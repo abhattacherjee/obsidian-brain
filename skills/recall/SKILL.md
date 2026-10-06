@@ -47,18 +47,7 @@ procedure variables `VAULT_PATH`/`VAULT`, `SESSIONS_FOLDER`/`SESS`, and
 `INSIGHTS_FOLDER`/`INS`. Use the canonical project returned in config JSON (and native `session` when available),
 not the basename of an unrelated shell working directory.
 
-Before preparing edits or requesting a summary of an existing note, call
-`note-read` and retain its exact `expected_revision`. Apply the proposed note
-with `note-apply` and that revision. A conflict leaves the current note intact;
-show the pending result and do not count the note as saved. New curated notes
-use `note-create`; they never overwrite a collision. Native memory discovery
-is unsupported for Codex because it has no equivalent native memory-file API; shared vault retrieval
-and wiki filing continue without borrowing another host's memory.
-
-Read `references/host-claude.md` or `references/host-codex.md` when present.
-All note writes described below use `note-create` or revision-bound `note-apply`,
-including bidirectional related links. Content is a JSON string, never shell code.
-Every later save or edit follows this revision-bound publication rule.
+Before drafting an edit or summary, call `note-read` and retain its exact `expected_revision`. Use `note-apply` with that revision for the reviewed edit. A conflict preserves the current note; show the pending result and do not count it as saved. Use only the operations documented for this skill. Their writes bind the source revisions before analysis and preserve manual edits on conflict. Content is JSON data, never shell code. Read `references/host-claude.md` or `references/host-codex.md` when present. Codex has no native memory-file API; shared vault retrieval and wiki filing continue without borrowing another host's memory.
 
 # Recall — Load Project Context from Obsidian Vault
 
@@ -84,7 +73,7 @@ Request for `config` (substitute the values as data):
 python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'config' < "$REQUEST_PATH"
 ```
 
-Parse each output line as KEY=VALUE, splitting on the first `=`. Also capture PIPELINE (defaults to "auto").
+Parse the single JSON object. Read its named fields; do not split output on `=`.
 
 If the user passed a project name argument (e.g. `/recall my-project`), override `PROJECT` with that value.
 
@@ -128,7 +117,8 @@ Request for `unsummarized` (substitute the values as data):
 
 ```json
 {
-  "project": "<canonical project>"
+  "project": "<canonical project>",
+  "include_aged": false
 }
 ```
 
@@ -137,11 +127,11 @@ python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_C
 ```
 
 **Optional flags (#168 aged-note deferral):**
-- If the user passed `--include-aged`, call with `include_aged=True` to include aged-out deferred notes:
+- If the user passed `--include-aged`, set JSON `include_aged` to `true` to include aged-out deferred notes:
   ```python
   find_unsummarized_notes(vault, sessions_folder, project, include_aged=True)
   ```
-- If the user passed `--max-age-days N`, call with `aged_threshold_days=N` to override the config threshold:
+- If the user passed `--max-age-days N`, set JSON `aged_threshold_days` to the positive integer `N` to override the config threshold:
   ```python
   find_unsummarized_notes(vault, sessions_folder, project, aged_threshold_days=N)
   ```
@@ -164,7 +154,7 @@ Update task #2 subject to `No unsummarized notes found` and set to `completed`. 
 
 #### Path B: N>=1 (parallel native pipelines with sub-agent fallback)
 
-> **Config escape hatch (#84):** If `PIPELINE=subagent`, skip Phase 1 and use Phase 2 for every note. With `PIPELINE=auto`, run the bound native backend first. Claude startup details are in [the Claude reference](references/host-claude.md).
+> Run the bound native backend first. The config response has no `PIPELINE` field. Claude startup details are in [the Claude reference](references/host-claude.md).
 
 **Task management threshold:** If N <= 5, create a sub-task per note. If N > 5, skip per-note sub-tasks — use a single progress update on task #2 instead. This saves ~15-20s of parent round-trip overhead at large N.
 
@@ -174,12 +164,15 @@ If N <= 5, create a sub-task for each note (subject `"Upgrade: <basename>"`, act
 
 **Single native shell call** — `upgrade_batch()` uses the invoking host’s bound AI backend and bounded batch concurrency.
 
+Resolve any vault-relative note paths from metadata against the returned
+`vault_path` before this request; keep already-absolute paths unchanged.
+
 Request for `upgrade-batch` (substitute the values as data):
 
 ```json
 {
   "paths": [
-    "<eligible source notes>"
+    "<eligible absolute source note paths>"
   ],
   "project": "<canonical project>"
 }
@@ -342,3 +335,28 @@ A native session summary is stale when `capture_revision` differs from
 `summary_revision`, or no `summary_revision` exists. Label it stale explicitly.
 Use unchanged raw capture facts as evidence; do not present its old summary as fresh.
 Failed or cancelled AI leaves the operation pending and preserves the note.
+
+## Fixed request shapes
+
+Pass these objects through the installed launcher for the named operation. Keep
+one operation ID across source reads, analysis and reviewed publication.
+
+Request for `note-read`:
+
+```json
+{
+  "operation_id": "<prepared id>",
+  "path": "<vault-relative note.md>"
+}
+```
+
+Request for `note-apply`:
+
+```json
+{
+  "operation_id": "<same prepared id>",
+  "path": "<same vault-relative note.md>",
+  "expected_revision": "<note-read SHA256>",
+  "content": "<complete reviewed note>"
+}
+```

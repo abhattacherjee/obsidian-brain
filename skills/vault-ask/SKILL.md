@@ -47,18 +47,7 @@ procedure variables `VAULT_PATH`/`VAULT`, `SESSIONS_FOLDER`/`SESS`, and
 `INSIGHTS_FOLDER`/`INS`. Use the canonical project returned in config JSON (and native `session` when available),
 not the basename of an unrelated shell working directory.
 
-Before preparing edits or requesting a summary of an existing note, call
-`note-read` and retain its exact `expected_revision`. Apply the proposed note
-with `note-apply` and that revision. A conflict leaves the current note intact;
-show the pending result and do not count the note as saved. New curated notes
-use `note-create`; they never overwrite a collision. Native memory discovery
-is unsupported for Codex because it has no equivalent native memory-file API; shared vault retrieval
-and wiki filing continue without borrowing another host's memory.
-
-Read `references/host-claude.md` or `references/host-codex.md` when present.
-All note writes described below use `note-create` or revision-bound `note-apply`,
-including bidirectional related links. Content is a JSON string, never shell code.
-Every later save or edit follows this revision-bound publication rule.
+Use only the operations documented for this skill. Their writes bind the source revisions before analysis and preserve manual edits on conflict. Content is JSON data, never shell code. Read `references/host-claude.md` or `references/host-codex.md` when present. Codex has no native memory-file API; shared vault retrieval and wiki filing continue without borrowing another host's memory.
 
 # Vault Ask
 
@@ -148,7 +137,7 @@ Request for `wiki-lookup` (substitute the values as data):
 
 ```json
 {
-  "data": "<the wiki JSON payload described in this step>"
+  "data": {"question": "<original question>"}
 }
 ```
 
@@ -158,9 +147,9 @@ python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_C
 
 `wiki.py` prints one JSON object. Exit 0 is success. Exit 1 means it refused: show its `ERROR:` line. Exit 2 is a usage error or a crash: show stderr. The commands below use fixed `wiki-*` operations with JSON data on stdin.
 
-1. Run the fixed `wiki-lookup` operation with `{"question": "<original question>"}`. It searches wiki pages with `search_vault` (reranked; the hits are logged as accesses) and returns up to 3 `candidates` (`path`, `question`, `updated`, `rank`).
+1. Run the fixed `wiki-lookup` operation with `{"data": {"question": "<original question>"}}`. It searches wiki pages with `search_vault` (reranked; the hits are logged as accesses) and returns up to 3 `candidates` (`path`, `question`, `updated`, `rank`).
 2. Decide whether a candidate asks the **same question** as the user (same intent, not just shared words). If none does, continue with Step 3.
-3. If one does, run the fixed `wiki-stale` operation with `{"page": "<its path>"}`. It returns `stale`, `reasons` and `memory_paths` (`{name: path}` for each memory file the page cites that this host has). Each reason is `changed: <note>` (a source's content changed), `missing: <note>` (a source is gone or unreadable), `newer: <note>` (a newer note matches the question) or `unverifiable: <page>` (the page's fingerprint is missing or bad, so it counts as stale). Memory files use the same forms with a `memory:` prefix: `changed: memory:<project-dir>/<file>.md` (the file changed), `missing: memory:<project-dir>/<file>.md` (this host listed its memory files and that one is gone) and `unverifiable: memory:<project-dir>/<file>.md` (no fingerprint, a host with no memory files, or the file or its folder could not be read).
+3. If one does, run the fixed `wiki-stale` operation with `{"data": {"page": "<its path>"}}`. It returns `stale`, `reasons` and `memory_paths` (`{name: path}` for each memory file the page cites that this host has). Each reason is `changed: <note>` (a source's content changed), `missing: <note>` (a source is gone or unreadable), `newer: <note>` (a newer note matches the question) or `unverifiable: <page>` (the page's fingerprint is missing or bad, so it counts as stale). Memory files use the same forms with a `memory:` prefix: `changed: memory:<project-dir>/<file>.md` (the file changed), `missing: memory:<project-dir>/<file>.md` (this host listed its memory files and that one is gone) and `unverifiable: memory:<project-dir>/<file>.md` (no fingerprint, a host with no memory files, or the file or its folder could not be read).
    - **`stale` itself fails** (exit 1 or 2, or no JSON): treat the page as not fresh. Do not answer from it. Continue with Step 3 as if no candidate matched, and in Step 8 do not update that page.
    - **Fresh:** read the page and present its answer. Cite it as `[[<page file name>]]` and say "From the wiki (updated `<updated>`)". Skip Steps 3–7. In Step 8, save nothing.
    - **Stale, and the page is not marked reviewed:** continue with Steps 3–7. Add the page's `sources` to `CANDIDATE_FILES`. Add each path in `memory_paths` to `CANDIDATE_FILES` as type `claude-memory`, and keep its name for citing. Step 8 refreshes the page without asking and tells the user why, using `reasons`.
@@ -219,9 +208,14 @@ Request for `grep` (substitute the values as data):
 python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'grep' < "$REQUEST_PATH"
 ```
 
-**Memory search.** The memory search runs on every ask that reaches Step 3 (a fresh wiki answer from Step 2b stops before it, by design), even when Step 3 skipped the pattern searches. Skip it only on `WIKI_MISSING`. For each term in `SEARCH_TERMS`, write `{"pattern": "<term>"}` to a payload file (as in Step 2b) and run the fixed `wiki-memgrep` operation. It prints `{"host": ..., "matches": [{"name": ..., "path": ...}], "skipped": [{"path": ..., "error": ...}]}`: `matches` are this host's memory files that contain the term (case-insensitive, a fixed string, not a regex), and `skipped` are files or folders that could not be read. Add each `path` in `matches` to `CANDIDATE_FILES` as type `claude-memory`, and keep its `name` for citing. When `skipped` is non-empty, show one line: "N memory file(s) could not be read" with the first `path` (count each path once across all terms). When `host` is not `claude-code`, say once that native memory discovery is unsupported for this host because it has no equivalent memory-file API. On exit 1 or 2, show the `ERROR:` line and continue without memory files.
+**Memory search.** The memory search runs on every ask that reaches Step 3 (a fresh wiki answer from Step 2b stops before it, by design), even when Step 3 skipped the pattern searches. Skip it only on `WIKI_MISSING`. For each term in `SEARCH_TERMS`, write `{"data": {"pattern": "<term>"}}` to a payload file (as in Step 2b) and run the fixed `wiki-memgrep` operation. It prints `{"host": ..., "matches": [{"name": ..., "path": ...}], "skipped": [{"path": ..., "error": ...}]}`: `matches` are this host's memory files that contain the term (case-insensitive, a fixed string, not a regex), and `skipped` are files or folders that could not be read. Add each `path` in `matches` to `CANDIDATE_FILES` as type `claude-memory`, and keep its `name` for citing. When `skipped` is non-empty, show one line: "N memory file(s) could not be read" with the first `path` (count each path once across all terms). When `host` is not `claude-code`, say once that native memory discovery is unsupported for this host because it has no equivalent memory-file API. On exit 1 or 2, show the `ERROR:` line and continue without memory files.
 
 Combine results from all three jobs and the memory search. Deduplicate by file path. Store as `CANDIDATE_FILES`.
+
+On Codex, continue shared vault and wiki retrieval when native memory discovery
+is unsupported. Do not read a Claude memory directory or run a Claude backend
+to fill that gap. Synthesize the answer with the invoking host and preserve
+the source citations from the shared retrieval results.
 
 If `CANDIDATE_FILES` is empty, tell the user:
 
@@ -330,10 +324,10 @@ Display the synthesized answer from Step 7 in the conversation first. A failed s
 
 Then decide whether to save it as a wiki page. Skip all of this when `WIKI` is empty, or when Step 2b answered from a fresh page.
 
-1. **Count.** Run the fixed `wiki-count` operation with `{"sources": [<every note cited in Sources, by file name>], "memory_sources": [<every memory file cited in Sources, by its memgrep name>]}`. It returns `count`, `qualifying`, `other` and `rejected`. Only 3 or more qualifying notes can be filed: insights, error-fixes, decisions, retros, sessions, migrated memory notes and memory files count; a snapshot counts as its parent session.
+1. **Count.** Run the fixed `wiki-count` operation with `{"data": {"sources": [<every note cited in Sources, by file name>], "memory_sources": [<every memory file cited in Sources, by its memgrep name>]}}`. It returns `count`, `qualifying`, `other` and `rejected`. Only 3 or more qualifying notes can be filed: insights, error-fixes, decisions, retros, sessions, migrated memory notes and memory files count; a snapshot counts as its parent session.
    - **Rejected names:** `file` refuses a payload that lists any name from `rejected` (unresolved or ambiguous). Drop every rejected name from the `sources` or `memory_sources` list before filing, and tell the user which names were dropped and why. Never file with a rejected name in `sources` or `memory_sources`.
    - **Below 3:** save nothing and say nothing about the wiki. Exception: on a stale refresh from Step 2b, tell the user the page could not be refreshed because the fresh answer has fewer than 3 qualifying sources (give the count); the old page stays as is.
-2. **Write the page body.** Run the fixed `wiki-rule` operation and rewrite the answer under that rule. Keep the `### Sources` section, every `[[wikilink]]` and every `memory:` line exactly. The chat answer keeps its normal style; only the page uses the rule.
+2. **Write the page body.** Run the fixed `wiki-rule` operation with `{"data": {}}` and rewrite the answer under that rule. Keep the `### Sources` section, every `[[wikilink]]` and every `memory:` line exactly. The chat answer keeps its normal style; only the page uses the rule.
 3. **Choose the action.** Before you choose an update path for a candidate page, Read the candidate page and check `reviewed:` in its frontmatter. It is reviewed unless the value is absent, empty, `false`, `no`, `off` or `0`.
    - **Stale refresh** (from Step 2b, page not reviewed, or the user chose "Refresh and overwrite my edits"): file with `"update": "<page path>"` (plus `"override_reviewed": true` only when the user chose to overwrite). Do not ask. Tell the user the page was refreshed and why.
    - **Reviewed page, user chose "Save the fresh answer as a new page":** file a new page, without `update` and without `override_reviewed`. The reviewed page stays untouched.
@@ -342,10 +336,10 @@ Then decide whether to save it as a wiki page. Skip all of this when `WIKI` is e
 4. **File.** Run the fixed `wiki-file` operation with:
 
    ```json
-   {"question": "<original question>", "body": "<page body from step 2>",
+   {"data": {"question": "<original question>", "body": "<page body from step 2>",
     "sources": ["<note>", "..."], "memory_sources": ["<project-dir>/<file>.md", "..."], "topics": ["<topic>", "..."],
     "confidence": "high|medium|low", "filed_by": "user|auto", "caller": "<only when auto>",
-    "update": "<page path, only when updating>"}
+    "update": "<page path, only when updating>"}}
    ```
 
    `confidence` follows your certainty wording from Step 7: "You explicitly decided" → `high`, "it appears" → `medium`, "Limited context" → `low`. `topics` are up to 8 short lowercase slugs (`[a-z0-9-]`) for the main subjects. Projects come from the cited sources; there is no `projects` field. A new page whose file name is taken gets `-2`, `-3` and so on.
@@ -381,3 +375,18 @@ A native session summary is stale when `capture_revision` differs from
 `summary_revision`, or no `summary_revision` exists. Label it stale explicitly.
 Use unchanged raw capture facts as evidence; do not present its old summary as fresh.
 Failed or cancelled AI leaves the operation pending and preserves the note.
+
+## Fixed request shapes
+
+Pass these objects through the installed launcher for the named operation. Keep
+one operation ID across source reads, analysis and reviewed publication.
+
+Request for `artifact-store`:
+
+```json
+{
+  "operation_id": "<prepared id>",
+  "name": "wiki-payload.json",
+  "content": "<reviewed helper output as data>"
+}
+```

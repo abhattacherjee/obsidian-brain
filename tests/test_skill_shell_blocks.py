@@ -94,9 +94,12 @@ def test_authored_content_stays_data_and_collision_keeps_original(tmp_path, inst
     if operation == 'note-create':
         payload.update(folder=folder, filename='note.md', content='---\ntype: claude-session\ntags:\n  - claude/session\n---\n\n## Summary\n'+hostile)
         if skill == 'vault-import':
-            source = tmp_path / 'historical.jsonl'
+            from runtime_context import historical_source_roots
+            source = historical_source_roots('claude')[0] / 'synthetic-project' / 'historical.jsonl'
+            source.parent.mkdir(parents=True, exist_ok=True)
             source.write_text(json.dumps({'type':'user','sessionId':'original-claude','uuid':'one','message':{'content':'Visible source'}})+'\n')
             run('import-read', {'operation_id':operation_id,'source_host':'claude','source_session_id':'original-claude','source_path':str(source)})
+            payload.update(source_host='claude', source_session_id='original-claude')
     else:
         destination.write_text('---\ntype: claude-insight\ntags:\n  - claude/insight\n---\n\nOriginal prose\n')
         source = json.loads(run('note-read', {'operation_id':operation_id,'path':str(destination)}).stdout)
@@ -112,6 +115,18 @@ def test_authored_content_stays_data_and_collision_keeps_original(tmp_path, inst
     assert parse_frontmatter_field(written, 'author_host') == host
     if operation=='note-create':
         repeated = _shell(tmp_path, installed, skill, command, payload, host, selected_host_context)
+        if skill == 'vault-import':
+            assert repeated.returncode == 0
+            assert json.loads(repeated.stdout)['status'] == 'skipped'
+            assert destination.read_text() == written
+            # Another legitimate source cannot replace the same destination.
+            other = source.with_name('different-source.jsonl')
+            other.write_text(json.dumps({'type':'user','sessionId':'different-claude','uuid':'two',
+                'message':{'content':'Distinct visible source'}})+'\n')
+            run('import-read', {'operation_id':operation_id,'source_host':'claude',
+                'source_session_id':'different-claude','source_path':str(other)})
+            collision = dict(payload,source_session_id='different-claude')
+            repeated = _shell(tmp_path, installed, skill, command, collision, host, selected_host_context)
         assert repeated.returncode != 0
         assert destination.read_text() == written
 

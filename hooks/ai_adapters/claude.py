@@ -27,6 +27,10 @@ def execute(context, prompt, schema, model, deadline, env):
     if code or (isinstance(envelope, dict) and envelope.get("is_error") is True):
         details = envelope.get("errors", []) if isinstance(envelope, dict) else []
         details = [item for item in details if isinstance(item, str)] if isinstance(details, list) else []
+        # Native login failures may appear only in the JSON result field.
+        native_result = envelope.get("result") if isinstance(envelope, dict) else None
+        if isinstance(native_result, str):
+            details.append(native_result[:4096])
         status, error = _failure_status(errors + "\n".join(details).encode())
         raise _BackendFailure(status, error)
     if not isinstance(envelope, dict):

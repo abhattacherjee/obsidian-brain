@@ -165,3 +165,59 @@ def test_invalid_summary_leaves_capture_and_frontmatter_unchanged(context, summa
         result = upgrade_note_with_summary(str(note), summary, str(context.vault_path), 'sessions', 'project')
     assert result.startswith('Failed: malformed summary')
     assert note.read_bytes() == before
+
+
+
+def test_native_auth_failure_remains_pending_without_model_escalation(context,monkeypatch):
+    import obsidian_utils as utils
+    import ai_backend
+    note=seeded_note(context)
+    original=note.read_text().replace('status: auto-logged\n','status: auto-logged\nsession_id: '+context.native_session_id+'\n')
+    note.write_text(original);calls=[]
+    def denied(actor,operation,request):
+        calls.append((actor,operation,request.model))
+        return ai_backend.AIResult('auth_error',None,request.input_revision,'native_auth_error',
+                                   actor.host,None,'native_auth_error')
+    monkeypatch.setattr(ai_backend,'execute_ai',denied)
+    status,elapsed,model,reason=utils.upgrade_unsummarized_note(str(note),str(context.vault_path),'sessions','project')
+    assert reason=='native_auth_error' and model is None
+    assert 'authentication required' in status and 'returned empty' not in status
+    assert len(calls)==1 and calls[0][0] is context
+    assert note.read_text()==original
+
+
+@pytest.mark.parametrize('error_code, expected_calls', [
+    ('native_auth_error', 1), ('native_execution_failed', 2),
+])
+def test_public_recall_batch_skips_only_auth_solo_retry(context, monkeypatch, error_code, expected_calls):
+    import io
+    import ai_backend
+    from skill_procedures import run_operation
+
+    note = seeded_note(context)
+    note.write_text(note.read_text().replace('status: auto-logged\n',
+                    'status: auto-logged\nsession_id: ' + context.native_session_id + '\n'))
+    original = note.read_bytes()
+    calls = []
+
+    def failed(actor, operation, request):
+        calls.append((actor, operation))
+        return ai_backend.AIResult(
+            'auth_error' if error_code == 'native_auth_error' else 'error',
+            None, request.input_revision, error_code, actor.host, None, error_code,
+        )
+
+    monkeypatch.setattr(ai_backend, 'execute_ai', failed)
+    stdout, stderr = io.StringIO(), io.StringIO()
+    result = run_operation(context, 'recall', 'upgrade-batch',
+                           {'paths': [str(note)], 'project': 'project'}, stdout, stderr)
+    assert result == 0, stderr.getvalue()
+    rows = json.loads(stdout.getvalue())
+    assert len(calls) == expected_calls and all(actor is context for actor, _ in calls)
+    assert calls[0][1] == 'session_summaries'
+    assert note.read_bytes() == original
+    assert rows[0]['fallback_reason'] == ('native_auth_error' if error_code == 'native_auth_error'
+                                         else 'haiku_subprocess_error')
+    if error_code == 'native_auth_error':
+        assert 'authentication required' in rows[0]['status']
+        assert 'returned empty' not in rows[0]['status']

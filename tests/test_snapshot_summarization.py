@@ -13,7 +13,7 @@ import pytest
 from dataclasses import replace
 from runtime_context import using_runtime_context
 
-@pytest.fixture
+@pytest.fixture(autouse=True)
 def selected_host_context(host, selected_host_context, tmp_path):
     vault = tmp_path / "v"
     selected = replace(selected_host_context, vault_path=vault,

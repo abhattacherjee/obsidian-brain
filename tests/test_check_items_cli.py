@@ -1270,8 +1270,8 @@ def test_classifier_chunking_above_threshold_splits(tmp_path, monkeypatch, capsy
     )
 
 
-def test_classifier_chunking_chunk_failure_preserves_previous_output(tmp_path, monkeypatch):
-    """An exhausted chunk cannot publish an incomplete successful result."""
+def test_classifier_chunking_chunk_failure_preserves_covered_results(tmp_path, monkeypatch, capsys):
+    """An exhausted chunk leaves its IDs missing and retains covered chunks."""
     import check_items_cli
     monkeypatch.setattr(check_items_cli, "CLASSIFIER_CHUNK_SIZE", 10)
     monkeypatch.setenv("CHECK_ITEMS_PREFILTER", "off")
@@ -1281,9 +1281,12 @@ def test_classifier_chunking_chunk_failure_preserves_previous_output(tmp_path, m
     fake_run, calls = _make_chunking_fake_run(output_path, timeout_on={1, 2})
     with patch("check_items_cli._request_ai", side_effect=fake_run):
         rc = check_items_cli.run_classifier(_make_payload(groups, EVIDENCE_WITH_MATCH_TEXT), output_path)
-    assert rc == 3
-    assert calls["n"] == 3
-    assert Path(output_path).read_text() == "previous"
+    assert rc == 0
+    assert calls["n"] == 4  # Three chunks plus one retry of the failed middle chunk.
+    output = json.loads(Path(output_path).read_text())
+    assert [row["group_id"] for row in output] == [f"g{i:03d}" for i in list(range(10)) + list(range(20, 30))]
+    assert not {f"g{i:03d}" for i in range(10, 20)}.intersection(row["group_id"] for row in output)
+    assert "failed_chunks=1 unclassified=10" in capsys.readouterr().err
 
 
 def test_classifier_chunking_env_override(tmp_path, monkeypatch, capsys):
@@ -1422,7 +1425,9 @@ def test_classifier_chunking_failure_cleans_up_chunk_outputs(tmp_path, monkeypat
     with patch("check_items_cli._request_ai", side_effect=fake_run):
         rc = check_items_cli.run_classifier(payload_str, output_path)
 
-    assert rc == 3, f"Expected timeout failure preserving output, got {rc}"
+    assert rc == 0
+    output = json.loads(Path(output_path).read_text())
+    assert [row["group_id"] for row in output] == [f"g{i:03d}" for i in list(range(10)) + list(range(20, 30))]
     post_classouts = set(workdir.glob("*.classout.json"))
     leaked = post_classouts - pre_classouts
     assert not leaked, (

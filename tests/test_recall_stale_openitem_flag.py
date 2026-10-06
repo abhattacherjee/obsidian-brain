@@ -45,7 +45,7 @@ def test_stale_open_item_flagged_by_newer_session_summary(tmp_path):
     """POSITIVE: earlier session has the open `- [ ]` item; a strictly LATER
     session's ## Summary reports it done -> the candidate is flagged with
     contradicted_by set to the later session's date."""
-    vault = tmp_path / "v"
+    vault = tmp_path
     sess = vault / "claude-sessions"
     ins = vault / "claude-insights"
     sess.mkdir(parents=True)
@@ -75,7 +75,7 @@ def test_stale_open_item_flagged_by_newer_session_summary(tmp_path):
 def test_open_item_not_flagged_when_completion_language_in_same_note(tmp_path):
     """NEGATIVE/BOUNDARY (a): completion language in the SAME note as the
     open box must NOT flag the item (no strictly-newer session exists)."""
-    vault = tmp_path / "v"
+    vault = tmp_path
     sess = vault / "claude-sessions"
     ins = vault / "claude-insights"
     sess.mkdir(parents=True)
@@ -101,7 +101,7 @@ def test_open_item_not_flagged_when_newer_session_lacks_completion_language(tmp_
     reaches confidence >= 3 with no completion phrase required, which is the
     false-positive this test guards against: mentioning work-in-progress on a
     branch is not evidence the item is done."""
-    vault = tmp_path / "v"
+    vault = tmp_path
     sess = vault / "claude-sessions"
     ins = vault / "claude-insights"
     sess.mkdir(parents=True)
@@ -130,7 +130,7 @@ def test_open_item_not_flagged_by_older_session_summary(tmp_path):
     """NEGATIVE/BOUNDARY (b): completion language in an OLDER session (dated
     before the open item's own source session) must NOT flag the item —
     only STRICTLY-NEWER sessions count as contradicting evidence."""
-    vault = tmp_path / "v"
+    vault = tmp_path
     sess = vault / "claude-sessions"
     ins = vault / "claude-insights"
     sess.mkdir(parents=True)
@@ -151,3 +151,8 @@ def test_open_item_not_flagged_by_older_session_summary(tmp_path):
     assert not candidates, (
         f"older-session completion language must NOT flag the item, got {candidates}"
     )
+
+import pytest
+
+from selected_legacy_vault import selected_host_context
+pytestmark = pytest.mark.usefixtures("selected_host_context")

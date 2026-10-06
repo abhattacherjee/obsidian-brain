@@ -9,11 +9,9 @@ from runtime_context import RuntimeContext, using_runtime_context
 from operation_state import store_artifact
 
 @pytest.fixture
-def context(tmp_path):
-    vault = tmp_path / 'vault'; (vault / 'sessions').mkdir(parents=True)
-    return RuntimeContext('codex', 'cli', 'pipeline-native', tmp_path, tmp_path, None,
-                          vault, tmp_path / 'config', MappingProxyType({}),
-                          tmp_path, tmp_path / 'index', tmp_path / 'state')
+def context(selected_host_context):
+    (selected_host_context.vault_path / "sessions").mkdir(parents=True, exist_ok=True)
+    return selected_host_context
 
 def test_producer_and_consumer_handoff_checks_revision(context, monkeypatch, capsys):
     note = context.vault_path / 'sessions' / 'note.md'; note.write_text('original')
@@ -41,5 +39,8 @@ def test_producer_and_consumer_handoff_checks_revision(context, monkeypatch, cap
 
 def test_producer_requires_native_context(monkeypatch, tmp_path):
     monkeypatch.setattr('sys.stdin', io.StringIO('{"basenames": [], "projects": []}'))
-    with pytest.raises(ValueError, match='context unavailable'):
+    with using_runtime_context(None), pytest.raises(ValueError, match='context unavailable'):
         deep_cli.run_pipeline(str(tmp_path), 'sessions', 'insights')
+
+from parity_test_helpers import host, selected_host_context
+pytestmark = pytest.mark.usefixtures("selected_host_context")

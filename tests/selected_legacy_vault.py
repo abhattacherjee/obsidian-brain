@@ -5,11 +5,12 @@ from runtime_context import resolve_runtime_context, using_runtime_context
 
 
 @pytest.fixture
-def selected_host_context(selected_host_context, host, tmp_path, tmp_path_factory):
+def selected_host_context(selected_host_context, host, tmp_path, tmp_path_factory, monkeypatch):
     original = selected_host_context
     configuration = dict(original.config, vault_path=str(tmp_path))
     original.config_path.write_text(json.dumps(configuration))
     private_root = tmp_path_factory.mktemp('selected-private-state')
+    monkeypatch.setenv("HOME", str(tmp_path_factory.mktemp("selected-account-home")))
     selected = resolve_runtime_context(original.host, original.client,
         {'session_id': original.native_session_id, 'cwd': str(original.worktree)},
         {'config_path': original.config_path, 'vault_path': tmp_path,

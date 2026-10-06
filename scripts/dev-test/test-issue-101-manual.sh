@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Manual smoke test for Issue #101 / PR #109 — source-session basename stability
 # Run AFTER: /dev-test install
-# Usage: bash scripts/dev-test/test-issue-101-manual.sh
+# Usage: OB_CACHE_PATH=/absolute/package/root bash scripts/dev-test/test-issue-101-manual.sh
 #
 # Validates the parts that can be checked without a fresh CC session:
 #   - Plugin cache has #101 helpers (_first_seen_date, _resolve_session_note_by_hash,
@@ -25,16 +25,12 @@ pass() { echo "  ✅ $1"; PASS=$((PASS + 1)); }
 fail() { echo "  ❌ $1"; FAIL=$((FAIL + 1)); }
 skip() { echo "  ⏭️  $1"; SKIP=$((SKIP + 1)); }
 
-# Locate the currently-installed plugin cache (the `dev-test install` target)
-CACHE_DIR=$(find ~/.claude/plugins/cache -type d -path "*/obsidian-brain/*" \
-    -not -path "*.bak*" 2>/dev/null | sort -V | tail -1 | xargs dirname 2>/dev/null || true)
-if [ -z "$CACHE_DIR" ] || [ ! -d "$CACHE_DIR" ]; then
-    echo "❌ Could not locate obsidian-brain plugin cache."
-    echo "   Run /dev-test install first."
-    exit 1
-fi
-
-HOOK_DIR=$(find "$CACHE_DIR" -maxdepth 2 -type d -name hooks | sort -V | tail -1)
+# This checks only the explicitly selected distribution, not current client binding.
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+CACHE_DIR=$(python3 "$SCRIPT_DIR/loaded_resource_root.py" --cache-path "${OB_CACHE_PATH:-}")
+HOOK_DIR="$CACHE_DIR/hooks"
+SKILL_ROOT="$CACHE_DIR/skills"
+SCRIPTS_ROOT="$CACHE_DIR/scripts"
 
 echo "═══════════════════════════════════════════════════════════════"
 echo "Issue #101 / PR #109 — Automated Validation"

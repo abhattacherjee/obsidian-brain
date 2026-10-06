@@ -228,22 +228,38 @@ def test_apply_rebuilds_index_backs_up_and_leaves_pages_alone(env, tmp_path):
     assert _scan(env) == []
 
 
-def test_apply_skips_when_the_wiki_lock_is_held(env, tmp_path):
+def test_apply_refuses_when_real_vault_ownership_is_held(env, tmp_path):
+    import fcntl
     page = _file(env)
     _link_from_session(env, page)
     idx = env["vault"] / "claude-wiki" / "index.md"
     idx.write_text(idx.read_text() + "- [[hand-added]]\n")
     rows = _scan(env)
-    from note_writer import _acquire_lock, _release_lock
-
-    lock, err = _acquire_lock(env["vault"] / "claude-wiki" / ".wiki")
-    assert not err
+    fd = os.open(env['vault'], os.O_RDONLY)
     try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         results = wp.apply(rows, str(tmp_path / "backup"))
     finally:
-        _release_lock(lock)
-    assert results[0].status == "skipped" and "another process" in results[0].error
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+    assert results[0].status == "error" and "writer owns the vault" in results[0].error
     assert "hand-added" in idx.read_text()
+
+
+def test_apply_ignores_obsolete_live_pid_marker(env, tmp_path):
+    page = _file(env)
+    _link_from_session(env, page)
+    idx = env['vault'] / 'claude-wiki' / 'index.md'
+    idx.write_text(idx.read_text()+'- [[hand-added]]\n')
+    rows = _scan(env)
+    from note_writer import _lock_path
+    marker = _lock_path(idx.parent / '.wiki')
+    marker.write_text('1 obsolete-owner\n')
+    os.utime(marker, (1, 1))
+    result = wp.apply(rows, str(tmp_path/'backup'))
+    assert [r.status for r in result] == ['applied']
+    assert 'hand-added' not in idx.read_text()
+    assert marker.read_text() == '1 obsolete-owner\n'
 
 
 def test_report_only_rows_are_unresolved(env):

@@ -5,6 +5,7 @@ import json
 import hashlib
 import io
 import os
+import re
 import sys
 from pathlib import Path
 import uuid
@@ -28,8 +29,8 @@ def _config(context, payload):
     value['config_path'] = str(context.config_path)
     value['state_path'] = str(context.state_path)
     value['folders'] = indexed_folders(value)
-    if value.get('wiki_folder') not in value['folders']:
-        value['wiki_folder'] = ''
+    wiki = value.get('wiki_folder', 'claude-wiki')
+    value['wiki_folder'] = wiki if wiki in value['folders'] else ''
     value['project'] = context.canonical_project_root.name
     _emit(value)
 
@@ -43,7 +44,14 @@ def _session(context, payload):
 
 def _note_path(context, payload):
     from note_writer import _resolve_note_path
-    path, error = _resolve_note_path(str(context.vault_path), payload['path'])
+    requested = Path(payload['path'])
+    if not requested.is_absolute():
+        if '..' in requested.parts:
+            raise ValueError('Note path must stay inside the vault.')
+        requested = context.vault_path / requested
+    if requested.is_symlink() or any(parent.is_symlink() for parent in requested.parents):
+        raise ValueError('Note source must not traverse symlinks.')
+    path, error = _resolve_note_path(str(context.vault_path), str(requested))
     if error:
         raise ValueError(error)
     return Path(path)
@@ -99,11 +107,18 @@ def _note_create(context, payload):
 
 def _upgrade_batch(context, payload):
     from obsidian_utils import upgrade_batch
-    _emit(upgrade_batch(payload['paths'], str(context.vault_path), context.config.get('sessions_folder', 'claude-sessions'), payload.get('project', 'unknown')))
+    paths = payload['paths']
+    if not isinstance(paths, list) or not all(isinstance(path, str) and path for path in paths):
+        raise ValueError('paths must be an array of nonempty note paths.')
+    resolved = [str(_note_path(context, {'path': path})) for path in paths]
+    _emit(upgrade_batch(resolved, str(context.vault_path), context.config.get('sessions_folder', 'claude-sessions'), payload.get('project', 'unknown')))
 
 def _consolidate(context, payload):
     from consolidate_cli import run_consolidate
-    return run_consolidate(full=payload.get('full', False))
+    full = payload.get('full', False)
+    if not isinstance(full, bool):
+        raise ValueError('full must be a boolean.')
+    return run_consolidate(full=full)
 
 def _theme_stats(context, payload):
     from consolidate_cli import run_stats
@@ -111,10 +126,14 @@ def _theme_stats(context, payload):
 
 def _theme_split(context, payload):
     from consolidate_cli import run_split
+    if isinstance(payload['theme_id'], bool) or not isinstance(payload['theme_id'], int) or payload['theme_id'] < 1:
+        raise ValueError('theme_id must be a positive integer.')
     return run_split(payload['theme_id'])
 
 def _theme_merge(context, payload):
     from consolidate_cli import run_merge
+    if any(isinstance(payload[key], bool) or not isinstance(payload[key], int) or payload[key] < 1 for key in ('a', 'b')):
+        raise ValueError('a and b must be positive integer theme IDs.')
     return run_merge(payload['a'], payload['b'])
 
 def _emerge_themes(context, payload):
@@ -135,6 +154,8 @@ def _deep_present(context, payload):
 
 def _deep_checkoffs(context, payload):
     from deep_cli import run_build_checkoffs
+    if not isinstance(payload.get('stdin'), list):
+        raise ValueError('Deep checkoffs require a list of reviewed targets on stdin.')
     return run_build_checkoffs()
 
 def _deep_edit(context, payload):
@@ -205,7 +226,8 @@ def run_operation(context, skill_name, operation, payload, stdout, stderr):
         return result if isinstance(result, int) else 0
     except SystemExit as exc:
         return exc.code if isinstance(exc.code, int) else 1
-    except (ValueError, KeyError, TypeError, OSError) as exc:
+    except (__import__('note_transactions').LockBusy, ValueError, KeyError, TypeError,
+            AttributeError, RecursionError, OSError) as exc:
         stderr.write(json.dumps({'code': 'operation_failed', 'message': str(exc)}) + '\n')
         return 1
     finally:
@@ -216,6 +238,10 @@ def run_operation(context, skill_name, operation, payload, stdout, stderr):
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = value
+
+def _project_head(repo_path):
+    import subprocess
+    return subprocess.run(['git', '-C', repo_path, 'rev-parse', 'HEAD'], capture_output=True, text=True, timeout=10)
 
 def _check_items_stage_01(context, payload):
     import sys, os, glob, json, subprocess
@@ -252,14 +278,30 @@ def _check_items_stage_01(context, payload):
             groups.append(g)
         coarse_by_proj[proj] = groups
     flat_groups = cross_project_dedup(coarse_by_proj) if scope['mode'] == 'vault' else [g for v in coarse_by_proj.values() for g in v]
+    provisional = os.path.join(os.path.dirname(scope_path), 'merged.json')
+    _store_json(context, payload, provisional, {'merged_by_proj': coarse_by_proj, 'mode': 'ok'})
+    previous_merged = os.environ.get('MERGED_PATH')
+    os.environ['MERGED_PATH'] = provisional
+    try:
+        from contextlib import redirect_stdout
+        with redirect_stdout(io.StringIO()):
+            _check_items_stage_03(context, payload)
+    finally:
+        if previous_merged is None:
+            os.environ.pop('MERGED_PATH', None)
+        else:
+            os.environ['MERGED_PATH'] = previous_merged
+    from check_items_cache import build_classifier_provenance
+    evidence = _load_json(context, payload, os.path.join(os.path.dirname(scope_path), 'evidence.json'))
+    provenance = build_classifier_provenance(context, [g for groups in coarse_by_proj.values() for g in groups], evidence)
     cache = load_cache()
     known, needs = ([], [])
     heads = {}
     for proj, groups in coarse_by_proj.items():
-        repo_path = None
+        repo_path = str(context.canonical_project_root) if proj == context.canonical_project_root.name and (context.canonical_project_root / '.git').exists() else None
         for _root in get_workspace_roots():
             _candidate = os.path.join(_root, proj)
-            if os.path.isdir(os.path.join(_candidate, '.git')):
+            if os.path.exists(os.path.join(_candidate, '.git')):
                 repo_path = _candidate
                 break
         if not repo_path:
@@ -268,7 +310,7 @@ def _check_items_stage_01(context, payload):
                 g['_reason'] = 'head_unavailable'
             needs.extend(groups)
             continue
-        head_proc = subprocess.run(['git', '-C', repo_path, 'rev-parse', 'HEAD'], capture_output=True, text=True, timeout=10)
+        head_proc = _project_head(repo_path)
         if head_proc.returncode != 0 or not head_proc.stdout.strip():
             print(f'[check-items] no HEAD for {proj} ({repo_path}); forcing reclassify', file=sys.stderr)
             for g in groups:
@@ -277,7 +319,7 @@ def _check_items_stage_01(context, payload):
             continue
         head = head_proc.stdout.strip()
         heads[proj] = head
-        k, n = partition(groups, cache, project=proj, head_sha=head, force=scope['no_cache'])
+        k, n = partition(groups, cache, project=proj, head_sha=head, force=scope['no_cache'], provenance=provenance)
         known.extend(k)
         needs.extend(n)
     out = os.path.join(os.path.dirname(scope_path), 'partition.json')
@@ -317,6 +359,59 @@ def _check_items_stage_03(context, payload):
     merged_path = os.environ['MERGED_PATH']
     scope = _load_json(context, payload, scope_path)
     data = _load_json(context, payload, merged_path)
+    import hashlib
+    raw = _load_json(context, payload, os.path.join(os.path.dirname(scope_path), 'raw_items.json'))
+    def verify_sources():
+        for item in raw:
+            path = Path(item['path'])
+            path.resolve().relative_to(context.vault_path.resolve())
+            if path.is_symlink() or any(parent.is_symlink() for parent in path.parents):
+                raise ValueError('Source is no longer a regular contained note')
+            with path.open('rb') as stream:
+                source_bytes = stream.read(1000001)
+            if len(source_bytes) > 1000000 or hashlib.sha256(source_bytes).hexdigest() != item.get('source_revision'):
+                raise ValueError('Source changed after collection; evidence and cache remain pending')
+    verify_sources()
+    from open_item_dedup import _resolve_project_paths
+    repo_paths = _resolve_project_paths()
+    def evidence_heads():
+        values = {}
+        for project in data['merged_by_proj']:
+            path = repo_paths.get(project)
+            if path is None:
+                values[project] = None
+            else:
+                result = _project_head(path)
+                if result.returncode != 0 or not result.stdout.strip():
+                    raise ValueError('Repository HEAD unavailable; evidence remains pending.')
+                values[project] = result.stdout.strip()
+        return values
+    heads = evidence_heads()
+    # Evidence and gaps are keyed by project, not transient classifier group IDs.
+    semantic_groups = {project: [{key: value for key, value in group.items()
+        if key != 'group_id' and not key.startswith('_')} for group in groups]
+        for project, groups in data['merged_by_proj'].items()}
+    def artifact_digest(value):
+        return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':'),
+            ensure_ascii=False).encode('utf-8')).hexdigest()
+    reuse_key = hashlib.sha256(json.dumps({'groups': semantic_groups, 'sources': raw,
+        'scope': scope, 'project': str(context.canonical_project_root), 'heads': heads}, sort_keys=True).encode()).hexdigest()
+    reuse_path = os.path.join(os.path.dirname(scope_path), 'evidence-reuse.json')
+    try:
+        reuse = _load_json(context, payload, reuse_path)
+    except FileNotFoundError:
+        reuse = None
+    if reuse is not None and reuse.get('input_digest') == reuse_key:
+        evidence_path = os.path.join(os.path.dirname(scope_path), 'evidence.json')
+        gaps_path = os.path.join(os.path.dirname(scope_path), 'gaps.json')
+        evidence = _load_json(context, payload, evidence_path)
+        gaps = _load_json(context, payload, gaps_path)
+        if (reuse.get('evidence_digest') == artifact_digest(evidence)
+                and reuse.get('gaps_digest') == artifact_digest(gaps)):
+            verify_sources()
+            print(evidence_path)
+            print(gaps_path)
+            return
     _config_path = str(context.config_path)
     try:
         config = dict(context.config, vault_path=str(context.vault_path))
@@ -347,6 +442,9 @@ def _check_items_stage_03(context, payload):
     status = deep_analysis_pipeline(basenames=basenames, projects_json=json.dumps(projects), output_path=output_path, vault_path=vault_path, sessions_folder=sessions_folder, insights_folder=insights_folder, db_path=str(context.index_path), operation_id=payload['operation_id'])
     if not status.startswith('OK'):
         raise ValueError('Evidence collection failed; operation remains pending: ' + status)
+    verify_sources()
+    if evidence_heads() != heads:
+        raise ValueError('Repository changed during evidence collection; operation remains pending.')
     try:
         pipeline_data = _load_json(context, payload, output_path)
         evidence = pipeline_data.get('evidence', {})
@@ -359,6 +457,8 @@ def _check_items_stage_03(context, payload):
     _store_json(context, payload, out, evidence)
     gaps_out = os.path.join(os.path.dirname(scope_path), 'gaps.json')
     _store_json(context, payload, gaps_out, evidence_gaps)
+    _store_json(context, payload, reuse_path, {'input_digest': reuse_key,
+        'evidence_digest': artifact_digest(evidence), 'gaps_digest': artifact_digest(evidence_gaps)})
     print(out)
     print(gaps_out)
 
@@ -394,14 +494,21 @@ def _check_items_stage_04(context, payload):
         c.setdefault('classifier_source', 'agent')
     _done_ids = {c.get('group_id') for c in primary}
     _missing = [g for g in to_classify if g.get('group_id') not in _done_ids]
-    if mode != 'ok' or _missing or len(primary) != len(to_classify) or _done_ids != {g.get('group_id') for g in to_classify}:
-        raise ValueError('Classifier incomplete; operation remains pending without publication.')
+    if len(_done_ids) != len(primary) or not _done_ids.issubset({g.get('group_id') for g in to_classify}):
+        raise ValueError('Classifier returned unknown or duplicate group IDs')
+    if mode not in {'ok', 'partial'}:
+        if not primary and not known:
+            raise ValueError('Classifier unavailable; operation remains pending without publication.')
+        mode = 'partial'
+    if _missing:
+        mode = 'partial'
+    warnings = [f'{len(_missing)} group(s) remain unclassified; no checkoff is proposed'] if _missing else []
     classifications = list(primary)
     for g in known:
         if g.get('_cached_classification'):
             classifications.append({'group_id': g.get('group_id'), 'classification': g['_cached_classification'], 'confidence': g.get('_cached_confidence', 'LOW'), 'canonical_text': g.get('representative', ''), 'evidence_citation': g.get('_cached_evidence_citation'), 'action_required': g.get('_cached_action_required'), 'project': g.get('project'), 'classifier_source': 'cache', 'note_evidence_only': note_evidence_only_for(evidence, g.get('project', ''))})
     out = os.path.join(os.path.dirname(scope_path), 'classifications.json')
-    _store_json(context, payload, out, {'classifications': classifications, 'classifier_mode': mode})
+    _store_json(context, payload, out, {'classifications': classifications, 'classifier_mode': mode, 'status': 'partial' if _missing else 'complete', 'warnings': warnings, 'unclassified_group_ids': [g['group_id'] for g in _missing], 'counts': {'requested': len(all_merged), 'classified': len(classifications), 'unclassified': len(_missing)}})
     _store_json(context, payload, os.path.join(os.path.dirname(scope_path), 'classifier-provenance.json'), {'groups': all_merged, 'evidence': evidence, 'provenance': provenance})
     print(out)
 
@@ -417,7 +524,9 @@ def _check_items_stage_05(context, payload):
         item['tier'] = assign_tier(item.get('evidence_citation'), item.get('canonical_text'), item.get('classification'), item.get('classifier_source'), item.get('note_evidence_only', False))
     buckets = partition_for_review(data['classifications'], show_all=scope['show_all'])
     mode = data.get('classifier_mode', 'ok')
-    if mode != 'ok':
+    if mode == 'partial':
+        print('CLASSIFIER PARTIAL: ' + '; '.join(data.get('warnings', [])), file=sys.stderr)
+    elif mode != 'ok':
         _deg = sum((1 for i in data['classifications'] if i.get('classifier_source') == 'heuristic'))
         print(f"\n!! CLASSIFIER DEGRADED (mode={mode}) — {_deg} of {len(data['classifications'])} verdict(s) come from the token-overlap heuristic, not evidence.", file=sys.stderr)
         print("   Heuristic citations read 'token X near completion phrase Y'. That is co-occurrence, NOT proof the item is done.", file=sys.stderr)
@@ -427,11 +536,12 @@ def _check_items_stage_05(context, payload):
     for item in sorted(buckets['review'], key=lambda x: ('HIGH MED LOW'.split().index(x.get('tier', 'LOW')), x.get('classification'))):
         mark = '[x]' if item['classification'] == 'DONE' and item['tier'] == 'HIGH' else '[ ]'
         _marker = ' [heuristic]' if item.get('classifier_source') == 'heuristic' else ''
-        print(f"  {mark} ({item['classification']}/{item['tier']}) {item['canonical_text']}{_marker}", file=sys.stderr)
+        print(f"  {mark} [group_id={item['group_id']}] ({item['classification']}/{item['tier']}) {item['canonical_text']}{_marker}", file=sys.stderr)
         print(f"      evidence: {item.get('evidence_citation')}", file=sys.stderr)
         if item.get('action_required'):
             print(f"      action:   {item['action_required']}", file=sys.stderr)
     out = os.path.join(os.path.dirname(scope_path), 'buckets.json')
+    buckets.update(status=data.get('status', 'complete'), warnings=data.get('warnings', []), counts=data.get('counts', {}), unclassified_group_ids=data.get('unclassified_group_ids', []))
     _store_json(context, payload, out, buckets)
     print(out)
 
@@ -578,7 +688,9 @@ def _check_items_stage_07(context, payload):
     merged_data = _load_json(context, payload, merged_path)
     semantic_merge_mode = merged_data.get('mode', 'ok')
     merges = merge_records_from_groups(merged_data.get('merged_by_proj', {}))
-    classifier_mode = _load_json(context, payload, classifications_path).get('classifier_mode', 'ok')
+    classifier_data = _load_json(context, payload, classifications_path)
+    classifier_mode = classifier_data.get('classifier_mode', 'ok')
+    warnings = list(classifier_data.get('warnings', []))
     buckets = _load_json(context, payload, buckets_path)
     classifications = buckets.get('review', []) + buckets.get('dashboard_only', [])
     applied = sum((1 for c in classifications if c.get('applied')))
@@ -588,6 +700,7 @@ def _check_items_stage_07(context, payload):
         print(f'WARNING: could not read {gaps_path}: {exc} -- evidence_gaps omitted from this report', file=sys.stderr)
         evidence_gaps = None
     cascade_summary_path = os.path.join(os.path.dirname(scope_path), 'cascade_summary.json')
+    cascade_incomplete = False
     try:
         cascade_summary = _load_json(context, payload, cascade_summary_path)
         cascaded = cascade_summary.get('cascaded', 0)
@@ -595,8 +708,22 @@ def _check_items_stage_07(context, payload):
     except (OSError, json.JSONDecodeError) as exc:
         print(f'WARNING: could not read {cascade_summary_path}: {exc} -- cascaded/skipped default to 0, which is WRONG if Step 8 ran and died before writing this file (correct only if Step 8 was skipped entirely)', file=sys.stderr)
         cascaded, skipped = (0, 0)
+        if applied:
+            cascade_incomplete = True
+            warnings.append('Applied items have no verified cascade summary; counts are incomplete')
     report_path = write_check_items_dashboard(vault_path=vault_path, scope_name=scope_name, date_str=date_str, window_days=window_days, raw_count=raw_count, group_count=group_count, classifications=classifications, applied=applied, cascaded=cascaded, merges=merges, semantic_merge_mode=semantic_merge_mode, classifier_mode=classifier_mode, dry_run=dry_run, skipped=skipped, evidence_gaps=evidence_gaps)
-    print(report_path)
+    counts = dict(classifier_data.get('counts', {}))
+    counts.update(raw=raw_count, groups=group_count, applied=applied,
+                  cascaded=None if cascade_incomplete else cascaded,
+                  skipped=None if cascade_incomplete else skipped)
+    outcome = {'status': 'pending' if cascade_incomplete else ('partial' if classifier_mode == 'partial' else 'complete'),
+               'warnings': warnings, 'counts': counts, 'report': report_path,
+               'unclassified_group_ids': classifier_data.get('unclassified_group_ids', [])}
+    _store_json(context, payload, os.path.join(os.path.dirname(scope_path), 'outcome.json'), outcome)
+    if scope.get('json_output'):
+        _emit(outcome)
+    else:
+        print(report_path)
 
 def _check_items_stage_08(context, payload):
     import sys, os, glob, json, time
@@ -609,6 +736,20 @@ def _check_items_stage_08(context, payload):
     data = _load_json(context, payload, classifications_path)
     part = _load_json(context, payload, partition_path)
     prepared = _load_json(context, payload, os.path.join(os.path.dirname(scope_path), 'classifier-provenance.json'))
+    from check_items_cache import classifier_cache_replay_status
+    cache_selection = classifier_cache_replay_status(context)
+    if not cache_selection['enabled']:
+        warning = 'cache disabled: native model is not pinned; choose an explicit invoking-host model for replay'
+        if scope.get('json_output'):
+            outcome_path = os.path.join(os.path.dirname(scope_path), 'outcome.json')
+            outcome = _load_json(context, payload, outcome_path)
+            outcome['cache_status'] = 'disabled'
+            outcome.setdefault('warnings', []).append(warning)
+            _store_json(context, payload, outcome_path, outcome)
+            _emit(outcome)
+        else:
+            print(warning)
+        return 0
     all_groups = prepared['groups']
     planned = build_classifier_provenance(context, all_groups, prepared['evidence'])
     if planned != prepared['provenance']:
@@ -649,7 +790,13 @@ def _check_items_stage_08(context, payload):
     except Exception as exc:
         print(f'cache NOT updated: {exc}')
         sys.exit(1)
-    print('cache updated')
+    if scope.get('json_output'):
+        outcome = _load_json(context, payload, os.path.join(os.path.dirname(scope_path), 'outcome.json'))
+        outcome['cache_status'] = 'updated'
+        _store_json(context, payload, os.path.join(os.path.dirname(scope_path), 'outcome.json'), outcome)
+        _emit(outcome)
+    else:
+        print('cache updated')
 OPERATIONS['check-items']['stage-01'] = _check_items_stage_01
 OPERATIONS['check-items']['stage-02'] = _check_items_stage_02
 OPERATIONS['check-items']['stage-03'] = _check_items_stage_03
@@ -706,7 +853,11 @@ def _cache_update(context, payload):
     _emit({'status': 'ok'})
 for _operations in OPERATIONS.values():
     _operations['prepare'] = _operation_prepare
-OPERATIONS['check-items'].update({'semantic-merge': _semantic_merge, 'classify': _classify, 'partition': _cache_partition, 'update-cache': _cache_update})
+# Cache writes are available only through the protected stage-08 artifacts.
+
+def _config_publication_fault(point):
+    """Test seam at the last config comparison; production has no triggers."""
+
 
 def _publish_config(context, value, expected_revision):
     import hashlib
@@ -730,6 +881,8 @@ def _publish_config(context, value, expected_revision):
             stream.flush()
             os.fsync(stream.fileno())
         os.chmod(temporary, 0o600)
+        _no_symlinks(path)
+        _config_publication_fault('before_config_cas')
         _no_symlinks(path)
         raw = path.read_bytes() if path.exists() else b''
         if hashlib.sha256(raw).hexdigest() != expected_revision:
@@ -783,7 +936,7 @@ def _configure(context, payload):
     settings = payload['settings']
     if not isinstance(settings, dict):
         raise ValueError('Settings must be a JSON object.')
-    allowed = {'vault_path', 'sessions_folder', 'insights_folder', 'dashboards_folder', 'check_items_folder', 'wiki_folder', 'index_path', 'min_messages', 'min_turns', 'min_duration_minutes', 'summary_model', 'auto_log_enabled', 'log_raw_messages', 'snapshot_on_compact', 'snapshot_on_clear', 'summary_timeout', 'summary_batch_size', 'summary_pipeline', 'codex_ai_model', 'codex_summary_model', 'optional_deps_prompted', 'optional_deps_declined'}
+    allowed = {'vault_path', 'sessions_folder', 'insights_folder', 'dashboards_folder', 'check_items_folder', 'wiki_folder', 'index_path', 'min_messages', 'min_turns', 'min_duration_minutes', 'summary_model', 'auto_log_enabled', 'log_raw_messages', 'snapshot_on_compact', 'snapshot_on_clear', 'summary_timeout', 'summary_batch_size', 'summary_pipeline', 'classifier_model', 'codex_ai_model', 'codex_summary_model', 'optional_deps_prompted', 'optional_deps_declined'}
     if set(settings) - allowed:
         raise ValueError('Unknown configuration setting.')
     for key in ('auto_log_enabled', 'log_raw_messages', 'snapshot_on_compact', 'snapshot_on_clear', 'optional_deps_prompted'):
@@ -794,6 +947,15 @@ def _configure(context, payload):
             raise ValueError(key + ' must be a positive integer.')
     if 'optional_deps_declined' in settings and (not isinstance(settings['optional_deps_declined'], list) or any(item not in {'numpy', 'scipy'} for item in settings['optional_deps_declined'])):
         raise ValueError('Declined dependencies must name numpy or scipy.')
+    for key in ('classifier_model', 'codex_ai_model', 'codex_summary_model'):
+        if key in settings:
+            model = settings[key]
+            if not isinstance(model, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}', model):
+                raise ValueError(key + ' must be an explicit valid native model name.')
+            if key == 'classifier_model' and not model.startswith('claude-'):
+                raise ValueError('classifier_model must name an explicit Claude model, not an alias.')
+            if key.startswith('codex_') and (model.startswith('claude-') or model in {'haiku', 'sonnet', 'opus'}):
+                raise ValueError(key + ' cannot select a Claude model or alias.')
     expected = payload['expected_revision']
     with ownership_lock(context):
         raw = context.config_path.read_bytes() if context.config_path.exists() else b''
@@ -827,7 +989,9 @@ def _reindex(context, payload):
 
 def _wiki(context, payload, command):
     import wiki
-    sys.stdin = io.StringIO(json.dumps(payload.get('data', {})))
+    if set(payload) != {'data'} or not isinstance(payload['data'], dict):
+        raise ValueError('Wiki operations require a data object and no other top-level fields.')
+    sys.stdin = io.StringIO(json.dumps(payload['data']))
     return wiki.main([command])
 
 def _wiki_lookup(context, payload):
@@ -888,7 +1052,7 @@ def _check_scope(context, payload):
             print('Did you mean: ' + ', '.join(nearby[:5]), file=sys.stderr)
         print('Valid forms: <project> | all | Nd | --show-all | --dry-run | --no-cache', file=sys.stderr)
         return 2
-    scope = {key: getattr(value, key) for key in ('mode', 'project', 'window_days', 'show_all', 'dry_run', 'no_cache')}
+    scope = {key: getattr(value, key) for key in ('mode', 'project', 'window_days', 'show_all', 'dry_run', 'no_cache', 'json_output')}
     path = _operation_directory(context, payload) / 'scope.json'
     _store_json(context, payload, path, scope)
     print(path)
@@ -993,6 +1157,9 @@ def _grep(context, payload):
     from vault_scan import main
     from obsidian_utils import indexed_folders
     folders = indexed_folders(dict(context.config, vault_path=str(context.vault_path)))
+    optional_wiki = context.config.get('wiki_folder', 'claude-wiki')
+    if optional_wiki in folders and not (context.vault_path / optional_wiki).exists():
+        folders = [folder for folder in folders if folder != optional_wiki]
     arguments = ['grep', str(context.vault_path), *folders,
                  '--pattern=' + payload['pattern']]
     if payload.get('ignore_case'):
@@ -1020,7 +1187,13 @@ def _sync(context, payload):
 
 def _unsummarized(context, payload):
     from obsidian_utils import find_unsummarized_notes
-    _emit(json.loads(find_unsummarized_notes(str(context.vault_path), context.config.get('sessions_folder', 'claude-sessions'), payload.get('project', context.canonical_project_root.name))))
+    include_aged = payload.get('include_aged', False)
+    threshold = payload.get('aged_threshold_days')
+    if not isinstance(include_aged, bool):
+        raise ValueError('include_aged must be a boolean.')
+    if threshold is not None and (isinstance(threshold, bool) or not isinstance(threshold, int) or threshold < 1):
+        raise ValueError('aged_threshold_days must be a positive integer.')
+    _emit(json.loads(find_unsummarized_notes(str(context.vault_path), context.config.get('sessions_folder', 'claude-sessions'), payload.get('project', context.canonical_project_root.name), include_aged=include_aged, aged_threshold_days=threshold)))
 
 
 def _brief(context, payload):
@@ -1040,7 +1213,13 @@ def _snapshots(context, payload):
 
 def _evidence(context, payload):
     from obsidian_utils import gather_session_evidence
-    _emit(gather_session_evidence(str(context.vault_path), context.config.get('sessions_folder', 'claude-sessions'), context.config.get('insights_folder', 'claude-insights'), context.native_session_id, context.canonical_project_root.name, also_session_ids=payload.get('also_session_ids', [])))
+    import re
+    ids = payload.get('also_session_ids', [])
+    if (not isinstance(ids, list) or any(not isinstance(value, str)
+            or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,199}', value)
+            or '..' in value for value in ids)):
+        raise ValueError('also_session_ids must contain explicit full native session IDs.')
+    _emit(gather_session_evidence(str(context.vault_path), context.config.get('sessions_folder', 'claude-sessions'), context.config.get('insights_folder', 'claude-insights'), context.native_session_id, context.canonical_project_root.name, also_session_ids=ids))
 
 
 def _retro_gate(context, payload):
@@ -1082,7 +1261,7 @@ def _stats(context, payload):
 def _doctor(context, payload):
     import importlib.util
     arguments = payload.get('argv', [])
-    permitted = {'--check', '--days', '--project', '--min-confidence', '--strict', '--reconstruct', '--apply', '--yes', '--json'}
+    permitted = {'--check', '--days', '--project', '--min-confidence', '--strict', '--reconstruct', '--apply', '--yes', '--json', '--discard-pending', '--expected-pending-sha256'}
     for argument in arguments:
         if argument.startswith('-') and argument not in permitted:
             raise ValueError('Unsupported doctor flag: ' + argument)
@@ -1100,11 +1279,37 @@ def _doctor(context, payload):
 
 def _dev_install(context, payload):
     import subprocess
-    operation = payload.get('mode', 'install')
+    operation = payload['mode']
     if operation not in {'install', 'restore', 'status'}:
         raise ValueError('Unsupported developer installation mode.')
     script = context.resource_root / 'scripts' / 'test-dev-skill.sh'
-    return subprocess.run(['bash', str(script), operation, '--host', context.host, '--source', str(context.resource_root)], stdin=subprocess.DEVNULL, timeout=120).returncode
+    command = ['bash', str(script), operation, '--host', context.host, '--source', str(context.resource_root)]
+    from runtime_context import selected_native_environment
+    environment = selected_native_environment(context, os.environ)
+    if context.host == 'codex':
+        requested = payload.get('cache_path')
+        if not isinstance(requested, str) or not Path(requested).is_absolute() or context.native_home is None:
+            raise ValueError('Codex dev install requires an explicit validated cache_path.')
+        path = Path(requested)
+        if '..' in path.parts:
+            raise ValueError('Cache path cannot traverse parent directories.')
+        root = context.native_home / 'plugins' / 'cache'
+        try:
+            relative = path.relative_to(root)
+        except ValueError as exc:
+            raise ValueError('Cache path must be inside the selected native home.') from exc
+        if (len(relative.parts) != 3 or relative.parts[1] != 'obsidian-brain'
+                or not re.fullmatch(r'\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.+-]+)?', relative.parts[2])):
+            raise ValueError('Cache path must select an explicit installed plugin version.')
+        for candidate in (path, *path.parents):
+            if candidate == context.native_home.parent:
+                break
+            if candidate.is_symlink():
+                raise ValueError('Cache path cannot traverse symbolic links.')
+        if not path.is_dir() and not path.with_name(path.name + '.bak').is_dir():
+            raise ValueError('Selected plugin cache or restore backup does not exist.')
+        command.extend(['--cache-path', str(path)])
+    return subprocess.run(command, env=environment, stdin=subprocess.DEVNULL, timeout=120).returncode
 
 
 for _name in ('compress', 'decide', 'error-log', 'retro'):
@@ -1159,6 +1364,74 @@ OPERATIONS['compress']['match-candidates'] = _match_candidates
 OPERATIONS['obsidian-setup'].update({'note-create': _note_create, 'note-read': _note_read, 'note-apply': _note_apply})
 
 
+def _approved_import_roots(context, source_host, source_root=None):
+    """Explicit roots may narrow native history, never grant a wider scope."""
+    from runtime_context import historical_source_roots
+    if source_host == context.host and context.native_home is not None:
+        names = ('projects',) if source_host == 'claude' else ('sessions', 'archived_sessions')
+        trusted = tuple(context.native_home.resolve() / name for name in names)
+    else:
+        trusted = historical_source_roots(source_host)
+    if any(root.is_symlink() for root in trusted):
+        raise ValueError('Approved native transcript roots cannot contain symbolic links.')
+    if source_root is None:
+        return trusted
+    selected = historical_source_roots(source_host, source_root)[0]
+    if not any(selected.is_relative_to(root.resolve()) for root in trusted):
+        raise ValueError('Historical source root may only narrow an approved native transcript root.')
+    return (selected,)
+
+
+def _historical_source_bytes(context, source_host, source_path, source_root=None, *, prefix_bytes=None):
+    """Read a bounded regular source through no-follow directory handles."""
+    import stat
+    path=Path(source_path)
+    roots=_approved_import_roots(context,source_host,source_root)
+    selected=next((root for root in roots if path.is_absolute() and path.is_relative_to(root)),None)
+    if selected is None:
+        raise ValueError('Historical source must remain inside its selected transcript root.')
+    trusted=next(root for root in _approved_import_roots(context,source_host) if path.is_relative_to(root))
+    directory_flags=os.O_RDONLY|os.O_DIRECTORY|getattr(os,'O_NOFOLLOW',0)
+    descriptors=[]
+    identities=[]
+    try:
+        descriptor=os.open(trusted,directory_flags);descriptors.append(descriptor)
+        identities.append((trusted,os.fstat(descriptor)))
+        current=trusted
+        parts=path.relative_to(trusted).parts
+        for name in parts[:-1]:
+            descriptor=os.open(name,directory_flags,dir_fd=descriptor);descriptors.append(descriptor)
+            current=current/name;identities.append((current,os.fstat(descriptor)))
+        descriptor=os.open(parts[-1],os.O_RDONLY|getattr(os,'O_NOFOLLOW',0)|getattr(os,'O_NONBLOCK',0),dir_fd=descriptor)
+        descriptors.append(descriptor)
+        metadata=os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ValueError('Historical source must be a regular transcript.')
+        identities.append((path,metadata))
+        with os.fdopen(os.dup(descriptor),'rb') as stream:
+            limit=16*1024*1024
+            raw=stream.read(prefix_bytes) if prefix_bytes is not None else stream.read(limit+1)
+        if prefix_bytes is None and len(raw)>limit:
+            raise ValueError('Historical source exceeds the bounded import size; operation remains pending.')
+        _approved_import_roots(context,source_host,source_root)
+        for current,opened in identities:
+            live=current.lstat()
+            if stat.S_ISLNK(live.st_mode) or (live.st_dev,live.st_ino)!=(opened.st_dev,opened.st_ino):
+                raise ValueError('Historical source ancestor changed; operation remains pending.')
+        return raw
+    except OSError as exc:
+        raise ValueError('Historical source containment or regular-file check failed; operation remains pending.') from exc
+    finally:
+        for descriptor in reversed(descriptors):os.close(descriptor)
+
+
+def _import_artifact_name(source_host, source_id):
+    import hashlib
+    if source_host not in {'claude', 'codex'} or not isinstance(source_id, str) or not source_id.strip() or any(ord(c) < 32 for c in source_id):
+        raise ValueError('Historical import requires an explicit source host and full native ID.')
+    return 'import-source-' + hashlib.sha256((source_host + '\0' + source_id).encode()).hexdigest() + '.json'
+
+
 def _import_read(context, payload):
     import hashlib
     import time
@@ -1172,16 +1445,47 @@ def _import_read(context, payload):
         raise ValueError('Historical import requires an explicit source host and full native ID.')
     if not source_path.is_absolute() or source_path.is_symlink() or not source_path.is_file():
         raise ValueError('Historical source must be an explicitly selected regular transcript.')
+    roots = _approved_import_roots(context, source_host, payload.get('source_root'))
+    if '..' in source_path.parts:
+        raise ValueError('Historical source must remain inside its selected transcript root.')
+    # Resolve only a proven native-home prefix, never the below-root suffix.
+    # A same-target project alias must remain visible to the no-follow checks.
+    canonical = None
+    for trusted in _approved_import_roots(context, source_host):
+        home = trusted.parent
+        for prefix in reversed(source_path.parents):
+            # A link below the history root cannot become a new trusted home.
+            if prefix != home and prefix.is_relative_to(home):
+                continue
+            if prefix.resolve() == home:
+                candidate = home / source_path.relative_to(prefix)
+                if candidate.is_relative_to(trusted):
+                    canonical = candidate
+                    break
+        if canonical is not None:
+            break
+    matched = next((root for root in roots if canonical is not None and canonical.is_relative_to(root)), None)
+    if matched is None:
+        raise ValueError('Historical source must remain inside its selected transcript root.')
+    relative = canonical.relative_to(matched)
+    current = matched
+    for part in relative.parts:
+        current = current / part
+        if current.is_symlink():
+            raise ValueError('Historical source cannot contain symbolic links below its trusted root.')
+    source_path = canonical
     origin = replace(context, host=source_host, native_session_id=source_id, transcript_path=source_path)
     deadline = time.monotonic() + 10
+    from vault_index import ensure_index
+    from obsidian_utils import indexed_folders
+    from note_transactions import ownership_lock
+    with ownership_lock(context, deadline=time.monotonic() + 3):
+        ensure_index(str(context.vault_path), indexed_folders(dict(context.config)), str(context.index_path))
     existing = find_existing_session(origin, deadline)
     if existing:
         _emit({'status': 'skipped', 'existing_path': str(existing), 'source_host': source_host, 'source_session_id': source_id})
         return 0
-    with source_path.open('rb') as stream:
-        raw = stream.read(16 * 1024 * 1024 + 1)
-    if len(raw) > 16 * 1024 * 1024:
-        raise ValueError('Historical source exceeds the bounded import size; operation remains pending.')
+    raw = _historical_source_bytes(context,source_host,source_path,payload.get('source_root'))
     revision = hashlib.sha256(raw).hexdigest()
     cursor = SourceCursor(historical=True)
     records = []
@@ -1199,34 +1503,51 @@ def _import_read(context, payload):
         cursor = SourceCursor(batch.source_generation, batch.consumed_offset, batch.source_identity, batch.anchor_digest, batch.parser_state, True, batch.source_size)
     else:
         raise ValueError('Historical import deadline reached; operation remains pending.')
-    with source_path.open('rb') as stream:
-        after = stream.read(16 * 1024 * 1024 + 1)
+    after = _historical_source_bytes(context,source_host,source_path,payload.get('source_root'))
     if len(after) > 16 * 1024 * 1024 or hashlib.sha256(after).hexdigest() != revision:
         raise ValueError('Historical source changed during normalization; operation remains pending.')
-    normalized = {'source_host': source_host, 'source_session_id': source_id, 'source_path': str(source_path), 'source_revision': revision, 'metadata': metadata, 'records': records}
+    if not source_path.resolve().is_relative_to(matched.resolve()):
+        raise ValueError('Historical source containment changed during normalization.')
+    normalized = {'source_host': source_host, 'source_session_id': source_id, 'source_path': str(source_path), 'source_root': str(matched.resolve()), 'source_revision': revision, 'metadata': metadata, 'records': records}
     from operation_state import store_artifact
-    path = store_artifact(context, payload['operation_id'], 'import-source.json', json.dumps(normalized))
+    path = store_artifact(context, payload['operation_id'], _import_artifact_name(source_host, source_id), json.dumps(normalized))
     _emit(dict(normalized, path=str(path), status='ready'))
 
 
 def _import_create(context, payload):
+    import time
+    from note_transactions import ownership_lock
+    with ownership_lock(context, deadline=time.monotonic() + 3):
+        return _import_create_locked(context, payload)
+
+
+def _import_create_locked(context, payload):
     import time
     import hashlib
     from dataclasses import replace
     from operation_state import read_artifact
     from session_lookup import find_existing_session
     from frontmatter import split_frontmatter, split_lines_lf_crlf
-    source = json.loads(read_artifact(context, payload['operation_id'], 'import-source.json'))
+    source_host, source_id = payload['source_host'], payload['source_session_id']
+    source = json.loads(read_artifact(context, payload['operation_id'], _import_artifact_name(source_host, source_id)))
+    if (source.get('source_host'), source.get('source_session_id')) != (source_host, source_id):
+        raise ValueError('Historical source artifact identity does not match the selected origin.')
     origin = replace(context, host=source['source_host'], native_session_id=source['source_session_id'], transcript_path=Path(source['source_path']))
+    from vault_index import ensure_index
+    from obsidian_utils import indexed_folders
+    ensure_index(str(context.vault_path), indexed_folders(dict(context.config)), str(context.index_path))
+    from vault_index import index_note
     existing = find_existing_session(origin, time.monotonic() + 3)
     if existing:
         _emit({'status': 'skipped', 'existing_path': str(existing)})
         return 0
     source_path = Path(source['source_path'])
+    roots = _approved_import_roots(context, source['source_host'], source.get('source_root'))
+    if not any(source_path.resolve().is_relative_to(root.resolve()) for root in roots):
+        raise ValueError('Historical source left its selected root; import remains pending.')
     if source_path.is_symlink() or not source_path.is_file():
         raise ValueError('Historical source is no longer regular; import remains pending.')
-    with source_path.open('rb') as stream:
-        current = stream.read(16 * 1024 * 1024 + 1)
+    current = _historical_source_bytes(context,source['source_host'],source_path,source.get('source_root'))
     if len(current) > 16 * 1024 * 1024 or hashlib.sha256(current).hexdigest() != source['source_revision']:
         raise ValueError('Historical source changed during summary generation; import remains pending.')
     content = payload['content']
@@ -1237,7 +1558,12 @@ def _import_create(context, payload):
     fields = [line for line in fields if not line.startswith(('agent_provider:', 'agent_session_id:', 'session_id:'))]
     fields.extend(['agent_provider: ' + source['source_host'] + eol, 'agent_session_id: ' + source['source_session_id'] + eol, 'session_id: ' + source['source_session_id'] + eol])
     approved = dict(payload, folder=context.config.get('sessions_folder', 'claude-sessions'), content=opened + ''.join(fields) + closed + ''.join(body))
-    return _note_create(context, approved)
+    result = _note_create(context, approved)
+    if result == 0:
+        path = context.vault_path / approved['folder'] / approved['filename']
+        if not index_note(str(context.index_path), str(path)):
+            raise ValueError('Imported note was saved but index publication is pending; retry before importing another source.')
+    return result
 
 
 OPERATIONS['vault-import'].update({'import-read': _import_read, 'note-create': _import_create})
@@ -1249,8 +1575,7 @@ def _import_list(context, payload):
     host = payload['source_host']
     if host not in {'claude', 'codex'}:
         raise ValueError('Select the historical source host explicitly.')
-    from runtime_context import historical_source_roots
-    roots = historical_source_roots(host, payload.get('source_root'))
+    roots = _approved_import_roots(context, host, payload.get('source_root'))
     days = payload.get('days', 30)
     if not isinstance(days, int) or isinstance(days, bool) or days <= 0:
         raise ValueError('Import days must be a positive integer.')
@@ -1269,7 +1594,7 @@ def _import_list(context, payload):
             if path.is_symlink() or not path.is_file() or path.stat().st_mtime < cutoff:
                 continue
             identity, project, timestamp = None, '', ''
-            with path.open('rb') as stream:
+            with io.BytesIO(_historical_source_bytes(context,host,path,payload.get('source_root'),prefix_bytes=65536)) as stream:
                 used = 0
                 for _ in range(32):
                     row = stream.readline(65536 - used)
@@ -1300,18 +1625,60 @@ def _import_list(context, payload):
 OPERATIONS['vault-import']['import-list'] = _import_list
 
 
+def _cascade_digest(records):
+    ordered = sorted(records, key=lambda row: (row['path'], row['line']))
+    return hashlib.sha256(json.dumps(ordered, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+
+
 def _cascade_collect(context, payload):
     from open_item_dedup import collect_open_item_records
-    from operation_state import store_artifact
-    records = collect_open_item_records(str(context.vault_path), context.config.get('sessions_folder', 'claude-sessions'), payload.get('project', context.canonical_project_root.name))
+    from operation_state import store_artifact, read_artifact
+    project = payload['project']
+    if not isinstance(project, str) or not project.strip():
+        raise ValueError('Cascade requires an explicit project.')
+    records = [dict(row, project=project) for row in collect_open_item_records(str(context.vault_path), context.config.get('sessions_folder', 'claude-sessions'), project)]
+    try:
+        existing = json.loads(read_artifact(context, payload['operation_id'], 'cascade-source.json'))
+    except FileNotFoundError:
+        existing = []
+    try:
+        projects = json.loads(read_artifact(context, payload['operation_id'], 'cascade-projects.json'))
+    except FileNotFoundError:
+        if existing:
+            raise ValueError('Cascade source lacks a collected project snapshot; prepare a new operation.')
+        projects = {}
+    if not isinstance(existing, list) or not isinstance(projects, dict):
+        raise ValueError('Cascade source lacks a collected project snapshot; prepare a new operation.')
+    if project in projects and projects[project] != _cascade_digest(records):
+        raise ValueError('Cascade source changed; prepare a new operation.')
+    by_location = {(row['path'], row['line']): row for row in existing}
+    for row in records:
+        key = (row['path'], row['line'])
+        if key in by_location and by_location[key] != row:
+            raise ValueError('Cascade source changed; prepare a new operation.')
+        by_location[key] = row
+    projects[project] = _cascade_digest(records)
+    records = list(by_location.values())
     path = store_artifact(context, payload['operation_id'], 'cascade-source.json', json.dumps(records))
-    _emit({'path': str(path), 'count': len(records)})
+    store_artifact(context, payload['operation_id'], 'cascade-projects.json', json.dumps(projects))
+    _emit({'path': str(path), 'count': len(records), 'collected_projects': sorted(projects)})
 
 
 def _cascade(context, payload):
     from operation_state import read_artifact
     from open_item_dedup import find_duplicates, cascade_group_members, parse_cascade_skipped_total
     source = json.loads(read_artifact(context, payload['operation_id'], 'cascade-source.json'))
+    project = payload['project']
+    if not isinstance(project, str) or not project.strip():
+        raise ValueError('Cascade requires an explicit project.')
+    if any(not isinstance(row.get('project'), str) for row in source):
+        raise ValueError('Cascade source lacks project ownership; prepare a new operation.')
+    projects = json.loads(read_artifact(context, payload['operation_id'], 'cascade-projects.json'))
+    if not isinstance(projects, dict) or project not in projects:
+        raise ValueError('Cascade project was not collected; operation remains pending.')
+    source = [row for row in source if row['project'] == project]
+    if projects[project] != _cascade_digest(source):
+        raise ValueError('Cascade collected snapshot changed; operation remains pending.')
     checked = payload['checked_texts']
     if not isinstance(checked, list) or any(not isinstance(item, str) for item in checked):
         raise ValueError('Cascade requires reviewed checked text strings.')
@@ -1422,7 +1789,7 @@ def _apply_reviewed(context, payload):
     _store_json(context, payload, directory / 'buckets.json', buckets)
     summary = {'cascaded': max(0, flipped-len(selected)), 'primary': len(selected), 'skipped': 0}
     _store_json(context, payload, directory / 'cascade_summary.json', summary)
-    _emit(dict(summary, status='applied'))
+    _emit(dict(summary, status='partial' if buckets.get('unclassified_group_ids') else 'applied', warnings=buckets.get('warnings', []), counts=buckets.get('counts', {}), unclassified_group_ids=buckets.get('unclassified_group_ids', [])))
 
 
 OPERATIONS['check-items']['apply-reviewed'] = _apply_reviewed

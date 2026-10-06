@@ -12,4 +12,4 @@ try:
     from native_entry import run
     run(started_at=STARTED_AT)
 except (Exception, SystemExit):
-    print("[obsidian-brain] native lifecycle failed; capture is deferred.", file=sys.stderr)
+    print("[obsidian-brain] native lifecycle failed; capture was skipped; no source was retained.", file=sys.stderr)

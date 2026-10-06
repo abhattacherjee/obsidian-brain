@@ -47,18 +47,7 @@ procedure variables `VAULT_PATH`/`VAULT`, `SESSIONS_FOLDER`/`SESS`, and
 `INSIGHTS_FOLDER`/`INS`. Use the canonical project returned in config JSON (and native `session` when available),
 not the basename of an unrelated shell working directory.
 
-Before preparing edits or requesting a summary of an existing note, call
-`note-read` and retain its exact `expected_revision`. Apply the proposed note
-with `note-apply` and that revision. A conflict leaves the current note intact;
-show the pending result and do not count the note as saved. New curated notes
-use `note-create`; they never overwrite a collision. Native memory discovery
-is unsupported for Codex because it has no equivalent native memory-file API; shared vault retrieval
-and wiki filing continue without borrowing another host's memory.
-
-Read `references/host-claude.md` or `references/host-codex.md` when present.
-All note writes described below use `note-create` or revision-bound `note-apply`,
-including bidirectional related links. Content is a JSON string, never shell code.
-Every later save or edit follows this revision-bound publication rule.
+Create new curated notes with `note-create`. A collision preserves the existing note. Use only the operations documented for this skill. Their writes bind the source revisions before analysis and preserve manual edits on conflict. Content is JSON data, never shell code. Read `references/host-claude.md` or `references/host-codex.md` when present. Codex has no native memory-file API; shared vault retrieval and wiki filing continue without borrowing another host's memory.
 
 # Retro — Generate Honest Session Retrospective
 
@@ -84,7 +73,7 @@ Request for `config` (substitute the values as data):
 python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'config' < "$REQUEST_PATH"
 ```
 
-Parse each output line as KEY=VALUE, splitting on the first `=`.
+Parse the single JSON object. Read its named fields; do not split output on `=`.
 
 If the file does not exist or is invalid JSON, tell the user:
 
@@ -126,7 +115,7 @@ Request for `evidence` (substitute the values as data):
 python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'evidence' < "$REQUEST_PATH"
 ```
 
-The canonical block above ships with zero trailing arguments, so the common no-compact-boundary case is correct by copying it verbatim — do not append a literal placeholder string. When a compact boundary IS detected and a prior id recovered, append it as a shell-quoted positional argument after the closing `'`, one argument per recovered id (per the "Detect a compact boundary" step above); the script rejects any argument that is not a bare hex-and-dash id, so a stray or malformed token fails loudly (see the "Helper crash / partial failure" handling below) rather than being silently dropped.
+For no proven prior session, send `also_session_ids: []`. For a proven compact boundary, put each full native ID in that JSON array. Do not append positional arguments or placeholder IDs to the command.
 
 Parse the JSON output. The bundle has these fields: `session_id` (the primary id exactly as passed — may be `"unknown"`), `session_ids` (the ordered, de-duplicated ids **actually scanned** — may be non-empty even when `session_id` is `"unknown"`), `snapshots`, `insights`, `decisions`, `error_fixes`, `retros`, `discovery_errors`, and `_ctx` (the cached `get_session_context()` result reused by Step 5).
 

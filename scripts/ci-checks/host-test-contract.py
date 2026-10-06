@@ -2,9 +2,13 @@
 import argparse
 import ast
 import json
+import hashlib
+import sys
 from pathlib import Path
 
-LAUNCHERS = {'run', 'Popen', 'check_output', 'check_call', 'run_path', 'run_module', 'spec_from_file_location'}
+PROCESS_LAUNCHERS = {'subprocess.run', 'subprocess.Popen', 'subprocess.call',
+                     'subprocess.check_output', 'subprocess.check_call', 'os.system'}
+LAUNCHERS = {'run_path', 'run_module', 'spec_from_file_location'}
 
 
 def text(node):
@@ -66,7 +70,7 @@ def inventory(root):
                 first, *tail = name.split('.')
                 qualified = '.'.join([names.get(first, first), *tail])
                 calls.add(qualified)
-                if name.split('.')[-1] in LAUNCHERS:
+                if qualified in PROCESS_LAUNCHERS or name.split('.')[-1] in LAUNCHERS:
                     values = strings(call, assignments)
                     targets = [value for value in values if '.py' in value or '.sh' in value]
                     launches.append({'line': call.lineno, 'callee': qualified, 'expression': text(call),
@@ -83,9 +87,45 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--root', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--parity-matrix', type=Path, required=True)
     args = parser.parse_args()
-    args.output.write_text(json.dumps(inventory(args.root.resolve()), indent=2) + '\n')
+    root = args.root.resolve()
+    result = inventory(root)
+    matrix = json.loads(args.parity_matrix.read_text())
+    errors = reviewed_processes(root, result, matrix)
+    result['errors'] = errors
+    args.output.write_text(json.dumps(result, indent=2) + '\n')
+    for error in errors:
+        print(error, file=sys.stderr)
+    return 1 if errors else 0
+
+
+def reviewed_processes(root, result, matrix):
+    """Direct test subprocesses need exact reviewed bytes and expressions.
+
+    Collection checks aliases and recursive helpers separately. This inventory
+    also covers helpers that no current test invokes.
+    """
+    contracts = {(entry['source'], entry['expression']): entry
+                 for entry in matrix.get('launchers', [])}
+    errors, digests = set(), {}
+    for function in result['functions']:
+        source = function['path']
+        if not source.startswith('tests/'):
+            continue
+        for launch in function['launches']:
+            if launch['callee'] not in PROCESS_LAUNCHERS:
+                continue
+            contract = contracts.get((source, launch['expression']))
+            if source not in digests:
+                digests[source] = hashlib.sha256((root / source).read_bytes()).hexdigest()
+            if (contract is None or contract.get('source_sha256') != digests[source]
+                    or not (contract.get('capability') or
+                            (contract.get('scope') in {'support', 'structural'}
+                             and contract.get('reason')))):
+                errors.add(f'{source}:{launch["line"]}: subprocess needs an exact reviewed launcher contract')
+    return sorted(errors)
 
 
 if __name__ == '__main__':
-    main()
+    raise SystemExit(main())

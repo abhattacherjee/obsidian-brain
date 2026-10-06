@@ -176,9 +176,8 @@ def _acted_items_path():
     context = current_runtime_context()
     if context is None:
         return _ACTED_ITEMS_PATH
-    from note_transactions import session_state_path
-    directory = session_state_path(context) / 'cache'
-    directory.mkdir(mode=0o700, exist_ok=True)
+    from session_auxiliary_state import cross_run_directory
+    directory = cross_run_directory(context)
     if directory.is_symlink():
         raise ValueError('Acted-item cache must not be a symlink')
     return str(directory / 'deep-acted-items.json')
@@ -186,37 +185,54 @@ def _acted_items_path():
 
 def _load_acted_items() -> set[str]:
     """Load recently acted-on item texts (within TTL)."""
-    if not os.path.isfile(_acted_items_path()):
-        return set()
     try:
+        if not os.path.isfile(_acted_items_path()):
+            return set()
+        if os.lstat(_acted_items_path()).st_nlink != 1:
+            raise ValueError("Acted-item cache must have one link")
         from runtime_context import current_runtime_context
+        import time
+        age = time.time() - os.path.getmtime(_acted_items_path())
+        if not 0 <= age <= _ACTED_TTL_SECONDS:
+            return set()
         if current_runtime_context() is not None:
             from operation_state import _read_private
-            return set(json.loads(_read_private(Path(_acted_items_path()))))
-        import time
-        if time.time() - os.path.getmtime(_acted_items_path()) > _ACTED_TTL_SECONDS:
-            os.remove(_acted_items_path())
-            return set()
-        with open(_acted_items_path(), "r", encoding="utf-8") as f:
-            return set(json.load(f))
-    except (OSError, json.JSONDecodeError):
+            value = json.loads(_read_private(Path(_acted_items_path())))
+        else:
+            if time.time() - os.path.getmtime(_acted_items_path()) > _ACTED_TTL_SECONDS:
+                os.remove(_acted_items_path())
+                return set()
+            with open(_acted_items_path(), "r", encoding="utf-8") as f:
+                value = json.load(f)
+        if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+            raise ValueError("Acted-item cache must contain a list of strings")
+        return set(value)
+    except (OSError, ValueError, TypeError) as exc:
+        print(f"[obsidian-brain] warning: could not load acted items: {exc}", file=sys.stderr)
         return set()
 
 
 def _save_acted_items(items: set[str]) -> None:
     """Persist acted-on item texts (append to existing). Best-effort."""
-    existing = _load_acted_items()
-    combined = existing | items
     try:
+        if not isinstance(items, (set, frozenset)) or any(not isinstance(item, str) for item in items):
+            raise ValueError("Acted items must contain strings")
+        existing = _load_acted_items()
+        combined = existing | items
         os.makedirs(os.path.dirname(_acted_items_path()), exist_ok=True)
+        if os.path.lexists(_acted_items_path()):
+            from operation_state import _read_private
+            if os.lstat(_acted_items_path()).st_nlink != 1:
+                raise ValueError("Acted-item cache must have one link")
+            _read_private(Path(_acted_items_path()))
         from runtime_context import current_runtime_context
         if current_runtime_context() is not None:
-            from operation_state import _write_private
-            _write_private(Path(_acted_items_path()), json.dumps(sorted(combined)).encode(), current_runtime_context())
+            from session_auxiliary_state import cross_run_write
+            cross_run_write(current_runtime_context(), 'deep-acted-items.json', sorted(combined))
         else:
             with open(_acted_items_path(), "w", encoding="utf-8") as f:
                 json.dump(sorted(combined), f)
-    except OSError as exc:
+    except (OSError, ValueError, TypeError) as exc:
         print(f"[obsidian-brain] warning: could not save acted items: {exc}", file=sys.stderr)
 
 
@@ -417,8 +433,12 @@ def run_build_checkoffs() -> None:
 
     def _resolve_path(file_field: str) -> str | None:
         """Resolve a basename-or-path to a contained full path, else None."""
-        if os.path.isabs(file_field) or os.sep in file_field:
+        if '..' in Path(file_field).parts:
+            return None
+        if os.path.isabs(file_field):
             candidates = [file_field]
+        elif os.sep in file_field:
+            candidates = [os.path.join(vault_root, file_field)]
         else:
             candidates = [
                 os.path.join(vault_root, sessions_folder, file_field),
@@ -442,10 +462,11 @@ def run_build_checkoffs() -> None:
         if real is None:
             # Distinguish containment violation from plain not-found for the report.
             probe = os.path.realpath(
-                file_field if (os.path.isabs(file_field) or os.sep in file_field)
+                file_field if os.path.isabs(file_field)
+                else os.path.join(vault_root, file_field) if os.sep in file_field
                 else os.path.join(vault_root, sessions_folder, file_field)
             )
-            reason = ("containment" if not (
+            reason = ("containment" if '..' in Path(file_field).parts or not (
                 probe == vault_root or probe.startswith(vault_root + os.sep)
             ) else "file not found")
             skipped.append({"file": file_field, "line": line_hint, "reason": reason})

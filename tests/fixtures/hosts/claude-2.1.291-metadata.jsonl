@@ -1,0 +1,5 @@
+{"type": "mode", "mode": "normal", "sessionId": "opaque-native-id"}
+{"type": "user", "uuid": "synthetic-user", "sessionId": "opaque-native-id", "message": {"role": "user", "content": "Synthetic question"}}
+{"type": "ai-title", "aiTitle": "Synthetic title", "sessionId": "opaque-native-id"}
+{"type": "assistant", "uuid": "synthetic-assistant", "sessionId": "opaque-native-id", "message": {"role": "assistant", "content": "Synthetic answer"}}
+{"type": "atis-latch", "atis": "", "sessionId": "opaque-native-id"}

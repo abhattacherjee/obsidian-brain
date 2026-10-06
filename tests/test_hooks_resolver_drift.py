@@ -35,8 +35,15 @@ def _context_command(skill):
     matches = [line for line in text.splitlines()
                if line.startswith('python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py"')
                and ' context < /dev/null' in line]
-    assert len(matches) == 1, f'{skill} must invoke the selected installation once'
-    return matches[0]
+    initial = [line for line in matches if '--vault' not in line]
+    assert len(initial) == 1, f'{skill} must look up configured state once'
+    retries = [line for line in matches if '--vault' in line]
+    if skill == 'obsidian-setup':
+        assert len(retries) == 1 and '--vault "$OB_VAULT"' in retries[0]
+        assert text.index('### Step 3 — Validate the vault path') < text.index(retries[0])
+    else:
+        assert retries == [], f'{skill} must not override the configured vault'
+    return initial[0]
 
 
 @pytest.mark.parametrize('skill', SKILLS)
@@ -146,13 +153,20 @@ def test_dev_install_passes_loaded_root_even_when_cwd_and_cache_disagree(install
                 and "--operation 'dev-install'" in line]
     assert commands, 'dev-test must invoke its trusted install procedure'
     request = cwd / 'request.json'
-    request.write_text('{"mode":"status"}')
+    payload = {'mode': 'status'}
+    expected = ['status', '--host', selected_host_context.host, '--source', str(root)]
+    if selected_host_context.host == 'codex':
+        cache = selected_host_context.native_home / 'plugins/cache/fixture/obsidian-brain/3.8.1'
+        cache.mkdir(parents=True)
+        payload['cache_path'] = str(cache)
+        expected.extend(['--cache-path', str(cache)])
+    request.write_text(json.dumps(payload))
     env = dict(env, OB_HOST=selected_host_context.host, OB_CLIENT=selected_host_context.client, OB_RESOURCE_ROOT=str(root),
                OB_SKILL_PATH=str(root / 'skills/dev-test/SKILL.md'), REQUEST_PATH=str(request))
     result = subprocess.run(['bash', '-c', commands[0]], cwd=cwd, env=env,
                             capture_output=True, text=True, timeout=10)
     assert result.returncode == 0, result.stderr
-    assert result.stdout.splitlines() == ['status', '--host', selected_host_context.host, '--source', str(root)]
+    assert result.stdout.splitlines() == expected
 
 
 def test_changed_loaded_hook_source_cannot_enter_combined_coverage(installed):

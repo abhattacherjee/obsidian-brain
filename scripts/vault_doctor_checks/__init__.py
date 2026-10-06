@@ -120,8 +120,9 @@ def all_checks() -> list:
 import contextlib
 import functools
 from pathlib import Path
+from uuid import uuid4
 
-from scripts.doctor_repair_state import REPAIRS as _REPAIRS
+from scripts.doctor_repair_state import REPAIRS as _REPAIRS, INVOCATION as _INVOCATION
 
 
 def vault_scan(function):
@@ -133,8 +134,11 @@ def vault_scan(function):
         before = {}
         for path in Path(vault).rglob("*.md"):
             try:
+                if path.is_symlink() or any(parent.is_symlink() for parent in path.parents):
+                    continue
+                path.resolve().relative_to(Path(vault).resolve())
                 before[str(path.resolve())] = hashlib.sha256(path.read_bytes()).hexdigest()
-            except OSError:
+            except (OSError, ValueError):
                 pass
         issues = function(*args, **kwargs)
         for issue in issues:
@@ -161,36 +165,28 @@ def _repair_context(issue=None, path=None):
 @contextlib.contextmanager
 def repair_scope(issues):
     """Keep original scan intent and trusted output across doctor checks."""
-    from note_transactions import ownership_lock, record_raw_read
+    from note_transactions import record_raw_read
     if _REPAIRS.get() is not None:
         yield _REPAIRS.get()
         return
     issues = list(issues)
-    contexts = {}
+    revisions = {}
     for issue in issues:
         if issue.extra.get("unresolved"):
             continue
         context = _repair_context(issue)
-        contexts[str(context.vault_path)] = context
-    with contextlib.ExitStack() as stack:
-        for key in sorted(contexts):
-            stack.enter_context(ownership_lock(contexts[key]))
-        revisions = {}
-        for issue in issues:
-            if issue.extra.get("unresolved"):
-                continue
-            context = _repair_context(issue)
-            path = Path(issue.note_path).resolve()
-            if path.exists():
-                current = record_raw_read(context, path, path.read_bytes())
-                original = issue.extra.get("raw_source_revision", current)
-                # Start from approved bytes, not a newly observed manual edit.
-                revisions.setdefault(str(path), (context, original, original))
-        token = _REPAIRS.set(revisions)
-        try:
-            yield revisions
-        finally:
-            _REPAIRS.reset(token)
+        path = Path(issue.note_path).resolve()
+        if path.exists():
+            current = record_raw_read(context, path, path.read_bytes())
+            original = issue.extra.get("raw_source_revision", current)
+            revisions.setdefault(str(path), (context, original, original))
+    token = _REPAIRS.set(revisions)
+    invocation = _INVOCATION.set(uuid4().hex)
+    try:
+        yield revisions
+    finally:
+        _INVOCATION.reset(invocation)
+        _REPAIRS.reset(token)
 
 
 def repair_batch(function):
@@ -248,7 +244,7 @@ def repair_write(path, text, *, encoding_repair=False):
     if not encoding_repair:
         resolved.read_bytes().decode("utf-8")
     operation = "doctor-" + hashlib.sha256(
-        (str(resolved) + "\0" + str(revision) + "\0" + text).encode("utf-8")).hexdigest()
+        ((_INVOCATION.get() or uuid4().hex) + "\0" + str(resolved) + "\0" + str(revision) + "\0" + text).encode("utf-8")).hexdigest()
     kind = "repair_document" if encoding_repair else "document"
     result = apply_mutations(context, [NoteMutation(resolved, revision, {kind: text}, operation)])
     if result.status not in {"applied", "unchanged"}:
@@ -271,7 +267,7 @@ def repair_move(source, destination, *, expected_revision="tracked"):
     if expected_revision != "tracked":
         revision = expected_revision
     operation = "doctor-move-" + hashlib.sha256(
-        (str(source) + "\0" + str(destination) + "\0" + str(revision)).encode("utf-8")).hexdigest()
+        ((_INVOCATION.get() or uuid4().hex) + "\0" + str(source) + "\0" + str(destination) + "\0" + str(revision)).encode("utf-8")).hexdigest()
     result = move_note(context, source, destination, revision, operation)
     if result.status not in {"applied", "unchanged"}:
         raise OSError("doctor move " + result.status + ": " + "; ".join(result.warnings))

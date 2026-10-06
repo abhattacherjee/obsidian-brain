@@ -225,8 +225,8 @@ def test_mtime_bump_triggers_partial_reclassify():
     assert needs[0]["_reason"] == "mtime_changed"
 
 
-def test_semantic_fingerprint_rejects_mtime_drift_even_within_tolerance():
-    """Complete input provenance invalidates even subsecond source drift."""
+def test_semantic_fingerprint_ignores_subsecond_mtime_when_content_is_same():
+    """Filesystem timestamp noise cannot change the semantic input."""
     from check_items_cache import partition
     groups = [_make_group("h1", members=[{"file": "a.md", "line": 1, "mtime": 1735000000.5}])]
     cache = {
@@ -242,8 +242,8 @@ def test_semantic_fingerprint_rejects_mtime_drift_even_within_tolerance():
         },
     }
     known, needs = partition(groups, cache, project="obsidian-brain", head_sha="abc1234")
-    assert len(known) == 0
-    assert needs[0]["_reason"] == "provenance_changed"
+    assert len(known) == 1
+    assert needs == []
 
 
 def test_ttl_expires_for_done_at_24h():
@@ -2612,19 +2612,15 @@ def test_unowned_cache_update_never_publishes(tmp_path, monkeypatch, lost):
     assert json.loads(cache_path.read_text()) == original
 
 
-def test_bound_native_cache_uses_private_state(tmp_path, monkeypatch):
-    from types import SimpleNamespace
+def test_bound_native_cache_uses_private_state(selected_host_context, tmp_path, monkeypatch):
     import check_items_cache as cic
-    from runtime_context import using_runtime_context
+    from session_auxiliary_state import cross_run_directory
     monkeypatch.setattr(cic, "CACHE_PATH", tmp_path / "legacy" / "cache.json")
     monkeypatch.setattr(cic, "CACHE_DIR", tmp_path / "legacy")
-    state = tmp_path / "native state"
-    selected = SimpleNamespace(state_path=state, vault_path=tmp_path / "vault", host="codex",
-                               session_key="session", canonical_project_root=tmp_path / "project")
-    with using_runtime_context(selected):
-        cic.save_cache({"schema_version": cic.SCHEMA_VERSION, "runs": {"native": {}}})
-        assert cic.load_cache()["runs"] == {"native": {}}
-    assert list(state.glob("v1/*/codex/session/*/cache/check-items-classifications.json"))
+    cic.save_cache({"schema_version": cic.SCHEMA_VERSION, "runs": {"native": {}}})
+    assert cic.load_cache()["runs"] == {"native": {}}
+    assert (cross_run_directory(selected_host_context) / "check-items-classifications.json").is_file()
+    assert not (tmp_path / "legacy" / "cache.json").exists()
 
 
 @pytest.mark.parametrize("field", ["text", "vault", "project", "algorithm", "backend", "model", "evidence"])

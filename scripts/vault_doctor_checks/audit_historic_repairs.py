@@ -4,7 +4,7 @@ One-shot audit tool (issue #95, companion to #93). Earlier `/vault-doctor fix`
 runs applied a buggy mtime-as-capture-time algorithm to `source_session`
 backlinks. Even after the algorithm fix (#93/#106), the vault still contains
 backlinks rewritten by the buggy versions. This check walks the doctor backup
-roots under ``~/.claude/obsidian-brain-doctor-backup/``, diffs each backed-up
+roots under ``the selected doctor backup root/``, diffs each backed-up
 note's ``source_session`` / ``source_session_note`` against the note's current
 state, and classifies every historic repair:
 
@@ -79,7 +79,13 @@ def _backup_root() -> Path:
     override = os.environ.get("OBSIDIAN_BRAIN_DOCTOR_BACKUP_ROOT")
     if override:
         return Path(override)
-    return Path.home() / ".claude" / "obsidian-brain-doctor-backup"
+    from runtime_context import current_runtime_context
+    context = current_runtime_context()
+    if context is not None:
+        from session_auxiliary_state import directory
+        return directory(context, "doctor-backups")
+    from runtime_adapters.claude import legacy_doctor_backup_root
+    return legacy_doctor_backup_root()
 
 
 def _parse_run_ts(dirname: str) -> float | None:

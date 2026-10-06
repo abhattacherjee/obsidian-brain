@@ -30,7 +30,7 @@ class TestAppendSessionEndLog:
         yield
         import importlib
         import obsidian_utils
-        importlib.reload(obsidian_utils)
+        # Selected native context owns the sink; no module reload is needed.
 
     def test_appends_one_line_with_expected_fields(self, tmp_path, monkeypatch):
         """Helper appends exactly one line with timestamp, event tag, project, sid, outcome, msgs, dur, detail."""
@@ -38,7 +38,7 @@ class TestAppendSessionEndLog:
         # Re-import obsidian_utils so the HOME-derived log path is picked up if cached.
         import importlib
         import obsidian_utils
-        importlib.reload(obsidian_utils)
+        # Selected native context owns the sink; no module reload is needed.
 
         obsidian_utils._append_sessionend_log(
             project="myproj",
@@ -49,7 +49,7 @@ class TestAppendSessionEndLog:
             detail="",
         )
 
-        log_path = tmp_path / ".claude" / "obsidian-brain-hook.log"
+        log_path = _selected_log_dir() / "obsidian-brain-hook.log"
         assert log_path.exists(), "telemetry log file was not created"
         content = log_path.read_text(encoding="utf-8")
         lines = [ln for ln in content.splitlines() if ln.strip()]
@@ -73,10 +73,10 @@ class TestAppendSessionEndLog:
         monkeypatch.setenv("HOME", str(tmp_path))
         import importlib
         import obsidian_utils
-        importlib.reload(obsidian_utils)
+        # Selected native context owns the sink; no module reload is needed.
 
-        log_dir = tmp_path / ".claude"
-        log_dir.mkdir()
+        log_dir = _selected_log_dir()
+        log_dir.mkdir(exist_ok=True)
         log_path = log_dir / "obsidian-brain-hook.log"
         # Pre-fill the log past the rotation threshold.
         log_path.write_text("x" * (150 * 1024), encoding="utf-8")
@@ -98,13 +98,13 @@ class TestAppendSessionEndLog:
         monkeypatch.setenv("HOME", str(tmp_path))
         import importlib
         import obsidian_utils
-        importlib.reload(obsidian_utils)
+        # Selected native context owns the sink; no module reload is needed.
 
         obsidian_utils._append_sessionend_log(
             project="", session_id="", outcome="EXCEPTION"
         )
 
-        log_path = tmp_path / ".claude" / "obsidian-brain-hook.log"
+        log_path = _selected_log_dir() / "obsidian-brain-hook.log"
         content = log_path.read_text(encoding="utf-8")
         # Empty project becomes "unknown"; empty sid becomes "unknown"[:8]
         assert "project=unknown" in content
@@ -118,7 +118,7 @@ class TestAppendSessionEndLog:
         monkeypatch.setenv("HOME", str(tmp_path))
         import importlib
         import obsidian_utils
-        importlib.reload(obsidian_utils)
+        # Selected native context owns the sink; no module reload is needed.
 
         obsidian_utils._append_sessionend_log(
             project="my\rproj\twith\nbad",
@@ -127,7 +127,7 @@ class TestAppendSessionEndLog:
             detail="multi\rline\twith\nstuff",
         )
 
-        log_path = tmp_path / ".claude" / "obsidian-brain-hook.log"
+        log_path = _selected_log_dir() / "obsidian-brain-hook.log"
         content = log_path.read_text(encoding="utf-8")
         # Exactly one logical line (one \n at end)
         assert content.count("\n") == 1, f"expected 1 line, got: {content!r}"
@@ -143,7 +143,7 @@ class TestAppendSessionEndLog:
 
 def _read_log_lines(tmp_path):
     """Helper: return the SessionEnd lines from the hook log, or [] if missing."""
-    log_path = tmp_path / ".claude" / "obsidian-brain-hook.log"
+    log_path = _selected_log_dir() / "obsidian-brain-hook.log"
     if not log_path.exists():
         return []
     return [
@@ -380,7 +380,7 @@ def test_native_sessionend_empty_source_stays_unpublished(selected_host_context)
     context.transcript_path.write_text('')
     result,proof=_native_session_child(context)
     assert proof['mutation_contexts']==[]
-    assert 'capture failed:' in result.stderr
+    assert '[obsidian-brain] capture pending: Native transcript identity is unverified' in result.stderr
     assert list(context.vault_path.rglob('*.md'))==[]
 
 
@@ -412,7 +412,7 @@ def test_native_sessionend_write_failure_keeps_input_for_retry(selected_host_con
     folder.chmod(0o500)
     try:
         result,proof=_native_session_child(context)
-        assert 'capture failed:' in result.stderr
+        assert '[obsidian-brain] capture pending: Source input remains pending.' in result.stderr
         assert list(context.vault_path.rglob('*.md'))==[]
     finally:
         folder.chmod(0o700)
@@ -461,8 +461,15 @@ def test_native_sessionend_unreadable_source_does_not_bless_lost_input(selected_
     try:
         result,proof=_native_session_child(context)
         assert proof['mutation_contexts']==[]
-        assert 'capture failed:' in result.stderr
+        assert '[obsidian-brain] capture pending: Native transcript identity is unverified' in result.stderr
         assert list(context.vault_path.rglob('*.md'))==[]
     finally:
         context.transcript_path.chmod(0o600)
     assert context.transcript_path.read_bytes()==before
+
+pytestmark = pytest.mark.usefixtures("selected_host_context")
+
+def _selected_log_dir():
+    from runtime_context import current_runtime_context
+    from session_auxiliary_state import directory
+    return directory(current_runtime_context(), "logs")

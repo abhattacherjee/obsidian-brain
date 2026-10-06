@@ -220,7 +220,7 @@ def test_merge_self_is_rejected(db):
     conn.execute("INSERT INTO theme_members VALUES (1,'m1.md',0.9,0.0,'d')")
     conn.execute("INSERT INTO theme_members VALUES (1,'m2.md',0.9,0.0,'d')")
     conn.commit(); conn.close()
-    consolidate_cli.run_merge(1, 1)
+    assert consolidate_cli.run_merge(1, 1) == 1
     conn = sqlite3.connect(db)
     theme_count = conn.execute("SELECT COUNT(*) FROM themes WHERE id=1").fetchone()[0]
     member_count = conn.execute("SELECT COUNT(*) FROM theme_members WHERE theme_id=1").fetchone()[0]
@@ -262,10 +262,9 @@ def test_merge_refreshes_activation(db):
     assert act > 0.0
 
 
-def test_merge_not_found_prints_marker_no_crash(db, capsys):
-    """run_merge on absent theme IDs prints the not-found marker, does not crash,
-    and never touches activation (no themes exist)."""
-    consolidate_cli.run_merge(99, 100)
+def test_merge_not_found_returns_failure(db, capsys):
+    """Missing IDs return failure and leave the database unchanged."""
+    assert consolidate_cli.run_merge(99, 100) == 1
     out = capsys.readouterr().out
     assert "ERROR theme(s) not found a=99 b=100" in out
     conn = sqlite3.connect(db)
@@ -303,7 +302,7 @@ def test_split_noop_when_cohesive(selected_host_context, db, capsys):
         conn.execute("INSERT INTO theme_members VALUES (1,?,0.9,0.0,'d')",(p,))
     conn.commit(); conn.close()
     with patch("consolidate_cli.generate_theme_names", _fake_names):
-        consolidate_cli.run_split(1)
+        assert consolidate_cli.run_split(1) == 0
     conn = sqlite3.connect(db)
     assert conn.execute("SELECT COUNT(*) FROM themes WHERE id=1").fetchone()[0] == 1  # unchanged
     conn.close()
@@ -407,7 +406,14 @@ def test_merge_self_emits_distinct_message(db, capsys):
     )
     conn.execute("INSERT INTO theme_members VALUES (1,'m1.md',0.9,0.0,'d')")
     conn.commit(); conn.close()
-    consolidate_cli.run_merge(1, 1)
+    assert consolidate_cli.run_merge(1, 1) == 1
     out = capsys.readouterr().out
     assert "cannot merge a theme with itself" in out
     assert "theme(s) not found" not in out
+
+
+def test_split_missing_theme_returns_failure(db, capsys):
+    assert consolidate_cli.run_split(99) == 1
+    assert "ERROR theme 99 not found" in capsys.readouterr().out
+    with sqlite3.connect(db) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM themes").fetchone()[0] == 0

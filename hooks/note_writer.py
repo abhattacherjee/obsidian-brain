@@ -887,7 +887,7 @@ def _release_lock(lock):
 def _atomic_rewrite(dest: Path, content: str, expect_stat=None,
                     expected_revision=None, context=None):
     """Publish an exact source revision through the shared transaction service."""
-    from note_transactions import NoteMutation, apply_mutations, context_for_vault, read_revision
+    from note_transactions import NoteMutation, apply_mutations, context_for_vault, read_revision, LockBusy
     import uuid
     try:
         if expect_stat is not None:
@@ -902,7 +902,7 @@ def _atomic_rewrite(dest: Path, content: str, expect_stat=None,
         )])
         if result.status not in {"applied", "unchanged"}:
             return f"write {result.status} for {dest}: {'; '.join(result.warnings)}"
-    except (OSError, ValueError, RuntimeError) as exc:
+    except (OSError, ValueError, LockBusy) as exc:
         return f"write failed for {dest}: {exc}"
     return None
 
@@ -1022,18 +1022,11 @@ def run_append_update(
     try:
         context = context_for_vault(vault_path)
         with ownership_lock(context):
-            lock, lock_err = _acquire_lock(resolved)
-            if lock_err:
-                print(f"ERROR: {lock_err}", file=sys.stderr)
-                return 1
-            try:
-                return _append_update_locked(
-                    resolved, note_path, update_text, last_updated, add_tags, context=context,
-                    expected_revision=expected_revision,
-                    author_host=author_host, operation_id=operation_id,
-                )
-            finally:
-                _release_lock(lock)
+            return _append_update_locked(
+                resolved, note_path, update_text, last_updated, add_tags, context=context,
+                expected_revision=expected_revision,
+                author_host=author_host, operation_id=operation_id,
+            )
 
     except (LockBusy, OSError, ValueError) as exc:
         print(f"ERROR: shared vault lock held or unavailable: {exc}", file=sys.stderr)
@@ -1051,9 +1044,8 @@ def _append_update_locked(
     author_host=None,
     operation_id=None,
 ) -> int:
-    """The read-modify-write half of run_append_update, run while holding the
-    note's lock. Split out purely so the lock has one obvious scope and one
-    release point (the caller's ``finally``)."""
+    """Read and publish the update while the caller holds shared vault ownership."""
+    from note_transactions import LockBusy
     try:
         with open(resolved, "r", encoding="utf-8", newline="") as fh:
             original_text = fh.read()
@@ -1068,12 +1060,12 @@ def _append_update_locked(
         # between (see its docstring).
         read_st = os.stat(resolved)
         read_stat = (read_st.st_mtime_ns, read_st.st_size)
-        from note_transactions import context_for_vault, record_read
+        from note_transactions import context_for_vault, record_read, LockBusy
         context = context or context_for_vault(resolved.parent)
         read_revision = record_read(context, resolved, original_text)
         if expected_revision is not None:
             read_revision = expected_revision
-    except OSError as exc:
+    except (OSError, ValueError, LockBusy) as exc:
         print(f"ERROR: cannot read {note_path}: {exc}", file=sys.stderr)
         return 1
 

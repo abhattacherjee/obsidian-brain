@@ -1,6 +1,6 @@
 ---
 name: vault-import
-description: "Backfills the Obsidian vault with historical Claude Code sessions using conversation search and parallel sub-agents. Use when: (1) /vault-import command to import recent sessions, (2) /vault-import 30d to import last 30 days, (3) /vault-import project:api-service 30d to filter by project, (4) user wants to populate vault with past session history."
+description: "Backfills the Obsidian vault from explicitly selected Claude or Codex transcript history. Use when: (1) /vault-import command to import recent sessions, (2) /vault-import 30d to import last 30 days, (3) /vault-import project:api-service 30d to filter by project, (4) user wants to populate vault with past session history."
 metadata:
   version: 1.0.0
 ---
@@ -47,28 +47,16 @@ procedure variables `VAULT_PATH`/`VAULT`, `SESSIONS_FOLDER`/`SESS`, and
 `INSIGHTS_FOLDER`/`INS`. Use the canonical project returned in config JSON (and native `session` when available),
 not the basename of an unrelated shell working directory.
 
-Before preparing edits or requesting a summary of an existing note, call
-`note-read` and retain its exact `expected_revision`. Apply the proposed note
-with `note-apply` and that revision. A conflict leaves the current note intact;
-show the pending result and do not count the note as saved. New curated notes
-use `note-create`; they never overwrite a collision. Native memory discovery
-is unsupported for Codex because it has no equivalent native memory-file API; shared vault retrieval
-and wiki filing continue without borrowing another host's memory.
-
-Read `references/host-claude.md` or `references/host-codex.md` when present.
-All note writes described below use `note-create` or revision-bound `note-apply`,
-including bidirectional related links. Content is a JSON string, never shell code.
-Every later save or edit follows this revision-bound publication rule.
+Create new curated notes with `note-create`. A collision preserves the existing note. Use only the operations documented for this skill. Their writes bind the source revisions before analysis and preserve manual edits on conflict. Content is JSON data, never shell code. Read `references/host-claude.md` or `references/host-codex.md` when present. Codex has no native memory-file API; shared vault retrieval and wiki filing continue without borrowing another host's memory.
 
 # Vault Import — Backfill Historical Sessions
 
-Discover historical Claude Code sessions, summarize them via parallel sub-agents, and write structured session notes to the Obsidian vault. Skips sessions already present in the vault.
+Discover the explicitly selected source host's history, summarize with the invoking host, and write structured session notes. Source identity stays unchanged when another host performs the import. Skip sessions already present in the vault.
 
-**Tools needed:** native shell, native file reading, Skill (for /context:shield sub-agents)
+**Tool use:** Read the invoking host's reference for its available shell and file operations. Use only tools that runtime exposes.
 
 **Prerequisites:**
-- `/context:search` skill must be installed (plugin `context@claude-code-skills`; was `conversation-search`)
-- `/context:shield` skill must be installed (same plugin; was `context-shield`)
+- Under Claude, optional `/context:search` and `/context:shield` come from `context@claude-code-skills`. Under Codex, use the fixed `import-list`/`import-read` operations documented below; do not invoke a Claude-only helper.
 - Obsidian Brain must be configured (run `/obsidian-setup` if not)
 
 ## Procedure
@@ -89,7 +77,7 @@ Request for `config` (substitute the values as data):
 python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'config' < "$REQUEST_PATH"
 ```
 
-Parse each output line as KEY=VALUE, splitting on the first `=`.
+Parse the single JSON object. Read its named fields; do not split output on `=`.
 
 If the command exits non-zero or prints ERROR, tell the user:
 
@@ -133,7 +121,8 @@ Store as `TIME_RANGE` and `PROJECT_FILTER` (empty string if no filter).
 Select `source_host` explicitly (Claude or Codex). The installed native
 registry discovers only that host's historical transcript roots. It reports a
 bounded discovery limit as pending; choose a narrower root/date window rather
-than silently dropping records. An explicit `source_root` may narrow the scan.
+than silently dropping records. An explicit `source_root` may narrow an existing
+native history root. It cannot authorize `/` or unrelated folders.
 
 Request for `import-list` (substitute the values as data):
 
@@ -155,9 +144,29 @@ and message counts stay unknown. Missing transcripts are skipped explicitly.
 
 Before requesting any summary, run `import-read` with `operation_id`,
 `source_host`, `source_path`, and the full `source_session_id`. It normalizes
-visible native records and stores immutable `import-source.json`. Unknown or
+visible native records and stores an immutable artifact keyed by full source
+provider/session identity. Retain `source_host` and `source_session_id` for
+the matching `note-create`; another import in this operation cannot replace them. Unknown or
 partial rows leave the operation pending. Use the normalized records as AI
 input. AI remains on the invoking host; origin metadata remains on the source.
+
+Map each discovered `session_path` to `source_path` and its full `session_id`
+to `source_session_id`. Keep the source host selected for that discovery.
+
+Request for `import-read`:
+
+```json
+{
+  "operation_id": "<prepared id>",
+  "source_host": "<claude or codex origin>",
+  "source_session_id": "<full source native ID>",
+  "source_path": "<absolute discovered session_path>"
+}
+```
+
+```bash
+python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'import-read' < "$REQUEST_PATH"
+```
 
 If no sessions are found, tell the user:
 
@@ -272,7 +281,8 @@ Request for `note-create` (substitute the values as data):
 ```json
 {
   "operation_id": "<prepared id>",
-  "folder": "<selected folder>",
+  "source_host": "<claude or codex origin>",
+  "source_session_id": "<full source native ID>",
   "filename": "<filename.md>",
   "content": "<complete frontmatter + body>"
 }

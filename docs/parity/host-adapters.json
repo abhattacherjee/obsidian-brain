@@ -166,5 +166,17 @@
   "hooks/ai_adapters/codex.py:_native_environment": {
     "claude": "unsupported:codex-native-analysis-environment; shared analysis selects the invoking provider",
     "codex": "supported"
+  },
+  "hooks/runtime_adapters/claude.py:legacy_doctor_backup_root": {
+    "claude": "supported",
+    "codex": "unsupported:claude-native-storage-and-legacy-compatibility-adapter"
+  },
+  "hooks/runtime_adapters/claude.py:legacy_native_projects_root": {
+    "claude": "supported",
+    "codex": "unsupported:claude-native-storage-and-legacy-compatibility-adapter"
+  },
+  "hooks/runtime_context.py:selected_native_environment": {
+    "claude": "supported",
+    "codex": "supported"
   }
 }

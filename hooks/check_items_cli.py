@@ -276,6 +276,8 @@ def _request_ai(operation, prompt, payload, model, groups):
     result = execute_ai(context, operation, request)
     if result.status != "ok":
         print(f"[check-items-cli] {operation}: {result.status}: {result.diagnostic}", file=sys.stderr)
+        if result.status == "unavailable" and result.error_code == "native_execution_failed":
+            return 3, result
         return {"timeout": 3, "invalid_output": 4, "cancelled": 7, "unavailable": 8, "auth_error": 8}.get(result.status, 4), result
     if result.input_revision != request.input_revision:
         return 4, result
@@ -782,6 +784,7 @@ def run_classifier(stdin_json: str, output_path: str) -> int:
     sub_results: list = []
     chunk_count = 0
     failed_chunks = 0
+    last_failure = 4
     unclassified_groups = 0
 
     if to_classify:
@@ -802,9 +805,10 @@ def run_classifier(stdin_json: str, output_path: str) -> int:
                 if rc == 0:
                     break
             if rc != 0:
-                # Completed chunks stay unpublished: exact requested coverage
-                # is required before the final private artifact can change.
-                return rc
+                last_failure = rc
+                failed_chunks += 1
+                unclassified_groups += len(chunk)
+                continue
             sub_results.extend(chunk_results)
 
     # -----------------------------------------------------------------------
@@ -841,6 +845,8 @@ def run_classifier(stdin_json: str, output_path: str) -> int:
             merged_by_id[gid]["note_evidence_only"] = _note_evidence_only(g.get("project", ""))
 
     ordered = [merged_by_id[g["group_id"]] for g in groups if g["group_id"] in merged_by_id]
+    if failed_chunks and not ordered:
+        return last_failure
 
     _publish_private_json(output_path, ordered)
 

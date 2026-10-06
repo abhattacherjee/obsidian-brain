@@ -1,12 +1,12 @@
 """vault_doctor check: detect SessionEnd-hook coverage gaps.
 
-For each ``<sid>.jsonl`` under ``~/.claude/projects/``, this check verifies
+For each ``<sid>.jsonl`` under ``the selected native projects root/``, this check verifies
 that a corresponding session note exists in ``<vault>/<sessions_folder>/``.
 When the SessionEnd hook fails, is killed, or never runs, the JSONL exists
 but the note is missing — this check surfaces those gaps.
 
 This check is OPT-IN (``OPT_IN = True``): it does not run in the default
-all-checks sweep because (a) it walks every JSONL under ``~/.claude/projects/``
+all-checks sweep because (a) it walks every JSONL under ``the selected native projects root/``
 across ALL projects — a heavy filesystem + parse pass that would slow every
 default `vault_doctor` run, and (b) it is a standing audit (gap rows persist
 until the operator recovers or accepts them), not actionable per-run drift.
@@ -29,7 +29,7 @@ Detection strategy:
 2. Build a ``referenced_by`` index: for each note in the insights/decisions/
    error-fixes/retros folders, map ``source_session`` UUID → list of
    basenames.
-3. Walk ``~/.claude/projects/`` for JSONLs whose mtime is within the window.
+3. Walk ``the selected native projects root/`` for JSONLs whose mtime is within the window.
    Derive the project name from the first parseable JSONL line that carries a
    ``cwd`` field (production JSONLs often start with summary/file-history
    lines without one).
@@ -172,7 +172,8 @@ def _load_thresholds(home: Path) -> tuple[int, float, bool]:
     (defaults apply — same as the hook); any other read/parse failure warns
     to stderr.
     """
-    cfg_path = home / ".claude" / "obsidian-brain-config.json"
+    from runtime_adapters.claude import legacy_config_path
+    cfg_path = legacy_config_path(home)
     min_messages, min_duration, auto_log = 3, 2.0, True
     try:
         with open(cfg_path, "r", encoding="utf-8") as fh:
@@ -559,6 +560,59 @@ def _index_referenced_by(
     return ref_index
 
 
+def _source_sha(path, deadline):
+    import time
+    digest = hashlib.sha256()
+    with path.open('rb') as stream:
+        while True:
+            if time.monotonic() >= deadline:
+                raise ValueError('Session coverage deadline reached; audit is incomplete')
+            chunk = stream.read(65536)
+            if not chunk:
+                return digest.hexdigest()
+            digest.update(chunk)
+
+
+def _incomplete_source(path, reason, **extra):
+    return Issue(check=NAME, note_path=str(path), project='', current_source=str(path),
+                 proposed_source='', confidence=0.0, reason=reason,
+                 extra={'unresolved': True, 'signal_class': 'session-coverage-incomplete',
+                        'audit_complete': False, **extra})
+
+
+def _native_identity_hint(context, path):
+    """Read a bounded scheduling hint; normalized parsing still certifies gaps."""
+    if context.host == 'claude':
+        return path.stem
+    try:
+        with path.open('rb') as stream:
+            first = stream.readline(1024 * 1024 + 1)
+        if len(first) > 1024 * 1024 or not first.endswith(b'\n'):
+            return None
+        header = json.loads(first)
+        payload = header.get('payload', {})
+        sid = payload.get('id') or payload.get('session_id')
+        return sid if header.get('type') == 'session_meta' and isinstance(sid, str) and sid else None
+    except (OSError, UnicodeError, ValueError, TypeError, AttributeError, RecursionError):
+        return None
+
+
+def _native_project_hint(context, path, preferred):
+    """Prefer a scheduling label without treating it as historical provenance."""
+    if context.host == 'claude':
+        label = _slugify(path.parent.name)
+        return label == preferred or label.endswith('-' + preferred)
+    try:
+        with path.open('rb') as stream:
+            first = stream.readline(1024 * 1024 + 1)
+        if len(first) > 1024 * 1024 or not first.endswith(b'\n'):
+            return False
+        cwd = json.loads(first).get('payload', {}).get('cwd')
+        return isinstance(cwd, str) and _slugify(Path(cwd).name) == preferred
+    except (OSError, UnicodeError, ValueError, TypeError, AttributeError, RecursionError):
+        return False
+
+
 def _scan_selected(context, vault_path, sessions_folder, insights_folder, days,
                    project=None, strict=False, reconstruct=False):
     """Audit the invoking host's verified normalized records, without writing."""
@@ -588,83 +642,145 @@ def _scan_selected(context, vault_path, sessions_folder, insights_folder, days,
             covered.add(sid)
     references = _index_referenced_by(vault, insights_folder)
     cutoff = datetime.now(timezone.utc).timestamp() - days * 86400
-    issues, seen = [], set()
+    issues, seen = [], {}
     deadline = time.monotonic() + 10
-    paths = sorted(path for root in roots if root.is_dir() for path in root.rglob('*.jsonl'))
-    if len(paths) > 1024:
-        raise ValueError('Session coverage source limit exceeded; narrow native storage before retry')
-    for path in paths:
-        if time.monotonic() >= deadline:
-            raise ValueError('Session coverage deadline reached; audit is incomplete')
-        if path.stat().st_mtime < cutoff or path.is_symlink():
+    import bisect
+    paths = []
+    preferred = _slugify(project or context.canonical_project_root.name)
+    eligible = 0
+    enumeration_complete = True
+    for root in roots:
+        if not root.is_dir():
             continue
-        if context.host == 'claude':
-            sid = path.stem
-        else:
+        candidates = root.glob('*/*.jsonl') if context.host == 'claude' else root.rglob('*.jsonl')
+        for path in candidates:
+            if time.monotonic() >= deadline:
+                enumeration_complete = False
+                break
+            if path.is_symlink() or any(parent.is_symlink() for parent in path.parents if parent != home.parent):
+                continue
             try:
-                with path.open('rb') as stream:
-                    first = stream.readline(65537)
-                header = json.loads(first)
-                payload = header.get('payload', {})
-                sid = payload.get('id') or payload.get('session_id')
-                if header.get('type') != 'session_meta' or not isinstance(sid, str) or not sid:
-                    raise ValueError('Native source identity is unverified')
-                if payload.get('id') and payload.get('session_id') and payload['id'] != payload['session_id']:
-                    raise ValueError('Native source identity conflicts')
-            except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-                raise ValueError('Cannot verify native source identity') from exc
-        if sid in seen:
-            raise ValueError('Native source identity is duplicated')
-        seen.add(sid)
-        source_revision = hashlib.sha256(path.read_bytes()).hexdigest()
-        source_context = replace(context, native_session_id=sid, transcript_path=path)
-        batch = read_records(source_context, SourceCursor(historical=True), deadline)
-        if batch.status != 'ok' or batch.loss_of_input or batch.metadata.get('native_session_id') != sid:
-            raise ValueError('Native source audit is incomplete or unverified')
-        if hashlib.sha256(path.read_bytes()).hexdigest() != source_revision:
-            raise ValueError('Native source changed during audit')
-        cwd = batch.metadata.get('cwd')
-        if context.host == 'claude':
-            # The adapter's worktree default describes the invoking actor.
-            # A historical gap needs its own recorded cwd before repair.
-            cwd = None
-            with path.open('rb') as stream:
-                prefix = stream.read(65536)
-            for line in prefix.splitlines():
-                try:
-                    row = json.loads(line)
-                except (ValueError, UnicodeError):
+                if not path.is_file() or path.stat().st_mtime < cutoff:
                     continue
-                if isinstance(row, dict) and isinstance(row.get('cwd'), str):
-                    cwd = row['cwd']
+            except OSError:
+                issues.append(_incomplete_source(path, 'Native source is unavailable'))
+                continue
+            eligible += 1
+            hint = _native_identity_hint(context, path)
+            # Historical project labels only schedule work. Parsing below
+            # still proves the real source ID and recorded project.
+            priority = 2 if hint in covered else int(not _native_project_hint(context, path, preferred))
+            bisect.insort(paths, (priority, path, hint))
+            if len(paths) > 1024:
+                paths.pop()
+        if not enumeration_complete:
+            break
+    remainder = eligible - len(paths)
+    if remainder or not enumeration_complete:
+        issues.append(_incomplete_source(vault / sessions_folder,
+            'Session coverage source window is incomplete',
+            unscanned_sources=remainder + int(not enumeration_complete),
+            remainder_is_lower_bound=not enumeration_complete))
+    for position, (_, path, sid) in enumerate(paths):
+        if time.monotonic() >= deadline:
+            issues.append(_incomplete_source(vault / sessions_folder,
+                'Session coverage deadline reached; audit is incomplete',
+                unscanned_sources=len(paths) - position, remainder_is_lower_bound=False))
+            break
+        try:
+            if path.stat().st_mtime < cutoff or path.is_symlink():
+                continue
+            if sid is None:
+                raise ValueError('Native source identity is unverified')
+            if sid in seen:
+                seen[sid].append(path)
+                continue
+            seen[sid] = [path]
+            # This is a missing-note check, not a certification of covered
+            # transcript content. Duplicate hints are still registered above.
+            if sid in covered:
+                continue
+            source_revision = _source_sha(path, deadline)
+            source_context = replace(context, native_session_id=sid, transcript_path=path)
+            cursor = SourceCursor(historical=True)
+            user_count = 0
+            first_timestamp = None
+            earliest = latest = None
+            source_loss = False
+            while True:
+                batch = read_records(source_context, cursor, deadline)
+                source_loss = source_loss or batch.loss_of_input
+                user_count += sum(record.kind == 'message' and record.role == 'user'
+                                  and bool(record.text.strip()) for record in batch.records)
+                for record in batch.records:
+                    if record.timestamp:
+                        instant = datetime.fromisoformat(record.timestamp.replace('Z', '+00:00')).timestamp()
+                        first_timestamp = first_timestamp or record.timestamp
+                        earliest = instant if earliest is None else min(earliest, instant)
+                        latest = instant if latest is None else max(latest, instant)
+                if batch.source_complete or time.monotonic() >= deadline:
                     break
-        if not isinstance(cwd, str) or not Path(cwd).is_absolute():
-            raise ValueError('Native source project identity is unverified')
-        slug = _slugify(Path(cwd).name)
-        if project and slug != project.replace('_', '-').lower():
-            continue
-        records = [record for record in batch.records if record.kind == 'message' and record.role == 'user' and record.text.strip()]
-        timestamps = [record.timestamp for record in batch.records if record.timestamp]
-        duration = 0
-        if timestamps:
-            times = [datetime.fromisoformat(stamp.replace('Z', '+00:00')).timestamp() for stamp in timestamps]
-            duration = (max(times) - min(times)) / 60
-        if (len(records) < int(context.config.get('min_messages', 3))
-                or 0 < duration < float(context.config.get('min_duration_minutes', 2))):
-            continue
-        if sid in covered:
-            continue
-        date = _first_seen_date_from_ts(timestamps[0] if timestamps else None)
-        note_path = vault / sessions_folder / _make_filename(date, slug, sid)
-        refs = references.get(sid, [])
-        issues.append(Issue(check=NAME, note_path=str(note_path), project=slug,
-                            current_source=str(path), proposed_source=f'[[{note_path.stem}]]',
-                            reason=('FAIL:' if strict and refs else 'WARN:') + ' Native source has no session note',
-                            confidence=.9 if reconstruct else 0,
-                            extra={'unresolved': not reconstruct, 'signal_class':'session-coverage-gap',
-                                   'sid':sid, 'agent_provider':context.host, 'jsonl_path':str(path),
-                                   'source_revision':source_revision,
-                                   'cwd':cwd, 'referenced_by':refs, 'strict_fail':bool(strict and refs)}))
+                # Continue only a bounded transport window. Semantic partial
+                # rows, opaque drains, identity errors and loss remain visible.
+                if (source_loss or batch.metadata.get('native_session_id') != sid
+                        or batch.status not in {'ok', 'partial'}
+                        or batch.parser_state.get('_deferred_source_rows')
+                        or batch.parser_state.get('_opaque_drain')
+                        or batch.consumed_offset <= cursor.offset
+                        or any(warning != 'Transcript batch limit reached' for warning in batch.warnings)):
+                    break
+                cursor = SourceCursor(batch.source_generation, batch.consumed_offset,
+                    batch.source_identity, batch.anchor_digest, batch.parser_state, historical=True,
+                    known_size=batch.source_size, exhausted=batch.source_complete)
+            if (batch.status != 'ok' or source_loss or not batch.source_complete
+                    or batch.metadata.get('native_session_id') != sid):
+                issues.append(_incomplete_source(path, 'Native source audit is incomplete or unverified',
+                    capture_status=batch.status, loss_of_input=source_loss))
+                continue
+            if _source_sha(path, deadline) != source_revision:
+                raise ValueError('Native source changed during audit')
+            cwd = batch.metadata.get('cwd')
+            if context.host == 'claude':
+                # Only provenance recorded by a recognized native row can
+                # select a historical project; the invoking actor is no proof.
+                cwd = batch.metadata.get('recorded_worktree')
+            if not isinstance(cwd, str) or not Path(cwd).is_absolute():
+                raise ValueError('Native source project identity is unverified')
+            slug = _slugify(Path(cwd).name)
+            if project and slug != project.replace('_', '-').lower():
+                continue
+            duration = (latest - earliest) / 60 if earliest is not None else 0
+            if (user_count < int(context.config.get('min_messages', 3))
+                    or 0 < duration < float(context.config.get('min_duration_minutes', 2))):
+                continue
+            if sid in covered:
+                continue
+            date = _first_seen_date_from_ts(first_timestamp)
+            note_path = vault / sessions_folder / _make_filename(date, slug, sid)
+            refs = references.get(sid, [])
+            issues.append(Issue(check=NAME, note_path=str(note_path), project=slug,
+                                current_source=str(path), proposed_source=f'[[{note_path.stem}]]',
+                                reason=('FAIL:' if strict and refs else 'WARN:') + ' Native source has no session note',
+                                confidence=.9 if reconstruct else 0,
+                                extra={'unresolved': not reconstruct, 'signal_class':'session-coverage-gap',
+                                       'sid':sid, 'agent_provider':context.host, 'jsonl_path':str(path),
+                                       'source_revision':source_revision,
+                                       'cwd':cwd, 'referenced_by':refs, 'strict_fail':bool(strict and refs)}))
+        except (OSError, ValueError, TypeError, UnicodeError, RecursionError) as exc:
+            # One unreadable or partial transcript must not hide other gaps.
+            issues.append(_incomplete_source(path, 'Native source audit is incomplete: ' + type(exc).__name__))
+    duplicated = {str(path) for paths in seen.values() if len(paths) > 1 for path in paths}
+    if duplicated:
+        # No alphabetical winner: remove any earlier candidate for that ID.
+        issues = [issue for issue in issues if issue.current_source not in duplicated]
+        issues.extend(_incomplete_source(Path(path), 'Native source identity is duplicated')
+                      for path in sorted(duplicated))
+    if any(issue.extra.get('unscanned_sources') for issue in issues):
+        # An incomplete identity window cannot certify uniqueness for repair.
+        for issue in issues:
+            if issue.extra.get('signal_class') == 'session-coverage-gap':
+                issue.confidence = 0.0
+                issue.extra.update(unresolved=True, audit_complete=False)
     return issues
 
 
@@ -706,7 +822,8 @@ def _scan_claude_legacy(
     # to pwd-database lookups when unset — sibling-module convention, more
     # defensive than expanduser-and-walk-up.
     home = Path.home()
-    projects_root = home / ".claude" / "projects"
+    from runtime_adapters.claude import legacy_native_projects_root
+    projects_root = legacy_native_projects_root(home)
 
     now = datetime.now(timezone.utc).timestamp()
     cutoff = now - days * 86400
@@ -746,7 +863,7 @@ def _scan_claude_legacy(
     if not projects_root.is_dir():
         # No projects directory at all — nothing to scan.
         print(
-            "[session-coverage] ~/.claude/projects not found; nothing to scan",
+            "[session-coverage] the selected native projects root not found; nothing to scan",
             file=sys.stderr,
         )
         return []

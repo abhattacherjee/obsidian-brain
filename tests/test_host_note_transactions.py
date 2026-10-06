@@ -125,20 +125,32 @@ def test_selected_vault_rejects_symlink_escape(context, tmp_path):
 
 
 def _holder(context):
+    path_fields = ('canonical_project_root', 'worktree', 'transcript_path', 'vault_path',
+                   'config_path', 'resource_root', 'index_path', 'state_path', 'native_home',
+                   'user_home', 'invocation_cwd', 'coordination_root')
+    descriptor = {name: str(getattr(context, name)) if getattr(context, name) is not None else None
+                  for name in path_fields}
+    descriptor.update(host=context.host, client=context.client,
+                      native_session_id=context.native_session_id, config=dict(context.config))
     script = '''
-import sys, time
+import sys, time, json
 from pathlib import Path
-from types import SimpleNamespace
 sys.path.insert(0, sys.argv[1])
 from note_transactions import ownership_lock
-ctx = SimpleNamespace(index_path=Path(sys.argv[2]))
-with ownership_lock(ctx):
+from runtime_context import RuntimeContext, using_runtime_context
+values = json.loads(sys.argv[2])
+for name in ('canonical_project_root','worktree','transcript_path','vault_path','config_path',
+             'resource_root','index_path','state_path','native_home','user_home','invocation_cwd','coordination_root'):
+    if values[name] is not None:
+        values[name] = Path(values[name])
+ctx = RuntimeContext(**values)
+with using_runtime_context(ctx), ownership_lock(ctx):
     print("held", flush=True)
     time.sleep(2)
 '''
     process = subprocess.Popen(
         [sys.executable, "-c", script, str(Path(__file__).resolve().parents[1] / "hooks"),
-         str(context.index_path)], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+         json.dumps(descriptor)], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
         stderr=subprocess.PIPE, text=True,
     )
     ready, _, _ = select.select([process.stdout], [], [], 5)
@@ -258,3 +270,25 @@ def test_prepared_retry_refuses_later_edits_to_its_owned_input(selected_host_con
     monkeypatch.setattr(transactions, '_atomic_write', atomic)
     assert apply_mutations(actor, [mutation]).status == 'conflict'
     assert note.read_text() == human
+
+
+def test_physical_vault_lock_excludes_process_with_different_XDG_root(context, tmp_path):
+    import note_transactions as transactions
+    alternate = tmp_path / 'other-private-xdg'
+    alternate.mkdir(mode=0o700)
+    other = replace(context, coordination_root=alternate.resolve())
+    assert transactions.coordination_location(other) != transactions.coordination_location(context)
+    process = _holder(other)
+    note = context.vault_path / 'different-root-contended.md'
+    try:
+        mutation = NoteMutation(note, None, {'document':'published after ownership'}, 'different-root')
+        result = apply_mutations(context, [mutation])
+        assert result.status == 'pending' and result.pending_path.is_file()
+        assert not note.exists()
+    finally:
+        process.terminate()
+        process.communicate(timeout=5)
+    pending=result.pending_path
+    result = transactions.recover_pending_mutations(context)
+    assert result.status in {'applied','unchanged'}
+    assert note.read_text() == 'published after ownership' and not pending.exists()

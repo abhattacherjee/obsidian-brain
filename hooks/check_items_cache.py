@@ -64,8 +64,8 @@ def _cache_path() -> Path:
     from runtime_context import current_runtime_context
     context = current_runtime_context()
     if context is not None:
-        from note_transactions import session_state_path
-        return session_state_path(context) / "cache" / "check-items-classifications.json"
+        from session_auxiliary_state import cross_run_directory
+        return cross_run_directory(context) / "check-items-classifications.json"
     return CACHE_PATH
 
 
@@ -410,11 +410,25 @@ def _cache_ai_identity(context, requested=None):
     return backend, model
 
 
+
+def classifier_cache_replay_status(context):
+    """Report whether today's native model selection can authorize replay."""
+    from runtime_context import current_runtime_context
+    if current_runtime_context() is not context:
+        raise ValueError("Classifier cache status requires the invoking context")
+    _, model = _cache_ai_identity(context)
+    enabled = isinstance(model, str) and bool(model)
+    return {"enabled": enabled, "reason": "ready" if enabled else "native_model_unresolved",
+            "model": model if enabled else None}
+
+
 def _classifier_contract(groups):
     from ai_backend import ai_contract_identity
+    identifiers = {group.get("group_id", ""): canonical_hash(group.get("representative", ""))
+                   for group in groups}
     return ai_contract_identity("classify_items", {
-        "expected_ids": [group.get("group_id", group.get("canonical_hash", "")) for group in groups],
-        "project_by_id": {group.get("group_id", group.get("canonical_hash", "")): group.get("project", "") for group in groups},
+        "expected_ids": [identifiers[group.get("group_id", "")] for group in groups],
+        "project_by_id": {identifiers[group.get("group_id", "")]: group.get("project", "") for group in groups},
         "expected_count": len(groups),
     })
 
@@ -488,7 +502,16 @@ def _provenance(group, project, extra=None, *, observed_model=None):
     # Unknown native defaults cannot prove replay uses the same model.
     if not isinstance(model, str) or not model:
         return None
-    semantic = {key: value for key, value in group.items() if not key.startswith("_")}
+    semantic = {key: value for key, value in group.items()
+                if not key.startswith("_") and key != "group_id"}
+    for field in ("members", "instances"):
+        if isinstance(semantic.get(field), list):
+            semantic[field] = [{key: value for key, value in member.items() if key != "mtime"}
+                               for member in semantic[field]]
+    stable_extra = {key: value for key, value in extra.items()
+                    if not key.startswith('_') and key not in {
+                        'classifier_model_by_id', 'classifier_backend_by_id', 'backend_contract_by_id'}}
+    stable_extra["backend_contract"] = extra.get("backend_contract_by_id", {}).get(group.get("group_id"))
     values = {
         "input": semantic,
         "vault": str(context.vault_path.resolve()),
@@ -502,7 +525,7 @@ def _provenance(group, project, extra=None, *, observed_model=None):
                               "prefilter": extra.get("prefilter", True)},
         "backend": backend,
         "model": model,
-        "evidence": extra,
+        "evidence": stable_extra,
     }
     return hashlib.sha256(json.dumps(values, sort_keys=True, separators=(",", ":"),
                                      ensure_ascii=False).encode()).hexdigest()

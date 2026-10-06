@@ -129,11 +129,10 @@ def test_native_start_never_scans_or_rebuilds_index(context, capture_calls, monk
 
 def test_existing_verified_index_can_supply_bounded_context(context, capture_calls):
     from native_lifecycle import dispatch
-    coordination = context.index_path.parent / ("." + context.index_path.name + ".coordination")
-    coordination.mkdir()
-    with sqlite3.connect(coordination / "state.sqlite3") as conn:
-        conn.execute("CREATE TABLE identity (vault TEXT PRIMARY KEY)")
-        conn.execute("INSERT INTO identity VALUES (?)", (str(context.vault_path.resolve()),))
+    from contextlib import closing
+    from note_transactions import connect_coordination
+    with closing(connect_coordination(context)):
+        pass
     note = context.vault_path / "claude-sessions" / "prior.md"
     with sqlite3.connect(context.index_path) as conn:
         conn.execute("CREATE TABLE notes(path TEXT, project TEXT, type TEXT, date TEXT, title TEXT, body TEXT)")
@@ -203,9 +202,13 @@ def test_native_wrapper_argument_errors_fail_open():
     assert "native client identity is unavailable" in result.stderr
 
 
-@pytest.mark.parametrize("status,pending,loss", [("pending", 1, False), ("complete", 0, True)])
+@pytest.mark.parametrize("status,pending,loss,expected_exit", [
+    ("pending", 1, False, 1),
+    ("complete", 0, True, 2),
+    ("unavailable", 1, False, 2),
+])
 def test_doctor_reports_pending_recovery_and_keeps_scanning(context, capture_calls, monkeypatch, capsys,
-                                                           status, pending, loss):
+                                                           status, pending, loss, expected_exit):
     from types import SimpleNamespace
     from scripts import vault_doctor
     import capture
@@ -218,9 +221,9 @@ def test_doctor_reports_pending_recovery_and_keeps_scanning(context, capture_cal
     monkeypatch.setattr(vault_doctor.vault_doctor_checks, "all_checks", lambda: [module])
     monkeypatch.setattr(capture, "recover_registered", lambda *a, **k: SimpleNamespace(
         status=status, applied_revision=None, pending_sources=pending, loss_of_input=loss, warnings=("deadline",)))
-    monkeypatch.setattr(sys, "argv", ["vault_doctor", "--json"])
+    monkeypatch.setattr(sys, "argv", ["vault_doctor", "--json", "--apply"])
     with using_runtime_context(context):
-        assert vault_doctor.main() == 2
+        assert vault_doctor.main() == expected_exit
     output = capsys.readouterr()
     assert scanned
     assert json.loads(output.out)["capture_recovery"]["pending_sources"] == pending
@@ -363,3 +366,246 @@ def test_native_reaper_reports_unavailable_without_crashing(context, monkeypatch
     assert result.status == "unavailable"
     assert result.pending_sources == 1
     assert "retained source unavailable" in result.warnings
+
+
+def test_unknown_source_retains_cursor_and_is_visible_without_index(selected_host_context):
+    from dataclasses import replace
+    import capture
+    import native_lifecycle
+    import note_transactions
+    selected = selected_host_context
+    secret = 'sk-test-secret-do-not-expose'
+    if selected.host == 'claude':
+        source = selected.native_home / 'projects' / 'synthetic' / 'source.jsonl'
+        header = {'type': 'user', 'sessionId': selected.native_session_id,
+                  'uuid': 'private-message-id', 'message': {'role': 'user', 'content': 'Visible first fact.'}}
+    else:
+        source = selected.native_home / 'sessions' / 'source.jsonl'
+        header = {'type': 'session_meta', 'payload': {'id': selected.native_session_id,
+                  'cwd': str(selected.canonical_project_root)}}
+    source.parent.mkdir(parents=True, exist_ok=True)
+    prefix = (json.dumps(header) + '\n').encode()
+    unknown = {'type': 'future_record', 'sessionId': selected.native_session_id,
+               'payload': {'content': secret, 'id': 'private-unknown-id'}}
+    raw = prefix + (json.dumps(unknown) + '\n').encode()
+    source.write_bytes(raw)
+    selected = replace(selected, transcript_path=source)
+    result = capture.capture_checkpoint(selected, capture.CaptureEvent('session_start'), time.monotonic()+1)
+    assert result.status == 'pending'
+    assert result.pending_sources == 1
+    # The format is incomplete, but the unread bytes remain available: no input loss.
+    assert result.loss_of_input is False
+    output = native_lifecycle.dispatch(selected, 'session_start', {}, time.monotonic())
+    hint = output['hookSpecificOutput']['additionalContext']
+    assert 'Unknown substantive' in hint
+    assert 'type=future_record' in hint
+    assert 'at least 1 source(s)' in hint
+    for private in (secret, str(source), selected.native_session_id, 'private-message-id', 'private-unknown-id'):
+        assert private not in hint
+    assert not selected.index_path.exists()
+    assert not list(selected.vault_path.rglob('*.md'))
+    assert source.read_bytes() == raw
+    with note_transactions.connect_coordination(selected) as connection:
+        row = connection.execute('SELECT cursor,completeness FROM source_sessions WHERE scope=?',
+                                 (selected.session_key,)).fetchone()
+    assert json.loads(row[0])['offset'] == len(raw)
+    refs = json.loads(row[0])['parser_state']['_deferred_source_rows']
+    assert len(refs) == 1 and refs[0]['offset'] == len(prefix)
+    assert row[1] == 'partial'
+
+
+def test_start_diagnostic_deduplicates_safe_labels_and_uses_lower_bound(context, monkeypatch):
+    import capture
+    import native_lifecycle
+    warning = 'Unknown substantive Claude transcript record (type=future_record)'
+    monkeypatch.setattr(capture, 'recover_registered', lambda *a, **k: capture.CaptureResult(
+        'pending', pending_sources=3, warnings=(warning, warning, 'raw secret sk-secret /private/path')
+        + tuple('Unknown substantive Claude transcript record (type=future_' + label + ')'
+                for label in ('one', 'two', 'three', 'four', 'five'))))
+    monkeypatch.setattr(capture, 'capture_checkpoint', lambda *a, **k: capture.CaptureResult(
+        'pending', pending_sources=1, warnings=(warning,
+        'Unknown substantive Claude transcript record (type=sk-secret)',
+        'Unknown substantive Claude transcript record (type=unsafe/path)')))
+    monkeypatch.setattr(native_lifecycle, '_context_hint', lambda *a: {
+        'hookSpecificOutput': {'hookEventName': 'SessionStart', 'additionalContext': 'Existing context'}})
+    hint = native_lifecycle.dispatch(context, 'resume', {}, time.monotonic())['hookSpecificOutput']['additionalContext']
+    assert hint.startswith('Existing context')
+    assert 'at least 3 source(s)' in hint
+    assert hint.count('future_record') == 1
+    assert 'future_three' in hint
+    assert 'future_four' not in hint and 'future_five' not in hint
+    assert 'sk-secret' not in hint and '/private/path' not in hint and 'unsafe/path' not in hint
+
+
+def test_oversized_source_record_remains_pending_with_visible_safe_hint(selected_host_context):
+    from dataclasses import replace
+    from contextlib import closing
+    import capture, native_lifecycle, note_transactions
+    selected = selected_host_context
+    if selected.host == 'claude':
+        source = selected.native_home / 'projects' / 'synthetic' / 'source.jsonl'
+        header = {'type': 'user', 'sessionId': selected.native_session_id,
+                  'uuid': 'private-message-id', 'message': {'role': 'user', 'content': 'Visible fact.'}}
+    else:
+        source = selected.native_home / 'sessions' / 'source.jsonl'
+        header = {'type': 'session_meta', 'payload': {'id': selected.native_session_id,
+                  'cwd': str(selected.canonical_project_root)}}
+    source.parent.mkdir(parents=True, exist_ok=True)
+    prefix = (json.dumps(header) + '\n').encode()
+    secret = 'private-source-body-secret'
+    raw = prefix + (json.dumps({'type': 'future_record', 'content': secret + 'x' * 1100000}) + '\n').encode()
+    source.write_bytes(raw)
+    selected = replace(selected, transcript_path=source)
+    result = capture.capture_checkpoint(selected, capture.CaptureEvent('session_start'), time.monotonic() + 2)
+    assert result.status == 'pending' and result.pending_sources == 1
+    assert result.loss_of_input is False
+    output = native_lifecycle.dispatch(selected, 'session_start', {}, time.monotonic())
+    hint = output['hookSpecificOutput']['additionalContext']
+    assert 'Oversized '+selected.host.capitalize()+' transcript record retained' in hint
+    assert 'at least 1 source(s)' in hint
+    for private in (secret, str(source), selected.native_session_id, 'private-message-id'):
+        assert private not in hint
+    with closing(note_transactions.connect_coordination(selected)) as connection:
+        row = connection.execute('SELECT descriptor FROM source_sessions WHERE scope=?', (capture._scope(selected),)).fetchone()
+        assert row is not None
+        state = json.loads(connection.execute('SELECT cursor FROM source_sessions WHERE scope=?', (capture._scope(selected),)).fetchone()[0])
+        assert state['offset'] == len(raw)
+        refs = state['parser_state']['_deferred_source_rows']
+        assert len(refs) == 1 and refs[0]['offset'] == len(prefix)
+        assert refs[0]['reason'] == 'oversized:unrecognized'
+        assert secret not in json.dumps(refs)
+    assert source.read_bytes() == raw and not selected.index_path.exists()
+
+
+@pytest.mark.parametrize('unknown_type',['future_record','foo-state'])
+def test_known_rows_after_unknown_publish_partial_and_doctor_names_type(selected_host_context, capsys, unknown_type):
+    from dataclasses import replace
+    import capture
+    import native_lifecycle
+    import note_transactions
+    import vault_doctor
+    selected = selected_host_context
+    if selected.host == 'claude':
+        source = selected.native_home/'projects'/'synthetic'/'around-unknown.jsonl'
+        header = {'type':'user','sessionId':selected.native_session_id,'uuid':'before',
+                  'message':{'role':'user','content':'Known before unknown.'}}
+        later = {'type':'user','sessionId':selected.native_session_id,'uuid':'after',
+                 'message':{'role':'user','content':'Known after unknown.'}}
+    else:
+        source = selected.native_home/'sessions'/'around-unknown.jsonl'
+        header = {'type':'session_meta','payload':{'id':selected.native_session_id,
+                  'cwd':str(selected.canonical_project_root)}}
+        later = {'type':'event_msg','payload':{'type':'item_completed',
+                 'thread_id':selected.native_session_id,'turn_id':'owned-later-turn',
+                 'item':{'type':'UserMessage','id':'after',
+                         'content':[{'type':'text','text':'Known after unknown.'}]}}}
+    unknown = {'type':unknown_type,'version':'private-unknown-version','cwd':'/private/unknown-directory',
+               'sessionId':'private-foreign-session-id',
+               'payload':{'content':'private-unknown-content','account_id':'private-account-id'}}
+    source.parent.mkdir(parents=True,exist_ok=True)
+    if selected.host == 'claude':
+        assistant = {'type':'assistant','sessionId':selected.native_session_id,'uuid':'answer',
+                     'message':{'role':'assistant','content':'Known answer after unknown.'}}
+    else:
+        assistant = {'type':'event_msg','payload':{'type':'item_completed',
+                     'thread_id':selected.native_session_id,'turn_id':'owned-later-turn',
+                     'item':{'type':'AgentMessage','id':'answer','content':[{'type':'text','text':'Known answer after unknown.'}]}}}
+    raw = ''.join(json.dumps(row)+'\n' for row in (header,unknown,later,assistant)).encode()
+    source.write_bytes(raw)
+    actor = replace(selected,transcript_path=source)
+    note = selected.vault_path/'partial.md'
+    result = capture.capture_checkpoint(actor,capture.CaptureEvent('stop',note_path=note,min_messages=1),time.monotonic()+2)
+    assert result.status == 'pending' and result.pending_sources == 1 and not result.loss_of_input
+    assert 'Known after unknown.' in note.read_text()
+    assert 'Known answer after unknown.' in note.read_text()
+    assert 'private-unknown-content' not in note.read_text()
+    output = native_lifecycle.dispatch(actor,'session_start',{},time.monotonic())
+    assert 'type='+unknown_type in output['hookSpecificOutput']['additionalContext']
+    report = vault_doctor._recover_runtime_pending()
+    assert report['status'] == 'pending' and report['pending_sources'] >= 1
+    assert any('type='+unknown_type in warning for warning in report['warnings'])
+    assert 'capture recovery pending' in capsys.readouterr().err
+    assert source.read_bytes() == raw
+    with note_transactions.connect_coordination(actor) as connection:
+        retained = connection.execute('SELECT cursor FROM source_sessions WHERE scope=?',(actor.session_key,)).fetchone()[0]
+    refs = json.loads(retained)['parser_state']['_deferred_source_rows']
+    assert len(refs) == 1 and 'private-unknown-content' not in json.dumps(refs)
+    with note_transactions.connect_coordination(actor) as connection:
+        facts = repr(connection.execute('SELECT text FROM capture_events').fetchall())
+        documents = repr(connection.execute('SELECT payload,document FROM operations').fetchall())
+    for secret in ('private-unknown-content','private-account-id','private-unknown-version',
+                   '/private/unknown-directory','private-foreign-session-id'):
+        assert secret not in facts+documents+retained+note.read_text()
+
+
+def test_retired_review_notice_is_project_scoped_and_has_no_scheduled_count(selected_host_context, monkeypatch, capsys):
+    import io
+    from dataclasses import replace
+    import capture
+    import native_entry
+    import note_transactions
+    selected = selected_host_context
+    source = selected.native_home / ('projects/synthetic/notice.jsonl' if selected.host == 'claude'
+                                    else 'sessions/notice.jsonl')
+    source.parent.mkdir(parents=True, exist_ok=True)
+    if selected.host == 'claude':
+        rows = [{'type':'user','sessionId':selected.native_session_id,'uuid':'before',
+                 'message':{'role':'user','content':'Known owned fact.'}},
+                {'type':'future_record','private':'not-a-visible-fact'},
+                {'type':'assistant','sessionId':selected.native_session_id,'uuid':'answer',
+                 'message':{'role':'assistant','content':'Known owned answer.'}}]
+    else:
+        rows = [{'type':'session_meta','payload':{'id':selected.native_session_id,
+                 'cwd':str(selected.canonical_project_root)}},
+                {'type':'future_record','private':'not-a-visible-fact'},
+                {'type':'event_msg','payload':{'type':'item_completed','thread_id':selected.native_session_id,
+                 'turn_id':'own-turn','item':{'type':'UserMessage','id':'before',
+                 'content':[{'type':'text','text':'Known owned fact.'}]}}},
+                {'type':'event_msg','payload':{'type':'item_completed','thread_id':selected.native_session_id,
+                 'turn_id':'own-turn','item':{'type':'AgentMessage','id':'answer',
+                 'content':[{'type':'text','text':'Known owned answer.'}]}}}]
+    source.write_text(''.join(json.dumps(row)+'\n' for row in rows))
+    selected.config_path.write_text(json.dumps(dict(selected.config,min_messages=1,min_duration_minutes=0)))
+    def entry(event, project=selected.canonical_project_root, native_id=selected.native_session_id, path=source):
+        monkeypatch.setattr('sys.stdin', io.StringIO(json.dumps({'session_id':native_id,
+            'cwd':str(project),'transcript_path':str(path),'reason':'other'})))
+        assert native_entry.run(['--host',selected.host,'--client',selected.client,
+            '--event',event,'--config',str(selected.config_path),'--index',str(selected.index_path),
+            '--state',str(selected.state_path)], started_at=time.monotonic()) == 0
+        return capsys.readouterr()
+    for _ in range(3):
+        output = entry('session_end')
+        assert 'retains unverified input for review' in output.err
+        assert 'at least 1 source(s)' not in output.err
+    actor = replace(selected,transcript_path=source)
+    with note_transactions.connect_coordination(actor) as connection:
+        assert connection.execute('SELECT COUNT(*) FROM retired_source_versions').fetchone()[0] == 1
+        refs = json.loads(connection.execute('SELECT cursor FROM source_sessions').fetchone()[0])
+        assert refs['parser_state']['_deferred_source_rows']
+    same_project = entry('session_start', native_id='next-same-project',path=source.parent/'not-created.jsonl')
+    assert 'retains unverified input for review' in same_project.out
+    other_project = selected.worktree.parent/'separate-parent'/selected.canonical_project_root.name
+    other_project.mkdir(parents=True)
+    foreign = entry('session_start',project=other_project,native_id='next-foreign-project',path=source.parent/'not-created.jsonl')
+    assert 'unverified input' not in foreign.out + foreign.err
+    assert 'future_record' not in foreign.out + foreign.err
+
+    # An incomplete appended row is real scheduled input, unlike retired refs.
+    if selected.host == 'claude':
+        late = {'type':'user','sessionId':selected.native_session_id,'uuid':'late',
+                'message':{'role':'user','content':'New owned append.'}}
+    else:
+        late = {'type':'event_msg','payload':{'type':'item_completed','thread_id':selected.native_session_id,
+                'turn_id':'late-turn','item':{'type':'UserMessage','id':'late',
+                'content':[{'type':'text','text':'New owned append.'}]}}}
+    with source.open('a') as stream:
+        stream.write(json.dumps(late))
+    append_notice = entry('session_end')
+    assert 'at least 1 source(s)' in append_notice.err
+    with note_transactions.connect_coordination(actor) as connection:
+        assert connection.execute('SELECT COUNT(*) FROM retired_source_versions').fetchone()[0] == 0
+    with source.open('a') as stream:
+        stream.write('\n')
+    finished = entry('session_end')
+    assert 'retains unverified input for review' in finished.err
+    assert 'at least 1 source(s)' not in finished.err

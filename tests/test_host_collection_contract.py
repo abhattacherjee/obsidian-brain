@@ -19,6 +19,8 @@ def _collect(tmp_path, test_source, fixture_source='', helper_files=None,
          'hosts':{host:{'status':'supported'} for host in ('claude','codex')}},
         {'id':'cli','required':True,'calls':['brain_cli.main'],
          'hosts':{host:{'status':'supported'} for host in ('claude','codex')}},
+        {'id':'skill.dispatch','required':True,'calls':['skill_procedures.run_operation'],
+         'hosts':{host:{'status':'supported'} for host in ('claude','codex')}},
         {'id':'claude_native_format','required':False,'calls':['parse_claude_record'],
          'hosts':{'claude':{'status':'supported'},'codex':{'status':'unsupported:claude-record-format'}}},
     ]}
@@ -335,3 +337,301 @@ def test_scratch_timeout_reports_bounded_child_output(tmp_path, monkeypatch):
     assert "exceeded its 60s deadline" in diagnostic
     assert "child stdout tail" in diagnostic and "child stderr tail" in diagnostic
     assert "x" * 4001 not in diagnostic and "y" * 4001 not in diagnostic
+
+
+def test_dynamic_imported_skill_alias_requires_real_host_fixture(tmp_path):
+    source = ('import skill_procedures as procedures\n'
+              'run = getattr(procedures, "run_" + "operation")\n'
+              'def test_new():\n    run(ctx, "vault-stats", {})\n')
+    result = _collect(tmp_path, source, helper_files={
+        'skill_procedures.py': 'def run_operation(context, operation, payload):\n    return 0\n'})
+    assert result.returncode != 0 and 'needs host fixture' in result.stderr
+
+
+def test_local_shared_service_import_cannot_hide_actor_scope(tmp_path):
+    result = _collect(tmp_path, 'def test_new():\n'
+                     '    from skill_procedures import run_operation as invoke\n'
+                     '    invoke(None, "vault-stats", {})\n', helper_files={
+        'skill_procedures.py': 'def run_operation(context, operation, payload):\n    return 0\n'})
+    assert result.returncode != 0 and 'needs host fixture' in result.stderr
+
+
+def test_dynamic_skill_alias_still_checks_actual_foreign_actor(tmp_path):
+    source = ('from dataclasses import replace\n'
+              'import skill_procedures as procedures\n'
+              'run = getattr(procedures, "run_" + "operation")\n'
+              '@pytest.mark.parametrize("host",["claude","codex"])\n'
+              'def test_new(host, selected_host_context):\n'
+              '    run(replace(selected_host_context, host="claude"), "vault-stats", {})\n')
+    result = _collect(tmp_path, source,
+                      'from parity_test_helpers import selected_host_context\n',
+                      helper_files={'skill_procedures.py':
+                          'def run_operation(context, operation, payload):\n    return 0\n'},
+                      execute=True)
+    assert result.returncode != 0
+    assert 'actual RuntimeContext does not match invoking host' in result.stdout + result.stderr
+
+
+def test_unresolved_shared_module_attribute_requires_actor_declaration(tmp_path):
+    source = ('import skill_procedures as procedures\n'
+              'method = "run_" + str("operation")\n'
+              'run = getattr(procedures, method)\n'
+              'def test_new():\n    run(None, "vault-stats", {})\n')
+    result = _collect(tmp_path, source, helper_files={
+        'skill_procedures.py': 'def run_operation(context, operation, payload):\n    return 0\n'})
+    assert result.returncode != 0 and 'needs host fixture' in result.stderr
+
+
+def test_aliased_getsource_reflection_is_structural_but_actual_call_is_not(tmp_path):
+    source = ('from inspect import getsource as source_of\n'
+              'import skill_procedures as procedures\n'
+              'def test_new():\n'
+              '    assert source_of(getattr(procedures, "run_" + "operation"))\n')
+    helpers = {'skill_procedures.py':'def run_operation(context, operation, payload):\n    return 0\n'}
+    reflected = _collect(tmp_path,source,helper_files=helpers)
+    assert reflected.returncode == 0
+    injected = _collect(tmp_path,source+'    procedures.run_operation(None, "vault-stats", {})\n',helper_files=helpers)
+    assert injected.returncode != 0 and 'needs host fixture' in injected.stderr
+
+
+@pytest.mark.parametrize("access", [
+    'run = sp.run_operation',
+    'run = importlib.import_module("skill_procedures").run_operation',
+    'run = __import__("skill_procedures").run_operation',
+    'run = vars(sp)["run_operation"]',
+    'run = sp.OPERATIONS["recall"]["config"]',
+])
+def test_reflective_shared_alias_requires_invoking_actor(tmp_path, access):
+    source = ('import importlib\nimport skill_procedures as sp\n'
+              + access + '\ndef test_new():\n    run(None, "recall", {})\n')
+    helper = ('def run_operation(context, skill, payload):\n    return 0\n'
+              'OPERATIONS = {"recall": {"config": run_operation}}\n')
+    result = _collect(tmp_path, source, helper_files={'skill_procedures.py': helper})
+    assert result.returncode != 0
+    assert 'needs host fixture' in result.stderr
+
+
+@pytest.mark.parametrize('paired', [False, True])
+@pytest.mark.parametrize('setup, invocation', [
+    ('fn = capture.capture_checkpoint', 'fn(ctx, event, deadline)'),
+    ('fn = functools.partial(capture.capture_checkpoint, ctx)', 'fn(event, deadline)'),
+    ('', 'list(map(capture.capture_checkpoint, rows))'),
+    ('fn = lambda ctx: capture.capture_checkpoint(ctx, event, deadline)', 'fn(ctx)'),
+    ('module = capture', 'module.capture_checkpoint(ctx, event, deadline)'),
+    ('dispatch = {"capture": capture.capture_checkpoint}', 'dispatch["capture"](ctx, event, deadline)'),
+])
+def test_callable_capture_alias_requires_paired_hosts(tmp_path, setup, invocation, paired):
+    declaration = ('@pytest.mark.parametrize("host", ["claude", "codex"])\n'
+                   'def test_new(host, selected_host_context):\n    ctx = selected_host_context\n'
+                   if paired else 'def test_new():\n')
+    source = 'import capture\nimport functools\nctx = None\n' + setup + '\n' + declaration + '    ' + invocation + '\n'
+    result = _collect(tmp_path, source, helper_files={
+        'capture.py': 'def capture_checkpoint(*args):\n    return True\n',
+    })
+    if paired:
+        assert result.returncode == 0 and '2 tests collected' in result.stdout, result.stdout + result.stderr
+    else:
+        assert result.returncode != 0 and 'needs host fixture' in result.stderr, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize('access', ['globals()["sp"].run_operation',
+                                  'sp.__dict__["run_operation"]'])
+def test_runtime_guard_refuses_dynamic_call_without_actor_before_service(tmp_path, access):
+    result = _collect(tmp_path,
+        'import skill_procedures as sp\ndef test_new():\n    '
+        + access + '(None, "recall", {})\n',
+        helper_files={'skill_procedures.py':
+            'from pathlib import Path\ndef run_operation(*args):\n'
+            '    Path("service-ran").write_text("unsafe")\n    return 0\n'},
+        execute=True)
+    assert result.returncode != 0
+    assert ('selected_host_context fixture is required' in result.stdout
+            or 'needs host fixture' in result.stderr), result.stdout + result.stderr
+    assert not (tmp_path / 'service-ran').exists()
+
+
+def test_source_change_during_collection_invalidates_cached_syntax(tmp_path):
+    fixture = ('import parity_collection_plugin as plugin\n'
+               'from pathlib import Path\n'
+               'original_scope = plugin._scope\n'
+               'def changed_scope(*args, **kwargs):\n'
+               '    result = original_scope(*args, **kwargs)\n'
+               '    path = Path(__file__).with_name("test_case.py")\n'
+               '    path.write_text(path.read_text() + "\\n# changed during collection\\n")\n'
+               '    return result\n'
+               'plugin._scope = changed_scope\n')
+    result = _collect(tmp_path, 'def test_new():\n    assert True\n', fixture)
+    assert result.returncode != 0
+    assert 'source bytes changed during collection' in result.stderr
+
+
+@pytest.mark.parametrize('paired', [False, True])
+@pytest.mark.parametrize('setup, call, fixture', [
+    ('NAME = "skill_procedures"\nrun = importlib.import_module(NAME).run_operation', 'run', ''),
+    ('run = sp.__dict__["run_operation"]', 'run', ''),
+    ('run = operator.attrgetter("run_operation")(sp)', 'run', ''),
+    ('', 'run', '@pytest.fixture\ndef run():\n    import skill_procedures as sp\n    return sp.run_operation\n'),
+    ('run, ignored = sp.run_operation, None', 'run', ''),
+    ('def helper():\n    return sp.run_operation\n', 'helper()', ''),
+    ('class Dispatch:\n    run = staticmethod(sp.run_operation)', 'Dispatch.run', ''),
+    ('for run in [sp.run_operation]:\n    pass', 'run', ''),
+    ('(run := sp.run_operation)', 'run', ''),
+    ('', 'run', ''),
+    ('', 'globals()["sp"].run_operation', ''),
+    ('', 'sys.modules["skill_procedures"].run_operation', ''),
+    ('run = sp.OPERATIONS.get("recall")["config"]', 'run', ''),
+    ('OPS = [sp.run_operation]', 'OPS[0]', ''),
+    ('run = lambda *args: (None, sp.run_operation(*args))', 'run', ''),
+    ('run: object = sp.run_operation', 'run', ''),
+    ('run = operator.methodcaller("run_operation", None, "recall", {})',
+     'lambda *args: run(sp)', ''),
+])
+def test_reviewed_reflective_forms_require_paired_invoking_actors(tmp_path, setup, call, fixture, paired):
+    default = 'run=sp.run_operation' if not setup and call == 'run' and not fixture else ''
+    parameters = ['host', 'selected_host_context'] if paired else []
+    if fixture:
+        parameters.append('run')
+    if default:
+        parameters.append(default)
+    declaration = '@pytest.mark.parametrize("host", ["claude", "codex"])\n' if paired else ''
+    source = ('import skill_procedures as sp\nimport importlib\nimport operator\nimport sys\n'
+              + setup + '\n' + declaration + 'def test_new(' + ', '.join(parameters)
+              + '):\n    (' + call + ')(None, "recall", {})\n')
+    helper = ('def run_operation(*args):\n    return 0\n'
+              'OPERATIONS = {"recall": {"config": run_operation}}\n')
+    result = _collect(tmp_path, source, fixture, {'skill_procedures.py': helper})
+    if paired:
+        assert result.returncode == 0 and '2 tests collected' in result.stdout, result.stdout + result.stderr
+    else:
+        assert result.returncode != 0 and 'needs host fixture' in result.stderr, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize('setup,invoke',[
+    ('OPS={"c":capture.capture_checkpoint}', 'for f in OPS.values():\n        f(None)'),
+    ('OPS=[capture.capture_checkpoint]', 'for f in OPS:\n        f(None)'),
+    ('CL=(lambda f: (lambda *a: f(*a)))(capture.capture_checkpoint)', 'CL(None)'),
+    ('import types\nNS=types.SimpleNamespace(f=capture.capture_checkpoint)', 'NS.f(None)'),
+    ('import types\nOPS=types.MappingProxyType({"c":capture.capture_checkpoint})', 'for f in OPS.values():\n        f(None)'),
+    ('OPS={capture.capture_checkpoint}', 'for f in OPS:\n        f(None)'),
+    ('def holder():\n    pass\nholder.f=capture.capture_checkpoint', 'holder.f(None)'),
+    ('class B:\n    f=staticmethod(capture.capture_checkpoint)\nclass K(B):\n    pass', 'K.f(None)'),
+])
+def test_stored_shared_original_cannot_bypass_runtime_actor(tmp_path,setup,invoke):
+    source='import capture\n'+setup+'\ndef test_new():\n    '+invoke+'\n'
+    result=_collect(tmp_path,source,helper_files={'capture.py':
+        'from pathlib import Path\ndef capture_checkpoint(*args):\n    Path("service-ran").write_text("unsafe")\n'},execute=True)
+    assert result.returncode!=0
+    assert ('selected_host_context fixture is required' in result.stdout
+            or 'needs host fixture' in result.stderr),result.stdout+result.stderr
+    assert not (tmp_path/'service-ran').exists()
+
+
+@pytest.mark.parametrize('setup,invoke',[
+    ('OPS={"c":capture.capture_checkpoint}', 'for f in OPS.values():\n        assert f(selected_host_context)'),
+    ('OPS=[capture.capture_checkpoint]', 'for f in OPS:\n        assert f(selected_host_context)'),
+    ('CL=(lambda f: (lambda *a: f(*a)))(capture.capture_checkpoint)', 'assert CL(selected_host_context)'),
+    ('import types\nNS=types.SimpleNamespace(f=capture.capture_checkpoint)', 'assert NS.f(selected_host_context)'),
+    ('import types\nOPS=types.MappingProxyType({"c":capture.capture_checkpoint})', 'for f in OPS.values():\n        assert f(selected_host_context)'),
+    ('OPS={capture.capture_checkpoint}', 'for f in OPS:\n        assert f(selected_host_context)'),
+    ('def holder():\n    pass\nholder.f=capture.capture_checkpoint', 'assert holder.f(selected_host_context)'),
+    ('class B:\n    f=staticmethod(capture.capture_checkpoint)\nclass K(B):\n    pass', 'assert K.f(selected_host_context)'),
+])
+def test_stored_shared_original_accepts_real_selected_actor(tmp_path,setup,invoke):
+    source=('import capture\n'+setup+'\n@pytest.mark.parametrize("host",["claude","codex"])\n'
+        'def test_new(host,selected_host_context):\n    '+invoke+'\n')
+    result=_collect(tmp_path,source,'from parity_test_helpers import selected_host_context\n',
+        helper_files={'capture.py':'def capture_checkpoint(context):\n    return True\n'},execute=True)
+    assert result.returncode==0 and '2 passed' in result.stdout,result.stdout+result.stderr
+
+
+def test_stored_shared_original_read_only_import_does_not_require_actor(tmp_path):
+    source=('import capture\nOPS={"c":capture.capture_checkpoint}\n'
+        'class B:\n    f=staticmethod(capture.capture_checkpoint)\nclass K(B):\n    pass\n'
+        'def test_new():\n    assert list(OPS)==["c"]\n    assert callable(K.f)\n')
+    result=_collect(tmp_path,source,helper_files={'capture.py':'def capture_checkpoint(*args):\n    return True\n'},execute=True)
+    assert result.returncode==0 and '1 passed' in result.stdout,result.stdout+result.stderr
+
+
+@pytest.mark.parametrize('setup,access,restore',[
+    ('OPS={"c":capture.capture_checkpoint}', 'OPS["c"]', 'module.OPS["c"]=saved[0]'),
+    ('OPS=[capture.capture_checkpoint]', 'OPS[0]', 'module.OPS[0]=saved[0]'),
+    ('class B:\n    f=staticmethod(capture.capture_checkpoint)\nclass K(B):\n    pass', 'K.f', 'module.B.f=staticmethod(saved[0])'),
+])
+def test_saved_container_guard_cannot_leak_to_next_actor(tmp_path,setup,access,restore):
+    source=('import capture\n'+setup+'\n@pytest.mark.parametrize("host",["claude","codex"])\n'
+        'def test_new(host,selected_host_context,saved_guard):\n'
+        '    saved_guard[:]=['+access+']\n    assert '+access+'(selected_host_context)\n')
+    fixture=('from parity_test_helpers import selected_host_context\n'
+        '@pytest.fixture\ndef saved_guard(request):\n    saved=[]\n    yield saved\n'
+        '    module=request.module\n    '+restore+'\n')
+    result=_collect(tmp_path,source,fixture,
+        helper_files={'capture.py':'def capture_checkpoint(context):\n    return True\n'},execute=True)
+    assert result.returncode==0 and '2 passed' in result.stdout,result.stdout+result.stderr
+
+
+def test_identity_guard_preserves_closure_defaults_and_restores_code(tmp_path):
+    source = ('import capture\n'
+              'saved=capture.capture_checkpoint\n'
+              'code=saved.__code__\n'
+              'CL=(lambda f: (lambda *a, **k: f(*a, **k)))(saved)\n'
+              '@pytest.mark.parametrize("host",["claude","codex"])\n'
+              'def test_new(host,selected_host_context,check_restoration):\n'
+              '    assert saved is capture.capture_checkpoint\n'
+              '    assert CL(selected_host_context)==("closed",7,9)\n'
+              '    with pytest.raises(ValueError,match="original failure"):\n'
+              '        CL(selected_host_context,flag=-1)\n')
+    fixture = ('from parity_test_helpers import selected_host_context\n'
+               '@pytest.fixture\ndef check_restoration(request):\n'
+               '    yield\n'
+               '    module=request.module\n'
+               '    assert module.saved.__code__ is module.code\n'
+               '    assert not any(k.startswith("__parity_dispatch_") for k in module.saved.__globals__)\n')
+    helper = ('def factory():\n    value="closed"\n'
+              '    def capture_checkpoint(context, number=7, *, flag=9):\n'
+              '        if flag==-1:\n            raise ValueError("original failure")\n'
+              '        return value,number,flag\n'
+              '    return capture_checkpoint\ncapture_checkpoint=factory()\n')
+    result = _collect(tmp_path, source, fixture, {'capture.py': helper}, execute=True)
+    assert result.returncode == 0 and '2 passed' in result.stdout, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize('module_name', ['capture', 'hooks.capture'])
+@pytest.mark.parametrize('method', ['exec', 'importlib'])
+def test_late_real_capture_import_cannot_bypass_actor_guard(tmp_path, module_name, method):
+    statement = 'import ' + module_name + '; ' + module_name + '.capture_checkpoint(None,None,1)'
+    invocation = ('exec(' + repr(statement) + ')' if method == 'exec' else
+                  'exec(' + repr('loader(' + repr(module_name) + ').capture_checkpoint(None,None,1)') + ')')
+    source = ('import sys,importlib\nloader=importlib.import_module\ndef test_new():\n'
+              '    assert ' + repr(module_name) + ' not in sys.modules\n'
+              '    try:\n        ' + invocation + '\n'
+              '    except AssertionError:\n        raise\n'
+              '    except Exception:\n        pass\n')
+    fixture = 'import sys\nsys.path.insert(0,' + repr(str(PLUGIN.parent.parent)) + ')\n'
+    result = _collect(tmp_path, source, fixture, execute=True)
+    assert result.returncode != 0
+    assert 'selected_host_context fixture is required' in result.stdout, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize('module_name', ['capture', 'hooks.capture'])
+def test_late_api_import_accepts_selected_actor_and_restores(tmp_path, module_name):
+    source = ('import sys,importlib\n'
+              '@pytest.mark.parametrize("host",["claude","codex"])\n'
+              'def test_new(host,selected_host_context):\n'
+              '    module=importlib.import_module(' + repr(module_name) + ')\n'
+              '    assert module.capture_checkpoint(selected_host_context)\n')
+    helper_files = {module_name.replace('.', '/') + '.py':
+                    'def capture_checkpoint(context):\n    return True\n'}
+    if module_name.startswith('hooks.'):
+        helper_files['hooks/__init__.py'] = ''
+    result = _collect(tmp_path, source, 'from parity_test_helpers import selected_host_context\n',
+                      helper_files, execute=True)
+    assert result.returncode == 0 and '2 passed' in result.stdout, result.stdout + result.stderr
+
+
+def test_late_api_import_failure_is_not_hidden_by_guard(tmp_path):
+    source = ('import importlib\ndef test_new():\n'
+              '    with pytest.raises(ImportError,match="synthetic import failure"):\n'
+              '        importlib.import_module("capture")\n')
+    result = _collect(tmp_path, source, helper_files={
+        'capture.py': 'raise ImportError("synthetic import failure")\n'}, execute=True)
+    assert result.returncode == 0 and '1 passed' in result.stdout, result.stdout + result.stderr

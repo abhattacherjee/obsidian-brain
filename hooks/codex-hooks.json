@@ -36,7 +36,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/native_entry.py\" --host codex --event session_end"
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/native_entry.py\" --host codex --event session_end",
+            "timeout": 3
           }
         ]
       }

@@ -38,7 +38,7 @@ def selected_host_context(host, tmp_path, monkeypatch):
     config_path = tmp_path / 'config.json'
     config_path.write_text(json.dumps(config))
     config_path.chmod(0o600)
-    selected = RuntimeContext(host, host + '-cli' if host == 'codex' else 'claude-code', 'native-session', project, project, None, vault, config_path, MappingProxyType(config), ROOT, tmp_path / 'index.sqlite3', tmp_path / 'state')
+    selected = RuntimeContext(host, host + '-cli' if host == 'codex' else 'claude-code', 'native-session', project, project, None, vault, config_path, MappingProxyType(config), ROOT, tmp_path / 'index.sqlite3', tmp_path / 'state', native_home=home/host, user_home=home)
     def no_live_backend(*args, **kwargs):
         pytest.fail('Acceptance fixtures must not launch a native AI backend')
     monkeypatch.setattr(ai_backend, 'execute_ai', no_live_backend)
@@ -169,7 +169,7 @@ def test_recall_summary_status_and_freshness_are_bound_to_original_source(contex
     operation = prepare(context, 'standup')['operation_id']
     read = source_read(context, 'standup', path, operation)
     invoke(context, 'standup', 'status', {'operation_id': operation, 'path': str(path), 'expected_revision': read['expected_revision'], 'status': 'summarized'})
-    assert 'status: "summarized"' in path.read_text()
+    assert 'status: summarized\n' in path.read_text()
     assert path.name in invoke(context, 'recall', 'brief')[1]
     assert invoke(context, 'recall', 'recurring-themes')[1].strip() == ''
 
@@ -185,7 +185,7 @@ def test_metadata_marks_native_summary_stale_without_changing_capture(context):
 
 def test_wiki_public_operations_file_lookup_stale_count_and_rule(context):
     sources = [note(context, name + '.md', 'Zebracorn ranking evidence ' + name, folder='claude-insights', kind='claude-insight') for name in ('i1', 'i2', 'i3')]
-    assert 'ASD-STE100' in json.loads(invoke(context, 'vault-ask', 'wiki-rule')[1])['rule']
+    assert 'ASD-STE100' in json.loads(invoke(context, 'vault-ask', 'wiki-rule', {'data': {}})[1])['rule']
     count = json.loads(invoke(context, 'vault-ask', 'wiki-count', {'data': {'sources': ['i1', 'i2', 'i3'], 'memory_sources': []}})[1])
     assert count['count'] == 3
     payload = {'question': 'How does zebracorn ranking work?', 'body': 'Ranking uses bm25.\n\n### Sources\n- [[i1]]\n- [[i2]]\n- [[i3]]\n', 'sources': ['i1', 'i2', 'i3'], 'memory_sources': [], 'topics': ['ranking'], 'confidence': 'high', 'filed_by': 'user'}
@@ -213,8 +213,8 @@ def test_retro_gate_and_source_evidence_use_native_identity(context):
 
 
 def test_historical_discovery_filters_source_host_project_and_date(context, tmp_path):
-    source_root = tmp_path / 'history'
-    source_root.mkdir()
+    source_root = context.native_home / ('sessions' if context.host == 'codex' else 'projects') / 'history'
+    source_root.mkdir(parents=True, exist_ok=True)
     for name, project in [('matching', '/work/project'), ('other', '/work/other')]:
         header = {'type': 'session_meta', 'payload': {'id': 'native-' + name, 'cwd': project, 'timestamp': '2026-10-05T00:00:00Z'}} if context.host == 'codex' else {'type': 'user', 'sessionId': 'native-' + name, 'cwd': project, 'timestamp': '2026-10-05T00:00:00Z', 'message': {'content': 'Visible'}}
         (source_root / (name + '.jsonl')).write_text(json.dumps(header) + '\n')
@@ -311,10 +311,10 @@ def test_cascade_handoff_checks_only_reviewed_duplicates_and_rejects_manual_edit
     first = note(context, 'first.md', '## Open Questions / Next Steps\n- [ ] Ship #42 durable capture\n')
     second = note(context, 'second.md', '## Open Questions / Next Steps\n- [ ] Ship #42 durable capture\n')
     operation = prepare(context, 'standup')['operation_id']
-    invoke(context, 'standup', 'cascade-collect', {'operation_id': operation})
+    invoke(context, 'standup', 'cascade-collect', {'operation_id': operation, 'project': 'project'})
     manual = first.read_bytes() + b'\nManual note\n'
     first.write_bytes(manual)
-    status, output, _ = invoke(context, 'standup', 'cascade', {'operation_id': operation, 'checked_texts': ['Ship #42 durable capture']}, success=False)
+    status, output, _ = invoke(context, 'standup', 'cascade', {'operation_id': operation, 'project': 'project', 'checked_texts': ['Ship #42 durable capture']}, success=False)
     assert status == 1 and 'SOURCE REVISION CONFLICT' in output
     assert first.read_bytes() == manual
     assert '- [x] Ship #42 durable capture' in second.read_text()

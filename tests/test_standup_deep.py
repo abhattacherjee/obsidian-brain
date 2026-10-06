@@ -1124,3 +1124,7 @@ class TestDeepClassOrder:
 
         assert "Unrecognized label item" in result
         assert "still surfaced" in result
+
+from selected_legacy_vault import selected_host_context  # noqa: E402,F401
+
+pytestmark = pytest.mark.usefixtures("selected_host_context")

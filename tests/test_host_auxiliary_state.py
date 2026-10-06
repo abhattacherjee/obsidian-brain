@@ -100,7 +100,12 @@ def test_session_helpers_use_bound_identity_and_project(selected_host_context, m
     assert selected["session_id"] == context.native_session_id
     assert selected["project"] == context.canonical_project_root.name
     assert selected["cwd"] == str(context.worktree)
-    assert selected["session_note_name"] == ""
+    from capture import planned_note_path
+    import time
+    planned = planned_note_path(context, time.monotonic() + 1)
+    assert selected["session_note_name"] == planned.stem
+    assert planned.parent == context.vault_path / context.config.get("sessions_folder", "claude-sessions")
+    assert not planned.exists()
     assert obsidian_utils._default_plugin_install_paths() == [str(context.resource_root)]
     with pytest.raises(ValueError):
         obsidian_utils.get_session_context(vault_path=str(unrelated))

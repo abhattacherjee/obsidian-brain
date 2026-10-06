@@ -66,7 +66,7 @@ def _readonly_flags(node):
     return False
 
 
-def _writes(node):
+def _writes(node, readonly_names=()):
     name = ast.unparse(node.func)
     if name in {'_publish_private_json', '_write_private', '_publish_config'}:
         return True
@@ -83,7 +83,8 @@ def _writes(node):
         for keyword in node.keywords:
             if keyword.arg == 'flags':
                 flag_node = keyword.value
-        return not _readonly_flags(flag_node)
+        return not (_readonly_flags(flag_node) or
+                    isinstance(flag_node, ast.Name) and flag_node.id in readonly_names)
     if name.endswith(('.write_text', '.write_bytes', '.write', '.writelines', '.rename', '.unlink')):
         return True
     if name in {'open', 'io.open', 'os.fdopen'} or name.endswith('.open'):
@@ -133,6 +134,11 @@ def _allowed(file, function, node):
         if name == 'stream.write':
             return [ast.unparse(arg) for arg in node.args] == ['text']
         return False
+    if file == 'hooks/session_auxiliary_state.py' and function == 'cross_run_write':
+        return (name == '_write_private' and not node.keywords
+                and [ast.unparse(arg) for arg in node.args] == [
+                    'path', 'json.dumps(value).encode()',
+                    'replace(context, state_path=coordination_path(context))'])
     if file == 'hooks/session_auxiliary_state.py' and function == '_write':
         if name == 'os.fdopen':
             return [ast.unparse(arg) for arg in node.args] == ['descriptor', "'w'"]
@@ -212,17 +218,31 @@ def _violations(source, file):
     class Visitor(ast.NodeVisitor):
         def __init__(self):
             self.functions = []
+            self.readonly_names = []
 
         def visit_FunctionDef(self, node):
             self.functions.append(node.name)
+            assignments = {}
+            for child in ast.walk(node):
+                if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store):
+                    assignments.setdefault(child.id, []).append(child)
+            readonly = set()
+            for child in ast.walk(node):
+                if isinstance(child, ast.Assign) and _readonly_flags(child.value):
+                    for target in child.targets:
+                        if isinstance(target, ast.Name) and len(assignments[target.id]) == 1:
+                            readonly.add(target.id)
+            self.readonly_names.append(readonly)
             self.generic_visit(node)
+            self.readonly_names.pop()
             self.functions.pop()
 
         visit_AsyncFunctionDef = visit_FunctionDef
 
         def visit_Call(self, node):
             function = '.'.join(self.functions) or '<module>'
-            if _writes(node) and not _allowed(file, function, node):
+            readonly = self.readonly_names[-1] if self.readonly_names else ()
+            if _writes(node, readonly) and not _allowed(file, function, node):
                 violations.append((file, function, node.lineno, ast.unparse(node.func)))
             self.generic_visit(node)
 
@@ -391,7 +411,7 @@ def test_config_private_exception_is_bound_to_selected_config_and_cas():
     assert 'path = Path(context.config_path)' in source
     assert "if path.suffix != '.json':" in source
     assert 'path.resolve().is_relative_to(context.vault_path.resolve())' in source
-    assert source.count('_no_symlinks(path)') == 2
+    assert source.count('_no_symlinks(path)') == 3
     assert 'stat.S_ISREG(details.st_mode)' in source
     assert 'details.st_uid != os.getuid()' in source
     assert 'stat.S_IMODE(details.st_mode) != 384' in source
@@ -432,3 +452,23 @@ def test_auxiliary_state_exceptions_require_selected_private_path():
         assert not _violations(source, 'hooks/session_auxiliary_state.py')
         assert _violations(source + '\n    Path(note_path).write_text("bypass")\n', 'hooks/session_auxiliary_state.py')
     assert _violations('def _write():\n    os.replace(temporary, vault_note)\n', 'hooks/session_auxiliary_state.py')
+
+
+def test_readonly_local_flags_cannot_hide_reassigned_write_flags():
+    safe = 'def reader():\n    flags = os.O_RDONLY | os.O_DIRECTORY\n    os.open(path, flags)\n'
+    assert not _violations(safe, 'hooks/new_reader.py')
+    changed = safe.replace('    os.open', '    flags = os.O_WRONLY\n    os.open')
+    assert _violations(changed, 'hooks/new_reader.py')
+    assert _violations(safe.replace('os.O_RDONLY', 'os.O_WRONLY'), 'hooks/new_reader.py')
+
+
+def test_cross_run_cache_exception_cannot_publish_a_note():
+    root = Path(__file__).resolve().parents[1]
+    tree = ast.parse((root / 'hooks/session_auxiliary_state.py').read_text())
+    function = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                    and node.name == 'cross_run_write')
+    source = ast.unparse(function)
+    assert 'path = cross_run_directory(context) / name' in source
+    assert not _violations(source, 'hooks/session_auxiliary_state.py')
+    assert _violations(source.replace('_write_private(path,', '_write_private(note_path,'),
+                       'hooks/session_auxiliary_state.py')

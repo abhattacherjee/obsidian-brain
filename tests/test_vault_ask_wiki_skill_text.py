@@ -7,7 +7,7 @@ def test_read_only_statement_is_gone():
     assert "this skill is read-only" not in SKILL
 
 
-def test_wiki_commands_are_used():
+def test_wiki_commands_are_used(selected_host_context):
     import skill_procedures
     for command in ('lookup','stale','count','rule','file'):
         assert 'wiki-' + command in SKILL
@@ -71,12 +71,23 @@ def test_payload_dir_created_private():
 
 
 
-def test_wiki_folder_comes_from_validated_helper():
-    import inspect, skill_procedures
-    source=inspect.getsource(skill_procedures._config)
-    assert 'indexed_folders(value)' in source
-    assert "value.get('wiki_folder') not in value['folders']" in source
-    assert "value['wiki_folder'] = ''" in source
+def test_wiki_folder_comes_from_validated_helper(selected_host_context):
+    from dataclasses import replace
+    from types import MappingProxyType
+    import io, json, skill_procedures
+    from runtime_context import using_runtime_context
+    original = dict(selected_host_context.config)
+    original.pop('wiki_folder', None)
+    for settings, expected in ((original, 'claude-wiki'),
+                               (dict(original,wiki_folder='custom-wiki'), 'custom-wiki'),
+                               (dict(original,wiki_folder=''), '')):
+        context = replace(selected_host_context,config=MappingProxyType(settings))
+        output, error = io.StringIO(), io.StringIO()
+        with using_runtime_context(context):
+            assert skill_procedures.run_operation(context,'vault-ask','config',{},output,error) == 0, error.getvalue()
+        result = json.loads(output.getvalue())
+        assert result['wiki_folder'] == expected
+        assert (expected in result['folders']) if expected else ('claude-wiki' not in result['folders'])
     assert 'empty validated `wiki_folder`' in SKILL
 
 

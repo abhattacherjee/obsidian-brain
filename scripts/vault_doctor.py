@@ -7,7 +7,7 @@ Dry-run by default — requires --apply to write anything.
 Config priority:
   1. CLI args (--vault, --sessions-folder, --insights-folder)
   2. Env vars (OBSIDIAN_BRAIN_VAULT, *_SESSIONS_FOLDER, *_INSIGHTS_FOLDER)
-  3. ~/.claude/obsidian-brain-config.json (read directly via json.load
+  3. the named legacy configuration path (read directly via json.load
      to avoid hooks/obsidian_utils.load_config()'s session-scoped cache,
      which can be stale when the CLI runs outside a live Claude Code
      session)
@@ -63,7 +63,8 @@ def _load_config(args) -> dict:
         # Fall back to config file only for values not yet resolved.
         # Read directly (bypass obsidian_utils.load_config's session cache,
         # which can be stale when the CLI runs outside a live session).
-        cfg_path = Path.home() / ".claude" / "obsidian-brain-config.json"
+        from runtime_adapters.claude import legacy_config_path
+        cfg_path = legacy_config_path()
         try:
             with open(cfg_path, "r", encoding="utf-8") as fh:
                 cfg = json.load(fh)
@@ -121,6 +122,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--insights-folder", default=None)
     p.add_argument("--apply", action="store_true", help="apply fixes (default: dry-run)")
     p.add_argument("--yes", action="store_true", help="assume yes for all confirmations")
+    p.add_argument("--discard-pending", default=None, metavar="PATH",
+                   help="explicitly discard one unchanged registered pending intent; requires --apply and its SHA256")
+    p.add_argument("--expected-pending-sha256", default=None, metavar="SHA256",
+                   help="exact private intent digest acknowledged by --discard-pending")
     p.add_argument("--json", dest="json_out", action="store_true",
                    help="emit JSON on stdout (for skill integration)")
     p.add_argument(
@@ -329,16 +334,126 @@ def _recover_runtime_pending():
         return None
     try:
         from capture import recover_registered
-        result = recover_registered(context, max_sources=8, deadline=time.monotonic() + 1,
-                                    include_active=True)
+        from note_transactions import (recover_pending_mutations, coordination_migration_budget,
+                                       ownership_lock, connect_coordination)
+        # This explicit admin call may finish migration before bounded replay.
+        with coordination_migration_budget(60):
+            with ownership_lock(context, deadline=time.monotonic() + 60):
+                connection = connect_coordination(context)
+                connection.close()
+        deadline = time.monotonic() + 1
+        writes = recover_pending_mutations(context, max_operations=8, deadline=deadline)
+        result = recover_registered(context, max_sources=8, deadline=deadline,
+                                    include_active=True, replay_retired=True)
         output = {name: getattr(result, name) for name in (
             "status", "applied_revision", "pending_sources", "loss_of_input", "warnings")}
+        output["warnings"] = list(output["warnings"]) + list(writes.warnings)
+        from note_transactions import pending_mutation_inventory
+        inventory = pending_mutation_inventory(context, limit=1024,
+                                               deadline=time.monotonic() + 1)
+        for key in ('pending_mutations', 'pending_intents', 'pending_intent_references_bounded'):
+            defaults = {'pending_mutations': 0, 'pending_intents': [],
+                        'pending_intent_references_bounded': True}
+            output[key] = inventory.get(key, defaults[key])
+        output['warnings'].extend(inventory.get('warnings', []))
+        if writes.status in {"unavailable", "error", "failed"}:
+            output["status"] = "unavailable"
+        elif (writes.status not in {"unchanged", "applied"}
+              and output["status"] not in {"unavailable", "error", "failed"}):
+            output["status"] = "pending"
+        if inventory['pending_mutations'] or inventory['bounded']:
+            if output['status'] not in {'unavailable', 'error', 'failed'}:
+                output['status'] = 'pending'
     except Exception as exc:
         output = {"status": "unavailable", "pending_sources": 1,
                   "loss_of_input": False, "warnings": [str(exc)]}
     if output["status"] != "complete" or output["pending_sources"] or output["loss_of_input"]:
         label = "capture source input lost" if output["loss_of_input"] else "capture recovery pending"
         print("[vault_doctor] " + label + ": " + json.dumps(output), file=sys.stderr)
+    return output
+
+
+def _inspect_runtime_pending():
+    """Read existing journal state without creating files or replaying writes."""
+    import contextlib
+    import hashlib
+    import sqlite3
+    import time
+    from runtime_context import current_runtime_context
+    from note_transactions import coordination_location, coordination_identity_matches
+    context = current_runtime_context()
+    if context is None:
+        return None
+    output = {"status": "complete", "pending_sources": 0, "pending_mutations": 0,
+              "loss_of_input": False, "warnings": []}
+    deadline = time.monotonic() + 1
+    try:
+        journal = coordination_location(context) / "state.sqlite3"
+        if any(parent.is_symlink() for parent in journal.parents) or journal.is_symlink():
+            raise ValueError("The coordination journal path is not safe")
+        wal = Path(str(journal) + "-wal")
+        if wal.is_symlink() or (wal.exists() and wal.stat().st_size):
+            raise ValueError("A live journal WAL prevents a complete read-only audit")
+        if journal.is_file():
+            # This selected coordination journal is not the derived vault index.
+            with contextlib.closing(sqlite3.connect(journal.as_uri() + "?immutable=1", uri=True)) as connection:  # noqa: vault-db-connect
+                connection.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
+                tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                if 'identity' not in tables or not coordination_identity_matches(context, connection):
+                    raise ValueError("The coordination journal vault identity is unverified")
+                pending_queries = []
+                if 'checkpoints' in tables:
+                    pending_queries.append("SELECT scope FROM checkpoints WHERE phase!='committed'")
+                if 'source_sessions' in tables:
+                    pending_queries.append("SELECT scope FROM source_sessions WHERE completeness!='complete'")
+                if 'source_sessions' in tables:
+                    from capture import pending_source_warnings
+                    for cursor, descriptor in connection.execute("SELECT cursor,descriptor FROM source_sessions WHERE completeness!='complete' LIMIT 32"):
+                        parsed_cursor, parsed_descriptor = json.loads(cursor), json.loads(descriptor)
+                        if not isinstance(parsed_cursor, dict) or not isinstance(parsed_descriptor, dict):
+                            raise ValueError("Retained capture metadata has an invalid shape")
+                        parser_state = parsed_cursor.get('parser_state',{})
+                        if not isinstance(parser_state, dict):
+                            raise ValueError("Retained parser state has an invalid shape")
+                        output['loss_of_input'] = output['loss_of_input'] or bool(parser_state.get('_capture_loss'))
+                        warnings = pending_source_warnings(parser_state, parsed_descriptor.get('host'))
+                        for warning in warnings:
+                            if warning not in output['warnings']:
+                                output['warnings'].append(warning)
+                if pending_queries:
+                    output['pending_sources'] = connection.execute(
+                        'SELECT COUNT(*) FROM (' + ' UNION '.join(pending_queries) + ')').fetchone()[0]
+        from note_transactions import pending_mutation_inventory
+        inventory = pending_mutation_inventory(context, limit=1024, deadline=deadline)
+        output['pending_mutations'] = inventory['pending_mutations']
+        output['pending_intents'] = inventory.get('pending_intents', [])
+        output['pending_intent_references_bounded'] = inventory.get('pending_intent_references_bounded', False)
+        output['warnings'].extend(inventory.get('warnings', []))
+        if inventory['bounded']:
+            output['status'] = 'pending'
+            output['warnings'].append('Pending intent inventory is incomplete within its audit bound')
+        selected_pending = 0
+        digest = lambda value: hashlib.sha256(value.encode()).hexdigest()
+        pending = context.state_path / 'v1' / digest(str(context.vault_path)) / context.host / context.session_key / digest(str(context.canonical_project_root)) / 'pending'
+        if any(parent.is_symlink() for parent in pending.parents) or pending.is_symlink():
+            raise ValueError("Pending intent path is not safe")
+        if pending.is_dir():
+            import os
+            with os.scandir(pending) as entries:
+                for index, entry in enumerate(entries):
+                    if index >= 1024 or time.monotonic() >= deadline:
+                        raise ValueError("Pending intent audit limit reached")
+                    if entry.name.endswith('.json'):
+                        if not entry.is_file(follow_symlinks=False):
+                            raise ValueError("Pending intent is not a regular file")
+                        selected_pending += 1
+        if not inventory['selected_pending_registered']:
+            output['pending_mutations'] += selected_pending
+        if output['pending_sources'] or output['pending_mutations']:
+            output['status'] = 'pending'
+    except (OSError, ValueError, sqlite3.Error) as exc:
+        output['status'] = 'unavailable'
+        output['warnings'].append(str(exc))
     return output
 
 
@@ -359,9 +474,30 @@ def main() -> int:
         )
         return 3
 
+    if args.discard_pending or args.expected_pending_sha256:
+        import re
+        if (not args.apply or not args.discard_pending
+                or not isinstance(args.expected_pending_sha256, str)
+                or not re.fullmatch(r"[0-9a-f]{64}", args.expected_pending_sha256)):
+            print("error: pending discard requires --apply, --discard-pending PATH, and --expected-pending-sha256 SHA256", file=sys.stderr)
+            return 3
+        from runtime_context import current_runtime_context
+        from note_transactions import discard_pending_mutation
+        context = current_runtime_context()
+        if context is None:
+            print("error: pending discard requires an explicit native context", file=sys.stderr)
+            return 3
+        acknowledgment = discard_pending_mutation(context, args.discard_pending, args.expected_pending_sha256)
+        if acknowledgment.status not in {"unchanged", "applied"}:
+            print("error: pending discard refused: " + "; ".join(acknowledgment.warnings), file=sys.stderr)
+            return 2
+        print("vault_doctor: explicitly acknowledged pending intent removed; destination note unchanged", file=sys.stderr)
+        return 0
+
     cfg = _load_config(args)
-    recovery = _recover_runtime_pending()
+    recovery = _recover_runtime_pending() if args.apply else _inspect_runtime_pending()
     recovery_pending = bool(recovery and (recovery["status"] != "complete" or recovery["pending_sources"] or recovery["loss_of_input"]))
+    recovery_error = bool(recovery and (recovery["status"] in {"unavailable", "error", "failed"} or recovery["loss_of_input"]))
 
     if args.check:
         try:
@@ -491,7 +627,7 @@ def main() -> int:
         if recovery_pending:
             detail = "capture source input was lost" if recovery["loss_of_input"] else "capture recovery remains pending"
             print("vault_doctor: diagnostics found no issues; " + detail, file=sys.stderr)
-            return 2
+            return 2 if recovery_error else 1
         if crashed_checks:
             # NOT clean: one or more checks never finished scanning. Saying
             # "clean" would be a literal falsehood — and exit 2 (not 0) so
@@ -519,12 +655,15 @@ def main() -> int:
     if not args.apply:
         # Issues found, not applied (dry-run default). A crashed check still
         # forces exit 2 — the report above is incomplete.
-        return 2 if (crashed_checks or recovery_pending) else 1
+        return 2 if (crashed_checks or recovery_error) else 1
 
     # --apply: per-project confirmation
-    backup_root = os.path.expanduser(
-        f"~/.claude/obsidian-brain-doctor-backup/{_iso_now().replace(':', '-')}"
-    )
+    from runtime_context import current_runtime_context
+    from session_auxiliary_state import directory
+    context = current_runtime_context()
+    backup_parent = (directory(context, "doctor-backups") if context is not None else
+                     __import__("runtime_adapters.claude", fromlist=["legacy_doctor_backup_root"]).legacy_doctor_backup_root())
+    backup_root = str(backup_parent / _iso_now().replace(':', '-'))
     print(f"\nBackup root: {backup_root}", file=sys.stderr)
 
     pending = [issue for rows in issues_by_check.values() for issue in rows]
@@ -590,7 +729,7 @@ def main() -> int:
         print(f"[vault_doctor] repair scope failed: {exc}", file=sys.stderr)
         return 2
 
-    return 2 if (any_errors or crashed_checks or recovery_pending) else 1
+    return 2 if (any_errors or crashed_checks or recovery_error) else 1
 
 
 if __name__ == "__main__":

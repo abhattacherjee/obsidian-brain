@@ -13,7 +13,7 @@ import time
 
 
 def directory(context, name):
-    if name not in {"cache", "calendar", "locks", "retro-gate", "logs"}:
+    if name not in {"cache", "calendar", "locks", "retro-gate", "logs", "doctor-backups"}:
         raise ValueError("Unknown session state directory")
     from operation_state import _no_symlinks
     from note_transactions import session_state_path
@@ -28,6 +28,28 @@ def directory(context, name):
         raise ValueError("Session state belongs to another user")
     scoped.chmod(0o700)
     return scoped
+
+
+def cross_run_directory(context, name="cache"):
+    """Reuse cache state for this vault, provider and project across sessions."""
+    if name != "cache":
+        raise ValueError("Unknown cross-run state directory")
+    from note_transactions import coordination_path, _digest, _private_dir
+    from operation_state import _no_symlinks
+    root = coordination_path(context) / "auxiliary" / context.host / _digest(str(context.canonical_project_root)) / name
+    _no_symlinks(root)
+    return _private_dir(root)
+
+
+def cross_run_write(context, name, value):
+    if name not in {"deep-acted-items.json", "check-items-classifications.json"}:
+        raise ValueError("Unknown cross-run cache file")
+    from dataclasses import replace
+    from note_transactions import coordination_path
+    from operation_state import _write_private
+    path = cross_run_directory(context) / name
+    _write_private(path, json.dumps(value).encode(),
+                   replace(context, state_path=coordination_path(context)))
 
 
 def _read(path):

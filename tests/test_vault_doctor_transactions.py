@@ -151,15 +151,16 @@ def test_dispatcher_manual_edit_between_checks_is_preserved(tmp_path, monkeypatc
     assert "my manual edit after first repair" in text
 
 
-def test_standalone_doctor_cli_uses_shared_writer(tmp_path):
+def test_standalone_doctor_cli_uses_shared_writer(tmp_path, tmp_path_factory):
     import subprocess
     import sys
     import os
     path = _project_note(tmp_path)
     path.write_bytes(path.read_bytes() + b"\xff")
     environment = os.environ.copy()
-    environment["HOME"] = str(tmp_path / "test-home")
+    environment["HOME"] = str(tmp_path_factory.mktemp("doctor-child-account"))
     environment["OBSIDIAN_BRAIN_DB"] = str(tmp_path / "state" / "index.sqlite3")
+    environment["XDG_STATE_HOME"] = str(tmp_path_factory.mktemp("doctor-child-coordination"))
     script = Path(__file__).resolve().parents[1] / "scripts" / "vault_doctor.py"
     result = subprocess.run(
         [sys.executable, str(script), "--vault", str(tmp_path),
@@ -170,7 +171,12 @@ def test_standalone_doctor_cli_uses_shared_writer(tmp_path):
     assert result.returncode == 1, result.stderr
     assert "applied" in result.stderr
     assert path.read_text().endswith("\ufffd")
-    assert list((tmp_path / "state").rglob("state.sqlite3"))
+    import hashlib
+    details = tmp_path.stat()
+    vault_key = hashlib.sha256((str(details.st_dev) + ":" + str(details.st_ino)).encode()).hexdigest()
+    journal = Path(environment["XDG_STATE_HOME"]) / "obsidian-brain" / "vaults" / vault_key / "state.sqlite3"
+    assert journal.is_file()
+    assert not list(Path(environment["HOME"]).rglob("state.sqlite3"))
 
 
 # Every scoped operation uses the same selected temporary vault.
@@ -178,3 +184,35 @@ from selected_legacy_vault import selected_host_context, native_ai_frontend  # n
 import pytest
 
 pytestmark = pytest.mark.usefixtures("selected_host_context")
+
+
+def test_restored_damage_is_repaired_in_a_new_invocation(tmp_path):
+    path = _project_note(tmp_path)
+    damaged = path.read_bytes()
+    for _ in range(2):
+        issues = project_name_normalization.scan(str(tmp_path), 'claude-sessions', 'claude-insights', 9999)
+        results = project_name_normalization.apply(issues, str(tmp_path / 'backups'))
+        assert results[0].status == 'applied'
+        assert 'project: my-project' in path.read_text()
+        path.write_bytes(damaged)
+
+
+def test_repair_scope_does_not_hold_vault_lock_during_user_work(tmp_path):
+    import threading
+    from scripts.vault_doctor_checks import repair_scope
+    from note_transactions import context_for_vault, ownership_lock
+    path = _project_note(tmp_path)
+    issues = project_name_normalization.scan(str(tmp_path), 'claude-sessions', 'claude-insights', 9999)
+    outcome = []
+    context = context_for_vault(tmp_path)
+    def other_writer():
+        try:
+            with ownership_lock(context):
+                outcome.append('owned')
+        except Exception as exc:
+            outcome.append(type(exc).__name__)
+    with repair_scope(issues):
+        thread = threading.Thread(target=other_writer)
+        thread.start()
+        thread.join(timeout=1)
+        assert outcome == ['owned']

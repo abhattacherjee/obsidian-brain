@@ -47,18 +47,7 @@ procedure variables `VAULT_PATH`/`VAULT`, `SESSIONS_FOLDER`/`SESS`, and
 `INSIGHTS_FOLDER`/`INS`. Use the canonical project returned in config JSON (and native `session` when available),
 not the basename of an unrelated shell working directory.
 
-Before preparing edits or requesting a summary of an existing note, call
-`note-read` and retain its exact `expected_revision`. Apply the proposed note
-with `note-apply` and that revision. A conflict leaves the current note intact;
-show the pending result and do not count the note as saved. New curated notes
-use `note-create`; they never overwrite a collision. Native memory discovery
-is unsupported for Codex because it has no equivalent native memory-file API; shared vault retrieval
-and wiki filing continue without borrowing another host's memory.
-
-Read `references/host-claude.md` or `references/host-codex.md` when present.
-All note writes described below use `note-create` or revision-bound `note-apply`,
-including bidirectional related links. Content is a JSON string, never shell code.
-Every later save or edit follows this revision-bound publication rule.
+Before drafting an edit or summary, call `note-read` and retain its exact `expected_revision`. Use `note-apply` with that revision for the reviewed edit. A conflict preserves the current note; show the pending result and do not count it as saved. Create new curated notes with `note-create`. A collision preserves the existing note. Use only the operations documented for this skill. Their writes bind the source revisions before analysis and preserve manual edits on conflict. Content is JSON data, never shell code. Read `references/host-claude.md` or `references/host-codex.md` when present. Codex has no native memory-file API; shared vault retrieval and wiki filing continue without borrowing another host's memory.
 
 # Standup — Generate Standup Summaries from Obsidian Vault
 
@@ -84,7 +73,7 @@ Request for `config` (substitute the values as data):
 python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'config' < "$REQUEST_PATH"
 ```
 
-Parse each output line as KEY=VALUE, splitting on the first `=`.
+Parse the single JSON object. Read its named fields; do not split output on `=`.
 
 If the command exits non-zero or prints ERROR, tell the user:
 
@@ -348,9 +337,11 @@ On success this prints `OK: <absolute path>` and the file is now at mode `0o600`
 Move all upgraded files from `UNSUMMARIZED` into the working set alongside `SUMMARIZED`. Track the count of upgraded notes as `UPGRADED_COUNT`.
 
 Before analyzing open items, call `cascade-collect` with the prepared
-`operation_id` and selected project. Its immutable source revisions govern
-all later `cascade` calls, whose payload includes `checked_texts` and the same
-operation ID. Preserve missing/stale sources as pending.
+`operation_id` for every project with open items, one collection call per project,
+including an explicitly selected project whose collection is empty. An uncollected
+project cannot be cascaded. Its immutable source revisions govern
+all later `cascade` calls, whose payload includes `checked_texts`, the same
+`project`, and the operation ID. Identical text in another project is not confirmed. Preserve missing/stale sources as pending.
 
 ### Step 7 — Read and distill note content
 
@@ -577,8 +568,9 @@ Request for `cascade` (substitute the values as data):
 ```json
 {
   "operation_id": "<prepared id>",
-  "argv": [
-    "<arguments from this step>"
+  "project": "<project>",
+  "checked_texts": [
+    "<confirmed item text>"
   ]
 }
 ```
@@ -587,7 +579,7 @@ Request for `cascade` (substitute the values as data):
 python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'cascade' < "$REQUEST_PATH"
 ```
 
-Where `$CHECKED_ITEMS_JSON` is a JSON array of the confirmed item texts for that project (passed via stdin to avoid shell quoting issues with special characters in item text), and `$PROJECT` is the project name.
+Set `checked_texts` to the confirmed item texts and `project` to their project. Put these values in the JSON request.
 
 Run one call per project that has completed items. If multiple projects have items, run the calls in parallel.
 
@@ -632,7 +624,8 @@ Request for `deep-pipeline` (substitute the values as data):
 
 ```json
 {
-  "operation_id": "<prepared id>"
+  "operation_id": "<prepared id>",
+  "stdin": {"basenames": ["<selected note basename>"], "projects": ["<selected project>"]}
 }
 ```
 
@@ -640,9 +633,9 @@ Request for `deep-pipeline` (substitute the values as data):
 python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'deep-pipeline' < "$REQUEST_PATH"
 ```
 
-If the status starts with `CACHED:`, report "Using cached deep analysis (< 15 min old)" and skip to Step 16.
+If the operation reports reuse, say it reused verified analysis from this operation. Reuse requires unchanged source revisions and git HEAD; age alone does not permit it.
 
-Where `$NOTE_BASENAMES_JSON` is a JSON array of note basenames from Step 7's NOTE_DATA, and `$PROJECTS_JSON` is the JSON string from Step 8's project list. Both are passed via stdin to avoid shell argument injection. Mark task #1 complete, task #2 in_progress.
+Set `stdin.basenames` to the note basenames from Step 7's NOTE_DATA and `stdin.projects` to the project list from Step 8. Pass both arrays in the JSON request. Mark task #1 complete, task #2 in_progress.
 
 **Step 16 — Classify open items.** Use one native analysis helper that:
 1. Reads `<registered PIPELINE_PATH>`
@@ -671,14 +664,14 @@ Display the output to the user. Wait for user response — they may confirm acti
 
 **Step 18 — Execute confirmed actions.** Parse user response. If user typed `skip`, skip this step.
 
-**Important:** Publish batch vault edits through the shared transaction boundary — it requires Read first for each file, which is impractical for 20+ files. Instead, use the two Python helpers below.
+Before analysis, call `note-read` for every selected destination with this same `operation_id`. Keep the protected revisions; the helpers cannot bless a new revision after analysis. Publish only reviewed edits through the shared transaction boundary.
 
 **Checkoffs are text-anchored (#201).** Do NOT hand-build `old_text` from a classifier's `instances[].line` — a drifted line number can check off the WRONG still-active item, and a substring `old_text` can corrupt quoted prose. Instead, build a JSON array of confirmed checkoff items and let `run_build_checkoffs` re-resolve each target by TEXT against the file's real `- [ ] ` lines, emitting verified `[filepath, old_text, new_text]` triples. Then feed those `.edits` into `run_batch_edit` (which additionally line-anchors each flip).
 
 Request for `deep-checkoffs` (substitute the values as data):
 
 ```json
-{}
+{"stdin": [{"file": "<vault-relative note>", "line": 12, "text": "<reviewed checkbox text>"}]}
 ```
 
 ```bash
@@ -689,13 +682,14 @@ python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_C
 
 **Also surface Stage 2 drops.** `run_batch_edit` prints `Applied N/M edits`; whenever `N < M` it follows with a `Skipped K checkoff(s) with no matching line:` block listing each dropped `old_text`. A Stage-1-resolved triple can still be dropped here if the line changed between stages — **report any `Applied N/M` where N<M and the listed skipped checkoffs to the user** so a silently-dropped checkoff is never missed.
 
-For confirmed link additions (NOT checkoffs), pass `[filepath, old_text, new_text]` triples directly into `run_batch_edit` via `$EDITS_JSON` — non-checkbox edits keep the substring-replace path:
+For confirmed link additions, pass `[filepath, old_text, new_text]` triples in the `deep-edit` request below. First read every destination with `note-read` under the same `operation_id`; the edit uses those protected source revisions. Non-checkbox edits keep the substring-replace path:
 
 Request for `deep-edit` (substitute the values as data):
 
 ```json
 {
-  "stdin": "<reviewed JSON edits with source_revision>"
+  "stdin": [["<vault-relative note>", "<exact original text>", "<reviewed replacement text>"]],
+  "operation_id": "<same prepared id>"
 }
 ```
 
@@ -730,3 +724,47 @@ A native session summary is stale when `capture_revision` differs from
 `summary_revision`, or no `summary_revision` exists. Label it stale explicitly.
 Use unchanged raw capture facts as evidence; do not present its old summary as fresh.
 Failed or cancelled AI leaves the operation pending and preserves the note.
+
+## Fixed request shapes
+
+Pass these objects through the installed launcher for the named operation. Keep
+one operation ID across source reads, analysis and reviewed publication.
+
+Request for `note-read`:
+
+```json
+{
+  "operation_id": "<prepared id>",
+  "path": "<vault-relative note.md>"
+}
+```
+
+Request for `note-apply`:
+
+```json
+{
+  "operation_id": "<same prepared id>",
+  "path": "<same vault-relative note.md>",
+  "expected_revision": "<note-read SHA256>",
+  "content": "<complete reviewed note>"
+}
+```
+
+Request for `cascade-collect`:
+
+```json
+{
+  "operation_id": "<prepared id>",
+  "project": "<selected project>"
+}
+```
+
+Request for `artifact-store`:
+
+```json
+{
+  "operation_id": "<prepared id>",
+  "name": "deep-classifications.json",
+  "content": "<reviewed helper output as data>"
+}
+```

@@ -55,7 +55,7 @@ def test_import_or_runtime_failure_remains_fail_open(monkeypatch, capsys):
     monkeypatch.setitem(sys.modules, "brain_cli", SimpleNamespace(main=fail))
     assert module.run(["--host", "claude", "--client", "claude-code", "--event", "stop"]) == 0
     error = capsys.readouterr().err
-    assert "capture is deferred" in error
+    assert "capture was skipped; no source was retained" in error
     assert "Sensitive" not in error
 
 
@@ -65,3 +65,11 @@ def test_malformed_binding_fails_open_without_entering_runtime(monkeypatch, caps
     monkeypatch.setitem(sys.modules, "brain_cli", SimpleNamespace(main=lambda *args, **kwargs: pytest.fail("Malformed binding reached runtime")))
     assert module.run(arguments) == 0
     assert "arguments are invalid" in capsys.readouterr().err
+
+
+def test_codex_sessionend_descriptor_grants_supported_three_second_budget():
+    import json
+    definition = json.loads((ROOT/'hooks/codex-hooks.json').read_text())
+    handlers = [handler for group in definition['hooks']['SessionEnd'] for handler in group['hooks']]
+    assert handlers and all(handler['timeout'] == 3 for handler in handlers)
+    assert all('--client codex-cli' not in handler['command'] for handler in handlers)

@@ -147,7 +147,9 @@ def test_native_snapshot_filename_is_stable_on_replay(selected_host_context,nati
     snapshots=[p for p in context.vault_path.rglob('*.md') if 'type: "claude-snapshot"' in p.read_text()]
     assert len(snapshots)==1
     before=snapshots[0].read_bytes()
-    assert re.match(r'2026-04-18-'+context.host+r'-snapshot-[a-f0-9]{64}\.md$',snapshots[0].name)
+    from obsidian_utils import slugify
+    project = slugify(context.canonical_project_root.name)
+    assert re.fullmatch(r'2026-04-18-' + re.escape(project) + '-' + context.host + r'-snapshot-[a-f0-9]{64}\.md', snapshots[0].name)
     assert checkpoint(context,'pre_compact',trigger='manual').status=='complete'
     assert snapshots[0].read_bytes()==before
     assert len(list(context.vault_path.rglob('*snapshot*.md')))==1
@@ -194,3 +196,6 @@ def test_native_snapshot_and_parent_keep_first_date_across_midnight(selected_hos
     assert parent.name.startswith('2026-04-18-')
     assert 'After midnight.' in parent.read_text()
     assert 'parent_session: "[['+parent.stem+']]"' in next(context.vault_path.rglob('*snapshot*.md')).read_text()
+
+import pytest
+pytestmark = pytest.mark.usefixtures("selected_host_context")

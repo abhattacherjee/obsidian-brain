@@ -3,10 +3,12 @@ import json
 
 import pytest
 from runtime_context import using_runtime_context
+from selected_legacy_vault import selected_host_context
+
+pytestmark = pytest.mark.usefixtures("selected_host_context")
 from vault_doctor_checks.wiki_pages import _read_config
 
 
-@pytest.mark.host_only('claude', reason='claude-record-format', capability='claude_native_format')
 @pytest.mark.parametrize('value', ['', '../outside', 'tmp-only-wiki'])
 def test_legacy_reader_preserves_config_values_at_call_time(tmp_path, monkeypatch, value):
     monkeypatch.setenv('HOME', str(tmp_path))
@@ -19,7 +21,6 @@ def test_legacy_reader_preserves_config_values_at_call_time(tmp_path, monkeypatc
         assert _read_config()['wiki_folder'] == value
 
 
-@pytest.mark.host_only('claude', reason='claude-record-format', capability='claude_native_format')
 def test_legacy_reader_rejects_corrupt_config(tmp_path, monkeypatch):
     monkeypatch.setenv('HOME', str(tmp_path))
     path = tmp_path / '.claude' / 'obsidian-brain-config.json'

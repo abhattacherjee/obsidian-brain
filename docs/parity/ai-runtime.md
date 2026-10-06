@@ -33,8 +33,10 @@ requested alias as the executed model.
 The shared backend rejects duplicate JSON keys, nonfinite numbers, wrong
 schemas and semantic violations. Check-items also verifies known IDs,
 project boundaries, merge totals and exact classifier coverage. Every
-requested chunk must succeed. Cancellation, unavailable backends and exhausted
-retries retain prior output and publish no partial classification.
+successful chunk must verify its requested IDs. Retryable exhausted chunks stay
+unclassified while later verified chunks can remain in a partial result. No
+checkoff is proposed for an unclassified group. Cancellation, authentication and
+policy failures end the run and preserve prior output.
 
 Classifier cache keys include the full input and evidence, selected vault and
 canonical project, local prompt and threshold/chunk/prefilter policy, and the
@@ -49,6 +51,13 @@ explicit full `classifier_model` establishes the selection. A previous run's
 observed alias resolution cannot authorize replay. Unknown Codex defaults also
 miss. Matching explicit known models may replay only when the other inputs and
 policies match.
+
+Setup's unknown model defaults disable classifier cache replay. Stage 8 reports
+`cache_disabled` and skips storing an unusable classifier cache. Configure an
+explicit full Claude `classifier_model` or a Codex model to enable replay;
+matching evidence and policy are still required. A logged-out Claude JSON
+result is an authentication error, including when stderr is empty. Its private
+result text is not returned in diagnostics.
 
 ## Publication and identity
 

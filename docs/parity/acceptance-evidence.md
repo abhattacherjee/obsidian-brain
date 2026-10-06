@@ -33,18 +33,21 @@ is a failed/blocked capture, never fresh evidence. If weekly capture cannot run,
 equivalent fresh native evidence is required before release. Desktop bundled
 CLI metadata alone does not prove a desktop task dispatched a hook.
 
-The actual Desktop probe is blocked. Automatic approval review rejected the
-read-only CUA `getApp("Codex")` probe with this reason:
+The actual Desktop probe is blocked. An earlier automatic approval review
+rejected a CUA probe for missing authorization. The user then explicitly
+approved CUA inspection. On 2026-10-06, the authorized `cua.getApp("Codex")`
+attempt still returned:
 
-> This starts a native Desktop UI probe through CUA after the Desktop
-> hook-manager access was previously denied; it lacks explicit authorization
-> for that bypass approach.
+> Computer Use is not allowed to use the app com.openai.codex for safety reasons.
 
-It also instructed: “Do not bypass this rejection through a workaround or
-indirect execution.” No substitute CLI or simulated frontend counts as Desktop
-dispatch evidence. The native event contract currently has no observed
-event-local client field; a daemon environment snapshot cannot prove which
-frontend invoked the event. Explicit frontend binding remains pending.
+No UI observation or native dispatch proof was obtained. This is a tool
+restriction, not a pending user approval. Evidence:
+`/private/tmp/obsidian-272-native-cua-attempt.txt`.
+Do not bypass the restriction through another automation path. No substitute
+CLI or simulated frontend counts as Desktop dispatch evidence. The native
+event contract currently has no observed event-local client field; a daemon
+environment snapshot cannot prove which frontend invoked the event. Explicit
+frontend binding remains pending.
 
 A separate native read-only sandbox check passed. The disposable target was
 writable outside the sandbox, then `codex sandbox -c
@@ -102,3 +105,10 @@ actual Desktop dispatch remains blocked. CI uploads the validated bundle as
 `native-acceptance-<SHA>` for audit only; it never selects a moving latest artifact.
 GitHub documents [context index lookup](https://docs.github.com/en/actions/reference/workflows-and-actions/contexts)
 and the [48 KB variable limit](https://docs.github.com/en/actions/reference/workflows-and-actions/variables).
+
+Native acceptance runs on explicit dispatch and on `release/*` or `hotfix/*`
+PRs to `main`. Feature PRs to `develop` run the shared contract gates without
+claiming native certification. The ship gate still requires native proof for
+this parity PR. Before a release bundle can pass, each required capability in
+`capabilities.json` must name its verified client version range and fixture
+provenance. Pending capability records cannot certify a release.

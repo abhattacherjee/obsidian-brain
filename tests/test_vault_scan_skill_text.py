@@ -153,7 +153,7 @@ def test_vault_scan_calls_single_quote_pasted_values(skill):
     for call in calls:
         assert '< "$REQUEST_PATH"' in call
         assert '<pattern>' not in call and '<term>' not in call
-    assert 'Content is a JSON string, never shell code.' in text
+    assert 'Content is JSON data, never shell code.' in text
 
 
 
@@ -183,3 +183,6 @@ def test_vault_import_reads_whole_frontmatter_for_session_ids(tmp_path):
     note.write_text('---\ntype: claude-session\n' + ''.join('custom_%s: value\n' % i for i in range(80)) + 'session_id: deeply-nested-native-id\n---\nBody\n')
     fields=session_lookup._identity(note, tmp_path, folder, time.monotonic()+1)
     assert fields['session_id']=='deeply-nested-native-id'
+
+from selected_legacy_vault import selected_host_context
+pytestmark = pytest.mark.usefixtures("selected_host_context")

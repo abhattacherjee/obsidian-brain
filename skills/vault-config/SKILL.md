@@ -47,18 +47,7 @@ procedure variables `VAULT_PATH`/`VAULT`, `SESSIONS_FOLDER`/`SESS`, and
 `INSIGHTS_FOLDER`/`INS`. Use the canonical project returned in config JSON (and native `session` when available),
 not the basename of an unrelated shell working directory.
 
-Before preparing edits or requesting a summary of an existing note, call
-`note-read` and retain its exact `expected_revision`. Apply the proposed note
-with `note-apply` and that revision. A conflict leaves the current note intact;
-show the pending result and do not count the note as saved. New curated notes
-use `note-create`; they never overwrite a collision. Native memory discovery
-is unsupported for Codex because it has no equivalent native memory-file API; shared vault retrieval
-and wiki filing continue without borrowing another host's memory.
-
-Read `references/host-claude.md` or `references/host-codex.md` when present.
-All note writes described below use `note-create` or revision-bound `note-apply`,
-including bidirectional related links. Content is a JSON string, never shell code.
-Every later save or edit follows this revision-bound publication rule.
+Use only the operations documented for this skill. Their writes bind the source revisions before analysis and preserve manual edits on conflict. Content is JSON data, never shell code. Read `references/host-claude.md` or `references/host-codex.md` when present. Codex has no native memory-file API; shared vault retrieval and wiki filing continue without borrowing another host's memory.
 
 # Vault Config — Manage obsidian-brain Settings
 
@@ -155,3 +144,14 @@ Where `$KEY` is the setting name and `$JSON_VALUE` is the new value as a JSON li
 If the changed key is `sessions_folder`, `insights_folder` or `wiki_folder`: other skills in this session read a cached copy of the config, so tell the user to run `/vault-reindex`, which reads the config fresh and re-indexes the new folders. For `wiki_folder`, first check the value: it must be a relative folder name with no `..`, `~` or dot-prefixed segment (an empty value turns the wiki folder off). `/vault-reindex` refuses an invalid value and names it.
 
 Confirm the change, then go back to Step 2 to redisplay the table.
+
+## Fixed request shapes
+
+Pass these objects through the installed launcher for the named operation. Keep
+one operation ID across source reads, analysis and reviewed publication.
+
+Request for `config-read`:
+
+```json
+{}
+```

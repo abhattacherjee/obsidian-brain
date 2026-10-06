@@ -10,6 +10,40 @@ def module(name):
     result=importlib.util.module_from_spec(spec);spec.loader.exec_module(result);return result
 
 
+def test_unused_subprocess_helper_requires_exact_reviewed_inventory(tmp_path):
+    import hashlib
+    checker = module('host-test-contract.py')
+    helpers = tmp_path / 'tests'
+    helpers.mkdir()
+    source = helpers / 'unused.py'
+    source.write_text('import subprocess\ndef unused(command):\n'
+                      '    return subprocess.run(command)\n')
+    result = checker.inventory(tmp_path)
+    assert checker.reviewed_processes(tmp_path, result, {'launchers': []})
+    contract = {'source': 'tests/unused.py',
+                'expression': 'subprocess.run(command)',
+                'source_sha256': hashlib.sha256(source.read_bytes()).hexdigest(),
+                'scope': 'support', 'reason': 'Disposable helper control'}
+    matrix = {'launchers': [contract]}
+    assert checker.reviewed_processes(tmp_path, result, matrix) == []
+    source.write_text(source.read_text() + '# changed after review\n')
+    assert checker.reviewed_processes(tmp_path, result, matrix)
+
+
+def test_inventory_cannot_approve_a_launcher_without_actor_or_review_reason(tmp_path):
+    import hashlib
+    checker = module('host-test-contract.py')
+    (tmp_path / 'tests').mkdir()
+    source = tmp_path / 'tests/unused.py'
+    source.write_text('import subprocess\ndef unused(command):\n'
+                      '    return subprocess.run(command)\n')
+    matrix = {'launchers': [{'source': 'tests/unused.py',
+        'expression': 'subprocess.run(command)',
+        'source_sha256': hashlib.sha256(source.read_bytes()).hexdigest(),
+        'scope': 'support'}]}
+    assert checker.reviewed_processes(tmp_path, checker.inventory(tmp_path), matrix)
+
+
 @pytest.mark.parametrize('checked,evidence,passes',[
     ([], 'test evidence',False),
     ([0,1], 'test evidence',False),
@@ -151,3 +185,67 @@ def test_acceptance_workflow_uses_external_feature_sha_evidence():
     assert "vars[format('P_{0}', github.event.pull_request.head.sha || github.sha)]" in acceptance
     assert '--bundle-env' in acceptance and '--ledger docs/parity/acceptance-ledger.json' not in acceptance
     assert 'native-acceptance-${{ github.event.pull_request.head.sha || github.sha }}' in acceptance
+
+
+@pytest.mark.parametrize('declaration,expression', [
+    ('from subprocess import check_output as co', 'co(command)'),
+    ('import os', 'os.system(command)'),
+    ('from os import system as sh', 'sh(command)'),
+    ('import subprocess as sp', 'sp.run(command)'),
+])
+def test_unused_imported_process_alias_requires_review(tmp_path, declaration, expression):
+    import hashlib
+    checker = module('host-test-contract.py')
+    (tmp_path / 'tests').mkdir()
+    source = tmp_path / 'tests' / 'unused.py'
+    source.write_text(declaration + '\ndef unused(command):\n    return ' + expression + '\n')
+    result = checker.inventory(tmp_path)
+    assert checker.reviewed_processes(tmp_path, result, {'launchers': []})
+    contract = {'source': 'tests/unused.py', 'expression': expression,
+                'source_sha256': hashlib.sha256(source.read_bytes()).hexdigest(),
+                'scope': 'support', 'reason': 'Disposable unused helper control'}
+    assert checker.reviewed_processes(tmp_path, result, {'launchers': [contract]}) == []
+
+
+def test_inventory_cli_failure_and_reviewed_success(tmp_path, monkeypatch, capsys):
+    import hashlib
+    import json
+    import sys
+    checker = module('host-test-contract.py')
+    (tmp_path / 'tests').mkdir()
+    source = tmp_path / 'tests' / 'unused.py'
+    source.write_text('from subprocess import check_output as co\ndef unused(command):\n    return co(command)\n')
+    matrix = tmp_path / 'matrix.json'
+    output = tmp_path / 'inventory.json'
+    matrix.write_text(json.dumps({'launchers': []}))
+    monkeypatch.setattr(sys, 'argv', ['host-test-contract.py', '--root', str(tmp_path),
+                        '--output', str(output), '--parity-matrix', str(matrix)])
+    assert checker.main() == 1
+    assert json.loads(output.read_text())['errors']
+    assert 'exact reviewed launcher contract' in capsys.readouterr().err
+    matrix.write_text(json.dumps({'launchers': [{'source': 'tests/unused.py',
+        'expression': 'co(command)', 'source_sha256': hashlib.sha256(source.read_bytes()).hexdigest(),
+        'scope': 'support', 'reason': 'Disposable CLI exit control'}]}))
+    assert checker.main() == 0
+    assert json.loads(output.read_text())['errors'] == []
+
+
+def test_unmatched_backticks_cannot_expose_comment_across_paragraphs():
+    checker = module('check-codex-impact.py')
+    body = ('Note the ` mark.\n\n<!--\n- [x] No Codex impact; explain why\n\n'
+            'Impact evidence: hidden\n-->\n\nAnd the ` mark again.\n')
+    with pytest.raises(ValueError, match='Choose exactly one'):
+        checker.validate(body)
+    checker.validate('- [x] No Codex impact; explain why\nImpact evidence: the literal `<!--` token.\n')
+
+
+def test_inline_code_and_fence_boundaries_cannot_certify_hidden_impact():
+    checker = module('check-codex-impact.py')
+    bodies = [
+        '`example\n- [x] No Codex impact; explain why\nImpact evidence: hidden\n`',
+        'Unmatched ` mark.\n```text\nignored\n```\n<!--\n'
+        '- [x] No Codex impact; explain why\nImpact evidence: hidden\n-->\nClosing ` mark.',
+    ]
+    for body in bodies:
+        with pytest.raises(ValueError, match='Choose exactly one'):
+            checker.validate(body)

@@ -133,8 +133,8 @@ def test_total_failure_prints_terminal_diagnostic(selected_host_context, monkeyp
 
     captured = capsys.readouterr()
     assert result == []
-    assert "falling back to the token-overlap heuristic" in captured.err, (
-        f"Expected terminal fallback diagnostic; got: {captured.err!r}"
+    assert "operation remains pending; no classification was published" in captured.err, (
+        f"Expected terminal pending diagnostic; got: {captured.err!r}"
     )
     assert "2" in captured.err, (
         f"Expected group count '2' named in terminal diagnostic; got: {captured.err!r}"
@@ -146,7 +146,7 @@ def test_total_failure_prints_terminal_diagnostic(selected_host_context, monkeyp
 # Test 3: incomplete native results cannot report partial success
 # ---------------------------------------------------------------------------
 
-def test_partial_native_result_is_rejected(selected_host_context, monkeypatch, capsys):
+def test_partial_native_result_retains_only_verified_groups(selected_host_context, monkeypatch, capsys):
     merged_groups = [
         _make_group("g1", "Fix bug #87"),
         _make_group("g2", "Other item"),
@@ -171,9 +171,9 @@ def test_partial_native_result_is_rejected(selected_host_context, monkeypatch, c
     result = oid.classify_groups_with_agent(merged_groups, EVIDENCE)
 
     captured = capsys.readouterr()
-    assert result == []
-    assert oid.get_last_classifier_mode() == "heuristic-fallback"
-    assert "PARTIAL" not in captured.err
+    assert [row["group_id"] for row in result] == ["g1", "g2"]
+    assert oid.get_last_classifier_mode() == "partial"
+    assert "PARTIAL" in captured.err and "1 of 3" in captured.err
 
 
 # ---------------------------------------------------------------------------

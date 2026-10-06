@@ -146,3 +146,42 @@ def test_oversized_record_and_bounded_batch(source_case, monkeypatch):
     batch = read(context)
     assert batch.consumed_offset <= 50 and not batch.source_complete
     assert batch.status == "partial"
+
+
+def test_source_larger_than_16mb_is_read_incrementally_without_loss(source_case):
+    context, path = source_case
+    text = 'x' * (512 * 1024)
+    write_rows(path, [{'sessionId': 'native-session', 'text': text}] + [{'text': text}] * 33)
+    assert path.stat().st_size > 16 * 1024 * 1024
+    cursor = SourceCursor()
+    sequences = []
+    for _ in range(10):
+        batch = read(context, cursor)
+        assert not batch.loss_of_input
+        assert batch.consumed_offset > cursor.offset
+        sequences.extend(record.sequence for record in batch.records)
+        cursor = cursor_for(batch)
+        if batch.source_complete:
+            break
+        assert batch.status == 'partial'
+    assert batch.source_complete and batch.consumed_offset == path.stat().st_size
+    assert len(sequences) == len(set(sequences)) == 34
+
+
+def test_oversized_later_record_keeps_exact_private_source_reference(source_case):
+    context, path = source_case
+    good = b'{"sessionId":"native-session","text":"good"}\n'
+    path.write_bytes(good + b'{"text":"' + b'x' * (1024 * 1024) + b'"}\n')
+    batch = read(context)
+    assert batch.status == 'partial' and not batch.source_complete
+    assert batch.consumed_offset == path.stat().st_size
+    assert [record.text for record in batch.records] == ['good']
+    reference = batch.parser_state['_deferred_source_rows'][0]
+    assert reference['offset'] == len(good)
+    assert reference['end_offset'] == path.stat().st_size
+    assert reference['reason'] == 'oversized:unrecognized'
+    assert reference['digest_kind'] == 'sha256-chunks-v1'
+    assert 'row_sha256' not in reference
+    following = read(context, cursor_for(batch))
+    assert following.status == 'partial' and following.consumed_offset == path.stat().st_size
+    assert not following.source_complete and not following.records

@@ -339,8 +339,14 @@ def _rewrite_wikilinks_in_vault(
         ):
             continue
         try:
+            if p.is_symlink() or any(parent.is_symlink() for parent in p.parents if parent != Path(vault_path).parent):
+                continue
+            p_resolved.relative_to(Path(vault_path).resolve())
+            raw = p.read_bytes()
+            if ("[[" + old_stem + "]]").encode("utf-8") not in raw:
+                continue
             text = repair_read(p, vault_path)
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
             failed.append(f"{p}: {exc}")
             continue
         if pattern.search(text):

@@ -258,7 +258,7 @@ class TestRetroGateHelpers:
         # (Path.home() re-evaluates on each call on CPython when HOME changes).
 
     def _gate_dir(self) -> Path:
-        return self._tmp_home / ".claude" / "obsidian-brain" / "retro-gate"
+        return obsidian_utils._retro_gate_dir()
 
     def test_mark_creates_sentinel(self):
         path = obsidian_utils.mark_retro_classification_pending(SID, "/vault/retro.md")
@@ -308,6 +308,7 @@ class TestRetroGateHelpers:
         string, not a bare "" that the skill would print as a blank line
         and mistake for success."""
         gate_dir = self._gate_dir()
+        gate_dir.rmdir()
         real_mkdir = Path.mkdir
 
         def fake_mkdir(self, *args, **kwargs):
@@ -327,7 +328,7 @@ class TestRetroGateHelpers:
         explicit "Failed: ..." string."""
         gate_dir = self._gate_dir()
         gate_dir.mkdir(parents=True, exist_ok=True)
-        sanitized = obsidian_utils._RETRO_SID_SAFE.sub("_", SID)
+        sanitized = obsidian_utils._retro_sentinel_key(SID)
         expected_resolved = (gate_dir / f"{sanitized}.json").resolve()
 
         real_relative_to = Path.relative_to
@@ -473,6 +474,7 @@ class TestRetroGateHelpers:
         """_reap_stale_retro_sentinels returns 0 and does not raise when the gate dir is absent."""
         # HOME is redirected by the autouse fixture; gate dir was never created.
         gate_dir = self._gate_dir()
+        gate_dir.rmdir()
         assert not gate_dir.exists(), "Pre-condition: gate dir should not exist"
 
         result = obsidian_utils._reap_stale_retro_sentinels()
@@ -537,3 +539,5 @@ def selected_host_context(selected_host_context, host):
          'index_path': original.index_path, 'state_path': original.state_path})
     with using_runtime_context(selected):
         yield selected
+
+pytestmark = pytest.mark.usefixtures("selected_host_context")

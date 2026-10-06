@@ -36,7 +36,7 @@ def legacy_writer_context(vault, project, resource_root, index_path, state_path)
     home = selected_home()
     return RuntimeContext('claude', 'cli', '', project, project, None, vault,
                           home / 'obsidian-brain-config.json', MappingProxyType({}),
-                          resource_root, index_path, state_path, native_home=home)
+                          resource_root, index_path, state_path, native_home=home, user_home=Path.home().resolve())
 
 
 def legacy_project_transcript_dir(project, context=None):
@@ -66,9 +66,9 @@ def legacy_private_directory():
     return Path.home() / ".claude" / "obsidian-brain"
 
 
-def legacy_config_path():
+def legacy_config_path(home=None):
     """Legacy default ~/.claude/obsidian-brain-config.json."""
-    return Path.home() / ".claude" / "obsidian-brain-config.json"
+    return (Path(home) if home is not None else Path.home()) / ".claude" / "obsidian-brain-config.json"
 
 
 def legacy_foreign_host_markers():
@@ -79,3 +79,13 @@ def legacy_foreign_host_markers():
     CODEX_HOME is user configuration and never evidence of the invoking host.
     """
     return ("CODEX_THREAD_ID", "CODEX_SANDBOX", "CODEX_SANDBOX_NETWORK_DISABLED")
+
+
+def legacy_doctor_backup_root(home=None):
+    """Named shipped Claude backup path; bound callers use selected state."""
+    return (Path(home) if home is not None else Path.home()) / '.claude' / 'obsidian-brain-doctor-backup'
+
+
+def legacy_native_projects_root(home=None):
+    """Named shipped Claude transcript path for explicit legacy callers."""
+    return (Path(home) if home is not None else Path.home()) / '.claude' / 'projects'

@@ -63,6 +63,9 @@ def _write_script(dest_dir: Path) -> Path:
     script_path.write_bytes(SCRIPT_PATH.read_bytes())
     script_path.chmod(0o755)
     shutil.copytree(REPO_ROOT / "scripts/dev-test", dest_dir / "dev-test", dirs_exist_ok=True)
+    for name in ("vault_doctor.py", "doctor_repair_state.py"):
+        shutil.copy2(REPO_ROOT / "scripts" / name, dest_dir / name)
+    shutil.copytree(REPO_ROOT / "scripts/vault_doctor_checks", dest_dir / "vault_doctor_checks", dirs_exist_ok=True)
     return script_path
 
 
@@ -359,6 +362,7 @@ def _stage_production_geometry(
     repo = home.joinpath(*repo_rel)
     script = _write_script(repo / "scripts")
     (repo / "hooks").mkdir(parents=True)
+    shutil.copy2(REPO_ROOT / "hooks/brain_cli.py", repo / "hooks/brain_cli.py")
     (repo / "hooks" / "obsidian_utils.py").write_text("# dev hook\n")
     (repo / "hooks" / "hooks.json").write_text("{}\n")
     (repo / "skills" / "dev-test").mkdir(parents=True)

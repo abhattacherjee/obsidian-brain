@@ -191,10 +191,11 @@ def test_legacy_utilities_use_bound_context_without_identity_scanning(runtime_ca
     assert not foreign.exists()
 
 
-def test_equal_host_ids_do_not_share_legacy_cache(runtime_case):
+def test_equal_host_ids_do_not_share_legacy_cache(runtime_case, host_identity_scenario):
     utils = importlib.import_module("obsidian_utils")
     codex = resolve(runtime_case, host="codex", sid="equal")
     claude = resolve(runtime_case, host="claude", client="claude-code", sid="equal")
+    host_identity_scenario.register(codex, claude)
     utils.cache_set("equal", "owner", "codex", context=codex)
     utils.cache_set("equal", "owner", "claude", context=claude)
     assert utils.cache_get("equal", "owner", context=codex) == "codex"
@@ -214,12 +215,13 @@ def test_dedup_claims_do_not_use_claude_state_for_codex(runtime_case):
     assert not foreign.exists()
 
 
-def test_retro_gate_keys_include_host_when_state_is_shared(runtime_case, monkeypatch):
+def test_retro_gate_keys_include_host_when_state_is_shared(runtime_case, monkeypatch, host_identity_scenario):
     utils = importlib.import_module("obsidian_utils")
     runtime = importlib.import_module("runtime_context")
     monkeypatch.setenv("OBSIDIAN_BRAIN_STATE_DIR", str(runtime_case["home"] / "selected shared state"))
     codex = resolve(runtime_case, host="codex", sid="equal")
     claude = resolve(runtime_case, host="claude", client="claude-code", sid="equal")
+    host_identity_scenario.register(codex, claude)
     with runtime.using_runtime_context(codex):
         codex_path = utils.mark_retro_classification_pending("equal", "codex-retro.md")
     with runtime.using_runtime_context(claude):
