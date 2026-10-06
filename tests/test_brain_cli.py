@@ -60,3 +60,18 @@ def test_native_process_rejects_excessive_json_nesting(runtime_case):
                             cwd=runtime_case["worktree"], timeout=5)
     assert result.returncode == 2
     assert json.loads(result.stderr)["code"] == "input_invalid"
+
+
+def test_parser_recursion_error_is_structured_before_runtime_resolution(runtime_case, monkeypatch):
+    module = importlib.import_module("brain_cli")
+    decode = json.loads
+    def recurse(*args, **kwargs):
+        raise RecursionError("synthetic native JSON decoder recursion limit")
+    def resolve(*args, **kwargs):
+        pytest.fail("Invalid JSON must not resolve runtime state")
+    monkeypatch.setattr(module.json, "loads", recurse)
+    monkeypatch.setattr(module, "resolve_runtime_context", resolve)
+    code, output, errors = invoke(runtime_case, '{"nested": []}')
+    assert code == 2 and not output
+    assert decode(errors)["code"] == "input_invalid"
+    assert "Traceback" not in errors

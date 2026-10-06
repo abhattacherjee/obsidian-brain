@@ -3259,6 +3259,10 @@ class TestUpgradeBatchBatching:
         batch_calls: list[list[dict]] = []
         # Return good summaries for notes 0-3, missing_section for note 4.
         def fake_generate_summaries_batch(prepared_notes, **kwargs):
+            # This fake supplies the native response's observed model too;
+            # caller-global state from another test is not model evidence.
+            if selected_host_context.host == "codex":
+                obsidian_utils._SUMMARY_NATIVE_MODEL.set("synthetic-native-model")
             batch_calls.append(prepared_notes)
             results = []
             for i, _ in enumerate(prepared_notes):
@@ -3315,6 +3319,40 @@ class TestUpgradeBatchBatching:
         assert results[4]["status"].startswith("Upgraded "), (
             f"solo fallback note should still succeed, got: {results[4]['status']!r}"
         )
+
+    def test_batch_preparation_does_not_contend_with_its_own_revision_reads(self, monkeypatch, tmp_path):
+        import time
+        import note_transactions
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir()
+        paths = [str(self._write_session_note(sessions_dir, "owned%d.md" % i))
+                 for i in range(3)]
+        original = note_transactions._record_read
+        first = [True]
+
+        def slow_first_read(*args, **kwargs):
+            # This runs while the real vault lock is held. A sibling prep
+            # must not spend its 100ms external-writer budget on our batch.
+            if first[0]:
+                first[0] = False
+                time.sleep(0.2)
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(note_transactions, "_record_read", slow_first_read)
+        monkeypatch.setattr(obsidian_utils, "find_transcript_jsonl", lambda sid: None)
+        monkeypatch.setattr(obsidian_utils, "generate_summaries_batch",
+                            lambda prepared, **kwargs: [(None, "haiku_timeout")] * len(prepared))
+        fallback = []
+
+        def solo(path, *args, **kwargs):
+            fallback.append(path)
+            return "Upgraded " + os.path.basename(path), 0.0, "synthetic", None
+
+        monkeypatch.setattr(obsidian_utils, "upgrade_unsummarized_note", solo)
+        results = obsidian_utils.upgrade_batch(paths, str(tmp_path), "sessions", "test-project",
+                                              summary_batch_size=3)
+        assert sorted(fallback) == sorted(paths)
+        assert all(row["status"].startswith("Upgraded ") for row in results)
 
     def test_batch_size_1_uses_solo_path(self, monkeypatch, tmp_path):
         """batch_size=1: legacy fan-out fires for every note; generate_summaries_batch never called."""

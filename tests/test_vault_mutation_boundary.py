@@ -343,7 +343,15 @@ def test_codex_wire_files_require_private_directory_outside_vault():
     assert 'metadata.st_uid != os.geteuid()' in source
     assert 'stat.S_IMODE(metadata.st_mode) != 448' in source
     assert 'directory.resolve().is_relative_to(context.vault_path.resolve())' in source
-    assert "schema_path, output_path = (directory / 'schema.json', directory / 'result.json')" in source
+    expected_assignment = ast.parse(
+        "schema_path, output_path = (directory / 'schema.json', directory / 'result.json')"
+    ).body[0]
+    assert any(
+        isinstance(node, ast.Assign)
+        and ast.dump(node, include_attributes=False)
+        == ast.dump(expected_assignment, include_attributes=False)
+        for node in ast.walk(function)
+    )
     assert not _violations(source, 'hooks/ai_adapters/codex.py')
     assert _violations(source + '\n    Path(note_path).write_text(prompt)\n',
                        'hooks/ai_adapters/codex.py')

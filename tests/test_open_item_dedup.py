@@ -550,18 +550,25 @@ def test_dedup_note_stat_oserror_fallback(selected_host_context, tmp_vault, monk
         ["Fix hooks/obsidian_utils.py import error", "Another item"],
     )
 
-    original_stat = os.stat
+    from pathlib import Path
+
+    original_stat = Path.stat
+    failed_stats = []
 
     def patched_stat(path, *args, **kwargs):
-        if str(newer_note) in str(path):
+        if path == newer_note:
+            failed_stats.append(path)
             raise OSError("stat failed")
         return original_stat(path, *args, **kwargs)
 
-    monkeypatch.setattr(os, "stat", patched_stat)
+    # Python 3.9 caches os.stat in pathlib's accessor. Patch the API the
+    # publisher actually calls, so every supported Python injects the fault.
+    monkeypatch.setattr(Path, "stat", patched_stat)
     removed = dedup_note_open_items(
         str(tmp_vault), "claude-sessions", "myproject", str(newer_note)
     )
     # Without source metadata, preserve the note and report no published removal.
+    assert failed_stats
     assert removed == []
     assert "- [ ] Fix hooks/obsidian_utils.py import error" in newer_note.read_text()
 

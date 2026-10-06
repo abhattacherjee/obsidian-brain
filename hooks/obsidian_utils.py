@@ -7275,15 +7275,13 @@ def upgrade_batch(
 
     # ---- Batched path (batch_size >= 2) ---------------------------------------
 
-    # Step 1: Prepare all notes concurrently.
-    workers = min(max_workers, len(paths))
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        prep_futs = {p: ex.submit(copy_context().run, _prepare_note_for_summary, p, vault_path, sessions_folder, project)
-                     for p in paths}
+    # Step 1: Record source revisions in order before any model work.
+    # Sibling preparers share the vault lock; racing them can exhaust the
+    # external-writer deadline on our own batch. AI work below stays parallel.
     preps: dict[str, dict] = {}
-    for p, fut in prep_futs.items():
+    for p in paths:
         try:
-            preps[p] = fut.result()
+            preps[p] = copy_context().run(_prepare_note_for_summary, p, vault_path, sessions_folder, project)
         except Exception as exc:  # noqa: BLE001
             preps[p] = {
                 "ok": False,

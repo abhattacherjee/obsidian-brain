@@ -28,7 +28,7 @@ def read_payload(raw):
 
         value = json.loads(raw, object_pairs_hook=object_fields,
                            parse_constant=invalid_constant) if raw.strip() else {}
-    except ValueError as exc:
+    except (ValueError, RecursionError) as exc:
         raise RuntimeContextError("input_invalid", "Native input must be valid JSON.") from exc
     if not isinstance(value, dict):
         raise RuntimeContextError("input_invalid", "Native input must be a JSON object.")
