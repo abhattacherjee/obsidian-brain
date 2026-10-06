@@ -1,14 +1,12 @@
-"""Run the /vault-reindex and /obsidian-setup rebuild snippets for real (#393 review).
+"""Run authored reindex procedures against isolated config, vault and index.
 
-test_skill_snippets.py only compiles snippets. These run the two snippets
-that call rebuild_index, against a temp HOME, config, vault and DB, so an
-argv shift or a wrong folder source fails here.
+The file-derived launcher must preserve folder selection and refuse bad config
+without removing indexed rows.
 """
 from __future__ import annotations
 
 import json
 import os
-import re
 import sqlite3
 import subprocess
 import sys
@@ -17,15 +15,27 @@ from pathlib import Path
 import pytest
 
 REPO = Path(__file__).resolve().parent.parent
-_SNIPPET_RE = re.compile(r"python3 -c '(.*?)'((?: \"\$[A-Z_]+\")*)", re.DOTALL)
-
-
-def _rebuild_snippet(skill: str):
+def _rebuild_command(skill):
     text = (REPO / "skills" / skill / "SKILL.md").read_text(encoding="utf-8")
-    for m in _SNIPPET_RE.finditer(text):
-        if "rebuild_index(" in m.group(1):
-            return m.group(1), re.findall(r"\$([A-Z_]+)", m.group(2))
-    raise AssertionError(f"no rebuild_index snippet in {skill}")
+    lines = [line for line in text.splitlines()
+             if line.startswith('python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py"')
+             and "--operation 'reindex'" in line]
+    assert len(lines) == 1, f"expected one trusted reindex invocation in {skill}"
+    return lines[0]
+
+
+def _invoke(skill, home, vault, db, environment, full="false"):
+    request = home / 'reindex-request.json'
+    request.write_text(json.dumps({'full': full == 'true'}))
+    cwd = home / 'unrelated cwd with spaces'
+    cwd.mkdir(exist_ok=True)
+    environment = dict(environment, OB_RESOURCE_ROOT=str(REPO),
+        OB_SKILL_PATH=str(REPO / 'skills' / skill / 'SKILL.md'),
+        OB_HOST='claude', OB_CLIENT='cli', OB_SESSION_ID='snippet-test-0000',
+        OB_CWD=str(cwd), OB_VAULT=str(vault), REQUEST_PATH=str(request),
+        CLAUDE_CONFIG_DIR=str(home / '.claude'), CODEX_HOME=str(home / '.codex'))
+    return subprocess.run(['bash', '-c', _rebuild_command(skill)], cwd=cwd,
+        env=environment, capture_output=True, text=True, timeout=60)
 
 
 def _note(p: Path, t: str) -> None:
@@ -50,11 +60,7 @@ def env(tmp_path):
 def _run(skill, home, vault, db, e, wiki_folder="claude-wiki", full="false"):
     (home / ".claude" / "obsidian-brain-config.json").write_text(
         json.dumps({"vault_path": str(vault), "wiki_folder": wiki_folder}))
-    code, names = _rebuild_snippet(skill)
-    values = {"VAULT_PATH": str(vault), "FULL_MODE": full}
-    argv = [values[n] for n in names]
-    return subprocess.run([sys.executable, "-c", code, *argv], cwd=REPO, env=e,
-                          capture_output=True, text=True, timeout=60)
+    return _invoke(skill, home, vault, db, e, full)
 
 
 def _paths(db):
@@ -103,10 +109,7 @@ def test_rebuild_snippet_refuses_unreadable_config_and_keeps_rows(skill, env):
     home, vault, db, e = env
     assert _run(skill, home, vault, db, e).returncode == 0
     (home / ".claude" / "obsidian-brain-config.json").write_text('{"vault_path": "x",}')
-    code, names = _rebuild_snippet(skill)
-    argv = [{"VAULT_PATH": str(vault), "FULL_MODE": "false"}[n] for n in names]
-    r = subprocess.run([sys.executable, "-c", code, *argv], cwd=REPO, env=e,
-                       capture_output=True, text=True, timeout=60)
+    r = _invoke(skill, home, vault, db, e)
     assert r.returncode != 0
-    assert "vault_path" in r.stderr
+    assert "configuration" in r.stderr
     assert _paths(db) == {"s.md", "10-03-q.md"}

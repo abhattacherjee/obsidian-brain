@@ -7,6 +7,7 @@ import sys
 import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+from check_items_test_helpers import native_ai_context, ai_response as _ai_response, verdicts, private_output
 
 HOOKS_DIR = os.path.join(os.path.dirname(__file__), "..", "hooks")
 if HOOKS_DIR not in sys.path:
@@ -88,7 +89,7 @@ def test_all_groups_have_evidence_subagent_called(tmp_path, monkeypatch):
     ]
     payload_str = _make_payload(groups, EVIDENCE_WITH_MATCH_TEXT)
 
-    output_path = str(tmp_path / "out.json")
+    output_path = str(private_output('out.json'))
 
     # Sub-agent output: two classification records
     subagent_result = [
@@ -117,11 +118,10 @@ def test_all_groups_have_evidence_subagent_called(tmp_path, monkeypatch):
 
     def fake_run(*args, **kwargs):
         # Write the sub-agent result to output_path
-        Path(output_path).write_text(json.dumps(subagent_result), encoding="utf-8")
-        return mock_cp
+        return _ai_response(subagent_result)
 
     monkeypatch.setenv("CHECK_ITEMS_PREFILTER", "on")
-    with patch("check_items_cli.subprocess.run", side_effect=fake_run) as mock_sub:
+    with patch("check_items_cli._request_ai", side_effect=fake_run) as mock_sub:
         rc = check_items_cli.run_classifier(payload_str, output_path)
 
     assert rc == 0
@@ -148,11 +148,11 @@ def test_no_groups_have_evidence_subagent_not_called(tmp_path, monkeypatch):
     ]
     payload_str = _make_payload(groups, EVIDENCE_EMPTY_TEXT)
 
-    output_path = str(tmp_path / "out.json")
+    output_path = str(private_output('out.json'))
 
     monkeypatch.setenv("CHECK_ITEMS_PREFILTER", "on")
     mock_sub = MagicMock()
-    with patch("check_items_cli.subprocess.run", mock_sub):
+    with patch("check_items_cli._request_ai", mock_sub):
         rc = check_items_cli.run_classifier(payload_str, output_path)
 
     assert rc == 0
@@ -187,7 +187,7 @@ def test_mixed_groups_order_preserved(tmp_path, monkeypatch):
     ]
     payload_str = _make_payload(groups, EVIDENCE_WITH_MATCH_TEXT)
 
-    output_path = str(tmp_path / "out.json")
+    output_path = str(private_output('out.json'))
 
     subagent_result = [
         {
@@ -209,11 +209,10 @@ def test_mixed_groups_order_preserved(tmp_path, monkeypatch):
 
     def fake_run(*args, **kwargs):
         subagent_call_count.append(1)
-        Path(output_path).write_text(json.dumps(subagent_result), encoding="utf-8")
-        return mock_cp
+        return _ai_response(subagent_result)
 
     monkeypatch.setenv("CHECK_ITEMS_PREFILTER", "on")
-    with patch("check_items_cli.subprocess.run", side_effect=fake_run):
+    with patch("check_items_cli._request_ai", side_effect=fake_run):
         rc = check_items_cli.run_classifier(payload_str, output_path)
 
     assert rc == 0
@@ -248,7 +247,7 @@ def test_prefilter_disabled_subagent_called_for_all(tmp_path, monkeypatch):
     ]
     payload_str = _make_payload(groups, EVIDENCE_EMPTY_TEXT)
 
-    output_path = str(tmp_path / "out.json")
+    output_path = str(private_output('out.json'))
 
     subagent_result = [
         {
@@ -275,11 +274,10 @@ def test_prefilter_disabled_subagent_called_for_all(tmp_path, monkeypatch):
     mock_cp.stdout = ""
 
     def fake_run(*args, **kwargs):
-        Path(output_path).write_text(json.dumps(subagent_result), encoding="utf-8")
-        return mock_cp
+        return _ai_response(subagent_result)
 
     monkeypatch.setenv("CHECK_ITEMS_PREFILTER", "off")
-    with patch("check_items_cli.subprocess.run", side_effect=fake_run) as mock_sub:
+    with patch("check_items_cli._request_ai", side_effect=fake_run) as mock_sub:
         rc = check_items_cli.run_classifier(payload_str, output_path)
 
     assert rc == 0
@@ -305,7 +303,7 @@ def test_bare_key_evidence_bridging_with_match(tmp_path, monkeypatch):
     # Use the live production evidence shape (bare keys, nested under project)
     payload_str = _make_payload(groups, EVIDENCE_BARE_KEYS_WITH_MATCH)
 
-    output_path = str(tmp_path / "out.json")
+    output_path = str(private_output('out.json'))
 
     subagent_result = [
         {
@@ -324,11 +322,10 @@ def test_bare_key_evidence_bridging_with_match(tmp_path, monkeypatch):
     mock_cp.stdout = ""
 
     def fake_run(*args, **kwargs):
-        Path(output_path).write_text(json.dumps(subagent_result), encoding="utf-8")
-        return mock_cp
+        return _ai_response(subagent_result)
 
     monkeypatch.setenv("CHECK_ITEMS_PREFILTER", "on")
-    with patch("check_items_cli.subprocess.run", side_effect=fake_run) as mock_sub:
+    with patch("check_items_cli._request_ai", side_effect=fake_run) as mock_sub:
         rc = check_items_cli.run_classifier(payload_str, output_path)
 
     assert rc == 0
@@ -351,11 +348,11 @@ def test_bare_key_evidence_bridging_no_match(tmp_path, monkeypatch):
     ]
     payload_str = _make_payload(groups, EVIDENCE_BARE_KEYS_EMPTY)
 
-    output_path = str(tmp_path / "out.json")
+    output_path = str(private_output('out.json'))
 
     monkeypatch.setenv("CHECK_ITEMS_PREFILTER", "on")
     mock_sub = MagicMock()
-    with patch("check_items_cli.subprocess.run", mock_sub):
+    with patch("check_items_cli._request_ai", mock_sub):
         rc = check_items_cli.run_classifier(payload_str, output_path)
 
     assert rc == 0
@@ -377,10 +374,10 @@ def test_telemetry_line_appears_in_stderr(tmp_path, monkeypatch, capsys):
     mtime_recent = time.time() - (10 * 86400)
     groups = [_make_group("g1", "Investigate dispatcher discovery", mtime_recent)]
     payload_str = _make_payload(groups, EVIDENCE_EMPTY_TEXT)
-    output_path = str(tmp_path / "out.json")
+    output_path = str(private_output('out.json'))
 
     monkeypatch.setenv("CHECK_ITEMS_PREFILTER", "on")
-    with patch("check_items_cli.subprocess.run", MagicMock()):
+    with patch("check_items_cli._request_ai", MagicMock()):
         rc = check_items_cli.run_classifier(payload_str, output_path)
 
     assert rc == 0
@@ -403,10 +400,10 @@ def test_telemetry_line_has_all_five_fields(tmp_path, monkeypatch, capsys):
         _make_group("g2", "Explore vault growth patterns", mtime_recent),
     ]
     payload_str = _make_payload(groups, EVIDENCE_EMPTY_TEXT)
-    output_path = str(tmp_path / "out.json")
+    output_path = str(private_output('out.json'))
 
     monkeypatch.setenv("CHECK_ITEMS_PREFILTER", "on")
-    with patch("check_items_cli.subprocess.run", MagicMock()):
+    with patch("check_items_cli._request_ai", MagicMock()):
         rc = check_items_cli.run_classifier(payload_str, output_path)
 
     assert rc == 0
@@ -453,11 +450,11 @@ def test_all_synthetic_subprocess_never_invoked(tmp_path, monkeypatch):
         _make_group("g3", "Document architecture decisions", mtime_recent),
     ]
     payload_str = _make_payload(groups, EVIDENCE_EMPTY_TEXT)
-    output_path = str(tmp_path / "out.json")
+    output_path = str(private_output('out.json'))
 
     monkeypatch.setenv("CHECK_ITEMS_PREFILTER", "on")
     mock_sub = MagicMock()
-    with patch("check_items_cli.subprocess.run", mock_sub):
+    with patch("check_items_cli._request_ai", mock_sub):
         rc = check_items_cli.run_classifier(payload_str, output_path)
 
     assert rc == 0, f"Expected exit 0, got {rc}"
@@ -610,10 +607,10 @@ def test_run_classifier_missing_group_id_returns_error(tmp_path, monkeypatch):
         },
     ]
     payload_str = _make_payload(groups, EVIDENCE_EMPTY_TEXT)
-    output_path = str(tmp_path / "out.json")
+    output_path = str(private_output('out.json'))
 
     monkeypatch.setenv("CHECK_ITEMS_PREFILTER", "on")
-    with patch("check_items_cli.subprocess.run", MagicMock()):
+    with patch("check_items_cli._request_ai", MagicMock()):
         rc = check_items_cli.run_classifier(payload_str, output_path)
 
     assert rc != 0, f"Expected non-zero rc for groups with group_id=None, got {rc}"
@@ -633,10 +630,10 @@ def test_run_classifier_missing_group_id_logs_to_stderr(tmp_path, monkeypatch, c
         }
     ]
     payload_str = _make_payload(groups, EVIDENCE_EMPTY_TEXT)
-    output_path = str(tmp_path / "out.json")
+    output_path = str(private_output('out.json'))
 
     monkeypatch.setenv("CHECK_ITEMS_PREFILTER", "on")
-    with patch("check_items_cli.subprocess.run", MagicMock()):
+    with patch("check_items_cli._request_ai", MagicMock()):
         rc = check_items_cli.run_classifier(payload_str, output_path)
 
     assert rc != 0
@@ -651,14 +648,14 @@ def test_run_classifier_missing_group_id_logs_to_stderr(tmp_path, monkeypatch, c
 # I3: file-path branch must apply _validate_classifier_payload
 # ---------------------------------------------------------------------------
 
-def test_file_path_branch_validates_schema(tmp_path, monkeypatch):
+def test_inline_result_validates_schema(tmp_path, monkeypatch):
     """If sub-agent writes invalid JSON to output file, run_classifier returns rc=4 (I3)."""
     import check_items_cli
 
     mtime_recent = time.time() - (10 * 86400)
     groups = [_make_group("g1", "Fix session_log race condition", mtime_recent)]
     payload_str = _make_payload(groups, EVIDENCE_WITH_MATCH_TEXT)
-    output_path = str(tmp_path / "out.json")
+    output_path = str(private_output('out.json'))
 
     # Sub-agent writes a dict instead of a list (wrong shape) to output_path
     invalid_result = {"wrong": "shape"}
@@ -669,24 +666,23 @@ def test_file_path_branch_validates_schema(tmp_path, monkeypatch):
     mock_cp.stdout = ""
 
     def fake_run(*args, **kwargs):
-        Path(output_path).write_text(json.dumps(invalid_result), encoding="utf-8")
-        return mock_cp
+        return _ai_response(invalid_result)
 
     monkeypatch.setenv("CHECK_ITEMS_PREFILTER", "on")
-    with patch("check_items_cli.subprocess.run", side_effect=fake_run):
+    with patch("check_items_cli._request_ai", side_effect=fake_run):
         rc = check_items_cli.run_classifier(payload_str, output_path)
 
     assert rc == 4, f"Expected rc=4 for invalid file-path output shape, got {rc}"
 
 
-def test_file_path_branch_validates_schema_missing_fields(tmp_path, monkeypatch):
+def test_inline_result_validates_schema_missing_fields(tmp_path, monkeypatch):
     """File-path branch rejects list of dicts missing required classifier fields (I3)."""
     import check_items_cli
 
     mtime_recent = time.time() - (10 * 86400)
     groups = [_make_group("g1", "Fix session_log race condition", mtime_recent)]
     payload_str = _make_payload(groups, EVIDENCE_WITH_MATCH_TEXT)
-    output_path = str(tmp_path / "out.json")
+    output_path = str(private_output('out.json'))
 
     # Missing required fields like 'evidence_citation', 'action_required', etc.
     invalid_result = [{"group_id": "g1", "classification": "DONE"}]
@@ -697,11 +693,10 @@ def test_file_path_branch_validates_schema_missing_fields(tmp_path, monkeypatch)
     mock_cp.stdout = ""
 
     def fake_run(*args, **kwargs):
-        Path(output_path).write_text(json.dumps(invalid_result), encoding="utf-8")
-        return mock_cp
+        return _ai_response(invalid_result)
 
     monkeypatch.setenv("CHECK_ITEMS_PREFILTER", "on")
-    with patch("check_items_cli.subprocess.run", side_effect=fake_run):
+    with patch("check_items_cli._request_ai", side_effect=fake_run):
         rc = check_items_cli.run_classifier(payload_str, output_path)
 
     assert rc == 4, f"Expected rc=4 for file-path output missing required fields, got {rc}"
@@ -803,14 +798,11 @@ def test_non_dict_records_dropped_with_warning(tmp_path, monkeypatch, capsys):
     mock_cp.stderr = ""
     mock_cp.stdout = ""
 
-    def fake_run(*args, **kwargs):
-        # Extract out_path from the CLI args: ["python3", cli_path, "classifier", out_path]
-        cli_args = args[0]
-        out_path = cli_args[3]
+    def fake_run(stdin_json, out_path):
         Path(out_path).write_text(json.dumps(malformed_response), encoding="utf-8")
-        return mock_cp
+        return 0
 
-    with patch("open_item_dedup.subprocess.run", side_effect=fake_run):
+    with patch("check_items_cli.run_classifier", side_effect=fake_run):
         result = oid.classify_groups_with_agent(merged_groups, evidence)
 
     captured = capsys.readouterr()
@@ -854,11 +846,11 @@ def test_empty_evidence_dict_all_groups_synthetic(tmp_path, monkeypatch):
     ]
     # evidence={}: no evidence key at all in the payload
     payload_str = json.dumps({"groups": groups, "evidence": {}})
-    output_path = str(tmp_path / "out.json")
+    output_path = str(private_output('out.json'))
 
     monkeypatch.setenv("CHECK_ITEMS_PREFILTER", "on")
     mock_sub = MagicMock()
-    with patch("check_items_cli.subprocess.run", mock_sub):
+    with patch("check_items_cli._request_ai", mock_sub):
         rc = check_items_cli.run_classifier(payload_str, output_path)
 
     assert rc == 0, f"Expected rc=0 for evidence={{}}, got {rc}"
@@ -906,7 +898,7 @@ def test_l2_prefilter_active_project_fixture(tmp_path, monkeypatch, capsys):
         "evidence": evidence,
     }
     stdin_json = json.dumps(payload)
-    output_path = str(tmp_path / "classifications.json")
+    output_path = str(private_output('classifications.json'))
 
     monkeypatch.setenv("CHECK_ITEMS_PREFILTER", "on")
     HOOKS = os.path.join(os.path.dirname(__file__), "..", "hooks")
@@ -920,19 +912,10 @@ def test_l2_prefilter_active_project_fixture(tmp_path, monkeypatch, capsys):
     # classified is out of scope for #173.
     import re as _re
 
-    def _fake_run(*_a, **_k):
-        prompt = _k.get("input", "")
-        out_match = _re.search(r"JSON to (/\S+?)\.?(?:\s|$)", prompt)
-        if out_match:
-            Path(out_match.group(1)).write_text(json.dumps([]), encoding="utf-8")
+    def _fake_run(operation, prompt, payload, model, requested):
+        return _ai_response(verdicts(requested, "ACTIVE", "LOW"))
 
-        class R:
-            returncode = 0
-            stdout = json.dumps([])
-            stderr = ""
-        return R()
-
-    monkeypatch.setattr(check_items_cli.subprocess, "run", _fake_run)
+    monkeypatch.setattr(check_items_cli, "_request_ai", _fake_run)
     check_items_cli.run_classifier(stdin_json, output_path)
 
     err = capsys.readouterr().err
@@ -1208,62 +1191,16 @@ def test_strip_unreleased_unreleased_at_end_with_no_released_section():
 
 def _make_chunking_fake_run(output_path: str, return_rcs: list | None = None,
                             timeout_on: int | set | None = None):
-    """Build a subprocess.run stub that handles chunked dispatch.
-
-    For each call, the stub:
-      - parses the embedded `<output-json-path>` from the prompt (which is
-        either output_path for single dispatch, or a temp `.classout.json`
-        file for chunked dispatch)
-      - reads the corresponding `<input-json-path>` to learn which group_ids
-        are in this chunk
-      - writes one DONE-classification record per group_id to the per-chunk
-        output path
-    Optionally returns a non-zero rc for the call index in `return_rcs`, or
-    raises TimeoutExpired for the call index (or any index in the set) given
-    by `timeout_on` — a set lets a test time out BOTH of a chunk's retry
-    attempts (see run_classifier's CHUNK_MAX_ATTEMPTS) rather than just one.
-    """
-    import re as _re
+    """Mock the inline request, preserving chunk IDs and retry statuses."""
     call_index = {"n": 0}
-    timeout_indices = (
-        {timeout_on} if isinstance(timeout_on, int) else set(timeout_on or [])
-    )
-
-    def fake_run(*args, **kwargs):
+    timeout_indices = {timeout_on} if isinstance(timeout_on, int) else set(timeout_on or [])
+    def fake_run(operation, prompt, payload, model, requested):
         idx = call_index["n"]
         call_index["n"] += 1
-
         if idx in timeout_indices:
-            raise subprocess.TimeoutExpired(cmd=args[0] if args else "claude", timeout=1)
-
-        prompt = kwargs.get("input", "")
-        in_match = _re.search(r"(/\S+\.classin\.json)", prompt)
-        out_match = _re.search(r"JSON to (/\S+?)\.?(?:\s|$)", prompt)
-        assert in_match, f"input path missing from prompt: {prompt[:200]!r}"
-        assert out_match, f"output path missing from prompt: {prompt[:200]!r}"
-        in_path = in_match.group(1)
-        out_path = out_match.group(1)
-
-        chunk_payload = json.loads(Path(in_path).read_text())
-        chunk_results = [
-            {
-                "group_id": g["group_id"],
-                "classification": "DONE",
-                "confidence": "HIGH",
-                "canonical_text": g["representative"],
-                "evidence_citation": "commit abc1234",
-                "action_required": None,
-            }
-            for g in chunk_payload["groups"]
-        ]
-        Path(out_path).write_text(json.dumps(chunk_results), encoding="utf-8")
-
-        mock_cp = MagicMock()
-        mock_cp.returncode = (return_rcs[idx] if return_rcs and idx < len(return_rcs) else 0)
-        mock_cp.stderr = ""
-        mock_cp.stdout = ""
-        return mock_cp
-
+            return _ai_response(rc=3)
+        rc = return_rcs[idx] if return_rcs and idx < len(return_rcs) else 0
+        return _ai_response(verdicts(requested), rc)
     return fake_run, call_index
 
 
@@ -1281,10 +1218,10 @@ def test_classifier_chunking_under_threshold_single_dispatch(tmp_path, monkeypat
 
     groups = [_make_group(f"g{i}", f"Fix bug number {i}") for i in range(25)]
     payload_str = _make_payload(groups, EVIDENCE_WITH_MATCH_TEXT)
-    output_path = str(tmp_path / "out.json")
+    output_path = str(private_output('out.json'))
 
     fake_run, calls = _make_chunking_fake_run(output_path)
-    with patch("check_items_cli.subprocess.run", side_effect=fake_run):
+    with patch("check_items_cli._request_ai", side_effect=fake_run):
         rc = check_items_cli.run_classifier(payload_str, output_path)
 
     assert rc == 0
@@ -1310,10 +1247,10 @@ def test_classifier_chunking_above_threshold_splits(tmp_path, monkeypatch, capsy
     # 60 groups → 3 chunks of 25 / 25 / 10
     groups = [_make_group(f"g{i:03d}", f"Fix bug number {i}") for i in range(60)]
     payload_str = _make_payload(groups, EVIDENCE_WITH_MATCH_TEXT)
-    output_path = str(tmp_path / "out.json")
+    output_path = str(private_output('out.json'))
 
     fake_run, calls = _make_chunking_fake_run(output_path)
-    with patch("check_items_cli.subprocess.run", side_effect=fake_run):
+    with patch("check_items_cli._request_ai", side_effect=fake_run):
         rc = check_items_cli.run_classifier(payload_str, output_path)
 
     assert rc == 0
@@ -1333,35 +1270,20 @@ def test_classifier_chunking_above_threshold_splits(tmp_path, monkeypatch, capsy
     )
 
 
-def test_classifier_chunking_chunk_failure_degrades_not_aborts(tmp_path, monkeypatch):
-    """A chunk that times out on BOTH retry attempts degrades — its groups are
-    dropped, but chunk 1 (already completed) and chunk 3 (still to run) are
-    unaffected, so run_classifier returns 0 (#297 defect 2, superseding the
-    old all-or-nothing `return rc` this test used to pin)."""
+def test_classifier_chunking_chunk_failure_preserves_previous_output(tmp_path, monkeypatch):
+    """An exhausted chunk cannot publish an incomplete successful result."""
     import check_items_cli
-
-    monkeypatch.setattr("check_items_cli.CLASSIFIER_CHUNK_SIZE", 10)
+    monkeypatch.setattr(check_items_cli, "CLASSIFIER_CHUNK_SIZE", 10)
     monkeypatch.setenv("CHECK_ITEMS_PREFILTER", "off")
-
-    # 30 groups → 3 chunks of 10. Time out BOTH attempts of the 2nd chunk
-    # (call indices 1 and 2 — chunk 1 takes index 0 on its lone attempt).
     groups = [_make_group(f"g{i:03d}", f"Fix bug number {i}") for i in range(30)]
-    payload_str = _make_payload(groups, EVIDENCE_WITH_MATCH_TEXT)
-    output_path = str(tmp_path / "out.json")
-
+    output_path = str(private_output('out.json'))
+    Path(output_path).write_text("previous")
     fake_run, calls = _make_chunking_fake_run(output_path, timeout_on={1, 2})
-    with patch("check_items_cli.subprocess.run", side_effect=fake_run):
-        rc = check_items_cli.run_classifier(payload_str, output_path)
-
-    assert rc == 0, f"Expected 0 (partial failure degrades, doesn't abort), got {rc}"
-    # chunk 1 (1 attempt) + chunk 2 (2 attempts, both time out) + chunk 3 (1 attempt)
-    assert calls["n"] == 4, f"Expected 4 dispatches (1+2+1), got {calls['n']}"
-
-    out = json.loads(Path(output_path).read_text())
-    kept_ids = {r["group_id"] for r in out}
-    assert kept_ids == {f"g{i:03d}" for i in list(range(10)) + list(range(20, 30))}, (
-        "chunk 2's group_ids (g010..g019) must be dropped; chunks 1 and 3 kept"
-    )
+    with patch("check_items_cli._request_ai", side_effect=fake_run):
+        rc = check_items_cli.run_classifier(_make_payload(groups, EVIDENCE_WITH_MATCH_TEXT), output_path)
+    assert rc == 3
+    assert calls["n"] == 3
+    assert Path(output_path).read_text() == "previous"
 
 
 def test_classifier_chunking_env_override(tmp_path, monkeypatch, capsys):
@@ -1374,10 +1296,10 @@ def test_classifier_chunking_env_override(tmp_path, monkeypatch, capsys):
     # 12 groups, chunk_size=5 → 3 chunks of 5/5/2
     groups = [_make_group(f"g{i:02d}", f"Fix bug number {i}") for i in range(12)]
     payload_str = _make_payload(groups, EVIDENCE_WITH_MATCH_TEXT)
-    output_path = str(tmp_path / "out.json")
+    output_path = str(private_output('out.json'))
 
     fake_run, calls = _make_chunking_fake_run(output_path)
-    with patch("check_items_cli.subprocess.run", side_effect=fake_run):
+    with patch("check_items_cli._request_ai", side_effect=fake_run):
         rc = check_items_cli.run_classifier(payload_str, output_path)
 
     assert rc == 0
@@ -1421,10 +1343,10 @@ def test_classifier_chunking_boundary_at_chunk_size_plus_one(tmp_path, monkeypat
 
     groups = [_make_group(f"g{i:03d}", f"Fix bug number {i}") for i in range(26)]
     payload_str = _make_payload(groups, EVIDENCE_WITH_MATCH_TEXT)
-    output_path = str(tmp_path / "out.json")
+    output_path = str(private_output('out.json'))
 
     fake_run, calls = _make_chunking_fake_run(output_path)
-    with patch("check_items_cli.subprocess.run", side_effect=fake_run):
+    with patch("check_items_cli._request_ai", side_effect=fake_run):
         rc = check_items_cli.run_classifier(payload_str, output_path)
 
     assert rc == 0
@@ -1455,33 +1377,12 @@ def test_classifier_chunking_merge_preserves_input_order_across_chunks(tmp_path,
 
     groups = [_make_group(f"g{i:03d}", f"Fix bug number {i}") for i in range(12)]
     payload_str = _make_payload(groups, EVIDENCE_WITH_MATCH_TEXT)
-    output_path = str(tmp_path / "out.json")
+    output_path = str(private_output('out.json'))
 
-    def fake_run_reversed(*args, **kwargs):
-        prompt = kwargs.get("input", "")
-        in_match = _re.search(r"(/\S+\.classin\.json)", prompt)
-        out_match = _re.search(r"JSON to (/\S+?)\.?(?:\s|$)", prompt)
-        chunk_payload = json.loads(Path(in_match.group(1)).read_text())
-        # Reverse the sub-agent's output order — production must reorder by group_id.
-        chunk_results = [
-            {
-                "group_id": g["group_id"],
-                "classification": "DONE",
-                "confidence": "HIGH",
-                "canonical_text": g["representative"],
-                "evidence_citation": "commit abc1234",
-                "action_required": None,
-            }
-            for g in reversed(chunk_payload["groups"])
-        ]
-        Path(out_match.group(1)).write_text(json.dumps(chunk_results))
-        mock_cp = MagicMock()
-        mock_cp.returncode = 0
-        mock_cp.stderr = ""
-        mock_cp.stdout = ""
-        return mock_cp
+    def fake_run_reversed(operation, prompt, payload, model, requested):
+        return _ai_response(verdicts(list(reversed(requested))))
 
-    with patch("check_items_cli.subprocess.run", side_effect=fake_run_reversed):
+    with patch("check_items_cli._request_ai", side_effect=fake_run_reversed):
         rc = check_items_cli.run_classifier(payload_str, output_path)
 
     assert rc == 0
@@ -1512,16 +1413,16 @@ def test_classifier_chunking_failure_cleans_up_chunk_outputs(tmp_path, monkeypat
 
     groups = [_make_group(f"g{i:03d}", f"Fix bug number {i}") for i in range(30)]
     payload_str = _make_payload(groups, EVIDENCE_WITH_MATCH_TEXT)
-    output_path = str(tmp_path / "out.json")
+    output_path = str(private_output('out.json'))
 
     # Time out BOTH attempts of chunk 2 so it degrades (partial failure) —
     # cleanup must still fire for its temp output even though it never
     # produced a rc==0 result.
     fake_run, _ = _make_chunking_fake_run(output_path, timeout_on={1, 2})
-    with patch("check_items_cli.subprocess.run", side_effect=fake_run):
+    with patch("check_items_cli._request_ai", side_effect=fake_run):
         rc = check_items_cli.run_classifier(payload_str, output_path)
 
-    assert rc == 0, f"Expected 0 (partial failure degrades, doesn't abort), got {rc}"
+    assert rc == 3, f"Expected timeout failure preserving output, got {rc}"
     post_classouts = set(workdir.glob("*.classout.json"))
     leaked = post_classouts - pre_classouts
     assert not leaked, (
@@ -1549,40 +1450,15 @@ def test_classifier_chunking_uses_per_chunk_model_picking(tmp_path, monkeypatch,
     # 10 (haiku threshold). All chunks must pick haiku.
     groups = [_make_group(f"g{i:03d}", f"Fix bug number {i}") for i in range(60)]
     payload_str = _make_payload(groups, EVIDENCE_WITH_MATCH_TEXT)
-    output_path = str(tmp_path / "out.json")
+    output_path = str(private_output('out.json'))
 
     models_seen: list = []
 
-    def model_recording_run(*args, **kwargs):
-        cmd = args[0] if args else kwargs.get("args", [])
-        # cmd shape: ["claude", "-p", "--model", model]
-        if len(cmd) >= 4 and cmd[2] == "--model":
-            models_seen.append(cmd[3])
-        # Write empty result to the chunk output path
-        prompt = kwargs.get("input", "")
-        out_match = _re.search(r"JSON to (/\S+?)\.?(?:\s|$)", prompt)
-        if out_match:
-            in_match = _re.search(r"(/\S+\.classin\.json)", prompt)
-            chunk_payload = json.loads(Path(in_match.group(1)).read_text())
-            chunk_results = [
-                {
-                    "group_id": g["group_id"],
-                    "classification": "ACTIVE",
-                    "confidence": "LOW",
-                    "canonical_text": g["representative"],
-                    "evidence_citation": None,
-                    "action_required": None,
-                }
-                for g in chunk_payload["groups"]
-            ]
-            Path(out_match.group(1)).write_text(json.dumps(chunk_results))
-        mock_cp = MagicMock()
-        mock_cp.returncode = 0
-        mock_cp.stderr = ""
-        mock_cp.stdout = ""
-        return mock_cp
+    def model_recording_run(operation, prompt, payload, model, requested):
+        models_seen.append(model)
+        return _ai_response(verdicts(requested, "ACTIVE", "LOW"))
 
-    with patch("check_items_cli.subprocess.run", side_effect=model_recording_run):
+    with patch("check_items_cli._request_ai", side_effect=model_recording_run):
         rc = check_items_cli.run_classifier(payload_str, output_path)
 
     assert rc == 0

@@ -133,7 +133,7 @@ def _hook_env(tmp_path: Path) -> dict:
     return env
 
 
-def test_snapshot_e2e_pipeline(tmp_path, monkeypatch):
+def test_snapshot_e2e_pipeline(tmp_path, monkeypatch, native_ai_frontend):
     """Fire both hooks, then walk the in-process pipeline, asserting at every boundary."""
 
     # --- Stage 0: fixtures ---
@@ -284,116 +284,126 @@ def test_snapshot_e2e_pipeline(tmp_path, monkeypatch):
             )
         return _real_run(cmd, *args, **kwargs)
 
-    monkeypatch.setattr("obsidian_utils.subprocess.run", fake_run)
+    import native_ai_test_adapter
+    monkeypatch.setattr(native_ai_test_adapter, "run", fake_run)
 
-    _status_tuple = obsidian_utils.upgrade_unsummarized_note(
-        str(session_path), str(vault), "claude-sessions", PROJECT
-    )
-    status = _status_tuple[0]
-    assert status.startswith("Upgraded "), (
-        f"upgrade_unsummarized_note did not succeed: {status!r}"
-    )
-
-    session_text_after = session_path.read_text(encoding="utf-8")
-    assert "status: summarized" in session_text_after, (
-        f"expected status: summarized after upgrade, got:\n{session_text_after[:2000]}"
-    )
-    # Summary body present (find the section header and at least one char of content).
-    summary_match = re.search(
-        r"^## Summary\n(.+?)(?=\n^## |\Z)",
-        session_text_after,
-        re.MULTILINE | re.DOTALL,
-    )
-    assert summary_match and summary_match.group(1).strip(), (
-        "expected non-empty `## Summary` section after upgrade"
-    )
-
-    # Also upgrade the SNAPSHOT note. upgrade_unsummarized_note dispatches
-    # snapshots through generate_snapshot_summary (a distinct code path from
-    # the generate_summary used for sessions above). Without this, the
-    # snapshot-type routing branch is never exercised by the E2E test.
-    _snap_status_tuple = obsidian_utils.upgrade_unsummarized_note(
-        str(snapshot_path), str(vault), "claude-sessions", PROJECT
-    )
-    snap_status = _snap_status_tuple[0]
-    assert snap_status.startswith("Upgraded "), (
-        f"upgrade_unsummarized_note on snapshot did not succeed: {snap_status!r}"
-    )
-    snapshot_text_after = snapshot_path.read_text(encoding="utf-8")
-    assert "status: summarized" in snapshot_text_after, (
-        f"expected snapshot `status: summarized` after upgrade, got:\n"
-        f"{snapshot_text_after[:2000]}"
-    )
-
-    # --- Stage 5: build_context_brief nested row + snapshot_count ---
-    brief = obsidian_utils.build_context_brief(
-        str(vault), "claude-sessions", "claude-insights", PROJECT,
-        hook_status_line="[OK] test",
-    )
-
-    # Parse delimited sections.
-    def _section(label: str) -> str:
-        m = re.search(
-            rf"<<<{label}>>>\n(.*?)(?=\n<<<[A-Z_]+>>>|\Z)",
-            brief,
-            re.DOTALL,
+    from dataclasses import replace
+    from runtime_context import using_runtime_context
+    from types import MappingProxyType
+    context = replace(native_ai_frontend, vault_path=vault,
+                      config_path=home / '.claude' / 'obsidian-brain-config.json',
+                      config=MappingProxyType(json.loads((home / '.claude' / 'obsidian-brain-config.json').read_text())),
+                      index_path=home / '.claude' / 'obsidian-brain-vault.db',
+                      state_path=tmp_path / 'native-state')
+    with using_runtime_context(context):
+        _status_tuple = obsidian_utils.upgrade_unsummarized_note(
+            str(session_path), str(vault), "claude-sessions", PROJECT
         )
-        assert m, f"missing section <<<{label}>>> in brief:\n{brief[:2000]}"
-        return m.group(1)
+        status = _status_tuple[0]
+        assert status.startswith("Upgraded "), (
+            f"upgrade_unsummarized_note did not succeed: {status!r}"
+        )
 
-    context_brief_section = _section("OB_CONTEXT_BRIEF")
-    load_manifest_section = _section("OB_LOAD_MANIFEST")
-    most_recent_path = _section("OB_MOST_RECENT_SESSION_PATH").strip()
+        session_text_after = session_path.read_text(encoding="utf-8")
+        assert ("status: summarized" in session_text_after or 'status: "summarized"' in session_text_after), (
+            f"expected status: summarized after upgrade, got:\n{session_text_after[:2000]}"
+        )
+        # Summary body present (find the section header and at least one char of content).
+        summary_match = re.search(
+            r"^## Summary\n(.+?)(?=\n^## |\Z)",
+            session_text_after,
+            re.MULTILINE | re.DOTALL,
+        )
+        assert summary_match and summary_match.group(1).strip(), (
+            "expected non-empty `## Summary` section after upgrade"
+        )
 
-    # Extract the 6-digit HHMMSS tail from our snapshot's stem. The same
-    # value is used both (a) to match the nested `↳ HH:MM:SS` row in the
-    # context-brief table and (b) to match the `snapshot: [HHMMSS]` line in
-    # LOAD_MANIFEST. Tying both assertions to the SAME stem-derived value
-    # catches cross-session contamination that a shape-only regex would miss.
-    stem_hhmmss_match = re.search(r"-snapshot-(\d{6})$", snapshot_path.stem)
-    assert stem_hhmmss_match, (
-        f"snapshot stem missing trailing -snapshot-HHMMSS: {snapshot_path.stem}"
-    )
-    hhmmss = stem_hhmmss_match.group(1)  # e.g. "075610"
-    hhmmss_pretty = f"{hhmmss[:2]}:{hhmmss[2:4]}:{hhmmss[4:6]}"  # "07:56:10"
+        # Also upgrade the SNAPSHOT note. upgrade_unsummarized_note dispatches
+        # snapshots through generate_snapshot_summary (a distinct code path from
+        # the generate_summary used for sessions above). Without this, the
+        # snapshot-type routing branch is never exercised by the E2E test.
+        _snap_status_tuple = obsidian_utils.upgrade_unsummarized_note(
+            str(snapshot_path), str(vault), "claude-sessions", PROJECT
+        )
+        snap_status = _snap_status_tuple[0]
+        assert snap_status.startswith("Upgraded "), (
+            f"upgrade_unsummarized_note on snapshot did not succeed: {snap_status!r}"
+        )
+        snapshot_text_after = snapshot_path.read_text(encoding="utf-8")
+        assert ("status: summarized" in snapshot_text_after or 'status: "summarized"' in snapshot_text_after), (
+            f"expected snapshot `status: summarized` after upgrade, got:\n"
+            f"{snapshot_text_after[:2000]}"
+        )
 
-    # Cross-midnight: build_context_brief() looks up snapshots via
-    # fetch_snapshot_summaries(), which discovers date-agnostically from the
-    # shared snapshot index (#70). If Stage 1 (snapshot hook) and Stage 2
-    # (session-log hook) straddle a calendar day boundary the two files get
-    # different date prefixes, and the snapshot must STILL be found — that is
-    # the whole point of the fix, so these assertions are unconditional. They
-    # used to be guarded by `if snapshot_date_prefix == session_date_prefix`,
-    # with a degraded "the file still exists on disk" branch for the straddle
-    # case; that branch encoded the defect and would have gone on passing
-    # after it was fixed. The straddle window is ~100 ms per year, so the
-    # guard also almost never ran — a mutation that reintroduced the dated
-    # glob would not have been caught here either way.
-    assert f"↳ {hhmmss_pretty}" in context_brief_section, (
-        f"expected nested snapshot row `↳ {hhmmss_pretty}` in context brief "
-        f"(snapshot_date={snapshot_path.stem[:10]}, "
-        f"session_date={session_path.stem[:10]}):\n"
-        f"{context_brief_section[:2000]}"
-    )
+        # --- Stage 5: build_context_brief nested row + snapshot_count ---
+        brief = obsidian_utils.build_context_brief(
+            str(vault), "claude-sessions", "claude-insights", PROJECT,
+            hook_status_line="[OK] test",
+        )
 
-    assert re.search(
-        r"^snapshot_count:\s*1\b", load_manifest_section, re.MULTILINE
-    ), (
-        f"expected `snapshot_count: 1` in LOAD_MANIFEST:\n{load_manifest_section}"
-    )
+        # Parse delimited sections.
+        def _section(label: str) -> str:
+            m = re.search(
+                rf"<<<{label}>>>\n(.*?)(?=\n<<<[A-Z_]+>>>|\Z)",
+                brief,
+                re.DOTALL,
+            )
+            assert m, f"missing section <<<{label}>>> in brief:\n{brief[:2000]}"
+            return m.group(1)
 
-    # Producer emits `snapshot: [{hhmmss}] ({trigger}) {summary}` in
-    # build_context_brief's LOAD_MANIFEST composition — the full filename stem
-    # never appears on the line, only the HHMMSS tail. Match on that substring.
-    assert re.search(
-        rf"^snapshot:\s*\[{hhmmss}\]",
-        load_manifest_section,
-        re.MULTILINE,
-    ), (
-        f"expected `snapshot: [{hhmmss}]` line in LOAD_MANIFEST "
-        f"(stem={snapshot_path.stem}):\n{load_manifest_section}"
-    )
+        context_brief_section = _section("OB_CONTEXT_BRIEF")
+        load_manifest_section = _section("OB_LOAD_MANIFEST")
+        most_recent_path = _section("OB_MOST_RECENT_SESSION_PATH").strip()
 
-    assert most_recent_path == str(session_path), (
-        f"expected MOST_RECENT_SESSION_PATH={session_path}, got={most_recent_path}"
-    )
+        # Extract the 6-digit HHMMSS tail from our snapshot's stem. The same
+        # value is used both (a) to match the nested `↳ HH:MM:SS` row in the
+        # context-brief table and (b) to match the `snapshot: [HHMMSS]` line in
+        # LOAD_MANIFEST. Tying both assertions to the SAME stem-derived value
+        # catches cross-session contamination that a shape-only regex would miss.
+        stem_hhmmss_match = re.search(r"-snapshot-(\d{6})$", snapshot_path.stem)
+        assert stem_hhmmss_match, (
+            f"snapshot stem missing trailing -snapshot-HHMMSS: {snapshot_path.stem}"
+        )
+        hhmmss = stem_hhmmss_match.group(1)  # e.g. "075610"
+        hhmmss_pretty = f"{hhmmss[:2]}:{hhmmss[2:4]}:{hhmmss[4:6]}"  # "07:56:10"
+
+        # Cross-midnight: build_context_brief() looks up snapshots via
+        # fetch_snapshot_summaries(), which discovers date-agnostically from the
+        # shared snapshot index (#70). If Stage 1 (snapshot hook) and Stage 2
+        # (session-log hook) straddle a calendar day boundary the two files get
+        # different date prefixes, and the snapshot must STILL be found — that is
+        # the whole point of the fix, so these assertions are unconditional. They
+        # used to be guarded by `if snapshot_date_prefix == session_date_prefix`,
+        # with a degraded "the file still exists on disk" branch for the straddle
+        # case; that branch encoded the defect and would have gone on passing
+        # after it was fixed. The straddle window is ~100 ms per year, so the
+        # guard also almost never ran — a mutation that reintroduced the dated
+        # glob would not have been caught here either way.
+        assert f"↳ {hhmmss_pretty}" in context_brief_section, (
+            f"expected nested snapshot row `↳ {hhmmss_pretty}` in context brief "
+            f"(snapshot_date={snapshot_path.stem[:10]}, "
+            f"session_date={session_path.stem[:10]}):\n"
+            f"{context_brief_section[:2000]}"
+        )
+
+        assert re.search(
+            r"^snapshot_count:\s*1\b", load_manifest_section, re.MULTILINE
+        ), (
+            f"expected `snapshot_count: 1` in LOAD_MANIFEST:\n{load_manifest_section}"
+        )
+
+        # Producer emits `snapshot: [{hhmmss}] ({trigger}) {summary}` in
+        # build_context_brief's LOAD_MANIFEST composition — the full filename stem
+        # never appears on the line, only the HHMMSS tail. Match on that substring.
+        assert re.search(
+            rf"^snapshot:\s*\[{hhmmss}\]",
+            load_manifest_section,
+            re.MULTILINE,
+        ), (
+            f"expected `snapshot: [{hhmmss}]` line in LOAD_MANIFEST "
+            f"(stem={snapshot_path.stem}):\n{load_manifest_section}"
+        )
+
+        assert most_recent_path == str(session_path), (
+            f"expected MOST_RECENT_SESSION_PATH={session_path}, got={most_recent_path}"
+        )

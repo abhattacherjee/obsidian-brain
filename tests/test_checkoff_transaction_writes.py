@@ -45,11 +45,23 @@ def test_dedup_preserves_concurrent_manual_edit(tmp_vault, monkeypatch):
 
 
 def test_cascade_group_preserves_concurrent_manual_edit(tmp_vault, monkeypatch):
+    import hashlib
     note = tmp_vault / 'claude-sessions' / 'note.md'
     note.write_text('- [ ] Fix importer\n')
-    edited = _race(monkeypatch, note)
+    original = note.read_bytes()
+    pre_ai_revision = hashlib.sha256(original).hexdigest()
+    edited = original + b'Manual addition\n'
+    register = note_transactions.record_raw_read
+    def edit_after_raw_read(context, path, raw):
+        assert raw == original
+        revision = register(context, path, raw)
+        assert revision == pre_ai_revision
+        note.write_bytes(edited)
+        return revision
+    monkeypatch.setattr(note_transactions, 'record_raw_read', edit_after_raw_read)
     result = open_item_dedup.cascade_group_members([
-        {'members': [{'file': str(note), 'line': 1, 'text': 'Fix importer'}]},
+        {'members': [{'file': str(note), 'line': 1, 'text': 'Fix importer',
+                      'source_revision': pre_ai_revision}]},
     ], vault_path=str(tmp_vault))
     assert 'WRITE FAILED' in result
     assert note.read_bytes() == edited

@@ -4116,6 +4116,10 @@ def _escalation_models(primary: str) -> list[str]:
     """Ordered model list: the primary, then any fallback-chain model strictly
     more capable than the primary (#165). e.g. haiku -> [haiku, sonnet, opus];
     sonnet -> [sonnet, opus]; opus -> [opus]."""
+    from runtime_context import current_runtime_context
+    context = current_runtime_context()
+    if context is not None and context.host == "codex":
+        return [primary]
     base = _MODEL_RANK.get(primary, 0)
     return [primary] + [m for m in _SUMMARY_FALLBACK_CHAIN if _MODEL_RANK.get(m, 0) > base]
 
@@ -4289,6 +4293,41 @@ def _summary_recovery_enabled() -> bool:
         return True
 
 
+from contextvars import ContextVar
+
+_SUMMARY_NATIVE_MODEL = ContextVar("obsidian_brain_summary_native_model", default=None)
+
+
+def _execute_summary_ai(prompt, operation, model, timeout, input_revision="", expected_count=None):
+    """Keep legacy return formats while dispatching only the bound native host."""
+    from runtime_context import current_runtime_context
+    from types import SimpleNamespace
+    context = current_runtime_context()
+    _SUMMARY_NATIVE_MODEL.set(None)
+    if context is None:
+        return SimpleNamespace(returncode=1, stdout="", stderr="native context unavailable", failure_reason="haiku_subprocess_error")
+    from ai_backend import AIRequest, execute_ai
+    selected_model = model if context.host == "claude" else context.config.get("codex_summary_model")
+    options = {} if expected_count is None else {"expected_count": expected_count}
+    result = execute_ai(context, operation, AIRequest(
+        input=prompt, input_revision=input_revision or hashlib.sha256(prompt.encode()).hexdigest(), timeout=timeout,
+        model=selected_model, options=options,
+    ))
+    _SUMMARY_NATIVE_MODEL.set(result.model)
+    if result.status == "timeout":
+        raise subprocess.TimeoutExpired([context.host], timeout)
+    if result.status != "ok":
+        reason = result.error_code if result.error_code in {"empty_output", "parse_error", "count_mismatch", "missing_section"} else "haiku_subprocess_error"
+        return SimpleNamespace(returncode=1, stdout="", stderr=result.status, failure_reason=reason)
+    output = result.data
+    if operation == "theme_names":
+        output = json.dumps(output)
+    elif operation == "session_summaries":
+        output = "\n\n".join("===== SUMMARY %d =====\n%s" % (index, text)
+                              for index, text in sorted(output.items()))
+    return SimpleNamespace(returncode=0, stdout=output, stderr="", model=result.model, failure_reason=None)
+
+
 def generate_snapshot_summary(
     user_msgs: list[str],
     assistant_msgs: list[str],
@@ -4296,7 +4335,7 @@ def generate_snapshot_summary(
     model: str = "haiku",
     timeout: int = 120,
 ) -> tuple[str | None, str | None]:
-    """Call ``claude -p --model <model>`` with the snapshot-specific prompt.
+    """Ask the bound native backend with the snapshot-specific prompt.
 
     Returns ``(summary_text, fallback_reason)``:
       * On success: ``(text, None)``
@@ -4323,34 +4362,33 @@ def generate_snapshot_summary(
     last_reason: str | None = None
     for i, attempt_timeout in enumerate(attempts):
         try:
-            result = subprocess.run(
-                ["claude", "-p", "--model", model],
-                input=prompt, capture_output=True, text=True, timeout=attempt_timeout,
-            )
+            result = _execute_summary_ai(prompt, 'snapshot_summary', model, attempt_timeout, input_revision=metadata.get("input_revision", ""))
+            if result.failure_reason:
+                return None, result.failure_reason
             if result.returncode == 0 and result.stdout.strip():
                 return result.stdout.strip(), None
             if result.returncode != 0:
                 last_reason = "haiku_subprocess_error"
             else:
                 last_reason = "empty_output"
-            print(f"[obsidian-brain] claude -p (snapshot) failed (rc={result.returncode})",
+            print(f"[obsidian-brain] native AI (snapshot) failed (rc={result.returncode})",
                   file=sys.stderr)
             break
         except FileNotFoundError:
             last_reason = "haiku_subprocess_error"
-            print("[obsidian-brain] claude CLI not found", file=sys.stderr)
+            print("[obsidian-brain] native backend not found", file=sys.stderr)
             break
         except subprocess.TimeoutExpired:
             last_reason = "haiku_timeout"
             if i < len(attempts) - 1:
-                print(f"[obsidian-brain] claude -p (snapshot) timed out at {attempt_timeout}s, retrying...",
+                print(f"[obsidian-brain] native AI (snapshot) timed out at {attempt_timeout}s, retrying...",
                       file=sys.stderr)
                 continue
-            print(f"[obsidian-brain] claude -p (snapshot) timed out at {attempt_timeout}s",
+            print(f"[obsidian-brain] native AI (snapshot) timed out at {attempt_timeout}s",
                   file=sys.stderr)
         except Exception as exc:  # noqa: BLE001
             last_reason = "haiku_subprocess_error"
-            print(f"[obsidian-brain] claude -p (snapshot) error: {exc}", file=sys.stderr)
+            print(f"[obsidian-brain] native AI (snapshot) error: {exc}", file=sys.stderr)
             break
     return None, last_reason or "unknown_failure"
 
@@ -4360,7 +4398,7 @@ def generate_theme_names(
     model: str = "haiku",
     timeout: int = 120,
 ) -> tuple[list[dict] | None, str | None]:
-    """Name + summarize N clusters in ONE ``claude -p --model <model>`` spawn.
+    """Name + summarize N clusters in ONE ``native AI --model <model>`` spawn.
 
     ``clusters`` items: ``{"top_terms": [...], "sample_titles": [...]}``.
     Returns ``([{"name","summary"}, ...], None)`` with exactly ``len(clusters)``
@@ -4388,10 +4426,9 @@ def generate_theme_names(
     last_reason = "unknown_failure"
     for idx, attempt_timeout in enumerate(attempts):
         try:
-            result = subprocess.run(
-                ["claude", "-p", "--model", model],
-                input=prompt, capture_output=True, text=True, timeout=attempt_timeout,
-            )
+            result = _execute_summary_ai(prompt, 'theme_names', model, attempt_timeout, input_revision="", expected_count=len(clusters))
+            if result.failure_reason:
+                return None, result.failure_reason
         except FileNotFoundError:
             return None, "haiku_subprocess_error"
         except subprocess.TimeoutExpired:
@@ -4430,7 +4467,7 @@ def generate_summary(
     model: str = "haiku",
     timeout: int = 120,
 ) -> tuple[str | None, str | None]:
-    """Call ``claude -p --model <model>`` to summarize the session.
+    """Call ``native AI --model <model>`` to summarize the session.
 
     Returns ``(summary_text, fallback_reason)``:
       * On success: ``(text, None)``
@@ -4471,7 +4508,7 @@ def generate_summary(
             "three disjoint summaries.\n"
         )
 
-    prompt = f"""You are a technical summarizer. You will be given the transcript of a Claude Code coding session. Your job is to produce a structured summary. Do NOT respond conversationally. Do NOT ask questions. Just output the summary.
+    prompt = f"""You are a technical summarizer. You will be given the retained transcript of a coding session. Your job is to produce a structured summary. Do NOT respond conversationally. Do NOT ask questions. Just output the summary.
 {cohesion_hint}
 SESSION METADATA:
 - Project: {metadata.get('project', 'unknown')}
@@ -4538,13 +4575,9 @@ Rate this session 1-10. 1-3: trivial (config, interrupted). 4-6: standard work. 
     last_reason: str | None = None
     for i, attempt_timeout in enumerate(attempts):
         try:
-            result = subprocess.run(
-                ["claude", "-p", "--model", model],
-                input=prompt,
-                capture_output=True,
-                text=True,
-                timeout=attempt_timeout,
-            )
+            result = _execute_summary_ai(prompt, 'session_summary', model, attempt_timeout, input_revision=metadata.get("input_revision", ""))
+            if result.failure_reason:
+                return None, result.failure_reason
             if result.returncode == 0 and result.stdout.strip():
                 summary_text = result.stdout.strip()
                 # Layer 2: Post-generation dedup pass (string-based, pre-write)
@@ -4554,14 +4587,14 @@ Rate this session 1-10. 1-3: trivial (config, interrupted). 4-6: standard work. 
             if result.returncode != 0:
                 last_reason = "haiku_subprocess_error"
                 print(
-                    f"[obsidian-brain] claude -p failed (rc={result.returncode}): "
+                    f"[obsidian-brain] native AI failed (rc={result.returncode}): "
                     f"{result.stderr[:200]}",
                     file=sys.stderr,
                 )
                 break  # non-timeout failure, don't retry
             last_reason = "empty_output"
             print(
-                f"[obsidian-brain] claude -p failed (rc={result.returncode}): "
+                f"[obsidian-brain] native AI failed (rc={result.returncode}): "
                 f"{result.stderr[:200]}",
                 file=sys.stderr,
             )
@@ -4569,7 +4602,7 @@ Rate this session 1-10. 1-3: trivial (config, interrupted). 4-6: standard work. 
         except FileNotFoundError:
             last_reason = "haiku_subprocess_error"
             print(
-                "[obsidian-brain] claude CLI not found, summarization unavailable",
+                "[obsidian-brain] native backend not found, summarization unavailable",
                 file=sys.stderr,
             )
             break  # won't succeed on retry
@@ -4577,12 +4610,12 @@ Rate this session 1-10. 1-3: trivial (config, interrupted). 4-6: standard work. 
             last_reason = "haiku_timeout"
             stderr_snippet = f" stderr: {exc.stderr[:200]}" if exc.stderr else ""
             if i < len(attempts) - 1:
-                print(f"[obsidian-brain] claude -p timed out at {attempt_timeout}s, retrying with {attempts[i+1]}s{stderr_snippet}", file=sys.stderr)
+                print(f"[obsidian-brain] native AI timed out at {attempt_timeout}s, retrying with {attempts[i+1]}s{stderr_snippet}", file=sys.stderr)
                 continue
-            print(f"[obsidian-brain] claude -p timed out at {attempt_timeout}s, giving up{stderr_snippet}", file=sys.stderr)
+            print(f"[obsidian-brain] native AI timed out at {attempt_timeout}s, giving up{stderr_snippet}", file=sys.stderr)
         except Exception as exc:
             last_reason = "haiku_subprocess_error"
-            print(f"[obsidian-brain] claude -p error ({type(exc).__name__}): {exc}", file=sys.stderr)
+            print(f"[obsidian-brain] native AI error ({type(exc).__name__}): {exc}", file=sys.stderr)
             break  # unknown error, don't retry
 
     return None, last_reason or "unknown_failure"
@@ -4914,9 +4947,14 @@ def find_unsummarized_notes(
             continue
         frontmatter = content[:fm_end]
 
-        # Must be auto-logged
+        # Native summaries name their exact capture region. A later capture
+        # needs another summary even when the older status says summarized.
+        from note_transactions import _regions
+        capture_digest = _regions(content).get('capture')
+        summary_digest = parse_frontmatter_field(frontmatter, 'summary_revision')
+        stale_summary = capture_digest is not None and summary_digest != capture_digest
         status_val = parse_frontmatter_field(frontmatter, "status")
-        if status_val != "auto-logged":
+        if status_val != "auto-logged" and not (status_val == "summarized" and stale_summary):
             continue
 
         # Type filter — accept both sessions and snapshots. Legacy notes
@@ -4937,7 +4975,7 @@ def find_unsummarized_notes(
         has_summary = bool(re.search(r'^## Summary', content, re.MULTILINE))
         has_unavailable = 'AI summary unavailable' in content
 
-        if has_summary and not has_unavailable:
+        if has_summary and not has_unavailable and not stale_summary:
             # Already summarized by legacy code path — fix status on disk
             try:
                 from note_transactions import NoteMutation, apply_mutations, record_read
@@ -5048,6 +5086,24 @@ def build_context_brief(
     sessions_dir = Path(vault_path) / sessions_folder
     insights_dir = Path(vault_path) / insights_folder
 
+    def summary_pending(content):
+        from note_transactions import _regions
+        match = re.match(r'\ufeff?---[ \t]*\r?\n(.*?)\r?\n---[ \t]*(?:\r?\n|\Z)', content, re.DOTALL)
+        frontmatter = match.group(1) if match else ''
+        capture = _regions(content).get('capture') or parse_frontmatter_field(frontmatter, 'capture_revision')
+        return capture is not None and parse_frontmatter_field(frontmatter, 'summary_revision') != capture
+
+    def summary_source(content):
+        from note_transactions import _REGION
+        owned = next((match.group(2) for match in _REGION.finditer(content)
+                      if match.group(1) == 'summary'), None)
+        return owned if owned is not None else content
+
+    def historical_summary(summary):
+        return '(Summary stale; refresh pending.)\n\nHistorical summary:\n' + summary
+
+    most_recent_pending = False
+
     # --- 1. Scan and filter sessions ---
     def _safe_sort_key(p: Path) -> tuple:
         try:
@@ -5091,13 +5147,17 @@ def build_context_brief(
         if meta.get('git_branch'):
             most_recent_title += f" ({meta['git_branch']})"
         try:
-            text = Path(most_recent_path).read_text(encoding='utf-8', errors='replace')
-            m = _summary_re.search(text)
+            text = Path(most_recent_path).read_bytes().decode('utf-8', errors='replace')
+            most_recent_pending = summary_pending(text)
+            m = _summary_re.search(summary_source(text))
             if m:
                 most_recent_summary = m.group(1).strip()
                 # Use first sentence of summary as title
                 first_line = most_recent_summary.split('\n')[0].strip()
-                if first_line:
+                if most_recent_pending:
+                    most_recent_summary = historical_summary(most_recent_summary)
+                    most_recent_title += ' (Summary stale; refresh pending)'
+                elif first_line:
                     most_recent_title = first_line
             m = _next_steps_re.search(text)
             if m:
@@ -5121,15 +5181,18 @@ def build_context_brief(
         if meta.get('git_branch'):
             second_title += f" ({meta['git_branch']})"
         try:
-            with open(second_path, 'r', encoding='utf-8', errors='replace') as f:
-                lines = [f.readline() for _ in range(50)]
-            text = ''.join(lines)
-            m = _summary_re.search(text)
+            full_text = Path(second_path).read_bytes().decode('utf-8', errors='replace')
+            text = ''.join(full_text.splitlines(keepends=True)[:50])
+            second_pending = summary_pending(full_text)
+            m = _summary_re.search(summary_source(full_text) if "<!-- obsidian-brain:summary:start -->" in full_text else text)
             if m:
                 second_summary = m.group(1).strip()
                 # Use first sentence of summary as title
                 first_line = second_summary.split('\n')[0].strip()
-                if first_line:
+                if second_pending:
+                    second_summary = historical_summary(second_summary)
+                    second_title += ' (Summary stale; refresh pending)'
+                elif first_line:
                     second_title = first_line
         except OSError:
             second_summary = "(could not read session note)"
@@ -5163,11 +5226,12 @@ def build_context_brief(
         else:
             duration = ""
         try:
-            with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
-                content_text = f.read()
+            content_text = Path(fpath).read_bytes().decode('utf-8', errors='replace')
             # Prefer first sentence of ## Summary as title (more descriptive)
-            summary_match = re.search(r'## Summary\n+(.+)', content_text)
-            if summary_match:
+            summary_match = re.search(r'## Summary\n+(.+)', summary_source(content_text))
+            if summary_pending(content_text):
+                title += ' (Summary stale; refresh pending)'
+            elif summary_match:
                 title = summary_match.group(1).strip()
             else:
                 # Fall back to H1 heading
@@ -5213,7 +5277,7 @@ def build_context_brief(
                 _session_tags.append(tag)
 
     # Build summary from loaded sessions
-    if most_recent_summary:
+    if most_recent_summary and not most_recent_pending:
         _session_summary = most_recent_summary
 
     _use_vault_index = True
@@ -5405,10 +5469,12 @@ def build_context_brief(
                 if not _date:
                     continue
                 try:
-                    _content = Path(_fpath).read_text(encoding='utf-8', errors='replace')
+                    _content = Path(_fpath).read_bytes().decode('utf-8', errors='replace')
                 except OSError:
                     continue
-                _m = _summary_re.search(_content)
+                if summary_pending(_content):
+                    continue
+                _m = _summary_re.search(summary_source(_content))
                 if not _m:
                     continue
                 _summary_text = _m.group(1).strip()
@@ -6065,8 +6131,8 @@ def upgrade_note_with_summary(
     """Apply a pre-generated summary to a raw session note.
 
     Handles the pipeline finish: read raw note, validate summary has
-    ## Summary, rebuild note (frontmatter with status: summarized, title,
-    summary sections, audit trail), run dedup, and publish conditionally.
+    ## Summary, preserve user prose and capture, update summary metadata,
+    run dedup, and publish conditionally.
     Pass the pre-model ``expected_revision`` when generation runs separately.
 
     Returns a one-line status string.
@@ -6097,77 +6163,27 @@ def upgrade_note_with_summary(
     except (OSError, ValueError) as exc:
         return f"Failed: cannot read {os.path.basename(note_path)}: {exc}"
 
-    # Build upgraded note: original frontmatter + new summary + original audit trail
-    new_lines: list[str] = []
+    if not re.match(r"\ufeff?---[ \t]*\r?\n(.*?)\r?\n---[ \t]*(?:\r?\n|\Z)", raw_text, re.DOTALL):
+        return f"Failed: YAML frontmatter not found in {os.path.basename(note_path)}"
 
-    # Copy frontmatter, flipping status
-    past_first_marker = False
-    frontmatter_end = 0
-    for i, line in enumerate(raw_lines):
-        if line.strip() == '---':
-            if not past_first_marker:
-                past_first_marker = True
-                new_lines.append(line)
-                continue
-            else:
-                # End of frontmatter
-                new_lines.append(line)
-                frontmatter_end = i + 1
-                break
-        if past_first_marker:
-            if line.strip().startswith('status:'):
-                new_lines.append(re.sub(r'^(\s*status:\s*).*', r'\1summarized', line) + '\n' if not line.endswith('\n') else re.sub(r'^(\s*status:\s*).*', r'\1summarized', line))
-            else:
-                new_lines.append(line)
-
-    if frontmatter_end == 0:
-        return f"Failed: malformed frontmatter in {os.path.basename(note_path)} (missing closing ---)"
-
-    # Add title from original
-    title_found = False
-    for line in raw_lines[frontmatter_end:]:
-        if line.strip().startswith('# '):
-            new_lines.append('\n')
-            new_lines.append(line)
-            title_found = True
-            break
-    if not title_found:
-        new_lines.append('\n# Untitled Session\n')
-
-    # Add warnings if any
+    # Publish only the owned summary and preserve capture and user prose.
+    from note_transactions import connect_coordination, ownership_lock
+    with ownership_lock(context):
+        connection = connect_coordination(context)
+        try:
+            row = connection.execute("SELECT regions FROM revisions WHERE path=? AND revision=?",
+                                     (str(Path(note_path).resolve()), expected_revision)).fetchone()
+            capture_revision = json.loads(row[0]).get("capture") if row else None
+        finally:
+            connection.close()
+    summary_body = summary_text.rstrip() + "\n\n_(Summary source: " + source + ")_\n"
     if warnings:
-        new_lines.append('\n## ⚠️ Transcript re-parse warnings\n')
-        for w in warnings:
-            new_lines.append(f'- {w}\n')
-
-    # Add summary sections
-    new_lines.append('\n')
-    new_lines.append(summary_text + '\n')
-
-    # Add source note
-    new_lines.append(f'\n_(Summary source: {source})_\n')
-
-    # Preserve original audit trail sections (skip frontmatter).
-    # Only exclude ## Changes Made / ## Errors Encountered if summary_text
-    # actually contains them — otherwise preserve the raw audit data.
-    audit_sections = [
-        '## Tool Usage', '## Conversation (raw)',
-        '## Session Metadata', '## Files Touched',
-    ]
-    if '## Changes Made' not in summary_text:
-        audit_sections.append('## Changes Made')
-    if '## Errors Encountered' not in summary_text:
-        audit_sections.append('## Errors Encountered')
-
-    in_audit = False
-    for line in raw_lines[frontmatter_end:]:
-        stripped = line.strip()
-        if any(stripped.startswith(s) for s in audit_sections):
-            in_audit = True
-        elif stripped.startswith('## '):
-            in_audit = False
-        if in_audit:
-            new_lines.append(line)
+        summary_body += "\n## ⚠️ Transcript re-parse warnings\n" + "".join("- " + w + "\n" for w in warnings)
+    summary_operation_id = uuid.uuid4().hex
+    metadata_changes = {"status": "summarized", "author_host": context.host,
+                        "operation_id": summary_operation_id}
+    if capture_revision is not None:
+        metadata_changes["summary_revision"] = capture_revision
 
     # Extract the summary body signature BEFORE writing so we can fail the
     # upgrade with a clear "malformed summary" error rather than silently
@@ -6207,10 +6223,15 @@ def upgrade_note_with_summary(
 
     importance = parse_importance(summary_text)
 
+    changes = {"summary": summary_body, "metadata": json.dumps(metadata_changes)}
+    if capture_revision is None:
+        # Legacy model input comes from the full source, without an owned
+        # capture baseline. Preserve prose while requiring its exact revision.
+        from note_transactions import _render
+        changes = {"document": _render(raw_text, changes)}
     try:
         result = apply_mutations(context, [NoteMutation(
-            Path(note_path), expected_revision, {"document": "".join(new_lines)},
-            uuid.uuid4().hex,
+            Path(note_path), expected_revision, changes, summary_operation_id,
         )])
         if result.status not in {"applied", "unchanged"}:
             return f"Failed: summary publication {result.status} for {os.path.basename(note_path)}"
@@ -6233,14 +6254,14 @@ def upgrade_note_with_summary(
     # UTF-8 BOM) so a Markdown horizontal rule `---` in the body cannot
     # be mistaken for the opening frontmatter delimiter.
     fm_match = re.match(
-        r'\ufeff?---[ \t]*\n(.*?)\n---[ \t]*(?:\n|\Z)',
+        r'\ufeff?---[ \t]*\r?\n(.*?)\r?\n---[ \t]*(?:\r?\n|\Z)',
         verify_content,
         re.DOTALL,
     )
     if fm_match is None:
         return f"Failed: post-write verification — YAML frontmatter not found at start of {os.path.basename(note_path)}"
     frontmatter_block = fm_match.group(1)
-    if not re.search(r'^\s*status:\s*summarized\s*$', frontmatter_block, re.MULTILINE):
+    if not re.search(r'^\s*status:\s*["\']?summarized["\']?\s*$', frontmatter_block, re.MULTILINE):
         return f"Failed: post-write verification — status not flipped to summarized in {os.path.basename(note_path)}"
 
     # Scope the signature check to the ## Summary section specifically.
@@ -6250,9 +6271,12 @@ def upgrade_note_with_summary(
     # Boundary uses `##(?:\s|$)` to be consistent with ATX-heading rules —
     # tab-separated or multi-space-separated next sections still terminate
     # the Summary block extraction cleanly.
+    from note_transactions import _REGION
+    owned_summary = next((match.group(2) for match in _REGION.finditer(verify_content)
+                          if match.group(1) == "summary"), "")
     summary_match = re.search(
         r'^## Summary\s*\n(.*?)(?=^##(?:\s|$)|\Z)',
-        verify_content,
+        owned_summary,
         re.MULTILINE | re.DOTALL,
     )
     if summary_match is None:
@@ -6531,6 +6555,8 @@ def _prepare_note_for_summary(
             raw_text = f.read()
         raw_lines = raw_text.splitlines(keepends=True)
         expected_revision = record_read(context, Path(note_path), raw_text)
+        from note_transactions import _regions
+        input_capture_revision = _regions(raw_text).get("capture", expected_revision)
     except (OSError, ValueError) as exc:
         return {
             "ok": False,
@@ -6538,13 +6564,9 @@ def _prepare_note_for_summary(
             "fallback_reason": "unreadable_note",
         }
 
-    # Extract session_id from frontmatter
-    session_id = None
-    for line in raw_lines[:20]:
-        stripped = line.strip()
-        if stripped.startswith('session_id:'):
-            session_id = stripped.split(':', 1)[1].strip().strip('"').strip("'")
-            break
+    # IDs can follow user fields or expanded native provenance metadata.
+    frontmatter_match = re.match(r'\ufeff?---[ \t]*\r?\n(.*?)\r?\n---[ \t]*(?:\r?\n|\Z)', raw_text, re.DOTALL)
+    session_id = parse_frontmatter_field(frontmatter_match.group(1), 'session_id') if frontmatter_match else None
     if not session_id:
         return {
             "ok": False,
@@ -6552,15 +6574,28 @@ def _prepare_note_for_summary(
             "fallback_reason": "no_session_id",
         }
 
-    # Find and parse the JSONL transcript
-    jsonl_path = find_transcript_jsonl(session_id)
+    # Native capture is frozen at the pre-AI revision. A transcript lookup
+    # could read later facts or the other host's storage.
+    from note_transactions import _REGION
+    retained_capture = next((match.group(2) for match in _REGION.finditer(raw_text)
+                             if match.group(1) == 'capture'), None)
+    from runtime_context import current_runtime_context
+    native_context = current_runtime_context()
+    jsonl_path = (None if retained_capture is not None or
+                  (native_context is not None and native_context.host == 'codex')
+                  else find_transcript_jsonl(session_id))
     parsed: dict = {}
     warnings: list[str] = []
     user_msgs: list[str] = []
     assistant_msgs: list[str] = []
     source = "raw note"
 
-    if jsonl_path:
+    if retained_capture is not None:
+        # Roles and tool categories remain in the retained text; do not
+        # recast tool observations as assistant actions.
+        user_msgs = [retained_capture] if retained_capture.strip() else []
+        source = "retained native capture"
+    elif jsonl_path:
         parsed = parse_full_transcript(jsonl_path)
         user_msgs = parsed.get("user_msgs", [])
         assistant_msgs = parsed.get("assistant_msgs", [])
@@ -6668,6 +6703,7 @@ def _prepare_note_for_summary(
         "ok": True,
         "raw_lines": raw_lines,
         "expected_revision": expected_revision,
+        "input_capture_revision": input_capture_revision,
         "session_id": session_id,
         "user_msgs": user_msgs,
         "assistant_msgs": assistant_msgs,
@@ -6755,7 +6791,8 @@ def upgrade_unsummarized_note(
         return _ret(prep["status"], fallback_reason=prep["fallback_reason"])
     user_msgs = prep["user_msgs"]
     assistant_msgs = prep["assistant_msgs"]
-    metadata = prep["metadata"]
+    metadata = dict(prep["metadata"])
+    metadata["input_revision"] = prep.get("input_capture_revision") or ""
     note_type = prep["note_type"]
     source = prep["source"]
     warnings = prep["warnings"]
@@ -6782,7 +6819,9 @@ def upgrade_unsummarized_note(
                 summary_text, _rec = _normalize_summary(summary_text)
                 if _rec:
                     warnings = warnings + [f"summary recovered (#167): {', '.join(_rec)}"]
-            model_used = _model
+            from runtime_context import current_runtime_context
+            native = current_runtime_context()
+            model_used = _SUMMARY_NATIVE_MODEL.get() if native is not None and native.host == "codex" else _model
             break
         if fallback_reason not in _MODEL_ESCALATION_REASONS:
             # timeout / subprocess error — escalating model won't help
@@ -6812,7 +6851,7 @@ def generate_summaries_batch(
     vault_path: str = "",
     sessions_folder: str = "",
 ) -> list[tuple[str | None, str | None]]:
-    """Summarize N SESSION notes in ONE ``claude -p --model <model>`` spawn.
+    """Summarize N SESSION notes in ONE ``native AI --model <model>`` spawn.
 
     ``prepared_notes`` is a list of ok=True session-note prep dicts (caller
     guarantees: not snapshots, not prep failures).  Returns a list of
@@ -6921,48 +6960,44 @@ def generate_summaries_batch(
 
     for i, attempt_timeout in enumerate(attempts):
         try:
-            result = subprocess.run(
-                ["claude", "-p", "--model", model],
-                input=prompt,
-                capture_output=True,
-                text=True,
-                timeout=attempt_timeout,
-            )
+            result = _execute_summary_ai(prompt, 'session_summaries', model, attempt_timeout, input_revision=hashlib.sha256(json.dumps([p.get("input_capture_revision", "") for p in prepared_notes]).encode()).hexdigest(), expected_count=n)
+            if result.failure_reason:
+                return [(None, result.failure_reason)] * n
             if result.returncode == 0 and result.stdout.strip():
                 stdout_text = result.stdout.strip()
                 break
             if result.returncode != 0:
                 last_reason = "haiku_subprocess_error"
                 print(
-                    f"[obsidian-brain] claude -p batch failed (rc={result.returncode}): "
+                    f"[obsidian-brain] native AI batch failed (rc={result.returncode}): "
                     f"{result.stderr[:200]}",
                     file=sys.stderr,
                 )
                 break
             # rc==0 but empty stdout
             last_reason = "empty_output"
-            print("[obsidian-brain] claude -p batch returned empty stdout", file=sys.stderr)
+            print("[obsidian-brain] native AI batch returned empty stdout", file=sys.stderr)
             break
         except FileNotFoundError:
             last_reason = "haiku_subprocess_error"
-            print("[obsidian-brain] claude CLI not found, batch summarization unavailable", file=sys.stderr)
+            print("[obsidian-brain] native backend not found, batch summarization unavailable", file=sys.stderr)
             break
         except subprocess.TimeoutExpired:
             last_reason = "haiku_timeout"
             if i < len(attempts) - 1:
                 print(
-                    f"[obsidian-brain] claude -p batch timed out at {attempt_timeout}s, retrying...",
+                    f"[obsidian-brain] native AI batch timed out at {attempt_timeout}s, retrying...",
                     file=sys.stderr,
                 )
                 continue
             print(
-                f"[obsidian-brain] claude -p batch timed out at {attempt_timeout}s, giving up",
+                f"[obsidian-brain] native AI batch timed out at {attempt_timeout}s, giving up",
                 file=sys.stderr,
             )
             break
         except Exception as exc:  # noqa: BLE001
             last_reason = "haiku_subprocess_error"
-            print(f"[obsidian-brain] claude -p batch error ({type(exc).__name__}): {exc}", file=sys.stderr)
+            print(f"[obsidian-brain] native AI batch error ({type(exc).__name__}): {exc}", file=sys.stderr)
             break
 
     # Whole-spawn failure — return same reason for all notes.
@@ -7082,6 +7117,7 @@ def upgrade_batch(
         raise ValueError(f"max_workers must be >= 1, got {max_workers}")
 
     from concurrent.futures import ThreadPoolExecutor
+    from contextvars import copy_context
     from datetime import datetime, timezone
 
     # Resolve batch size.
@@ -7107,7 +7143,7 @@ def upgrade_batch(
         with ThreadPoolExecutor(max_workers=workers) as ex:
             futs = [
                 ex.submit(
-                    upgrade_unsummarized_note,
+                    copy_context().run, upgrade_unsummarized_note,
                     p,
                     vault_path,
                     sessions_folder,
@@ -7158,7 +7194,7 @@ def upgrade_batch(
     # Step 1: Prepare all notes concurrently.
     workers = min(max_workers, len(paths))
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        prep_futs = {p: ex.submit(_prepare_note_for_summary, p, vault_path, sessions_folder, project)
+        prep_futs = {p: ex.submit(copy_context().run, _prepare_note_for_summary, p, vault_path, sessions_folder, project)
                      for p in paths}
     preps: dict[str, dict] = {}
     for p, fut in prep_futs.items():
@@ -7193,7 +7229,7 @@ def upgrade_batch(
         snap_workers = min(max_workers, len(snapshot_paths))
         with ThreadPoolExecutor(max_workers=snap_workers) as ex:
             snap_futs = {
-                p: ex.submit(upgrade_unsummarized_note, p, vault_path, sessions_folder, project, summary_model, summary_timeout)
+                p: ex.submit(copy_context().run, upgrade_unsummarized_note, p, vault_path, sessions_folder, project, summary_model, summary_timeout)
                 for p in snapshot_paths
             }
         for p, fut in snap_futs.items():
@@ -7256,7 +7292,9 @@ def upgrade_batch(
             if all(text is None and reason == "empty_output" for text, reason in batch_out):
                 if _model != models_to_try[-1]:
                     continue  # try next model
-            used_model = _model
+            from runtime_context import current_runtime_context
+            native = current_runtime_context()
+            used_model = _SUMMARY_NATIVE_MODEL.get() if native is not None and native.host == "codex" else _model
             group_results = batch_out
             break
 
@@ -7310,7 +7348,7 @@ def upgrade_batch(
             solo_workers = min(max_workers, len(solo_fallback_paths))
             with ThreadPoolExecutor(max_workers=solo_workers) as ex:
                 solo_futs = {
-                    p: ex.submit(upgrade_unsummarized_note, p, vault_path, sessions_folder, project, summary_model, summary_timeout)
+                    p: ex.submit(copy_context().run, upgrade_unsummarized_note, p, vault_path, sessions_folder, project, summary_model, summary_timeout)
                     for p in solo_fallback_paths
                 }
             for p, fut in solo_futs.items():

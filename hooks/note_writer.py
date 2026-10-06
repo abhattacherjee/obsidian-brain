@@ -948,6 +948,9 @@ def run_append_update(
     update_text: str,
     last_updated: str | None = None,
     add_tags_csv: str | None = None,
+    expected_revision: str | None = None,
+    author_host: str | None = None,
+    operation_id: str | None = None,
 ) -> int:
     """Append ``update_text`` to the existing note at ``note_path`` and, in
     the SAME atomic write, apply frontmatter mutations.
@@ -995,6 +998,12 @@ def run_append_update(
         or _validate_update_text(update_text)
         or _validate_last_updated(last_updated)
     )
+    if author_host is not None and (not isinstance(author_host, str)
+                                   or author_host not in {"claude", "codex"}):
+        vault_err = "invalid author host"
+    if operation_id is not None and (not isinstance(operation_id, str)
+                                    or not re.fullmatch(r"[a-f0-9]{32}", operation_id)):
+        vault_err = "invalid operation identity"
     if vault_err:
         print(f"ERROR: {vault_err}", file=sys.stderr)
         return 1
@@ -1019,7 +1028,9 @@ def run_append_update(
                 return 1
             try:
                 return _append_update_locked(
-                    resolved, note_path, update_text, last_updated, add_tags, context=context
+                    resolved, note_path, update_text, last_updated, add_tags, context=context,
+                    expected_revision=expected_revision,
+                    author_host=author_host, operation_id=operation_id,
                 )
             finally:
                 _release_lock(lock)
@@ -1036,6 +1047,9 @@ def _append_update_locked(
     last_updated,
     add_tags: list[str],
     context=None,
+    expected_revision=None,
+    author_host=None,
+    operation_id=None,
 ) -> int:
     """The read-modify-write half of run_append_update, run while holding the
     note's lock. Split out purely so the lock has one obvious scope and one
@@ -1043,6 +1057,11 @@ def _append_update_locked(
     try:
         with open(resolved, "r", encoding="utf-8", newline="") as fh:
             original_text = fh.read()
+        if expected_revision is not None:
+            import hashlib
+            if hashlib.sha256(original_text.encode("utf-8")).hexdigest() != expected_revision:
+                print(f"ERROR: SOURCE REVISION CONFLICT: {note_path}", file=sys.stderr)
+                return 1
         # Snapshot taken AFTER the read, so it reflects exactly the bytes this
         # run is about to mutate. _atomic_rewrite re-checks it before the
         # rename and refuses to clobber a note another process changed in
@@ -1052,6 +1071,8 @@ def _append_update_locked(
         from note_transactions import context_for_vault, record_read
         context = context or context_for_vault(resolved.parent)
         read_revision = record_read(context, resolved, original_text)
+        if expected_revision is not None:
+            read_revision = expected_revision
     except OSError as exc:
         print(f"ERROR: cannot read {note_path}: {exc}", file=sys.stderr)
         return 1
@@ -1063,6 +1084,21 @@ def _append_update_locked(
     if fm_split_err:
         print(f"ERROR: {fm_split_err}: {note_path}", file=sys.stderr)
         return 1
+
+    for key, value in (("author_host", author_host), ("operation_id", operation_id)):
+        if value is None:
+            continue
+        positions = [idx for idx, line in enumerate(fm_lines)
+                     if re.match(r"^" + key + r"\s*:", line)]
+        if len(positions) > 1:
+            print(f"ERROR: duplicate {key} metadata: {note_path}", file=sys.stderr)
+            return 1
+        import json
+        field = f"{key}: {json.dumps(value)}{eol}"
+        if positions:
+            fm_lines[positions[0]] = field
+        else:
+            fm_lines.append(field)
 
     # `is not None`, not truthiness: an empty value is a *present* flag with
     # a broken value (already rejected by _validate_last_updated above), not

@@ -345,3 +345,39 @@ def _doctor_tests_do_not_read_live_config(request, monkeypatch):
     import hooks.obsidian_utils as qualified_utils
     monkeypatch.setattr(obsidian_utils, "load_config", lambda: {})
     monkeypatch.setattr(qualified_utils, "load_config", lambda: {})
+
+
+@pytest.fixture(autouse=True)
+def _block_unmocked_native_ai_processes(monkeypatch):
+    """Tests must replace native AI transport before dispatching model jobs."""
+    import shlex
+    import subprocess
+    original = subprocess.Popen
+
+    def guarded(args, *positional, **kwargs):
+        values = shlex.split(args) if isinstance(args, str) else list(args)
+        commands = [Path(str(value)).name for value in values]
+        if commands and (commands[0] in {"claude", "codex"} or
+                         commands[0] == "env" and any(value in {"claude", "codex"} for value in commands[1:])):
+            pytest.fail("Native AI subprocess transport must be mocked in tests", pytrace=False)
+        return original(args, *positional, **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", guarded)
+
+
+@pytest.fixture
+def native_ai_frontend(tmp_path, monkeypatch):
+    """Frontend tests bind Claude explicitly and fake the backend, not a CLI."""
+    from types import MappingProxyType
+    import ai_backend
+    import native_ai_test_adapter
+    from runtime_context import RuntimeContext, using_runtime_context
+    vault = tmp_path / "native-ai-vault"
+    vault.mkdir()
+    context = RuntimeContext("claude", "cli", "test-native-ai", tmp_path, tmp_path,
+                             None, vault, tmp_path / "native-ai-config.json",
+                             MappingProxyType({}), Path(_REPO_ROOT),
+                             tmp_path / "native-ai-index.sqlite3", tmp_path / "native-ai-state")
+    monkeypatch.setattr(ai_backend, "execute_ai", native_ai_test_adapter.execute_ai)
+    with using_runtime_context(context):
+        yield context

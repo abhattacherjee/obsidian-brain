@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import native_ai_test_adapter
+
 import hashlib
 import json
 import os
@@ -1277,7 +1279,7 @@ class TestUpgradeNoteWithSummary:
 
         assert result.startswith("Upgraded")
         content = sample_unsummarized_note.read_text(encoding="utf-8")
-        assert "status: summarized" in content
+        assert "status: summarized" in content or 'status: "summarized"' in content
         assert "## Summary" in content
         assert "Fixed the login bug" in content
 
@@ -1390,7 +1392,7 @@ class TestUpgradeNoteWithSummary:
             real_replace(src, dst, *args, **kwargs)
             if str(dst) == note_path_str:
                 with open(dst, "w", encoding="utf-8") as f:
-                    f.write(fake_summarized)
+                    f.write(fake_summarized.replace("## Summary\n", "<!-- obsidian-brain:summary:start -->\n## Summary\n", 1) + "\n<!-- obsidian-brain:summary:end -->\n")
 
         monkeypatch.setattr(os, "replace", clobbering_replace)
 
@@ -1447,7 +1449,7 @@ class TestUpgradeNoteWithSummary:
             real_replace(src, dst, *args, **kwargs)
             if str(dst) == note_path_str:
                 with open(dst, "w", encoding="utf-8") as f:
-                    f.write(fake_content)
+                    f.write(fake_content.replace("## Summary\n", "<!-- obsidian-brain:summary:start -->\n## Summary\n", 1) + "\n<!-- obsidian-brain:summary:end -->\n")
 
         monkeypatch.setattr(os, "replace", clobbering_replace)
 
@@ -1550,7 +1552,7 @@ class TestUpgradeNoteWithSummary:
             real_replace(src, dst, *args, **kwargs)
             if str(dst) == note_path_str:
                 with open(dst, "w", encoding="utf-8") as f:
-                    f.write(clobber_content)
+                    f.write(clobber_content.replace("## Summary\n", "<!-- obsidian-brain:summary:start -->\n## Summary\n", 1) + "\n<!-- obsidian-brain:summary:end -->\n")
 
         monkeypatch.setattr(os, "replace", clobbering_replace)
 
@@ -1595,7 +1597,7 @@ class TestUpgradeNoteWithSummary:
             f"was incorrectly classified as a heading"
         )
         disk_content = sample_unsummarized_note.read_text(encoding="utf-8")
-        assert "status: summarized" in disk_content
+        assert "status: summarized" in disk_content or 'status: "summarized"' in disk_content
         assert "#1234 issue reference — fixed the auth bug." in disk_content
 
     def test_upgrade_note_with_summary_skips_sub_headings_inside_summary(
@@ -1669,7 +1671,7 @@ class TestUpgradeNoteWithSummary:
             real_replace(src, dst, *args, **kwargs)
             if str(dst) == note_path_str:
                 with open(dst, "w", encoding="utf-8") as f:
-                    f.write(fake_content)
+                    f.write(fake_content.replace("## Summary\n", "<!-- obsidian-brain:summary:start -->\n## Summary\n", 1) + "\n<!-- obsidian-brain:summary:end -->\n")
 
         monkeypatch.setattr(os, "replace", clobbering_replace)
 
@@ -1710,7 +1712,7 @@ class TestUpgradeNoteWithSummary:
 
         assert result.startswith("Upgraded"), f"expected Upgraded, got {result!r}"
         disk_content = sample_unsummarized_note.read_text(encoding="utf-8")
-        assert "status: summarized" in disk_content
+        assert "status: summarized" in disk_content or 'status: "summarized"' in disk_content
         assert "BARE_FILENAME_SIGNATURE content line." in disk_content
 
     def test_upgrade_note_with_summary_frontmatter_anchored_to_file_start(
@@ -1755,7 +1757,7 @@ class TestUpgradeNoteWithSummary:
             real_replace(src, dst, *args, **kwargs)
             if str(dst) == note_path_str:
                 with open(dst, "w", encoding="utf-8") as f:
-                    f.write(fake_content)
+                    f.write(fake_content.replace("## Summary\n", "<!-- obsidian-brain:summary:start -->\n## Summary\n", 1) + "\n<!-- obsidian-brain:summary:end -->\n")
 
         monkeypatch.setattr(os, "replace", clobbering_replace)
 
@@ -1866,7 +1868,7 @@ class TestUpgradeNoteWithSummary:
         assert result.startswith("Upgraded")
         # Re-read from disk (not cached text).
         disk_content = sample_unsummarized_note.read_text(encoding="utf-8")
-        assert "status: summarized" in disk_content
+        assert "status: summarized" in disk_content or 'status: "summarized"' in disk_content
         assert "UNIQUE_POST_WRITE_CHECK_PHRASE landed on disk successfully." in disk_content
 
 
@@ -1935,10 +1937,11 @@ class TestGenerateSummarySampling:
             )()
         return fake_run
 
+    @pytest.mark.usefixtures("native_ai_frontend")
     def test_generate_summary_sampling_under_20(self, monkeypatch):
         """15 messages — no '[... middle messages omitted ...]' marker."""
         captured: dict = {}
-        monkeypatch.setattr("subprocess.run", self._fake_run_factory(captured))
+        monkeypatch.setattr("native_ai_test_adapter.run", self._fake_run_factory(captured))
 
         user_msgs = [f"user message {i}" for i in range(15)]
         assistant_msgs = [f"assistant response {i}" for i in range(15)]
@@ -1952,10 +1955,11 @@ class TestGenerateSummarySampling:
         assert "user message 0" in captured["prompt"]
         assert "user message 14" in captured["prompt"]
 
+    @pytest.mark.usefixtures("native_ai_frontend")
     def test_generate_summary_sampling_over_20(self, monkeypatch):
         """30 messages — marker present, first/last present, middle absent."""
         captured: dict = {}
-        monkeypatch.setattr("subprocess.run", self._fake_run_factory(captured))
+        monkeypatch.setattr("native_ai_test_adapter.run", self._fake_run_factory(captured))
 
         user_msgs = [f"user message {i}" for i in range(30)]
         assistant_msgs = [f"assistant response {i}" for i in range(30)]
@@ -1971,10 +1975,11 @@ class TestGenerateSummarySampling:
         # Middle absent
         assert "user message 15" not in prompt
 
+    @pytest.mark.usefixtures("native_ai_frontend")
     def test_generate_summary_truncation_12k(self, monkeypatch):
         """15 messages of 1000 chars each — total prompt stays bounded."""
         captured: dict = {}
-        monkeypatch.setattr("subprocess.run", self._fake_run_factory(captured))
+        monkeypatch.setattr("native_ai_test_adapter.run", self._fake_run_factory(captured))
 
         user_msgs = ["u" * 1000 for _ in range(15)]
         assistant_msgs = ["a" * 1000 for _ in range(15)]
@@ -1997,18 +2002,21 @@ class TestSummarizerTimeoutBudget:
             return type("Result", (), {"returncode": 0, "stdout": "## Summary\nDone.\n", "stderr": ""})()
         return fake_run
 
+    @pytest.mark.usefixtures("native_ai_frontend")
     def test_generate_summary_first_attempt_timeout_is_120(self, monkeypatch):
         captured: dict = {}
-        monkeypatch.setattr(obsidian_utils.subprocess, "run", self._capture_timeout_run(captured))
+        monkeypatch.setattr(native_ai_test_adapter, "run", self._capture_timeout_run(captured))
         obsidian_utils.generate_summary(["u"], ["a"], {"project": "t", "files_touched": []})
         assert captured.get("timeout") == 120
 
+    @pytest.mark.usefixtures("native_ai_frontend")
     def test_generate_snapshot_summary_first_attempt_timeout_is_120(self, monkeypatch):
         captured: dict = {}
-        monkeypatch.setattr(obsidian_utils.subprocess, "run", self._capture_timeout_run(captured))
+        monkeypatch.setattr(native_ai_test_adapter, "run", self._capture_timeout_run(captured))
         obsidian_utils.generate_snapshot_summary(["u"], ["a"], {"project": "t"})
         assert captured.get("timeout") == 120
 
+    @pytest.mark.usefixtures("native_ai_frontend")
     def test_generate_summary_retry_uses_double_timeout(self, monkeypatch):
         """Both attempts must time out; second attempt must use timeout * 2 == 240."""
         seen = []
@@ -2017,7 +2025,7 @@ class TestSummarizerTimeoutBudget:
             seen.append(kwargs.get("timeout"))
             raise subprocess.TimeoutExpired(cmd=cmd, timeout=kwargs.get("timeout"))
 
-        monkeypatch.setattr(obsidian_utils.subprocess, "run", fake_run)
+        monkeypatch.setattr(native_ai_test_adapter, "run", fake_run)
         result = obsidian_utils.generate_summary(["u"], ["a"], {"project": "t", "files_touched": []})
         assert seen == [120, 240]
         assert result == (None, "haiku_timeout")
@@ -3067,7 +3075,7 @@ class TestUpgradeBatch:
 
         # Verify the note was actually rewritten with a summary
         updated = note_path.read_text()
-        assert "status: summarized" in updated
+        assert "status: summarized" in updated or 'status: "summarized"' in updated
         assert "## Summary" in updated
         assert "Did a thing." in updated
 
@@ -3395,6 +3403,7 @@ class TestUpgradeBatchBatching:
                 f"all notes should be Upgraded, got: {r['status']!r}"
             )
 
+    @pytest.mark.usefixtures("native_ai_frontend")
     def test_generate_summaries_batch_parses_delimited_output(self, monkeypatch, tmp_path):
         """Unit-test the parser: well-formed block 1, missing ## Summary block 2."""
         sessions_dir = tmp_path / "sessions"
@@ -3436,7 +3445,7 @@ class TestUpgradeBatchBatching:
                 stderr = ""
             return _Res()
 
-        monkeypatch.setattr(obsidian_utils.subprocess, "run", fake_subprocess_run)
+        monkeypatch.setattr(native_ai_test_adapter, "run", fake_subprocess_run)
 
         results = obsidian_utils.generate_summaries_batch(
             [prep1, prep2],
@@ -3458,6 +3467,7 @@ class TestUpgradeBatchBatching:
         assert text2 is None, f"block 2 should be rejected (missing ## Summary)"
         assert reason2 == "missing_section"
 
+    @pytest.mark.usefixtures("native_ai_frontend")
     def test_duplicate_summary_delimiter_first_wins(self, monkeypatch, tmp_path):
         """Fix 1: first-occurrence-wins — a repeated ===== SUMMARY k ===== delimiter
         in model output must NOT overwrite the valid first block with the junk repeat."""
@@ -3506,7 +3516,7 @@ class TestUpgradeBatchBatching:
                 stderr = ""
             return _Res()
 
-        monkeypatch.setattr(obsidian_utils.subprocess, "run", fake_subprocess_run)
+        monkeypatch.setattr(native_ai_test_adapter, "run", fake_subprocess_run)
 
         results = obsidian_utils.generate_summaries_batch(
             [prep1, prep2],
@@ -3586,6 +3596,7 @@ class TestUpgradeBatchBatching:
                 f"all notes should be Upgraded, got: {r['status']!r}"
             )
 
+    @pytest.mark.usefixtures("native_ai_frontend")
     def test_dedup_failure_does_not_fail_note(self, monkeypatch, tmp_path):
         """Fix 2: if _dedup_summary_open_items raises, the note is still accepted
         with the undeduped block_text — result is (text, None), NOT (None, 'missing_section')."""
@@ -3618,7 +3629,7 @@ class TestUpgradeBatchBatching:
                 stderr = ""
             return _Res()
 
-        monkeypatch.setattr(obsidian_utils.subprocess, "run", fake_subprocess_run)
+        monkeypatch.setattr(native_ai_test_adapter, "run", fake_subprocess_run)
 
         # Make _dedup_summary_open_items raise.
         monkeypatch.setattr(
@@ -4175,6 +4186,7 @@ def test_resolve_source_session_note_unknown_session_id_omits(tmp_path):
 class TestGenerateSummaryReturnsFallbackReason:
     """generate_summary returns (summary, fallback_reason); reason populated only on failure."""
 
+    @pytest.mark.usefixtures("native_ai_frontend")
     def test_success_returns_summary_and_none_reason(self, monkeypatch):
         import obsidian_utils
 
@@ -4183,7 +4195,7 @@ class TestGenerateSummaryReturnsFallbackReason:
             stdout = "## Summary\nOK\n## Importance\n5\n"
             stderr = ""
 
-        monkeypatch.setattr(obsidian_utils.subprocess, "run", lambda *a, **kw: FakeResult())
+        monkeypatch.setattr(native_ai_test_adapter, "run", lambda *a, **kw: FakeResult())
 
         summary, reason = obsidian_utils.generate_summary(
             ["hello"], ["hi"], {"project": "t"}, model="haiku", timeout=30,
@@ -4191,19 +4203,21 @@ class TestGenerateSummaryReturnsFallbackReason:
         assert summary.startswith("## Summary")
         assert reason is None
 
+    @pytest.mark.usefixtures("native_ai_frontend")
     def test_timeout_returns_none_and_haiku_timeout(self, monkeypatch):
         import obsidian_utils
 
         def fake_run(*a, **kw):
             raise obsidian_utils.subprocess.TimeoutExpired(cmd=a, timeout=kw["timeout"])
 
-        monkeypatch.setattr(obsidian_utils.subprocess, "run", fake_run)
+        monkeypatch.setattr(native_ai_test_adapter, "run", fake_run)
         summary, reason = obsidian_utils.generate_summary(
             ["hello"], ["hi"], {"project": "t"}, model="haiku", timeout=1,
         )
         assert summary is None
         assert reason == "haiku_timeout"
 
+    @pytest.mark.usefixtures("native_ai_frontend")
     def test_nonzero_rc_returns_none_and_subprocess_error(self, monkeypatch):
         import obsidian_utils
 
@@ -4212,13 +4226,14 @@ class TestGenerateSummaryReturnsFallbackReason:
             stdout = ""
             stderr = "boom"
 
-        monkeypatch.setattr(obsidian_utils.subprocess, "run", lambda *a, **kw: FakeResult())
+        monkeypatch.setattr(native_ai_test_adapter, "run", lambda *a, **kw: FakeResult())
         summary, reason = obsidian_utils.generate_summary(
             ["hello"], ["hi"], {"project": "t"}, model="haiku", timeout=30,
         )
         assert summary is None
         assert reason == "haiku_subprocess_error"
 
+    @pytest.mark.usefixtures("native_ai_frontend")
     def test_empty_stdout_returns_none_and_empty_output(self, monkeypatch):
         import obsidian_utils
 
@@ -4227,7 +4242,7 @@ class TestGenerateSummaryReturnsFallbackReason:
             stdout = "   "
             stderr = ""
 
-        monkeypatch.setattr(obsidian_utils.subprocess, "run", lambda *a, **kw: FakeResult())
+        monkeypatch.setattr(native_ai_test_adapter, "run", lambda *a, **kw: FakeResult())
         summary, reason = obsidian_utils.generate_summary(
             ["hello"], ["hi"], {"project": "t"}, model="haiku", timeout=30,
         )
@@ -4241,6 +4256,7 @@ class TestGenerateSummaryReturnsFallbackReason:
 
 
 class TestGenerateSnapshotSummaryReturnsFallbackReason:
+    @pytest.mark.usefixtures("native_ai_frontend")
     def test_success_returns_summary_and_none_reason(self, monkeypatch):
         import obsidian_utils
 
@@ -4249,20 +4265,21 @@ class TestGenerateSnapshotSummaryReturnsFallbackReason:
             stdout = "snapshot OK"
             stderr = ""
 
-        monkeypatch.setattr(obsidian_utils.subprocess, "run", lambda *a, **kw: FakeResult())
+        monkeypatch.setattr(native_ai_test_adapter, "run", lambda *a, **kw: FakeResult())
         summary, reason = obsidian_utils.generate_snapshot_summary(
             ["u"], ["a"], {"project": "t"}, model="haiku", timeout=30,
         )
         assert summary == "snapshot OK"
         assert reason is None
 
+    @pytest.mark.usefixtures("native_ai_frontend")
     def test_timeout_returns_none_and_haiku_timeout(self, monkeypatch):
         import obsidian_utils
 
         def fake_run(*a, **kw):
             raise obsidian_utils.subprocess.TimeoutExpired(cmd=a, timeout=kw["timeout"])
 
-        monkeypatch.setattr(obsidian_utils.subprocess, "run", fake_run)
+        monkeypatch.setattr(native_ai_test_adapter, "run", fake_run)
         summary, reason = obsidian_utils.generate_snapshot_summary(
             ["u"], ["a"], {"project": "t"}, model="haiku", timeout=1,
         )
@@ -4944,6 +4961,7 @@ class TestBatchRecovery:
             "- Used pattern X.\n"
         )
 
+    @pytest.mark.usefixtures("native_ai_frontend")
     def test_batch_recovers_loose_block(self, monkeypatch):
         """generate_summaries_batch: loose # Summary block is recovered (default enabled).
 
@@ -4962,7 +4980,7 @@ class TestBatchRecovery:
                 stderr = ""
             return _R()
 
-        monkeypatch.setattr(obsidian_utils.subprocess, "run", fake_run)
+        monkeypatch.setattr(native_ai_test_adapter, "run", fake_run)
 
         prep1 = dict(self._BASE_PREP)
         prep2 = dict(self._BASE_PREP)
@@ -4985,6 +5003,7 @@ class TestBatchRecovery:
         _, reason2 = results[1]
         assert reason2 is None, f"block 2 (well-formed) should also be accepted; {reason2!r}"
 
+    @pytest.mark.usefixtures("native_ai_frontend")
     def test_batch_recovery_disabled_yields_missing_section(self, monkeypatch):
         """generate_summaries_batch: with summary_recovery=False, a loose # Summary
         block returns (None, 'missing_section') instead of being recovered.
@@ -5004,7 +5023,7 @@ class TestBatchRecovery:
                 stderr = ""
             return _R()
 
-        monkeypatch.setattr(obsidian_utils.subprocess, "run", fake_run)
+        monkeypatch.setattr(native_ai_test_adapter, "run", fake_run)
 
         # Disable recovery via load_config — _summary_recovery_enabled() reads
         # load_config().get("summary_recovery", True), so patching here exercises

@@ -5,11 +5,63 @@ metadata:
   version: 1.0.0
 ---
 
+## Native runtime and installed resources
+
+Use the absolute path of this loaded `SKILL.md` as `OB_SKILL_PATH`. Read the
+reference for the invoking host when this skill has paired host references.
+Set `OB_HOST`, `OB_CLIENT`, `OB_SESSION_ID`, and `OB_CWD` from that native
+invocation. Use the selected host's own session ID. Keep curated note taxonomy
+separate from `agent_provider` and `agent_session_id` provenance.
+
+```bash
+OB_SKILL_PATH='<absolute path of this loaded SKILL.md>'
+OB_RESOURCE_ROOT=$(python3 -c 'import pathlib,sys; p=pathlib.Path(sys.argv[1]); assert p.is_absolute(); p=p.resolve(); assert p.name == "SKILL.md" and p.parent.parent.name == "skills"; print(p.parents[2])' "$OB_SKILL_PATH")
+python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" context < /dev/null
+```
+
+Use the returned `config_path`, `vault_path`, `index_path`, and `state_path`.
+Create the operation with this fixed literal request:
+
+```bash
+printf '{}' | python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'prepare'
+```
+
+Call `prepare` to create a private operation under native state. Retain its
+`operation_id` and `operation_dir`. Register approved helper output names with `artifact-store`;
+inputs are read through the immutable artifact manifest. Do not discover resources from the current directory or another plugin
+cache. Each shell invocation supplies the same explicit values; a previous
+shell's variables are not assumed to persist.
+
+Each data operation uses the installed launcher with a JSON request on stdin:
+
+```bash
+python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation '<fixed operation>' < "$REQUEST_PATH"
+```
+
+Map config JSON `vault_path`, `sessions_folder`, and `insights_folder` to the
+procedure variables `VAULT_PATH`/`VAULT`, `SESSIONS_FOLDER`/`SESS`, and
+`INSIGHTS_FOLDER`/`INS`. Use the canonical project returned in config JSON (and native `session` when available),
+not the basename of an unrelated shell working directory.
+
+Before preparing edits or requesting a summary of an existing note, call
+`note-read` and retain its exact `expected_revision`. Apply the proposed note
+with `note-apply` and that revision. A conflict leaves the current note intact;
+show the pending result and do not count the note as saved. New curated notes
+use `note-create`; they never overwrite a collision. Native memory discovery
+is unsupported for Codex until its adapter is verified; shared vault retrieval
+and wiki filing continue without borrowing another host's memory.
+
+Read `references/host-claude.md` or `references/host-codex.md` when present.
+All note writes described below use `note-create` or revision-bound `note-apply`,
+including bidirectional related links. Content is a JSON string, never shell code.
+Keep this rule when a later step uses the word Write or Edit.
+
+
 # Dev Test — Install/Restore Dev Plugin for Testing
 
 Swaps the installed plugin cache with the current repo working copy for local testing. After install, start a new Claude Code session to pick up the changes.
 
-**If this repo is registered as a directory-source marketplace** (`source.source == "directory"` in `~/.claude/plugins/known_marketplaces.json`, which is how a local checkout is normally installed), `/dev-test install` no longer changes which hooks the skills load: since #278 every skill resolves the registered checkout first and only falls back to the plugin cache. Your working copy is already what runs — edit and re-run, no install step. `/dev-test install` still matters for a **github-source** install (where the cache is what resolves) and for the manual test scripts under `scripts/dev-test/` that deliberately assert on the cache's contents.
+Use the absolute loaded SKILL.md to select the installed resource root.
 
 **Tools needed:** Bash
 
@@ -27,55 +79,24 @@ Check the argument passed to `/dev-test`:
 
 This works from any directory — it locates the obsidian-brain checkout itself, it does not require the cwd to be inside it. Run:
 
+Request for `dev-install` (substitute the values as data):
+
+```json
+{
+  "mode": "install"
+}
+```
+
+Request for `dev-install`:
+
+```json
+{
+  "mode": "install"
+}
+```
+
 ```bash
-# Layer 1 -- the checkout you are STANDING IN, when it is itself an
-# obsidian-brain checkout. A git worktree or a second clone is a deliberate
-# context signal: that tree is the one you mean, and the registry can only
-# ever name one checkout. The `-f "$_T/scripts/test-dev-skill.sh"` sentinel
-# is what makes the cwd safe to trust here -- it can only ever select an
-# obsidian-brain checkout, never the arbitrary project you happen to be
-# working in. That project (#287's bug) has no sentinel and falls through
-# to layer 2 exactly as before.
-#
-# NOTE: that sentinel check is LOAD-BEARING -- delete it and any foreign
-# toplevel wins layer 1 outright, layer 2 is never consulted, and #287
-# regresses. Pinned by
-# test_shell_uses_the_registry_when_the_cwd_toplevel_lacks_the_sentinel.
-REPO=""
-_T="$(git rev-parse --show-toplevel 2>/dev/null || true)"
-if [ -n "$_T" ] && [ -f "$_T/scripts/test-dev-skill.sh" ]; then
-    REPO="$_T"
-fi
-# Layer 2 -- the registered directory-source install (the #278 precedent),
-# reached only when the cwd is not inside an obsidian-brain checkout.
-if [ -z "$REPO" ]; then
-    REPO="$(python3 -c "
-import json, os
-def _ob_repo():
-    try:
-        for _m in json.load(open(os.path.expanduser('~/.claude/plugins/known_marketplaces.json'))).values():
-            _s = _m.get('source') if isinstance(_m, dict) else None
-            if not (isinstance(_s, dict) and _s.get('source') == 'directory'):
-                continue
-            _i = _m.get('installLocation') if isinstance(_m, dict) else None
-            if not (isinstance(_i, str) and os.path.isabs(_i)):
-                continue
-            if os.path.isfile(os.path.join(_i, 'scripts', 'test-dev-skill.sh')):
-                return _i
-    except Exception:
-        pass
-    return ''
-print(_ob_repo())
-")"
-fi
-if [ -z "$REPO" ] || [ ! -f "$REPO/scripts/test-dev-skill.sh" ]; then
-    echo "ERROR: could not locate the obsidian-brain checkout. Looked for scripts/test-dev-skill.sh under the current git repo's toplevel, then for a directory-source marketplace entry in ~/.claude/plugins/known_marketplaces.json. /dev-test needs a local checkout to copy from; run it from the obsidian-brain repo, or register the checkout with /plugin marketplace add <path>." >&2
-    exit 1
-fi
-# Several checkouts of this repo can coexist (worktrees, second clones, the
-# registered one). Which tree was used must be observable, not inferred.
-echo "Source checkout: $REPO"
-bash "$REPO/scripts/test-dev-skill.sh" install
+python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'dev-install' < "$REQUEST_PATH"
 ```
 
 Report the output, then **branch on the command's exit status** — the fenced block's last command *is* the script, so the block's exit status is the script's. Never tell the user the install succeeded without checking it.
@@ -100,55 +121,24 @@ Stop here.
 
 This works from any directory — it locates the obsidian-brain checkout itself, it does not require the cwd to be inside it. Run:
 
+Request for `dev-install` (substitute the values as data):
+
+```json
+{
+  "mode": "restore"
+}
+```
+
+Request for `dev-install`:
+
+```json
+{
+  "mode": "install"
+}
+```
+
 ```bash
-# Layer 1 -- the checkout you are STANDING IN, when it is itself an
-# obsidian-brain checkout. A git worktree or a second clone is a deliberate
-# context signal: that tree is the one you mean, and the registry can only
-# ever name one checkout. The `-f "$_T/scripts/test-dev-skill.sh"` sentinel
-# is what makes the cwd safe to trust here -- it can only ever select an
-# obsidian-brain checkout, never the arbitrary project you happen to be
-# working in. That project (#287's bug) has no sentinel and falls through
-# to layer 2 exactly as before.
-#
-# NOTE: that sentinel check is LOAD-BEARING -- delete it and any foreign
-# toplevel wins layer 1 outright, layer 2 is never consulted, and #287
-# regresses. Pinned by
-# test_shell_uses_the_registry_when_the_cwd_toplevel_lacks_the_sentinel.
-REPO=""
-_T="$(git rev-parse --show-toplevel 2>/dev/null || true)"
-if [ -n "$_T" ] && [ -f "$_T/scripts/test-dev-skill.sh" ]; then
-    REPO="$_T"
-fi
-# Layer 2 -- the registered directory-source install (the #278 precedent),
-# reached only when the cwd is not inside an obsidian-brain checkout.
-if [ -z "$REPO" ]; then
-    REPO="$(python3 -c "
-import json, os
-def _ob_repo():
-    try:
-        for _m in json.load(open(os.path.expanduser('~/.claude/plugins/known_marketplaces.json'))).values():
-            _s = _m.get('source') if isinstance(_m, dict) else None
-            if not (isinstance(_s, dict) and _s.get('source') == 'directory'):
-                continue
-            _i = _m.get('installLocation') if isinstance(_m, dict) else None
-            if not (isinstance(_i, str) and os.path.isabs(_i)):
-                continue
-            if os.path.isfile(os.path.join(_i, 'scripts', 'test-dev-skill.sh')):
-                return _i
-    except Exception:
-        pass
-    return ''
-print(_ob_repo())
-")"
-fi
-if [ -z "$REPO" ] || [ ! -f "$REPO/scripts/test-dev-skill.sh" ]; then
-    echo "ERROR: could not locate the obsidian-brain checkout. Looked for scripts/test-dev-skill.sh under the current git repo's toplevel, then for a directory-source marketplace entry in ~/.claude/plugins/known_marketplaces.json. /dev-test needs a local checkout to copy from; run it from the obsidian-brain repo, or register the checkout with /plugin marketplace add <path>." >&2
-    exit 1
-fi
-# Several checkouts of this repo can coexist (worktrees, second clones, the
-# registered one). Which tree was used must be observable, not inferred.
-echo "Source checkout: $REPO"
-bash "$REPO/scripts/test-dev-skill.sh" restore
+python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'dev-install' < "$REQUEST_PATH"
 ```
 
 Report the output, then **branch on the command's exit status** — the fenced block's last command *is* the script, so the block's exit status is the script's. Never tell the user the restore succeeded without checking it.
@@ -169,55 +159,24 @@ Stop here.
 
 This works from any directory — it locates the obsidian-brain checkout itself, it does not require the cwd to be inside it. Run:
 
+Request for `dev-install` (substitute the values as data):
+
+```json
+{
+  "mode": "status"
+}
+```
+
+Request for `dev-install`:
+
+```json
+{
+  "mode": "install"
+}
+```
+
 ```bash
-# Layer 1 -- the checkout you are STANDING IN, when it is itself an
-# obsidian-brain checkout. A git worktree or a second clone is a deliberate
-# context signal: that tree is the one you mean, and the registry can only
-# ever name one checkout. The `-f "$_T/scripts/test-dev-skill.sh"` sentinel
-# is what makes the cwd safe to trust here -- it can only ever select an
-# obsidian-brain checkout, never the arbitrary project you happen to be
-# working in. That project (#287's bug) has no sentinel and falls through
-# to layer 2 exactly as before.
-#
-# NOTE: that sentinel check is LOAD-BEARING -- delete it and any foreign
-# toplevel wins layer 1 outright, layer 2 is never consulted, and #287
-# regresses. Pinned by
-# test_shell_uses_the_registry_when_the_cwd_toplevel_lacks_the_sentinel.
-REPO=""
-_T="$(git rev-parse --show-toplevel 2>/dev/null || true)"
-if [ -n "$_T" ] && [ -f "$_T/scripts/test-dev-skill.sh" ]; then
-    REPO="$_T"
-fi
-# Layer 2 -- the registered directory-source install (the #278 precedent),
-# reached only when the cwd is not inside an obsidian-brain checkout.
-if [ -z "$REPO" ]; then
-    REPO="$(python3 -c "
-import json, os
-def _ob_repo():
-    try:
-        for _m in json.load(open(os.path.expanduser('~/.claude/plugins/known_marketplaces.json'))).values():
-            _s = _m.get('source') if isinstance(_m, dict) else None
-            if not (isinstance(_s, dict) and _s.get('source') == 'directory'):
-                continue
-            _i = _m.get('installLocation') if isinstance(_m, dict) else None
-            if not (isinstance(_i, str) and os.path.isabs(_i)):
-                continue
-            if os.path.isfile(os.path.join(_i, 'scripts', 'test-dev-skill.sh')):
-                return _i
-    except Exception:
-        pass
-    return ''
-print(_ob_repo())
-")"
-fi
-if [ -z "$REPO" ] || [ ! -f "$REPO/scripts/test-dev-skill.sh" ]; then
-    echo "ERROR: could not locate the obsidian-brain checkout. Looked for scripts/test-dev-skill.sh under the current git repo's toplevel, then for a directory-source marketplace entry in ~/.claude/plugins/known_marketplaces.json. /dev-test needs a local checkout to copy from; run it from the obsidian-brain repo, or register the checkout with /plugin marketplace add <path>." >&2
-    exit 1
-fi
-# Several checkouts of this repo can coexist (worktrees, second clones, the
-# registered one). Which tree was used must be observable, not inferred.
-echo "Source checkout: $REPO"
-bash "$REPO/scripts/test-dev-skill.sh" status
+python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'dev-install' < "$REQUEST_PATH"
 ```
 
 Report the output, then **branch on the command's exit status** — the fenced block's last command *is* the script, so the block's exit status is the script's.

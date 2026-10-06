@@ -132,6 +132,62 @@
 - [ ] Run all 19 skill snippets from unrelated working directories, paths with spaces, and isolated host installations. Test forced backend failures before review.
 - [ ] Run AI/skill tests and existing summarizer/theme/deferred-work tests; update architecture; preflight and commit.
 
+### Task 5 implementation evidence (2026-10-05)
+
+Task 5 remains under validation; Task 6 packaging, full host/client acceptance,
+preflight and whole-branch review have not passed for this change-set. See
+[Native AI runtime implementation](../parity/ai-runtime.md) for the current
+contracts and focused fixture commands. This is not a shipped parity claim.
+
+- The six shared AI operations dispatch only through the explicit invoking
+  host. Requests carry inline scrubbed input and source revisions; outputs pass
+  shared strict JSON/schema and semantic validation before private publication.
+- Requested aliases and observed full model IDs are separate. Claude success
+  uses exactly-one-full-ID `modelUsage` metadata; unknown identity stays unknown.
+  Explicit full `classifier_model` controls only Claude classification. Codex
+  uses its native model settings. Aliases and unknown defaults cannot authorize
+  classifier cache replay, including a prior run's observed alias resolution.
+- Cache fingerprints include the actual shared output schema, analysis
+  instruction and validation-policy revision, plus local prompt/policy and full
+  evidence/input. Focused regressions change each shared contract independently
+  and require a cache miss.
+- Check-items source SHA comes from the exact bytes parsed before AI and survives
+  member reconstruction. A manual edit during fake AI remains unchanged with a
+  conflict; independent notes can still save. Exhausted/cancelled classifier
+  chunks publish no partial output.
+- Private operation artifacts use explicit job IDs, identity/content manifests,
+  owner-only modes and symlink checks outside the vault. Summary tests preserve
+  user prose and reject stale capture. Bounded read-only session lookup verifies
+  full origin identity instead of adopting a short-hash collision.
+- CRLF parsing preserves bytes. Legacy summary publication without retained
+  capture uses full-document compare-and-swap against the pre-AI SHA; native
+  capture uses region checks that preserve outside prose and reject later
+  capture. Deep pipelines require explicit context/operation ID and register
+  cold and cached private outputs; no unbound direct-writer fallback remains.
+  Read-worker focused checks: 66 passed; loaded resolver/reindex/pipeline checks:
+  114 passed without skips.
+- `tests/test_check_items_native_ai.py` and `tests/test_check_items_cache.py`:
+  145 passed after shared-contract fingerprint tests. The mutation-boundary
+  fixture suite: 13 passed, including exact deadline-bounded native stdin-pipe
+  exceptions. All tests use mocked AI and disposable state. Broader Task 5 and
+  Task 6 gates remain required; these counts describe focused checks only.
+
+Task 5 freshness evidence: recall reads the owned summary region without
+truncating it at the outer ownership marker, then checks the actual capture
+SHA and summary revision. Stale summaries are labeled pending/historical and
+excluded from ranking and completion evidence. The focused utils, recall,
+snapshot and native-summary checks passed: 195 tests in 2.68 seconds.
+
+Direct registry checks found and fixed double-encoded unsummarized JSON, an
+incorrect status-mutation shape, and missing ACTIVE/STALE dashboard entries.
+Native deep edits now verify the protected pre-AI source-manifest revision and
+actor identity. Partial, stale or skipped updates return nonzero; the legacy
+default remains unchanged. The new direct-registry checks are still under
+validation. The latest full gate had 4963 passed and 30 xfailed, but failed
+coverage at 85.29% against the unchanged 90% requirement. Subprocess coverage
+and SHA-verified installed-source measurement are now configured; a fresh full
+gate remains required before committing.
+
 ## Task 6: Package, verify the full matrix, and review
 
 **Files:** Modify `hooks/hooks.json`, `.codex/hooks.json` and the Codex plugin manifest selected by Task 1, `.claude-plugin/plugin.json`, the single selected marketplace file, `scripts/test-dev-skill.sh`, `scripts/dev-test/`, `scripts/vault_doctor.py`, `scripts/vault_doctor_checks/wiki_pages.py`, `scripts/vault_doctor_checks/memory_index.py`, `README.md`, `CLAUDE.md`, `AGENTS.md`, architecture JSON/HTML, and `.github/workflows/ci.yml`. Change release metadata only through `scripts/bump-version.sh`. Create `docs/parity/capabilities.json`, `docs/parity/acceptance-evidence.md`, `tests/test_host_capability_inventory.py`, and `tests/test_host_behavior_conformance.py`. Add golden host fixtures under `tests/fixtures/hosts/golden/`.

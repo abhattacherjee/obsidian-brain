@@ -5,6 +5,57 @@ metadata:
   version: 1.4.0
 ---
 
+## Native runtime and installed resources
+
+Use the absolute path of this loaded `SKILL.md` as `OB_SKILL_PATH`. Read the
+reference for the invoking host when this skill has paired host references.
+Set `OB_HOST`, `OB_CLIENT`, `OB_SESSION_ID`, and `OB_CWD` from that native
+invocation. Use the selected host's own session ID. Keep curated note taxonomy
+separate from `agent_provider` and `agent_session_id` provenance.
+
+```bash
+OB_SKILL_PATH='<absolute path of this loaded SKILL.md>'
+OB_RESOURCE_ROOT=$(python3 -c 'import pathlib,sys; p=pathlib.Path(sys.argv[1]); assert p.is_absolute(); p=p.resolve(); assert p.name == "SKILL.md" and p.parent.parent.name == "skills"; print(p.parents[2])' "$OB_SKILL_PATH")
+python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" context < /dev/null
+```
+
+Use the returned `config_path`, `vault_path`, `index_path`, and `state_path`.
+Create the operation with this fixed literal request:
+
+```bash
+printf '{}' | python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'prepare'
+```
+
+Call `prepare` to create a private operation under native state. Retain its
+`operation_id` and `operation_dir`. Register approved helper output names with `artifact-store`;
+inputs are read through the immutable artifact manifest. Do not discover resources from the current directory or another plugin
+cache. Each shell invocation supplies the same explicit values; a previous
+shell's variables are not assumed to persist.
+
+Each data operation uses the installed launcher with a JSON request on stdin:
+
+```bash
+python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation '<fixed operation>' < "$REQUEST_PATH"
+```
+
+Map config JSON `vault_path`, `sessions_folder`, and `insights_folder` to the
+procedure variables `VAULT_PATH`/`VAULT`, `SESSIONS_FOLDER`/`SESS`, and
+`INSIGHTS_FOLDER`/`INS`. Use the canonical project returned in config JSON (and native `session` when available),
+not the basename of an unrelated shell working directory.
+
+Before preparing edits or requesting a summary of an existing note, call
+`note-read` and retain its exact `expected_revision`. Apply the proposed note
+with `note-apply` and that revision. A conflict leaves the current note intact;
+show the pending result and do not count the note as saved. New curated notes
+use `note-create`; they never overwrite a collision. Native memory discovery
+is unsupported for Codex until its adapter is verified; shared vault retrieval
+and wiki filing continue without borrowing another host's memory.
+
+Read `references/host-claude.md` or `references/host-codex.md` when present.
+All note writes described below use `note-create` or revision-bound `note-apply`,
+including bidirectional related links. Content is a JSON string, never shell code.
+Keep this rule when a later step uses the word Write or Edit.
+
 # Retro — Generate Honest Session Retrospective
 
 Analyze the current conversation candidly and save a structured retrospective to the Obsidian vault. The goal is honest reflection — not self-congratulation — so future sessions can improve.
@@ -19,37 +70,14 @@ Follow these steps exactly. Do not skip steps or reorder them.
 
 Run:
 
+Request for `config` (substitute the values as data):
+
+```json
+{}
+```
+
 ```bash
-cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-python3 -c '
-import sys, os
-import glob, json, os, re, sys
-def _ob_hooks():
-    try:
-        for _m in json.load(open(os.path.expanduser("~/.claude/plugins/known_marketplaces.json"))).values():
-            _s = _m.get("source") if isinstance(_m, dict) else None
-            if not (isinstance(_s, dict) and _s.get("source") == "directory"):
-                continue
-            _i = _m.get("installLocation") if isinstance(_m, dict) else None
-            if not (isinstance(_i, str) and os.path.isabs(_i)):
-                continue
-            _h = os.path.join(_i, "hooks")
-            if os.path.isfile(os.path.join(_h, "obsidian_utils.py")):
-                return _h
-    except Exception:
-        pass
-    _c = [_d for _d in glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")) if re.fullmatch("[0-9]+([.][0-9]+)*", _d.split("/")[-2])]
-    return max(_c, key=lambda _p: ([int(_n) for _n in _p.split("/")[-2].split(".")], _p), default="hooks")
-sys.path.insert(0, _ob_hooks())
-from obsidian_utils import load_config
-c = load_config()
-if not c.get("vault_path"):
-    print("ERROR: vault_path not configured", file=sys.stderr)
-    sys.exit(1)
-print("VAULT=" + c["vault_path"])
-print("SESS=" + c.get("sessions_folder", "claude-sessions"))
-print("INS=" + c.get("insights_folder", "claude-insights"))
-'
+python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'config' < "$REQUEST_PATH"
 ```
 
 Parse each output line as KEY=VALUE, splitting on the first `=`.
@@ -78,103 +106,20 @@ Stop here if FAIL.
 
 The active conversation buffer only covers the post-compact half of long sessions. Before drafting the analysis, gather every artifact the active session has already written to the vault.
 
-**Detect a compact boundary and recover the prior session id (#184).** Before running the helper below:
-1. Scan the active conversation for a continuation preamble — the phrase "This session is being continued from a previous conversation" or "conversation ... ran out of context".
-2. If present, find the transcript path it cites, of the shape `~/.claude/projects/<project-dir>/<session-id>.jsonl` — the basename minus `.jsonl` IS the prior session id.
-3. If no such boundary is present, pass **no** extra ids — invoke the helper below with zero trailing arguments.
+**Recover only proven prior session identity.** Follow the invoking host’s [Claude](references/host-claude.md) or [Codex](references/host-codex.md) reference. Pass any explicitly proven prior full native IDs as JSON `also_session_ids`. A compact boundary without full identity supplies no extra IDs; never infer identity from text similarity or a filename suffix.
 
-When a prior id is recovered, pass it as a **shell-quoted positional argument** after the `python3 -c` script below, one argument per id — never interpolated into the Python source itself (repo security rule). The script reads them from `sys.argv[1:]`, so it works whether zero or several are recovered.
+Request for `evidence` (substitute the values as data):
+
+```json
+{
+  "also_session_ids": [
+    "<verified prior native ID>"
+  ]
+}
+```
 
 ```bash
-cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-mkdir -p "$HOME/.claude/obsidian-brain" && chmod 700 "$HOME/.claude/obsidian-brain"
-_OB_BUNDLE="$HOME/.claude/obsidian-brain/retro-bundle-$$.json"
-_OB_ERR="$HOME/.claude/obsidian-brain/retro-bundle-$$.err"
-python3 -c '
-import sys, os, json, glob
-import glob, json, os, re, sys
-def _ob_hooks():
-    try:
-        for _m in json.load(open(os.path.expanduser("~/.claude/plugins/known_marketplaces.json"))).values():
-            _s = _m.get("source") if isinstance(_m, dict) else None
-            if not (isinstance(_s, dict) and _s.get("source") == "directory"):
-                continue
-            _i = _m.get("installLocation") if isinstance(_m, dict) else None
-            if not (isinstance(_i, str) and os.path.isabs(_i)):
-                continue
-            _h = os.path.join(_i, "hooks")
-            if os.path.isfile(os.path.join(_h, "obsidian_utils.py")):
-                return _h
-    except Exception:
-        pass
-    _c = [_d for _d in glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")) if re.fullmatch("[0-9]+([.][0-9]+)*", _d.split("/")[-2])]
-    return max(_c, key=lambda _p: ([int(_n) for _n in _p.split("/")[-2].split(".")], _p), default="hooks")
-sys.path.insert(0, _ob_hooks())
-_ID_RE = re.compile(r"^[0-9a-fA-F][0-9a-fA-F-]{7,63}$")
-_raw_ids = sys.argv[1:]
-_also_ids = [a for a in _raw_ids if _ID_RE.match(a)]
-_rejected = len(_raw_ids) - len(_also_ids)
-if _rejected:
-    # Loud, never silent: a rejected token (e.g. a leftover placeholder that
-    # was not stripped) used to just vanish from _also_ids and degrade to
-    # the empty post-compact bundle #184 exists to eliminate, with no
-    # signal. Exit non-zero so this routes through the existing crash path
-    # below into discovery_errors and the "evidence discovery partially or
-    # fully failed" banner. Never the token itself in the message — this
-    # is fed straight into the model context via the transcript.
-    print(f"rejected {_rejected} invalid also-session-id argument(s)", file=sys.stderr)
-    sys.exit(1)
-from obsidian_utils import load_config, get_session_context, gather_session_evidence
-try:
-    from obsidian_utils import resolve_source_session_note
-except ImportError:
-    # Stale hooks predating #330: fall back to the pre-#330 unguarded
-    # backlink rather than omitting it. Returning an empty string here would
-    # silently strip source_session_note from every retro on a partial
-    # upgrade -- the same regression the #330 review caught in the main path.
-    # NOTE: no apostrophes in this block; it lives inside a single-quoted
-    # python3 -c argument and one would terminate the shell string.
-    def resolve_source_session_note(_n="", *_a): return _n
-    print("WARN: stale obsidian-brain hooks; using the unguarded source_session_note", file=sys.stderr)
-c = load_config()
-ctx = get_session_context(c["vault_path"], c.get("sessions_folder", "claude-sessions"))
-bundle = gather_session_evidence(
-    c["vault_path"],
-    c.get("sessions_folder", "claude-sessions"),
-    c.get("insights_folder", "claude-insights"),
-    ctx["session_id"], ctx["project"],
-    also_session_ids=_also_ids,
-)
-ctx["resolved_source_session_note"] = resolve_source_session_note(
-    ctx["session_note_name"], ctx["session_id"],
-    c["vault_path"], c.get("sessions_folder", "claude-sessions"),
-)
-bundle["_ctx"] = ctx
-print(json.dumps(bundle))
-' >"$_OB_BUNDLE" 2>"$_OB_ERR"
-_OB_RC=$?
-if [ $_OB_RC -ne 0 ]; then
-  _OB_ERRMSG="$([ -f "$_OB_ERR" ] && head -c 500 "$_OB_ERR" || echo "")"
-  _OB_RC="$_OB_RC" _OB_ERRMSG="$_OB_ERRMSG" python3 -c "
-import os, json
-rc = os.environ.get('_OB_RC', '?')
-errmsg = os.environ.get('_OB_ERRMSG', '')
-print(json.dumps({
-  'session_id': 'unknown',
-  'session_ids': [],
-  'snapshots': [],
-  'insights': [],
-  'decisions': [],
-  'error_fixes': [],
-  'retros': [],
-  'discovery_errors': [f'evidence helper crashed (exit={rc}): {errmsg[:500]}'],
-  '_ctx': {'session_id': 'unknown', 'hash': 'unknown', 'project': 'unknown', 'session_note_name': 'unknown', 'resolved_source_session_note': ''},
-}))
-"
-else
-  cat "$_OB_BUNDLE"
-fi
-rm -f "$_OB_BUNDLE" "$_OB_ERR"
+python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'evidence' < "$REQUEST_PATH"
 ```
 
 The canonical block above ships with zero trailing arguments, so the common no-compact-boundary case is correct by copying it verbatim — do not append a literal placeholder string. When a compact boundary IS detected and a prior id recovered, append it as a shell-quoted positional argument after the closing `'`, one argument per recovered id (per the "Detect a compact boundary" step above); the script rejects any argument that is not a bare hex-and-dash id, so a stray or malformed token fails loudly (see the "Helper crash / partial failure" handling below) rather than being silently dropped.
@@ -301,7 +246,7 @@ Draft the note body using this exact structure:
 
 ### Steps 5 to 8 run inline
 
-Steps 5 to 8 (session ID, preview, write, classification, confirm) save the note. Run them yourself, inline in the main session. They **must not** be delegated to a subagent or the Agent tool. A subagent's write is invisible to this transcript: when one did the save, the session ended with no proof the note existed (#384). Analysis in Steps 1 to 4 may use helpers; the save may not.
+Steps 5 to 8 (session ID, preview, write, classification, confirm) save the note. Run them yourself, inline in the main session. They **must not** be delegated to a subagent or the native analysis helper. A subagent's write is invisible to this transcript: when one did the save, the session ended with no proof the note existed (#384). Analysis in Steps 1 to 4 may use helpers; the save may not.
 
 ### Step 5 — Derive session ID and backlinks
 
@@ -352,8 +297,14 @@ tags:
 Where:
 - `YYYY-MM-DD` is today's date
 - `<ISO-8601-UTC>` is the current UTC timestamp at second precision. Get it via:
+  Request for `clock` (substitute the values as data):
+
+  ```json
+  {}
+  ```
+
   ```bash
-  python3 -c 'from datetime import datetime, timezone; print(datetime.now(timezone.utc).isoformat(timespec="seconds"))'
+  python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'clock' < "$REQUEST_PATH"
   ```
   Example: `2026-04-24T18:42:11+00:00`
 - `<current-session-id>` and `<session-note-filename>` are derived from Step 5
@@ -394,32 +345,28 @@ Final filename: `YYYY-MM-DD-retro-<hash>.md`
 
 Example: `2026-04-05-retro-a3f2.md`
 
-Run the note-writer CLI, piping the full note (frontmatter + body) in on stdin. It creates `$INSIGHTS_FOLDER` if needed and writes the file atomically at mode `0o600` — no `mkdir`/`chmod` needed. **Two rules for the heredoc terminator, both load-bearing.** (1) It must stay **quoted** (`<<'OB_NOTE_EOF_<eof4>'`) — do not drop the quotes in a future edit. (2) It must be **unique per invocation**: substitute the same 4 random hex characters for `<eof4>` in BOTH the `<<'OB_NOTE_EOF_<eof4>'` opener and the terminator line, then confirm that **no line of the content you are about to emit is exactly that terminator** — if one is, pick different hex characters and re-check. **Never** replace this with a fixed delimiter. Quoting stops `$`/backtick expansion but does NOT stop early termination: a line equal to the terminator at column 0 ends the heredoc there, silently truncating the content AND handing everything after it to the shell as commands to execute. Notes written by this plugin routinely quote these very blocks, so a fixed terminator is a live hazard, not a theoretical one. **Self-check before you emit the block: if the terminator still contains `<` or `>`, you have not substituted it.** Stop and substitute it — the literal `<eof4>` form appears at column 0 inside these SKILL.md blocks themselves, so a note quoting one of them collides all over again, and nothing on the shell side can catch that. The `HOOKS=` line below checks the marketplace-registered directory-source install location FIRST (#278 — on a local checkout that is what loads, not the released cache), and only falls back to the plugin cache, where it sorts versions **numerically** (a plain `max()` is lexicographic and picks `3.9.0` over `3.10.0`, resolving to a cache with no `note_writer.py`); the `test -f` line turns a stale/incomplete cache into the documented `ERROR:` shape instead of a raw Python `can't open file` message. An unquoted delimiter lets the shell expand `$` variables and backtick commands embedded in the note body, silently corrupting it:
+Send the complete note or update as a JSON string to the fixed operation.
+The launcher writes atomically at mode `0o600`. Existing notes require their
+pre-analysis source revision. Content never becomes shell code.
+
+Request for `note-create` (substitute the values as data):
+
+```json
+{
+  "operation_id": "<prepared id>",
+  "folder": "<selected folder>",
+  "filename": "<filename.md>",
+  "content": "<complete frontmatter + body>"
+}
+```
 
 ```bash
-cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-HOOKS=$(python3 -c "
-import glob, json, os, re
-def _ob_hooks():
-    try:
-        for _m in json.load(open(os.path.expanduser('~/.claude/plugins/known_marketplaces.json'))).values():
-            _s = _m.get('source') if isinstance(_m, dict) else None
-            if not (isinstance(_s, dict) and _s.get('source') == 'directory'):
-                continue
-            _i = _m.get('installLocation') if isinstance(_m, dict) else None
-            if not (isinstance(_i, str) and os.path.isabs(_i)):
-                continue
-            _h = os.path.join(_i, 'hooks')
-            if os.path.isfile(os.path.join(_h, 'obsidian_utils.py')):
-                return _h
-    except Exception:
-        pass
-    _c = [_d for _d in glob.glob(os.path.expanduser('~/.claude/plugins/cache/*/obsidian-brain/*/hooks')) if re.fullmatch('[0-9]+([.][0-9]+)*', _d.split('/')[-2])]
-    return max(_c, key=lambda _p: ([int(_n) for _n in _p.split('/')[-2].split('.')], _p), default='hooks')
-print(_ob_hooks())
-")
-test -f "$HOOKS/note_writer.py" || { echo "ERROR: note_writer.py not found under $HOOKS - resolution checks the marketplace registered install location first, then falls back to the plugin cache; neither path produced a hooks directory containing it. Verify the obsidian-brain install resolved at $HOOKS is complete (git pull for a directory-source checkout, or run /plugin marketplace update for a cache install), then retry." >&2; exit 1; }
-python3 "$HOOKS/note_writer.py" write "$VAULT_PATH" "$INSIGHTS_FOLDER" "YYYY-MM-DD-retro-<hash>.md" <<'OB_NOTE_EOF_<eof4>'
+python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'note-create' < "$REQUEST_PATH"
+```
+
+Preserve this note content as the JSON `content` string:
+
+```markdown
 ---
 type: claude-retro
 ...
@@ -427,7 +374,6 @@ type: claude-retro
 
 # Session Retrospective: ...
 ...
-OB_NOTE_EOF_<eof4>
 ```
 
 On success this prints `OK: <absolute path>`. Keep that absolute path exactly as printed; the steps below call it `<NOTE_PATH>`. Shell variables do not survive between Bash calls, so wherever `<NOTE_PATH>` appears, paste the literal path in its place. It always sits inside single quotes, so the shell does not expand a `$` or backtick in it; if the path itself contains a `'`, write each one as `'\''`. Step 8 confirms against it, not against a path rebuilt from config. On failure it prints `ERROR: <reason>` to stderr and exits non-zero; surface that message to the user and stop here (do not proceed to arming the classification gate below on a failed write).
@@ -436,31 +382,16 @@ If the error is `note already exists`, the 4-hex filename hash collided with a n
 
 **Arm the classification gate.** Immediately after writing the note, mark classification as pending. This arms the `obsidian_retro_gate.py` **Stop** hook, which blocks the turn from ending until Step 7.5 clears the gate — so classification can no longer be silently skipped:
 
+Request for `classification-pending` (substitute the values as data):
+
+```json
+{
+  "path": "<saved retro note>"
+}
+```
+
 ```bash
-cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-python3 -c '
-import sys, os, glob
-import glob, json, os, re, sys
-def _ob_hooks():
-    try:
-        for _m in json.load(open(os.path.expanduser("~/.claude/plugins/known_marketplaces.json"))).values():
-            _s = _m.get("source") if isinstance(_m, dict) else None
-            if not (isinstance(_s, dict) and _s.get("source") == "directory"):
-                continue
-            _i = _m.get("installLocation") if isinstance(_m, dict) else None
-            if not (isinstance(_i, str) and os.path.isabs(_i)):
-                continue
-            _h = os.path.join(_i, "hooks")
-            if os.path.isfile(os.path.join(_h, "obsidian_utils.py")):
-                return _h
-    except Exception:
-        pass
-    _c = [_d for _d in glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")) if re.fullmatch("[0-9]+([.][0-9]+)*", _d.split("/")[-2])]
-    return max(_c, key=lambda _p: ([int(_n) for _n in _p.split("/")[-2].split(".")], _p), default="hooks")
-sys.path.insert(0, _ob_hooks())
-from obsidian_utils import mark_retro_classification_pending
-print(mark_retro_classification_pending(sys.argv[1], sys.argv[2]))
-' "<current-session-id>" '<NOTE_PATH>'
+python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'classification-pending' < "$REQUEST_PATH"
 ```
 
 (`<current-session-id>` is the value derived in Step 5. `<NOTE_PATH>` is the path from the `OK:` line above. The gate is keyed on the session id and fails open on an unusable id: if `session_id` is empty or `"unknown"` the gate stays inactive — never blocking the session.)
@@ -476,34 +407,17 @@ The retro is **not done** when the file is written. The literal next action afte
    - **Concrete deliverable** — a code change, doc edit, new flag, or SKILL.md section with a definable "done" state. If this project tracks work in an issue tracker, file it there (with `gh issue create`, sub-classified by target repo); otherwise record it wherever the project tracks TODOs.
    - **Behavioral discipline** — a do/don't-next-time rule ("verify before claiming X", "grep before citing Y"). Trackers don't enforce behavior; durable notes do. If a persistent memory index is available (e.g. Claude Code's `MEMORY.md`), add or extend an entry there — prefer an `## Update (date)` section on an existing entry over a duplicate; otherwise capture it as a vault insight with `/compress`.
    - **Skip / already covered** — informational learnings that aren't actionable, plus anything already tracked elsewhere (cite the artifact). Most **Key Learnings** belong here unless genuinely actionable; do not manufacture issues from informational insights.
-3. **Confirm via an in-turn tool, then file.** Surface the proposed classification (each item → bucket → target) and get the user's go-ahead **using `AskUserQuestion`** — do *not* end your turn to ask, because the Step 7 gate will block a turn-end before classification is done. In a non-interactive / auto-run context, file the clear-cut items directly and surface only judgment calls (which repo, which priority) for a one-line confirm; never skip tracking. After filing **2 or more** issues, run `/github-board:triage-issues` (when available) for labels/priority.
+3. **Confirm via an in-turn tool, then file.** Surface the proposed classification (each item → bucket → target) and get the user's go-ahead **using `native user decision tool`** — do *not* end your turn to ask, because the Step 7 gate will block a turn-end before classification is done. In a non-interactive / auto-run context, file the clear-cut items directly and surface only judgment calls (which repo, which priority) for a one-line confirm; never skip tracking. After filing **2 or more** issues, run `/github-board:triage-issues` (when available) for labels/priority.
 4. **Clear the gate.** Once every item is filed — or the user declined, or there were no actionable items — clear the gate so the turn can end:
 
+   Request for `classification-complete` (substitute the values as data):
+
+   ```json
+   {}
+   ```
+
    ```bash
-   cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-   python3 -c '
-   import sys, os, glob
-   import glob, json, os, re, sys
-   def _ob_hooks():
-       try:
-           for _m in json.load(open(os.path.expanduser("~/.claude/plugins/known_marketplaces.json"))).values():
-               _s = _m.get("source") if isinstance(_m, dict) else None
-               if not (isinstance(_s, dict) and _s.get("source") == "directory"):
-                   continue
-               _i = _m.get("installLocation") if isinstance(_m, dict) else None
-               if not (isinstance(_i, str) and os.path.isabs(_i)):
-                   continue
-               _h = os.path.join(_i, "hooks")
-               if os.path.isfile(os.path.join(_h, "obsidian_utils.py")):
-                   return _h
-       except Exception:
-           pass
-       _c = [_d for _d in glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")) if re.fullmatch("[0-9]+([.][0-9]+)*", _d.split("/")[-2])]
-       return max(_c, key=lambda _p: ([int(_n) for _n in _p.split("/")[-2].split(".")], _p), default="hooks")
-   sys.path.insert(0, _ob_hooks())
-   from obsidian_utils import clear_retro_classification_pending
-   print("cleared" if clear_retro_classification_pending(sys.argv[1]) else "no-gate")
-   ' "<current-session-id>"
+   python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'classification-complete' < "$REQUEST_PATH"
    ```
 5. Only after the gate is cleared **and** the filed actions are reflected in the user-facing summary do you proceed to Step 8.
 

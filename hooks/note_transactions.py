@@ -50,6 +50,7 @@ _METADATA_KEYS = frozenset({
     "type", "date", "project", "tags", "session_id", "source_session",
     "agent_provider", "agent_session_id", "capture_state", "capture_completeness",
     "capture_revision", "summary_revision", "parent_session", "source_revision", "trigger",
+    "status", "author_host", "operation_id",
 })
 
 

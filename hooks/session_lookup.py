@@ -1,4 +1,4 @@
-"""Read-only bounded adoption of a legacy Claude session note."""
+"""Read-only bounded lookup by full origin identity, with legacy adoption."""
 import hashlib
 import json
 import os
@@ -82,13 +82,13 @@ def _identity(path, vault, folder, deadline):
 
 
 def find_existing_session(context, deadline) -> Optional[Path]:
-    """Return one proven legacy Claude session path, without creating an index.
+    """Return one proven full-origin session path, without changing the index.
 
     Missing indexes and bounded nonmatches return None. Deadline, candidate
     overflow, and multiple full-identity matches remain pending, never guesses.
     """
     _deadline(deadline)
-    if context.host != 'claude':
+    if context.host not in {'claude', 'codex'} or not context.native_session_id:
         return None
     index = Path(context.index_path)
     if not index.is_file():
@@ -104,17 +104,34 @@ def find_existing_session(context, deadline) -> Optional[Path]:
         folder.relative_to(vault)
     except ValueError:
         raise SessionLookupPending('Selected sessions folder escapes vault')
-    suffix = '-' + hashlib.sha256(context.native_session_id.encode()).hexdigest()[:4] + '.md'
+    native_digest = hashlib.sha256((context.host + '\0' + context.native_session_id).encode()).hexdigest()
+    suffixes = ['-' + context.host + '-' + native_digest[:length] + '.md' for length in (16, 24, 32, 64)]
+    if context.host == 'claude':
+        suffixes.append('-' + hashlib.sha256(context.native_session_id.encode()).hexdigest()[:4] + '.md')
     prefix = str(folder) + os.sep
     connection = None
     try:
         connection = sqlite3.connect(index.resolve().as_uri() + '?mode=ro', uri=True, timeout=0)  # noqa: vault-db-connect — explicit read-only existing index with bounded query
         connection.set_progress_handler(lambda: int(time.monotonic() >= deadline), 100)
-        rows = connection.execute(
-            "SELECT path FROM notes WHERE type='claude-session' AND path>=? AND path<? "
-            "AND path LIKE ? ORDER BY path LIMIT ?",
-            (prefix, prefix + '\U0010ffff', '%' + suffix, MAX_CANDIDATES),
+        columns = {row[1] for row in connection.execute('PRAGMA table_info(notes)')}
+        rows = []
+        if {'agent_provider', 'agent_session_id'} <= columns:
+            rows = connection.execute(
+                "SELECT path FROM notes WHERE type='claude-session' AND path>=? AND path<? "
+                "AND agent_provider=? AND agent_session_id=? ORDER BY path LIMIT ?",
+                (prefix, prefix + '\U0010ffff', context.host, context.native_session_id, MAX_CANDIDATES),
+            ).fetchall()
+            if len(rows) >= MAX_CANDIDATES:
+                raise SessionLookupPending('Session candidate limit reached')
+        suffix_query = ' OR '.join('path LIKE ?' for _ in suffixes)
+        fallback = connection.execute(
+            "SELECT path FROM notes WHERE type='claude-session' AND path>=? AND path<? AND (" +
+            suffix_query + ") ORDER BY path LIMIT ?",
+            (prefix, prefix + '\U0010ffff', *['%' + suffix for suffix in suffixes], MAX_CANDIDATES),
         ).fetchall()
+        if len(fallback) >= MAX_CANDIDATES:
+            raise SessionLookupPending('Session candidate limit reached')
+        rows = list({row[0]: row for row in rows + fallback}.values())
     except sqlite3.Error as exc:
         raise SessionLookupPending('Existing session index lookup is pending: ' + type(exc).__name__) from exc
     finally:
@@ -131,8 +148,11 @@ def find_existing_session(context, deadline) -> Optional[Path]:
         identity = _identity(path, vault, folder, deadline)
         if identity is None:
             continue
+        provider = identity.get('agent_provider')
+        if 'agent_provider' not in identity and identity.get('session_id'):
+            provider = 'claude'
         if (identity.get('type') == 'claude-session'
-                and identity.get('agent_provider', 'claude') == context.host
+                and provider == context.host
                 and identity.get('agent_session_id', identity.get('session_id')) == context.native_session_id):
             matches.add(path.resolve())
     _deadline(deadline)

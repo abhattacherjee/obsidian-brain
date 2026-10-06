@@ -18,6 +18,7 @@ subprocess.run-mocking pattern for a repo-less project).
 
 from __future__ import annotations
 
+from tests.native_pipeline_test_adapter import private_pipeline_output, run_native_pipeline
 import json as _json
 import os
 import time as _time
@@ -154,7 +155,7 @@ def test_pipeline_attaches_note_completions_for_repo_less_project(tmp_path):
         summary="Shipped the foo exporter service end to end.",
     )
 
-    output_path = str(tmp_path / "pipeline-out.json")
+    output_path = str(private_pipeline_output(vault, "pipeline-out.json"))
 
     fake_vi = MagicMock()
     fake_vi.ensure_index.return_value = str(tmp_path / "vault.db")
@@ -165,7 +166,7 @@ def test_pipeline_attaches_note_completions_for_repo_less_project(tmp_path):
          patch.dict("sys.modules", {"vault_index": fake_vi}), \
          patch.object(oid, "_resolve_project_paths", return_value={}):
 
-        result = oid.deep_analysis_pipeline(
+        result = run_native_pipeline(
             basenames=[],
             projects_json=_json.dumps(["notes-only"]),
             output_path=output_path,
@@ -436,7 +437,7 @@ def test_repo_backed_project_never_gets_note_completions(tmp_path):
     repo_dir = tmp_path / "repo"
     repo_dir.mkdir()
 
-    output_path = str(tmp_path / "pipeline-out.json")
+    output_path = str(private_pipeline_output(vault, "pipeline-out.json"))
 
     fake_vi = MagicMock()
     fake_vi.ensure_index.return_value = str(tmp_path / "vault.db")
@@ -447,7 +448,7 @@ def test_repo_backed_project_never_gets_note_completions(tmp_path):
          patch.dict("sys.modules", {"vault_index": fake_vi}), \
          patch.object(oid, "_resolve_project_paths", return_value={"git-proj": str(repo_dir)}):
 
-        result = oid.deep_analysis_pipeline(
+        result = run_native_pipeline(
             basenames=[],
             projects_json=_json.dumps(["git-proj"]),
             output_path=output_path,
@@ -468,7 +469,13 @@ def test_repo_backed_project_never_gets_note_completions(tmp_path):
     assert data["evidence_gaps"]["projects_without_repo"] == []
 
 
-def test_bundle_note_completions_only_flags_note_evidence_only(tmp_path):
+@pytest.fixture
+def invoking_ai_context(tmp_path, monkeypatch):
+    from check_items_test_helpers import native_ai_context
+    yield from native_ai_context.__wrapped__(tmp_path, monkeypatch)
+
+
+def test_bundle_note_completions_only_flags_note_evidence_only(tmp_path, invoking_ai_context):
     """F7 bundle-level test, via check_items_cli.run_classifier(): a project
     whose evidence bundle is note_completions-ONLY (no git-derived bucket)
     is stamped note_evidence_only=True on its output record; a project
@@ -506,7 +513,8 @@ def test_bundle_note_completions_only_flags_note_evidence_only(tmp_path):
             },
         },
     }
-    output_path = str(tmp_path / "classout.json")
+    from check_items_test_helpers import private_output
+    output_path = str(private_output("classout.json"))
 
     rc = check_items_cli.run_classifier(_json.dumps(stdin_payload), output_path)
     assert rc == 0, rc

@@ -51,6 +51,8 @@ CREATE TABLE IF NOT EXISTS notes (
     date            TEXT,
     project         TEXT,
     title           TEXT,
+    agent_provider  TEXT,
+    agent_session_id TEXT,
     source_session  TEXT,
     source_note     TEXT,
     tags            TEXT,
@@ -205,7 +207,49 @@ def _init_schema(conn: sqlite3.Connection) -> None:
         stmt = stmt.strip()
         if stmt:
             cur.execute(stmt)
+    _ensure_identity_columns(conn)
     conn.commit()
+
+
+def _ensure_identity_columns(conn: sqlite3.Connection) -> None:
+    """Add derived origin fields without guessing from source references."""
+    columns = {row[1] for row in conn.execute('PRAGMA table_info(notes)')}
+    for name in ('agent_provider', 'agent_session_id'):
+        if name not in columns:
+            try:
+                conn.execute('ALTER TABLE notes ADD COLUMN ' + name + ' TEXT')
+            except sqlite3.OperationalError:
+                # Another writer may have completed this same migration.
+                current = {row[1] for row in conn.execute('PRAGMA table_info(notes)')}
+                if name not in current:
+                    raise
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_notes_origin_identity '
+                 'ON notes(agent_provider,agent_session_id,type,path)')
+
+
+def _origin_identity(lines):
+    fields = {}
+    for raw in lines:
+        if raw.startswith((' ', '\t')) or ':' not in raw:
+            continue
+        key, value = raw.rstrip('\r\n').split(':', 1)
+        if key not in {'agent_provider', 'agent_session_id', 'session_id'}:
+            continue
+        if key in fields:
+            return None, None
+        value = value.strip()
+        try:
+            value = json.loads(value)
+        except ValueError:
+            value = value.strip("'\"")
+        fields[key] = value if isinstance(value, str) and value.strip() else None
+    identity = fields.get('agent_session_id') if 'agent_session_id' in fields else fields.get('session_id')
+    provider = fields.get('agent_provider')
+    if 'agent_provider' not in fields and fields.get('session_id'):
+        provider = 'claude'
+    if provider not in {'claude', 'codex'}:
+        provider = None
+    return provider, identity
 
 
 def _needs_body_migration(conn: sqlite3.Connection) -> bool:
@@ -327,6 +371,13 @@ def _parse_note_detailed(file_path: str) -> tuple[dict | None, str | None]:
                 continue
             meta[key] = val
 
+    origin_provider, origin_session = _origin_identity(fm_lines)
+    for key, value in (("agent_provider", origin_provider), ("agent_session_id", origin_session)):
+        if value is None:
+            meta.pop(key, None)
+        else:
+            meta[key] = value
+
     if tags:
         meta["tags"] = ",".join(tags)
 
@@ -398,6 +449,7 @@ def _upsert_note(conn: sqlite3.Connection, rel_path: str, parsed: dict, mtime: f
     update we can issue the delete before inserting the new FTS row,
     keeping the FTS index from accumulating orphan entries across rewrites.
     """
+    _ensure_identity_columns(conn)
     row = conn.execute(
         "SELECT rowid, title, body, tags, importance FROM notes WHERE path = ?",
         (rel_path,),
@@ -453,15 +505,17 @@ def _upsert_note(conn: sqlite3.Connection, rel_path: str, parsed: dict, mtime: f
         conn.execute("DELETE FROM notes WHERE path = ?", (rel_path,))
 
     conn.execute(
-        "INSERT INTO notes (path, type, date, project, title, source_session, "
+        "INSERT INTO notes (path, type, date, project, title, agent_provider, agent_session_id, source_session, "
         "source_note, tags, status, mtime, size, body, importance, tfidf_vector) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             rel_path,
             parsed.get("type", "unknown"),
             parsed.get("date"),
             parsed.get("project"),
             parsed.get("title", ""),
+            parsed.get("agent_provider"),
+            parsed.get("agent_session_id"),
             parsed.get("source_session"),
             parsed.get("source_note"),
             parsed.get("tags", ""),
@@ -1438,6 +1492,8 @@ def index_note(db_path: str, note_path: str) -> bool:
             # (_prior_tokens_for → _update_term_df → SELECT COUNT → INSERT)
             # is serialized against other writers (concurrent hooks,
             # _sync runs). Matches assign_to_theme's locking discipline.
+            _ensure_identity_columns(conn)
+            conn.commit()
             conn.execute("BEGIN IMMEDIATE")
             _upsert_note(conn, note_path, parsed, st.st_mtime, st.st_size)
             conn.commit()

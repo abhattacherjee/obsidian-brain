@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from tests.native_pipeline_test_adapter import private_pipeline_output, run_native_pipeline
 import os
 
 import pytest
@@ -1966,7 +1967,7 @@ def _run_pipeline_with_fake_git(tmp_path, fake_run, db_name="test-vault.db"):
     Returns (result_str, proj_evidence dict for 'myproject')."""
     repo_dir = tmp_path / "fake-repo"
     repo_dir.mkdir(exist_ok=True)
-    output_path = str(tmp_path / "pipeline-out.json")
+    output_path = str(private_pipeline_output(tmp_path, "pipeline-out.json"))
     vault_path = str(tmp_path)
     sessions_folder = "sessions"
     insights_folder = "insights"
@@ -1979,7 +1980,7 @@ def _run_pipeline_with_fake_git(tmp_path, fake_run, db_name="test-vault.db"):
          patch.dict("sys.modules", {"vault_index": fake_vi}), \
          patch.object(oid, "_resolve_project_paths", return_value={"myproject": str(repo_dir)}):
 
-        result = oid.deep_analysis_pipeline(
+        result = run_native_pipeline(
             basenames=[],
             projects_json=_json.dumps(["myproject"]),
             output_path=output_path,

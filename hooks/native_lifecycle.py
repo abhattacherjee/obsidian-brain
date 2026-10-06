@@ -1,5 +1,6 @@
 """Native lifecycle integration; hooks capture facts without AI or index rebuilds."""
 import json
+import os
 import sqlite3
 import sys
 import time
@@ -62,6 +63,8 @@ def _context_hint(context, deadline):
 
 def dispatch(context, event, payload, started_at):
     """Use the wrapper-entry time for every recovery, capture and lookup budget."""
+    if os.environ.get("OBSIDIAN_BRAIN_NESTED_AI") == "1":
+        return None
     if event not in EVENTS:
         raise ValueError("Unknown lifecycle event")
     payload = payload if isinstance(payload, dict) else {}

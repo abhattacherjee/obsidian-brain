@@ -13,6 +13,7 @@ Adaptations from plan's verbatim version:
 
 from __future__ import annotations
 
+from tests.native_pipeline_test_adapter import private_pipeline_output, run_native_pipeline
 import importlib
 import json
 import os
@@ -33,6 +34,56 @@ SUBAGENT_TIMEOUT_SEC = _check_items_cli_mod.SUBAGENT_TIMEOUT_SEC
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+# Native CLI tests keep real schema validation and fake only the transport.
+from ai_backend import execute_ai as _REAL_NATIVE_AI
+
+
+@pytest.fixture
+def native_cli_context(tmp_path, monkeypatch):
+    from check_items_test_helpers import native_ai_context
+    generator = native_ai_context.__wrapped__(tmp_path, monkeypatch)
+    context = next(generator)
+    context.config.pop("classifier_model", None)
+    try:
+        yield context
+    finally:
+        generator.close()
+
+
+def _mock_native_transport(monkeypatch, *, status=None, invalid_json=False, data=None):
+    import ai_backend
+    import check_items_cli as cli
+    calls = []
+    def transport(command, prompt, **kwargs):
+        calls.append((command, prompt, kwargs))
+        if status:
+            raise ai_backend._BackendFailure(status, 'synthetic_failure')
+        if invalid_json:
+            return 0, b'not-json', b''
+        payload_text = prompt.rsplit('\n\nInput JSON:\n', 1)[1].split(ai_backend.ANALYSIS_INSTRUCTION, 1)[0]
+        payload = json.loads(payload_text)
+        groups = payload['groups']
+        if data is not None:
+            value = data
+        elif cli.SEMANTIC_MERGE_PROMPT in prompt:
+            value = {'merges':[], 'total_groups_before':len(groups), 'total_groups_after':len(groups)}
+        else:
+            value = {'items':[{'group_id':g['group_id'], 'classification':'ACTIVE', 'confidence':'LOW',
+                               'canonical_text':g.get('representative', 'work'), 'evidence_citation':None,
+                               'action_required':None} for g in groups]}
+        envelope = {'structured_output':value, 'modelUsage':{'claude-haiku-4-5-20251001':{}}}
+        return 0, json.dumps(envelope).encode(), b''
+    monkeypatch.setattr(ai_backend, '_run_bounded', transport)
+    monkeypatch.setattr(ai_backend, 'execute_ai', _REAL_NATIVE_AI)
+    return calls
+
+
+def _native_groups(count=1):
+    return [{'group_id':f'g{i}', 'project':'p', 'representative':f'work {i}', 'instances':[]}
+            for i in range(count)]
+
+
 
 def _fake_completed(stdout="", returncode=0):
     cp = MagicMock()
@@ -65,7 +116,7 @@ def test_deep_analysis_pipeline_includes_merged_prs_and_closed_issues(tmp_path):
     """
     repo_dir = tmp_path / "fake-repo"
     repo_dir.mkdir()
-    output_path = str(tmp_path / "pipeline-out.json")
+    output_path = str(private_pipeline_output(tmp_path, "pipeline-out.json"))
 
     # Minimal vault structure (no actual notes needed — projects list drives evidence loop)
     vault_path = str(tmp_path)
@@ -109,7 +160,7 @@ def test_deep_analysis_pipeline_includes_merged_prs_and_closed_issues(tmp_path):
          patch.dict("sys.modules", {"vault_index": fake_vi}), \
          patch.object(oid, "_resolve_project_paths", return_value={"myproject": str(repo_dir)}):
 
-        result = oid.deep_analysis_pipeline(
+        result = run_native_pipeline(
             basenames=[],
             projects_json=json.dumps(["myproject"]),
             output_path=output_path,
@@ -152,7 +203,7 @@ def test_deep_analysis_pipeline_subprocess_timeout_bounded(tmp_path):
     """All evidence subprocess calls must share the 10s timeout pattern."""
     repo_dir = tmp_path / "fake-repo"
     repo_dir.mkdir()
-    output_path = str(tmp_path / "pipeline-out.json")
+    output_path = str(private_pipeline_output(tmp_path, "pipeline-out.json"))
 
     vault_path = str(tmp_path)
     sessions_folder = "sessions"
@@ -183,7 +234,7 @@ def test_deep_analysis_pipeline_subprocess_timeout_bounded(tmp_path):
          patch.dict("sys.modules", {"vault_index": fake_vi}), \
          patch.object(oid, "_resolve_project_paths", return_value={"myproject": str(repo_dir)}):
 
-        result = oid.deep_analysis_pipeline(
+        result = run_native_pipeline(
             basenames=[],
             projects_json=json.dumps(["myproject"]),
             output_path=output_path,
@@ -208,7 +259,7 @@ def test_deep_analysis_pipeline_evidence_error_swallow(tmp_path):
 
     repo_dir = tmp_path / "fake-repo"
     repo_dir.mkdir()
-    output_path = str(tmp_path / "pipeline-out.json")
+    output_path = str(private_pipeline_output(tmp_path, "pipeline-out.json"))
 
     vault_path = str(tmp_path)
     sessions_folder = "sessions"
@@ -235,7 +286,7 @@ def test_deep_analysis_pipeline_evidence_error_swallow(tmp_path):
          patch.dict("sys.modules", {"vault_index": fake_vi}), \
          patch.object(oid, "_resolve_project_paths", return_value={"myproject": str(repo_dir)}):
 
-        result = oid.deep_analysis_pipeline(
+        result = run_native_pipeline(
             basenames=[],
             projects_json=json.dumps(["myproject"]),
             output_path=output_path,
@@ -386,60 +437,32 @@ def test_cross_project_dedup_single_project_passthrough():
 # Task 11: run_semantic_merge() CLI wrapper
 # ---------------------------------------------------------------------------
 
-def test_run_semantic_merge_picks_haiku_for_small_groups(tmp_path, monkeypatch):
-    """<=60 groups -> claude -p --model haiku."""
+def test_run_semantic_merge_picks_haiku_for_small_groups(native_cli_context, monkeypatch):
     import check_items_cli as cli
-
-    captured = {}
-
-    def fake_run(cmd, *args, **kwargs):
-        captured["cmd"] = cmd
-        captured["stdin"] = kwargs.get("input", "")
-        out_path = tmp_path / "out.json"
-        out_path.write_text(json.dumps({
-            "merges": [],
-            "total_groups_before": 5,
-            "total_groups_after": 5,
-        }))
-        return _fake_completed(stdout=out_path.read_text(), returncode=0)
-
-    monkeypatch.setattr(cli.subprocess, "run", fake_run)
-
-    stdin_json = json.dumps({"groups": [{"group_id": f"g{i}", "project": "p",
-                                          "representative": f"item {i}", "member_texts": []}
-                                         for i in range(5)]})
-    out_path = tmp_path / "merge.json"
-    rc = cli.run_semantic_merge(stdin_json=stdin_json, output_path=str(out_path))
+    from check_items_test_helpers import private_output
+    monkeypatch.setenv('CHECK_ITEMS_PREFILTER', 'off')
+    calls = _mock_native_transport(monkeypatch)
+    output = private_output()
+    payload = {'groups':_native_groups(5), 'evidence':{}}
+    rc = cli.run_semantic_merge(json.dumps(payload), str(output))
     assert rc == 0
-    assert out_path.exists()
-    assert "haiku" in " ".join(captured["cmd"])
+    assert calls and all(command[command.index('--model') + 1] == 'haiku' for command, _, _ in calls)
+    assert json.loads(output.read_text()) is not None
 
 
-def test_run_semantic_merge_picks_sonnet_above_60(tmp_path, monkeypatch):
-    """>60 groups escalates to sonnet."""
+
+def test_run_semantic_merge_picks_sonnet_above_60(native_cli_context, monkeypatch):
     import check_items_cli as cli
-
-    captured = {}
-
-    def fake_run(cmd, *args, **kwargs):
-        captured["cmd"] = cmd
-        out_path = tmp_path / "out.json"
-        out_path.write_text(json.dumps({
-            "merges": [],
-            "total_groups_before": 75,
-            "total_groups_after": 75,
-        }))
-        return _fake_completed(stdout=out_path.read_text(), returncode=0)
-
-    monkeypatch.setattr(cli.subprocess, "run", fake_run)
-
-    big_groups = [{"group_id": f"g{i}", "project": "p", "representative": f"x{i}",
-                   "member_texts": []} for i in range(75)]
-    stdin_json = json.dumps({"groups": big_groups})
-    out_path = tmp_path / "merge2.json"
-    rc = cli.run_semantic_merge(stdin_json=stdin_json, output_path=str(out_path))
+    from check_items_test_helpers import private_output
+    monkeypatch.setenv('CHECK_ITEMS_PREFILTER', 'off')
+    calls = _mock_native_transport(monkeypatch)
+    output = private_output()
+    payload = {'groups':_native_groups(75), 'evidence':{}}
+    rc = cli.run_semantic_merge(json.dumps(payload), str(output))
     assert rc == 0
-    assert "sonnet" in " ".join(captured["cmd"])
+    assert calls and all(command[command.index('--model') + 1] == 'sonnet' for command, _, _ in calls)
+    assert json.loads(output.read_text()) is not None
+
 
 
 def test_run_semantic_merge_caps_stdin_at_1mb():
@@ -686,87 +709,35 @@ def test_semantic_merge_prompt_contains_negative_examples():
 # ---------------------------------------------------------------------------
 
 
-def _make_model_pick_fake_run(captured: dict):
-    """Chunk-aware subprocess.run stub for model-selection assertions.
-
-    Parses the embedded output path out of the prompt and writes a one-record
-    classifier payload there, so the stub works for both single and chunked
-    dispatch paths. Records the most recent cmd in captured["cmd"].
-    """
-    import re as _re
-    from pathlib import Path as _Path
-
-    def fake_run(cmd, *args, **kwargs):
-        captured["cmd"] = cmd
-        prompt = kwargs.get("input", "")
-        in_match = _re.search(r"(/\S+\.classin\.json)", prompt)
-        out_match = _re.search(r"JSON to (/\S+?)\.?(?:\s|$)", prompt)
-        assert in_match and out_match, f"paths missing from prompt: {prompt[:200]!r}"
-        chunk_in = json.loads(_Path(in_match.group(1)).read_text())
-        chunk_out = [
-            {
-                "group_id": g["group_id"],
-                "classification": "ACTIVE",
-                "confidence": "LOW",
-                "canonical_text": g["representative"],
-                "evidence_citation": None,
-                "action_required": None,
-            }
-            for g in chunk_in["groups"]
-        ]
-        _Path(out_match.group(1)).write_text(json.dumps(chunk_out))
-        return _fake_completed(stdout=json.dumps(chunk_out), returncode=0)
-
-    return fake_run
 
 
-def test_run_classifier_picks_haiku_at_30_or_fewer(tmp_path, monkeypatch):
-    """<=30 merged groups -> claude -p --model haiku per spec line 106."""
+def test_run_classifier_picks_haiku_at_30_or_fewer(native_cli_context, monkeypatch):
     import check_items_cli as cli
-
-    # Disable L2 prefilter: this test exercises sub-agent model selection, not L2.
-    monkeypatch.setenv("CHECK_ITEMS_PREFILTER", "off")
-
-    captured: dict = {}
-    monkeypatch.setattr(cli.subprocess, "run", _make_model_pick_fake_run(captured))
-    payload = {
-        "groups": [{"group_id": f"g{i}", "project": "p", "representative": f"x{i}",
-                    "instances": []} for i in range(30)],
-        "evidence": {"p": {}},
-    }
-    out_path = tmp_path / "classify.json"
-    rc = cli.run_classifier(stdin_json=json.dumps(payload), output_path=str(out_path))
+    from check_items_test_helpers import private_output
+    monkeypatch.setenv('CHECK_ITEMS_PREFILTER', 'off')
+    calls = _mock_native_transport(monkeypatch)
+    output = private_output()
+    payload = {'groups':_native_groups(30), 'evidence':{}}
+    rc = cli.run_classifier(json.dumps(payload), str(output))
     assert rc == 0
-    assert "haiku" in " ".join(captured["cmd"])
+    assert calls and all(command[command.index('--model') + 1] == 'haiku' for command, _, _ in calls)
+    assert json.loads(output.read_text()) is not None
 
 
-def test_run_classifier_picks_sonnet_above_30(tmp_path, monkeypatch):
-    """>30 merged groups in a single dispatch escalates to sonnet.
 
-    Chunking is disabled (CLASSIFIER_CHUNK_SIZE > group_count) so model
-    selection runs on the full payload, exercising the documented
-    haiku/sonnet 30-group threshold per spec line 106.
-    """
+def test_run_classifier_picks_sonnet_above_30(native_cli_context, monkeypatch):
     import check_items_cli as cli
-
-    # Disable L2 prefilter: this test exercises sub-agent model selection, not L2.
-    monkeypatch.setenv("CHECK_ITEMS_PREFILTER", "off")
-    # Disable chunking: 45 groups in one dispatch lets the 30-group sonnet
-    # threshold fire. Under chunked dispatch the model is picked per chunk,
-    # so chunks <=30 always pick haiku — a separate code path.
-    monkeypatch.setattr(cli, "CLASSIFIER_CHUNK_SIZE", 100)
-
-    captured: dict = {}
-    monkeypatch.setattr(cli.subprocess, "run", _make_model_pick_fake_run(captured))
-    payload = {
-        "groups": [{"group_id": f"g{i}", "project": "p", "representative": f"x{i}",
-                    "instances": []} for i in range(45)],
-        "evidence": {"p": {}},
-    }
-    out_path = tmp_path / "classify2.json"
-    rc = cli.run_classifier(stdin_json=json.dumps(payload), output_path=str(out_path))
+    from check_items_test_helpers import private_output
+    monkeypatch.setenv('CHECK_ITEMS_PREFILTER', 'off')
+    monkeypatch.setattr(cli, 'CLASSIFIER_CHUNK_SIZE', 100)
+    calls = _mock_native_transport(monkeypatch)
+    output = private_output()
+    payload = {'groups':_native_groups(45), 'evidence':{}}
+    rc = cli.run_classifier(json.dumps(payload), str(output))
     assert rc == 0
-    assert "sonnet" in " ".join(captured["cmd"])
+    assert calls and all(command[command.index('--model') + 1] == 'sonnet' for command, _, _ in calls)
+    assert json.loads(output.read_text()) is not None
+
 
 
 def test_classifier_prompt_includes_self_referential_rule():
@@ -797,45 +768,46 @@ def test_run_semantic_merge_invalid_json_returns_2():
     assert rc == 2
 
 
-def test_run_semantic_merge_timeout_returns_3(tmp_path, monkeypatch):
-    """run_semantic_merge returns 3 on subprocess timeout."""
+def test_run_semantic_merge_timeout_returns_3(native_cli_context, monkeypatch):
+    """Native failure status is nonzero and leaves prior output unchanged."""
     import check_items_cli as cli
-
-    def fake_run(cmd, *args, **kwargs):
-        raise subprocess.TimeoutExpired(cmd, SUBAGENT_TIMEOUT_SEC)
-
-    monkeypatch.setattr(cli.subprocess, "run", fake_run)
-    payload = {"groups": [{"group_id": "g1", "project": "p",
-                           "representative": "x", "instances": []}]}
-    out_path = tmp_path / "out.json"
-    rc = cli.run_semantic_merge(stdin_json=json.dumps(payload), output_path=str(out_path))
+    from check_items_test_helpers import private_output
+    monkeypatch.setenv('CHECK_ITEMS_PREFILTER', 'off')
+    calls = _mock_native_transport(monkeypatch, status='timeout', invalid_json=False)
+    output = private_output(); output.write_text('previous')
+    rc = cli.run_semantic_merge(
+        json.dumps({'groups':_native_groups(), 'evidence':{}}), str(output))
     assert rc == 3
+    assert calls and output.read_text() == 'previous'
 
 
-def test_run_semantic_merge_nonzero_rc_propagated(tmp_path, monkeypatch):
-    """run_semantic_merge propagates non-zero subprocess return code."""
+
+def test_run_semantic_merge_nonzero_rc_propagated(native_cli_context, monkeypatch):
+    """Native failure status is nonzero and leaves prior output unchanged."""
     import check_items_cli as cli
+    from check_items_test_helpers import private_output
+    monkeypatch.setenv('CHECK_ITEMS_PREFILTER', 'off')
+    calls = _mock_native_transport(monkeypatch, status='unavailable', invalid_json=False)
+    output = private_output(); output.write_text('previous')
+    rc = cli.run_semantic_merge(
+        json.dumps({'groups':_native_groups(), 'evidence':{}}), str(output))
+    assert rc == 8
+    assert calls and output.read_text() == 'previous'
 
-    monkeypatch.setattr(cli.subprocess, "run",
-                        lambda *a, **kw: _fake_completed(returncode=5))
-    payload = {"groups": [{"group_id": "g1", "project": "p",
-                           "representative": "x", "instances": []}]}
-    out_path = tmp_path / "out.json"
-    rc = cli.run_semantic_merge(stdin_json=json.dumps(payload), output_path=str(out_path))
-    assert rc == 5
 
 
-def test_run_semantic_merge_invalid_stdout_json_returns_4(tmp_path, monkeypatch):
-    """run_semantic_merge returns 4 when stdout is not valid JSON and output file absent."""
+def test_run_semantic_merge_invalid_stdout_json_returns_4(native_cli_context, monkeypatch):
+    """Native failure status is nonzero and leaves prior output unchanged."""
     import check_items_cli as cli
-
-    monkeypatch.setattr(cli.subprocess, "run",
-                        lambda *a, **kw: _fake_completed(stdout="not-json", returncode=0))
-    payload = {"groups": [{"group_id": "g1", "project": "p",
-                           "representative": "x", "instances": []}]}
-    out_path = tmp_path / "no_such.json"  # must not exist
-    rc = cli.run_semantic_merge(stdin_json=json.dumps(payload), output_path=str(out_path))
+    from check_items_test_helpers import private_output
+    monkeypatch.setenv('CHECK_ITEMS_PREFILTER', 'off')
+    calls = _mock_native_transport(monkeypatch, status=None, invalid_json=True)
+    output = private_output(); output.write_text('previous')
+    rc = cli.run_semantic_merge(
+        json.dumps({'groups':_native_groups(), 'evidence':{}}), str(output))
     assert rc == 4
+    assert calls and output.read_text() == 'previous'
+
 
 
 def test_run_classifier_invalid_json_returns_2():
@@ -845,57 +817,46 @@ def test_run_classifier_invalid_json_returns_2():
     assert rc == 2
 
 
-def test_run_classifier_timeout_returns_3(tmp_path, monkeypatch):
-    """run_classifier returns 3 on subprocess timeout."""
+def test_run_classifier_timeout_returns_3(native_cli_context, monkeypatch):
+    """Native failure status is nonzero and leaves prior output unchanged."""
     import check_items_cli as cli
-
-    # Disable L2 prefilter so group reaches sub-agent and can trigger timeout.
-    monkeypatch.setenv("CHECK_ITEMS_PREFILTER", "off")
-
-    def fake_run(cmd, *args, **kwargs):
-        raise subprocess.TimeoutExpired(cmd, SUBAGENT_TIMEOUT_SEC)
-
-    monkeypatch.setattr(cli.subprocess, "run", fake_run)
-    payload = {"groups": [{"group_id": "g1", "project": "p",
-                           "representative": "x", "instances": []}],
-               "evidence": {"p": {}}}
-    out_path = tmp_path / "out.json"
-    rc = cli.run_classifier(stdin_json=json.dumps(payload), output_path=str(out_path))
+    from check_items_test_helpers import private_output
+    monkeypatch.setenv('CHECK_ITEMS_PREFILTER', 'off')
+    calls = _mock_native_transport(monkeypatch, status='timeout', invalid_json=False)
+    output = private_output(); output.write_text('previous')
+    rc = cli.run_classifier(
+        json.dumps({'groups':_native_groups(), 'evidence':{}}), str(output))
     assert rc == 3
+    assert calls and output.read_text() == 'previous'
 
 
-def test_run_classifier_nonzero_rc_propagated(tmp_path, monkeypatch):
-    """run_classifier propagates non-zero subprocess return code."""
+
+def test_run_classifier_nonzero_rc_propagated(native_cli_context, monkeypatch):
+    """Native failure status is nonzero and leaves prior output unchanged."""
     import check_items_cli as cli
-
-    # Disable L2 prefilter so group reaches sub-agent and can return non-zero rc.
-    monkeypatch.setenv("CHECK_ITEMS_PREFILTER", "off")
-
-    monkeypatch.setattr(cli.subprocess, "run",
-                        lambda *a, **kw: _fake_completed(returncode=7))
-    payload = {"groups": [{"group_id": "g1", "project": "p",
-                           "representative": "x", "instances": []}],
-               "evidence": {"p": {}}}
-    out_path = tmp_path / "out.json"
-    rc = cli.run_classifier(stdin_json=json.dumps(payload), output_path=str(out_path))
+    from check_items_test_helpers import private_output
+    monkeypatch.setenv('CHECK_ITEMS_PREFILTER', 'off')
+    calls = _mock_native_transport(monkeypatch, status='cancelled', invalid_json=False)
+    output = private_output(); output.write_text('previous')
+    rc = cli.run_classifier(
+        json.dumps({'groups':_native_groups(), 'evidence':{}}), str(output))
     assert rc == 7
+    assert calls and output.read_text() == 'previous'
 
 
-def test_run_classifier_invalid_stdout_json_returns_4(tmp_path, monkeypatch):
-    """run_classifier returns 4 when stdout is not valid JSON and output file absent."""
+
+def test_run_classifier_invalid_stdout_json_returns_4(native_cli_context, monkeypatch):
+    """Native failure status is nonzero and leaves prior output unchanged."""
     import check_items_cli as cli
-
-    # Disable L2 prefilter so group reaches sub-agent and can trigger the json-error path.
-    monkeypatch.setenv("CHECK_ITEMS_PREFILTER", "off")
-
-    monkeypatch.setattr(cli.subprocess, "run",
-                        lambda *a, **kw: _fake_completed(stdout="not-json", returncode=0))
-    payload = {"groups": [{"group_id": "g1", "project": "p",
-                           "representative": "x", "instances": []}],
-               "evidence": {"p": {}}}
-    out_path = tmp_path / "no_such_classifier.json"
-    rc = cli.run_classifier(stdin_json=json.dumps(payload), output_path=str(out_path))
+    from check_items_test_helpers import private_output
+    monkeypatch.setenv('CHECK_ITEMS_PREFILTER', 'off')
+    calls = _mock_native_transport(monkeypatch, status=None, invalid_json=True)
+    output = private_output(); output.write_text('previous')
+    rc = cli.run_classifier(
+        json.dumps({'groups':_native_groups(), 'evidence':{}}), str(output))
     assert rc == 4
+    assert calls and output.read_text() == 'previous'
+
 
 
 # ---------------------------------------------------------------------------
@@ -2195,92 +2156,40 @@ def test_dashboard_yaml_rejects_date_injection(tmp_path):
 # R6 regression: prompt piped via stdin, not argv  (Finding A + B)
 # ---------------------------------------------------------------------------
 
-def test_run_semantic_merge_pipes_prompt_via_stdin(tmp_path, monkeypatch):
-    """Prompt must NOT appear in argv (avoids ARG_MAX + ps leakage).
-
-    After the R6 fix, cmd is ["claude", "-p", "--model", model] and the full
-    prompt is passed via the `input=` kwarg to subprocess.run.
-    """
+def test_run_semantic_merge_pipes_prompt_via_stdin(native_cli_context, monkeypatch):
+    """Inline prompt reaches native stdin, never argv or a model input path."""
     import check_items_cli as cli
-
-    captured = {}
-
-    def fake_run(cmd, *args, **kwargs):
-        captured["cmd"] = list(cmd)
-        captured["input"] = kwargs.get("input", "")
-        out_path = tmp_path / "out.json"
-        out_path.write_text(json.dumps({
-            "merges": [],
-            "total_groups_before": 0,
-            "total_groups_after": 0,
-        }))
-        return _fake_completed(stdout=out_path.read_text(), returncode=0)
-
-    monkeypatch.setattr(cli.subprocess, "run", fake_run)
-
-    out_path = tmp_path / "merge.json"
+    from check_items_test_helpers import private_output
+    monkeypatch.setenv('CHECK_ITEMS_PREFILTER', 'off')
+    calls = _mock_native_transport(monkeypatch)
+    output = private_output()
     rc = cli.run_semantic_merge(
-        stdin_json=json.dumps({"groups": []}),
-        output_path=str(out_path),
-    )
-    assert rc == 0
-    # argv must only contain the known-safe tokens; no prompt text
-    allowed = {"claude", "-p", "--model", "haiku", "sonnet"}
-    unexpected = [arg for arg in captured["cmd"] if arg not in allowed]
-    assert not unexpected, (
-        f"argv contains unexpected items (likely prompt leaked into argv): {unexpected}"
-    )
-    # Prompt should be delivered via stdin (the input= kwarg)
-    assert "SHOULD MERGE" in captured["input"], (
-        "SEMANTIC_MERGE_PROMPT must be piped via stdin, not argv"
-    )
+        json.dumps({'groups':_native_groups(), 'evidence':{}}), str(output))
+    assert rc == 0 and len(calls) == 1
+    command, prompt, options = calls[0]
+    assert 'SHOULD MERGE' in prompt
+    assert all('SHOULD MERGE' not in argument for argument in command)
+    assert str(output) not in prompt and '<input-json-path>' not in prompt
+    assert options['env']['OBSIDIAN_BRAIN_NESTED_AI'] == '1'
 
 
-def test_run_classifier_pipes_prompt_via_stdin(tmp_path, monkeypatch):
-    """Same stdin-pipe contract for run_classifier (R6 Finding B).
 
-    cmd must be ["claude", "-p", "--model", model]; classifier prompt piped via input=.
-    """
+def test_run_classifier_pipes_prompt_via_stdin(native_cli_context, monkeypatch):
+    """Inline prompt reaches native stdin, never argv or a model input path."""
     import check_items_cli as cli
-
-    # Disable L2 prefilter: this test exercises prompt delivery via stdin, not L2.
-    # Also requires at least one group with content so sub-agent dispatch happens.
-    monkeypatch.setenv("CHECK_ITEMS_PREFILTER", "off")
-
-    captured = {}
-
-    def fake_run(cmd, *args, **kwargs):
-        captured["cmd"] = list(cmd)
-        captured["input"] = kwargs.get("input", "")
-        out_path = tmp_path / "out.json"
-        out_path.write_text(json.dumps([
-            {"group_id": "g1", "classification": "ACTIVE", "confidence": "LOW",
-             "canonical_text": "Investigate dispatcher", "evidence_citation": None,
-             "action_required": None}
-        ]))
-        return _fake_completed(stdout=out_path.read_text(), returncode=0)
-
-    monkeypatch.setattr(cli.subprocess, "run", fake_run)
-
-    payload = {"groups": [{"group_id": "g1", "project": "p",
-                           "representative": "Investigate dispatcher",
-                           "instances": []}],
-               "evidence": {}}
-    out_path = tmp_path / "classify.json"
+    from check_items_test_helpers import private_output
+    monkeypatch.setenv('CHECK_ITEMS_PREFILTER', 'off')
+    calls = _mock_native_transport(monkeypatch)
+    output = private_output()
     rc = cli.run_classifier(
-        stdin_json=json.dumps(payload),
-        output_path=str(out_path),
-    )
-    assert rc == 0
-    allowed = {"claude", "-p", "--model", "haiku", "sonnet"}
-    unexpected = [arg for arg in captured["cmd"] if arg not in allowed]
-    assert not unexpected, (
-        f"argv contains unexpected items (likely prompt leaked into argv): {unexpected}"
-    )
-    # Classifier prompt must also be delivered via stdin
-    assert "discovery" in captured["input"].lower(), (
-        "CLASSIFIER_PROMPT must be piped via stdin, not argv"
-    )
+        json.dumps({'groups':_native_groups(), 'evidence':{}}), str(output))
+    assert rc == 0 and len(calls) == 1
+    command, prompt, options = calls[0]
+    assert 'discovery' in prompt
+    assert all('discovery' not in argument for argument in command)
+    assert str(output) not in prompt and '<input-json-path>' not in prompt
+    assert options['env']['OBSIDIAN_BRAIN_NESTED_AI'] == '1'
+
 
 
 # ---------------------------------------------------------------------------
@@ -2363,82 +2272,32 @@ def test_strip_json_fences_empty_and_none_safe():
 # R13 C1 — classifier stdout-fallback shape validation
 # ---------------------------------------------------------------------------
 
-def test_classifier_stdout_fallback_rejects_invalid_shape(tmp_path, monkeypatch):
-    """run_classifier stdout-fallback must reject wrong-shape JSON (rc=4).
-
-    When the sub-agent writes a valid JSON object that doesn't match the
-    classifier list-of-dicts contract, the old code wrote it to output_path
-    and returned 0. The downstream orchestrator then consumed the bad data.
-    R13 C1 fix: _validate_classifier_payload rejects it and returns rc=4.
-    """
-    import json
-    import subprocess
+def test_classifier_stdout_fallback_rejects_invalid_shape(native_cli_context, monkeypatch):
+    """Wrong native result shape cannot publish classifier output."""
     import check_items_cli as cli
-    from unittest.mock import patch, MagicMock
-
-    # Disable L2 prefilter so group reaches sub-agent and triggers the fallback path.
-    monkeypatch.setenv("CHECK_ITEMS_PREFILTER", "off")
-
-    output_path = str(tmp_path / "out.json")
-
-    valid_payload = json.dumps({
-        "groups": [{"group_id": "g1", "representative": "Do the thing", "members": []}],
-        "evidence": {},
-    })
-
-    # Sub-agent returns rc=0 but emits wrong-shape JSON (object, not list)
-    cp = MagicMock()
-    cp.returncode = 0
-    cp.stdout = '{"not_classifications": []}'
-    cp.stderr = ""
-
-    with patch.object(cli.subprocess, "run", return_value=cp):
-        rc = cli.run_classifier(valid_payload, output_path)
-
-    assert rc == 4, f"Expected rc=4 for invalid shape, got {rc}"
-    # Output file must NOT have been written
-    assert not (tmp_path / "out.json").exists(), "output_path must not be written for invalid shape"
+    from check_items_test_helpers import private_output
+    monkeypatch.setenv('CHECK_ITEMS_PREFILTER', 'off')
+    _mock_native_transport(monkeypatch, data={'not_classifications':[]})
+    output = private_output(); output.unlink()
+    rc = cli.run_classifier(json.dumps({'groups':_native_groups(), 'evidence':{}}), str(output))
+    assert rc == 4 and not output.exists()
 
 
-def test_classifier_stdout_fallback_accepts_valid_shape(tmp_path, monkeypatch):
-    """run_classifier stdout-fallback writes output for a correctly-shaped response."""
-    import json
+
+def test_classifier_stdout_fallback_accepts_valid_shape(native_cli_context, monkeypatch):
+    """Validated native JSON is published as the unwrapped classifier list."""
     import check_items_cli as cli
-    from unittest.mock import patch, MagicMock
+    from check_items_test_helpers import private_output
+    monkeypatch.setenv('CHECK_ITEMS_PREFILTER', 'off')
+    record = {'group_id':'g0', 'classification':'DONE', 'confidence':'HIGH',
+              'canonical_text':'work 0', 'evidence_citation':'commit abc', 'action_required':None}
+    _mock_native_transport(monkeypatch, data={'items':[record]})
+    output = private_output()
+    assert cli.run_classifier(json.dumps({'groups':_native_groups(), 'evidence':{}}), str(output)) == 0
+    written = json.loads(output.read_text())
+    assert isinstance(written, list) and written[0]['classification'] == 'DONE'
+    assert written[0]['ai_model'] == 'claude-haiku-4-5-20251001'
 
-    # Disable L2 prefilter so group reaches sub-agent and triggers the fallback path.
-    monkeypatch.setenv("CHECK_ITEMS_PREFILTER", "off")
-
-    output_path = str(tmp_path / "out.json")
-
-    valid_payload = json.dumps({
-        "groups": [{"group_id": "g1", "representative": "Do the thing", "members": []}],
-        "evidence": {},
-    })
-
-    valid_response = json.dumps([
-        {
-            "group_id": "g1",
-            "classification": "DONE",
-            "confidence": 0.9,
-            "canonical_text": "Do the thing",
-            "evidence_citation": "commit abc",
-            "action_required": "",
-        }
-    ])
-
-    cp = MagicMock()
-    cp.returncode = 0
-    cp.stdout = valid_response
-    cp.stderr = ""
-
-    with patch.object(cli.subprocess, "run", return_value=cp):
-        rc = cli.run_classifier(valid_payload, output_path)
-
-    assert rc == 0
-    written = json.loads((tmp_path / "out.json").read_text(encoding="utf-8"))
-    assert isinstance(written, list)
-    assert written[0]["classification"] == "DONE"
 
 
 def test_validate_classifier_payload_rejects_missing_field():

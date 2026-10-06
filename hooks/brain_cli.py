@@ -4,6 +4,7 @@ import argparse
 import json
 import sys
 import time
+from pathlib import Path
 
 from runtime_context import RuntimeContextError, resolve_runtime_context, using_runtime_context
 
@@ -14,7 +15,19 @@ def read_payload(raw):
     if len(raw.encode("utf-8")) > MAX_INPUT_BYTES:
         raise RuntimeContextError("input_invalid", "Native input exceeds the 1 MB limit.")
     try:
-        value = json.loads(raw) if raw.strip() else {}
+        def object_fields(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError("Duplicate JSON field")
+                result[key] = value
+            return result
+
+        def invalid_constant(value):
+            raise ValueError("Nonfinite JSON value")
+
+        value = json.loads(raw, object_pairs_hook=object_fields,
+                           parse_constant=invalid_constant) if raw.strip() else {}
     except ValueError as exc:
         raise RuntimeContextError("input_invalid", "Native input must be valid JSON.") from exc
     if not isinstance(value, dict):
@@ -33,7 +46,9 @@ def main(argv=None, stdin=None, stdout=None, stderr=None, started_at=None):
         parser.add_argument("--" + flag)
     parser.add_argument("--event", choices=("session_start", "resume", "stop", "pre_compact", "session_end", "recover"))
     parser.add_argument("--max-sources", type=int, default=8)
-    parser.add_argument("command", choices=("context", "capture", "recover", "hook"))
+    parser.add_argument("--skill-path")
+    parser.add_argument("--operation")
+    parser.add_argument("command", choices=("context", "capture", "recover", "hook", "run"))
     args = parser.parse_args(argv)
     names = {"config": "config_path", "resource_root": "resource_root", "vault": "vault_path",
              "index": "index_path", "state": "state_path", "session_id": "session_id",
@@ -45,7 +60,24 @@ def main(argv=None, stdin=None, stdout=None, stderr=None, started_at=None):
             stdin = sys.stdin
         raw = stdin.read(MAX_INPUT_BYTES + 1)
         payload = read_payload(raw)
-        context = resolve_runtime_context(args.host, args.client, payload, overrides)
+        skill_name = None
+        if args.command == "run":
+            if not args.skill_path or not args.operation or not args.resource_root:
+                raise RuntimeContextError("input_invalid", "Select the loaded skill, resource root and operation.")
+            loaded = Path(args.skill_path)
+            if not loaded.is_absolute():
+                raise RuntimeContextError("resources_invalid", "The loaded skill path must be absolute.")
+            loaded = loaded.resolve()
+            root = Path(args.resource_root).resolve()
+            if (loaded.name != "SKILL.md" or loaded.parent.parent != root / "skills"
+                    or not loaded.is_file() or Path(__file__).resolve().parent.parent != root):
+                raise RuntimeContextError("resources_invalid", "The operation does not belong to the loaded installation.")
+            skill_name = loaded.parent.name
+        context = resolve_runtime_context(args.host, args.client, {} if args.command == "run" else payload, overrides)
+        if args.command == "run":
+            from skill_procedures import run_operation
+            with using_runtime_context(context):
+                return run_operation(context, skill_name, args.operation, payload, stdout, stderr)
         if not 1 <= args.max_sources <= 64:
             raise RuntimeContextError("input_invalid", "max-sources must be between 1 and 64.")
         if args.command in {"capture", "hook"} and args.event is None:

@@ -99,9 +99,18 @@ def _make_group(canonical_hash, project="obsidian-brain", text="Item X", members
     }
 
 
+
+def _successful_ai_metadata():
+    import hashlib
+    import check_items_cli
+    return {"ai_backend": "claude", "ai_model": "claude-haiku-4-5-20251001",
+            "ai_prompt_version": "check-items-classifier-v3",
+            "ai_prompt_sha256": hashlib.sha256(check_items_cli.CLASSIFIER_PROMPT.encode("utf-8")).hexdigest()}
+
 def _make_cached_entry(canonical_hash, classification="DONE", classified_ts=None,
                       members=None):
     return {
+        **_successful_ai_metadata(),
         "canonical_hash": canonical_hash,
         "canonical_text": "Item X",
         "members": members or [{"file": "n.md", "line": 1, "mtime": 1735000000}],
@@ -678,6 +687,7 @@ def test_cache_preserves_action_required_on_warm_runs():
     cache = {"schema_version": 1, "runs": {}}
     all_groups = [_make_group("h1")]
     fresh = [{
+        **_successful_ai_metadata(),
         "canonical_hash": "h1",
         "canonical_text": "Close #534",
         "members": [{"file": "n.md", "line": 1, "mtime": 1735000000}],
@@ -879,6 +889,7 @@ def test_partition_handles_non_numeric_classified_ts():
 def _make_fresh(canonical_hash, classifier_source="agent", classification="ACTIVE",
                  confidence="LOW", members=None, classified_ts=None):
     return {
+        **_successful_ai_metadata(),
         "canonical_hash": canonical_hash,
         "canonical_text": "Item X",
         "members": members or [{"file": "n.md", "line": 1, "mtime": 1735000000}],
@@ -2622,9 +2633,10 @@ def test_cache_provenance_rejects_semantic_changes(tmp_path, field):
     from runtime_context import using_runtime_context
     import check_items_cache as cic
     context = SimpleNamespace(vault_path=tmp_path / "vault", canonical_project_root=tmp_path / "project",
-                              host="codex", config={"codex_model": "model-a"})
+                              host="codex", config={"codex_ai_model": "model-a"})
     group = _make_group("same-hash")
-    fresh = {**_make_cached_entry("same-hash", classified_ts=100), "classifier_source": "agent"}
+    fresh = {**_make_cached_entry("same-hash", classified_ts=100), "classifier_source": "agent",
+             "ai_backend": "codex", "ai_model": "model-a"}
     evidence = {"algorithm": "algorithm-a", "backend": "codex", "evidence": "input-a"}
     with using_runtime_context(context):
         cache = cic.update_cache({}, "p", [group], [fresh], "head", now=100, provenance=evidence)
@@ -2636,7 +2648,7 @@ def test_cache_provenance_rejects_semantic_changes(tmp_path, field):
         elif field == "project":
             context.canonical_project_root = tmp_path / "other project"
         elif field == "model":
-            context.config["codex_model"] = "model-b"
+            context.config["codex_ai_model"] = "model-b"
         else:
             evidence[field] = "changed"
         known, needs = cic.partition([group], cache, "p", "head", now=101, provenance=evidence)
@@ -2718,3 +2730,38 @@ def test_cache_replaced_lock_inode_cannot_authorize_publication(tmp_path, monkey
         cache["runs"]["unowned"] = {}
     assert not path.exists()
     assert lock.read_bytes() == owner_bytes
+
+
+@pytest.fixture(autouse=True)
+def explicit_classifier_provenance_context(tmp_path, monkeypatch, request):
+    from types import SimpleNamespace
+    from runtime_context import current_runtime_context, using_runtime_context
+    import check_items_cache as cache
+    import subprocess
+    original_popen = subprocess.Popen
+    def blocked(command, *args, **kwargs):
+        local_lock_tests = {"test_acquire_lock_is_bounded_when_a_stale_lock_cannot_be_removed",
+                            "test_cache_os_lock_releases_when_holder_process_dies"}
+        if (request.node.name in local_lock_tests and isinstance(command, list)
+                and command[:2] == [sys.executable, "-c"]):
+            return original_popen(command, *args, **kwargs)
+        raise AssertionError("cache test attempted a live native AI subprocess")
+    monkeypatch.setattr(subprocess, "Popen", blocked)
+    original = cache._provenance
+    original_metadata = cache._agent_metadata_matches
+    context = SimpleNamespace(host="claude", config={"summary_model": "haiku", "classifier_model": "claude-haiku-4-5-20251001"},
+                              vault_path=tmp_path / "vault",
+                              canonical_project_root=tmp_path / "project")
+    def provenance(group, project, extra=None, **kwargs):
+        extra = {"complete": True, "evidence": {}, **(extra or {})}
+        if current_runtime_context() is not None:
+            return original(group, project, extra, **kwargs)
+        with using_runtime_context(context):
+            return original(group, project, extra, **kwargs)
+    def metadata(group, fresh, extra=None):
+        if current_runtime_context() is not None:
+            return original_metadata(group, fresh, extra)
+        with using_runtime_context(context):
+            return original_metadata(group, fresh, extra)
+    monkeypatch.setattr(cache, "_provenance", provenance)
+    monkeypatch.setattr(cache, "_agent_metadata_matches", metadata)

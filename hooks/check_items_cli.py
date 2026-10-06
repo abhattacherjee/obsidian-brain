@@ -13,7 +13,7 @@ from __future__ import annotations
 import json
 import os
 import re
-import subprocess
+import hashlib
 import sys
 import tempfile
 from pathlib import Path
@@ -93,11 +93,12 @@ def _validate_classifier_payload(parsed) -> bool:
             return False
         if item.get("classification") not in _VALID_CLASSIFICATIONS:
             return False
+        if not isinstance(item.get("group_id"), str) or not item["group_id"]:
+            return False
     return True
 
 
-SEMANTIC_MERGE_PROMPT = """You are the semantic-merge sub-agent for an open-items pipeline. Read
-<input-json-path>. It contains N coarse token-grouped open items.
+SEMANTIC_MERGE_PROMPT = """You are the semantic-merge sub-agent for an open-items pipeline. The inline JSON below contains N coarse token-grouped open items.
 
 ## Your job
 
@@ -160,7 +161,7 @@ Example 5:
 ## Output format
 
 Return STRICT JSON ONLY - no prose, no markdown fences, nothing
-outside the JSON. Write the same JSON to <output-json-path>.
+outside the JSON.
 
 {
   "merges": [
@@ -195,73 +196,142 @@ def _safe_workdir() -> Path:
     return workdir
 
 
-def run_semantic_merge(stdin_json: str, output_path: str) -> int:
-    """
-    Stage 2b: invoke the semantic-merge sub-agent.
-
-    Reads coarse groups from stdin_json, writes merge map to output_path
-    as STRICT JSON. Returns 0 on success, non-zero on subprocess failure
-    or JSON validation failure.
-    """
+def _publish_private_json(output_path, value):
+    """Publish validated private output without exposing a path to the model."""
+    from runtime_context import current_runtime_context
+    context = current_runtime_context()
+    if context is None:
+        raise ValueError("Private output requires the invoking host context")
+    import stat
+    if context.state_path.resolve().is_relative_to(context.vault_path.resolve()):
+        raise ValueError("Private result state must remain outside the vault")
+    from note_transactions import session_state_path
+    jobs = session_state_path(context) / "jobs"
+    destination = Path(output_path)
+    if destination.suffix != ".json":
+        raise ValueError("Private result must be JSON")
+    destination.absolute().relative_to(jobs.absolute())
+    relative = destination.resolve().relative_to(jobs.resolve())
+    for directory in destination.absolute().parents:
+        if directory == jobs.absolute():
+            break
+        if directory.is_symlink():
+            raise ValueError("Private result directory cannot be a symlink")
+    if len(relative.parts) < 2 or re.fullmatch(r"[0-9a-f]{32}", relative.parts[0]) is None:
+        raise ValueError("Private result requires a jobs operation ID")
+    directory = jobs
+    for part in relative.parts[:-1]:
+        directory = directory / part
+        details = directory.lstat()
+        if (directory.is_symlink() or not stat.S_ISDIR(details.st_mode)
+                or details.st_uid != os.getuid() or stat.S_IMODE(details.st_mode) != 0o700):
+            raise ValueError("Private result directory is unsafe")
+    if destination.is_symlink():
+        raise ValueError("Private result cannot be a symlink")
+    if destination.exists():
+        details = destination.lstat()
+        if (not stat.S_ISREG(details.st_mode) or details.st_uid != os.getuid()
+                or stat.S_IMODE(details.st_mode) != 0o600):
+            raise ValueError("Existing private result is unsafe")
+    descriptor, temporary = tempfile.mkstemp(dir=str(destination.parent), prefix=".check-items-", suffix=".json")
     try:
-        payload = json.loads(stdin_json)
-    except json.JSONDecodeError as exc:
-        print(f"[check-items-cli] ERROR: invalid stdin JSON: {exc}", file=sys.stderr)
-        return 2
-
-    groups = payload.get("groups", [])
-    model = _pick_model(len(groups))
-
-    workdir = _safe_workdir()
-    in_tmp = tempfile.NamedTemporaryFile(
-        mode="w", delete=False, dir=str(workdir), suffix=".in.json", encoding="utf-8"
-    )
-    try:
-        json.dump(payload, in_tmp)
-        in_tmp.flush()
-    finally:
-        in_tmp.close()
-    os.chmod(in_tmp.name, 0o600)
-
-    prompt = SEMANTIC_MERGE_PROMPT.replace(
-        "<input-json-path>", in_tmp.name
-    ).replace(
-        "<output-json-path>", output_path
-    )
-
-    cmd = ["claude", "-p", "--model", model]
-    try:
-        cp = subprocess.run(
-            cmd,
-            input=prompt,
-            capture_output=True,
-            text=True,
-            timeout=SUBAGENT_TIMEOUT_SEC,
-        )
-    except subprocess.TimeoutExpired:
-        print(f"[check-items-cli] timeout after {SUBAGENT_TIMEOUT_SEC}s on model={model}",
-              file=sys.stderr)
-        return 3
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(value, stream, ensure_ascii=False)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, destination)
     finally:
         try:
-            os.unlink(in_tmp.name)
-        except OSError:
+            os.unlink(temporary)
+        except FileNotFoundError:
             pass
 
-    if cp.returncode != 0:
-        print(f"[check-items-cli] subagent failed rc={cp.returncode}: {cp.stderr[:500]}",
-              file=sys.stderr)
-        return cp.returncode
 
-    if not Path(output_path).exists():
-        try:
-            parsed = json.loads(_strip_json_fences(cp.stdout))
-        except json.JSONDecodeError as exc:
-            print(f"[check-items-cli] subagent output invalid JSON: {exc}", file=sys.stderr)
-            return 4
-        Path(output_path).write_text(json.dumps(parsed), encoding="utf-8")
-        os.chmod(output_path, 0o600)
+def _request_ai(operation, prompt, payload, model, groups):
+    from ai_backend import AIRequest, execute_ai
+    from runtime_context import current_runtime_context
+    context = current_runtime_context()
+    if context is None:
+        print("[check-items-cli] invoking host context required", file=sys.stderr)
+        return 2, None
+    serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    if len(serialized.encode("utf-8")) > STDIN_CAP_CHARS:
+        return 2, None
+    ids = [group["group_id"] for group in groups]
+    selected_model = model if context.host == "claude" else None
+    if context.host == "claude" and operation == "classify_items":
+        explicit = context.config.get("classifier_model")
+        if isinstance(explicit, str) and explicit.startswith("claude-"):
+            selected_model = explicit
+    request = AIRequest(
+        input=prompt + "\n\nInput JSON:\n" + serialized,
+        input_revision=hashlib.sha256(serialized.encode("utf-8")).hexdigest(),
+        timeout=SUBAGENT_TIMEOUT_SEC,
+        model=selected_model,
+        options={"expected_ids": ids,
+                 "project_by_id": {group["group_id"]: group.get("project", "") for group in groups},
+                 "expected_count": len(groups)},
+    )
+    result = execute_ai(context, operation, request)
+    if result.status != "ok":
+        print(f"[check-items-cli] {operation}: {result.status}: {result.diagnostic}", file=sys.stderr)
+        return {"timeout": 3, "invalid_output": 4, "cancelled": 7, "unavailable": 8, "auth_error": 8}.get(result.status, 4), result
+    if result.input_revision != request.input_revision:
+        return 4, result
+    return 0, result
 
+
+def _valid_groups(groups):
+    return (isinstance(groups, list)
+            and all(isinstance(group, dict) and isinstance(group.get("group_id"), str)
+                    and group["group_id"] for group in groups)
+            and len({group["group_id"] for group in groups}) == len(groups))
+
+
+def _validate_merge_payload(value, groups):
+    if not isinstance(value, dict) or not isinstance(value.get("merges"), list):
+        return False
+    projects = {group["group_id"]: group.get("project", "") for group in groups}
+    absorbed = set()
+    canonicals = set()
+    for merge in value["merges"]:
+        if not isinstance(merge, dict):
+            return False
+        canonical = merge.get("canonical_group_id")
+        members = merge.get("absorbed_group_ids")
+        if (not isinstance(canonical, str) or canonical not in projects
+                or not isinstance(members, list) or not members
+                or not isinstance(merge.get("reasoning"), str)):
+            return False
+        if canonical in canonicals or canonical in absorbed:
+            return False
+        canonicals.add(canonical)
+        for member in members:
+            if (not isinstance(member, str) or member not in projects or member == canonical
+                    or member in absorbed or member in canonicals or projects[member] != projects[canonical]):
+                return False
+            absorbed.add(member)
+    return (not canonicals.intersection(absorbed)
+            and type(value.get("total_groups_before")) is int
+            and type(value.get("total_groups_after")) is int
+            and value["total_groups_before"] == len(groups)
+            and value["total_groups_after"] == len(groups) - len(absorbed))
+
+
+def run_semantic_merge(stdin_json: str, output_path: str) -> int:
+    try:
+        payload = json.loads(stdin_json)
+    except json.JSONDecodeError:
+        return 2
+    if not isinstance(payload, dict) or not _valid_groups(payload.get("groups")):
+        return 2
+    groups = payload["groups"]
+    rc, result = _request_ai("semantic_merge", SEMANTIC_MERGE_PROMPT, payload, _pick_model(len(groups)), groups)
+    if rc:
+        return rc
+    if not _validate_merge_payload(result.data, groups):
+        return 4
+    _publish_private_json(output_path, result.data)
     return 0
 
 
@@ -269,8 +339,7 @@ def run_semantic_merge(stdin_json: str, output_path: str) -> int:
 #   - Classifier contract / Prompt shape (lines 262-289)
 #   - Classification semantics (lines 317-322) — INCLUDING the self-referential
 #     rule (line 321, Patch 3): discovery evidence is NOT completion evidence.
-CLASSIFIER_PROMPT = """You are the classifier sub-agent for /check-items. Read the JSON at
-<input-json-path>. It contains:
+CLASSIFIER_PROMPT = """You are the classifier sub-agent for /check-items. The inline JSON below contains:
   - groups: list of merged open-item groups (post Stage 2b).
   - evidence: per-project bundle (commits, merged_prs, closed_issues,
     releases, changelog_excerpt, fts_mentions, note_completions).
@@ -341,10 +410,9 @@ that #N itself merged.
 
 ## Output format
 
-Return STRICT JSON ONLY - no prose, no markdown fences. Write the same
-JSON to <output-json-path>.
+Return STRICT JSON ONLY - no prose, no markdown fences.
 
-[
+{"items": [
   {
     "group_id": "ob-NNNN",
     "classification": "DONE | NEEDS-ACTION | STALE | ACTIVE | REVIEW",
@@ -353,9 +421,9 @@ JSON to <output-json-path>.
     "evidence_citation": "<specific commit sha / PR# / issue# / release / note ref, OR null>",
     "action_required": "<command string for NEEDS-ACTION, else null>"
   }
-]
+]}
 
-Your final message must be exactly the JSON array.
+Your final message must be exactly the JSON object.
 """
 
 
@@ -600,135 +668,35 @@ def _bridge_project_evidence(evidence: dict, project: str) -> dict:
     return {}
 
 
-def _dispatch_classifier_chunk(
-    chunk_groups: list, evidence: dict, model: str, output_path: str,
-    chunk_label: str = "",
-) -> tuple[int, list]:
-    """Dispatch one claude -p classifier call for a single chunk of groups.
-
-    Writes the classifier input as a temp file under the workdir, invokes
-    `claude -p --model {model}` with the CLASSIFIER_PROMPT pointing at that
-    file and at `output_path`, then reads results from `output_path` (or
-    stdout as fallback). The temp input is unlinked even if json.dump,
-    os.chmod, or the subprocess raise.
-
-    `chunk_label` is prepended to diagnostic messages so callers running
-    multiple sequential dispatches can identify the failing chunk. Pass
-    "" (default) for single-call use.
-
-    Returns (rc, sub_results). On success rc == 0 and sub_results is the
-    validated classifier payload. On any failure rc is non-zero and
-    sub_results is [].
-
-    rc semantics: 0 success; 3 subprocess timeout; 4 invalid JSON or
-    wrong payload shape from sub-agent; RC_NO_OUTPUT (6) the sub-agent
-    exited cleanly but wrote nothing parseable to either the output file
-    or stdout; any other value = passthrough of claude -p's non-zero
-    returncode.
-    """
-    workdir = _safe_workdir()
-    in_tmp = tempfile.NamedTemporaryFile(
-        mode="w", delete=False, dir=str(workdir),
-        suffix=".classin.json", encoding="utf-8",
-    )
-    in_tmp_path = in_tmp.name
-    try:
-        try:
-            sub_payload = {"groups": chunk_groups, "evidence": evidence}
-            json.dump(sub_payload, in_tmp)
-            in_tmp.flush()
-        finally:
-            in_tmp.close()
-        os.chmod(in_tmp_path, 0o600)
-
-        prompt = CLASSIFIER_PROMPT.replace(
-            "<input-json-path>", in_tmp_path
-        ).replace(
-            "<output-json-path>", output_path
-        )
-
-        cmd = ["claude", "-p", "--model", model]
-        try:
-            cp = subprocess.run(
-                cmd, input=prompt, capture_output=True, text=True,
-                timeout=SUBAGENT_TIMEOUT_SEC,
-            )
-        except subprocess.TimeoutExpired:
-            print(
-                f"[check-items-cli] {chunk_label}classifier timeout after "
-                f"{SUBAGENT_TIMEOUT_SEC}s",
-                file=sys.stderr,
-            )
-            return 3, []
-    finally:
-        try:
-            os.unlink(in_tmp_path)
-        except OSError:
-            pass
-
-    if cp.returncode != 0:
-        print(
-            f"[check-items-cli] {chunk_label}classifier failed "
-            f"rc={cp.returncode}: {cp.stderr[:500]}",
-            file=sys.stderr,
-        )
-        return cp.returncode, []
-
-    # The chunked caller pre-creates a 0-byte temp file to allocate a safe
-    # path, so `.exists()` is unconditionally true there and cannot tell
-    # "sub-agent wrote nothing" from "sub-agent wrote garbage" (#297 defect 1).
-    try:
-        file_text = Path(output_path).read_text(encoding="utf-8")
-    except OSError:
-        file_text = ""
-
-    if file_text.strip():
-        try:
-            parsed = json.loads(file_text)
-        except json.JSONDecodeError as exc:
-            print(
-                f"[check-items-cli] {chunk_label}classifier output invalid "
-                f"JSON: {exc}",
-                file=sys.stderr,
-            )
-            return 4, []
-        if not _validate_classifier_payload(parsed):
-            print(
-                f"[check-items-cli] {chunk_label}classifier file-path output "
-                f"produced invalid shape (expected list of classifier "
-                f"objects, got {type(parsed).__name__})",
-                file=sys.stderr,
-            )
-            return 4, []
-        return 0, parsed
-
-    stdout_text = _strip_json_fences(cp.stdout or "")
-    if not stdout_text.strip():
-        print(
-            f"[check-items-cli] {chunk_label}classifier wrote no output "
-            f"(output file {len(file_text)} bytes, stdout "
-            f"{len(cp.stdout or '')} bytes)",
-            file=sys.stderr,
-        )
-        return RC_NO_OUTPUT, []
-
-    try:
-        parsed = json.loads(stdout_text)
-    except json.JSONDecodeError as exc:
-        print(
-            f"[check-items-cli] {chunk_label}classifier output invalid "
-            f"JSON: {exc}",
-            file=sys.stderr,
-        )
-        return 4, []
+def _dispatch_classifier_chunk(chunk_groups: list, evidence: dict, model: str,
+                               output_path: str, chunk_label: str = "") -> tuple[int, list]:
+    """Return validated inline results; the model never sees an output path."""
+    if not _valid_groups(chunk_groups) or not isinstance(evidence, dict):
+        return 2, []
+    rc, result = _request_ai("classify_items", CLASSIFIER_PROMPT,
+                             {"groups": chunk_groups, "evidence": evidence}, model, chunk_groups)
+    if rc:
+        return rc, []
+    parsed = result.data
     if not _validate_classifier_payload(parsed):
-        print(
-            f"[check-items-cli] {chunk_label}classifier stdout-fallback "
-            f"produced invalid shape (expected list of classifier objects, "
-            f"got {type(parsed).__name__})",
-            file=sys.stderr,
-        )
         return 4, []
+    expected = {group["group_id"] for group in chunk_groups}
+    returned = [item["group_id"] for item in parsed]
+    if len(returned) != len(expected) or set(returned) != expected:
+        return 4, []
+    for item in parsed:
+        if (item.get("confidence") not in {"HIGH", "MED", "LOW"}
+                or not isinstance(item.get("canonical_text"), str)
+                or not isinstance(item.get("evidence_citation"), (str, type(None)))
+                or not isinstance(item.get("action_required"), (str, type(None)))
+                or (item["classification"] != "NEEDS-ACTION" and item["action_required"] is not None)
+                or (item["classification"] == "NEEDS-ACTION" and not item["action_required"])):
+            return 4, []
+    for item in parsed:
+        item["ai_backend"] = result.backend
+        item["ai_model"] = result.model
+        item["ai_prompt_version"] = "check-items-classifier-v3"
+        item["ai_prompt_sha256"] = hashlib.sha256(CLASSIFIER_PROMPT.encode("utf-8")).hexdigest()
     return 0, parsed
 
 
@@ -761,8 +729,13 @@ def run_classifier(stdin_json: str, output_path: str) -> int:
               file=sys.stderr)
         return 2
 
-    groups = payload.get("groups", [])
+    if not isinstance(payload, dict) or not _valid_groups(payload.get("groups")):
+        print("[check-items-cli] invalid groups or group_id", file=sys.stderr)
+        return 2
+    groups = payload["groups"]
     evidence = payload.get("evidence", {})
+    if not isinstance(evidence, dict):
+        return 2
 
     # -----------------------------------------------------------------------
     # Validate group_id presence — a None group_id causes silent key collision
@@ -811,110 +784,27 @@ def run_classifier(stdin_json: str, output_path: str) -> int:
     unclassified_groups = 0
 
     if to_classify:
-        if len(to_classify) <= CLASSIFIER_CHUNK_SIZE:
-            model = _pick_classifier_model(len(to_classify))
-            chunk_count = 1
-            rc, chunk_results = _dispatch_classifier_chunk(
-                to_classify, evidence, model, output_path
-            )
+        chunks = [to_classify[index:index + CLASSIFIER_CHUNK_SIZE]
+                  for index in range(0, len(to_classify), CLASSIFIER_CHUNK_SIZE)]
+        chunk_count = len(chunks)
+        if chunk_count > 1:
+            print(f"[check-items-cli] classifier: chunking {len(to_classify)} groups into {chunk_count} chunk(s)", file=sys.stderr)
+        for index, chunk in enumerate(chunks):
+            model = _pick_classifier_model(len(chunk))
+            for attempt in range(1, CHUNK_MAX_ATTEMPTS + 1):
+                rc, chunk_results = _dispatch_classifier_chunk(
+                    chunk, evidence, model, output_path,
+                    chunk_label=f"chunk {index + 1}/{chunk_count}, attempt {attempt}: ",
+                )
+                if rc in {7, 8}:
+                    return rc
+                if rc == 0:
+                    break
             if rc != 0:
+                # Completed chunks stay unpublished: exact requested coverage
+                # is required before the final private artifact can change.
                 return rc
-            sub_results = chunk_results
-        else:
-            chunks = [
-                to_classify[i:i + CLASSIFIER_CHUNK_SIZE]
-                for i in range(0, len(to_classify), CLASSIFIER_CHUNK_SIZE)
-            ]
-            chunk_count = len(chunks)
-            # Per-chunk model picking: the 30-group Haiku/Sonnet threshold was
-            # tuned against single-dispatch payloads. Each chunk here is sized
-            # at <=CLASSIFIER_CHUNK_SIZE, which is below that threshold by
-            # default — so chunks get Haiku regardless of the total payload
-            # size. Lets large vaults stay on the fast/cheap model per call.
-            print(
-                f"[check-items-cli] classifier: chunking {len(to_classify)} "
-                f"groups into {chunk_count} chunk(s) of <={CLASSIFIER_CHUNK_SIZE}",
-                file=sys.stderr,
-            )
-            workdir = _safe_workdir()
-            chunk_outputs: list = []
-            completed_chunks = 0
-            last_failure_rc = 0
-            try:
-                for idx, chunk in enumerate(chunks):
-                    out_tmp = tempfile.NamedTemporaryFile(
-                        mode="w", delete=False, dir=str(workdir),
-                        suffix=f".chunk-{idx}.classout.json", encoding="utf-8",
-                    )
-                    chunk_outputs.append(out_tmp.name)
-                    out_tmp.close()
-                    chunk_model = _pick_classifier_model(len(chunk))
-
-                    # A chunk that fails is retried up to CHUNK_MAX_ATTEMPTS
-                    # times before it is allowed to degrade — only its OWN
-                    # groups are dropped; every other chunk (already-completed
-                    # or still-to-run) is unaffected (#297 defect 2).
-                    rc = None
-                    chunk_results: list = []
-                    for attempt in range(1, CHUNK_MAX_ATTEMPTS + 1):
-                        # Truncate before every attempt: a partial/garbage
-                        # write from a prior attempt must never be read as
-                        # this attempt's output.
-                        try:
-                            Path(out_tmp.name).write_text("", encoding="utf-8")
-                        except OSError:
-                            pass
-                        label = (
-                            f"chunk {idx + 1}/{chunk_count} "
-                            f"(model={chunk_model}, attempt {attempt}/{CHUNK_MAX_ATTEMPTS}): "
-                        )
-                        rc, chunk_results = _dispatch_classifier_chunk(
-                            chunk, evidence, chunk_model, out_tmp.name,
-                            chunk_label=label,
-                        )
-                        if rc == 0:
-                            break
-
-                    if rc == 0:
-                        sub_results.extend(chunk_results)
-                        completed_chunks += 1
-                    else:
-                        failed_chunks += 1
-                        unclassified_groups += len(chunk)
-                        last_failure_rc = rc
-                        print(
-                            f"[check-items-cli] classifier: chunk "
-                            f"{idx + 1}/{chunk_count} failed rc={rc} after "
-                            f"{CHUNK_MAX_ATTEMPTS} attempt(s); {len(chunk)} "
-                            f"group(s) left unclassified, continuing "
-                            f"(completed={completed_chunks})",
-                            file=sys.stderr,
-                        )
-                        continue
-            finally:
-                for path in chunk_outputs:
-                    try:
-                        os.unlink(path)
-                    except OSError:
-                        pass
-
-            if failed_chunks == chunk_count:
-                # Total failure keeps today's semantics: the caller falls
-                # back to the whole-run heuristic.
-                print(
-                    f"[check-items-cli] classifier: aborting — all "
-                    f"{chunk_count} chunk(s) failed, last rc={last_failure_rc}",
-                    file=sys.stderr,
-                )
-                return last_failure_rc
-
-            if failed_chunks:
-                print(
-                    f"[check-items-cli] classifier: {failed_chunks}/{chunk_count} "
-                    f"chunk(s) failed; {unclassified_groups} group(s) "
-                    f"unclassified, {len(sub_results)} kept",
-                    file=sys.stderr,
-                )
+            sub_results.extend(chunk_results)
 
     # -----------------------------------------------------------------------
     # Merge in input order and write final output
@@ -951,8 +841,7 @@ def run_classifier(stdin_json: str, output_path: str) -> int:
 
     ordered = [merged_by_id[g["group_id"]] for g in groups if g["group_id"] in merged_by_id]
 
-    Path(output_path).write_text(json.dumps(ordered), encoding="utf-8")
-    os.chmod(output_path, 0o600)
+    _publish_private_json(output_path, ordered)
 
     # -----------------------------------------------------------------------
     # Telemetry — inner line (CLI sees only L1-miss groups; cache_hit is '-'

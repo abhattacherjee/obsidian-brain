@@ -396,24 +396,130 @@ def _warn_if_unusable_ts(cached: dict, now: float, h: str, project: str) -> None
         )
 
 
-def _provenance(group, project, extra=None):
-    """Fingerprint all semantic input and the invoking execution configuration."""
+def _cache_ai_identity(context, requested=None):
+    from ai_backend import resolve_ai_selection
+    backend, model = resolve_ai_selection(context, "classify_items", requested)
+    if backend == "claude":
+        # An observed ID from a previous run cannot resolve today's alias.
+        explicit = context.config.get("classifier_model")
+        model = explicit if isinstance(explicit, str) and explicit.startswith("claude-") else None
+    return backend, model
+
+
+def _classifier_contract(groups):
+    from ai_backend import ai_contract_identity
+    return ai_contract_identity("classify_items", {
+        "expected_ids": [group.get("group_id", group.get("canonical_hash", "")) for group in groups],
+        "project_by_id": {group.get("group_id", group.get("canonical_hash", "")): group.get("project", "") for group in groups},
+        "expected_count": len(groups),
+    })
+
+
+def build_classifier_provenance(context, groups, evidence, classifications=None):
+    """Build the full namespace before cache replay; never invoke AI."""
+    import copy
     from runtime_context import current_runtime_context
+    from check_items_cli import (CLASSIFIER_CHUNK_SIZE, CLASSIFIER_PROMPT,
+                                 _bridge_project_evidence, _pick_classifier_model, _valid_groups)
+    from check_items_prefilter import has_classifiable_evidence, is_prefilter_enabled
+    if current_runtime_context() is not context or not _valid_groups(groups) or not isinstance(evidence, dict):
+        raise ValueError("Classifier provenance requires bound complete input")
+    enabled = is_prefilter_enabled()
+    classified = []
+    for group in groups:
+        normalized = dict(group)
+        normalized.setdefault("instances", group.get("members", []))
+        if not enabled or has_classifiable_evidence(normalized, _bridge_project_evidence(evidence, group.get("project", ""))):
+            classified.append(group)
+    selections = {}
+    contracts = {}
+    for index in range(0, len(classified), CLASSIFIER_CHUNK_SIZE):
+        chunk = classified[index:index + CLASSIFIER_CHUNK_SIZE]
+        requested = _pick_classifier_model(len(chunk)) if context.host == "claude" else None
+        backend, model = _cache_ai_identity(context, requested)
+        for group in chunk:
+            selections[group["group_id"]] = {"backend": backend, "model": model}
+            contracts[group["group_id"]] = _classifier_contract(chunk)
+    backend, fallback = _cache_ai_identity(context, "haiku" if context.host == "claude" else None)
+    for group in groups:
+        selections.setdefault(group["group_id"], {"backend": backend, "model": fallback})
+        contracts.setdefault(group["group_id"], _classifier_contract([group]))
+    if classifications is not None:
+        for record in classifications:
+            if record.get("classifier_source") != "agent":
+                continue
+            expected = selections.get(record.get("group_id"))
+            observed = record.get("ai_model")
+            if (expected is None or record.get("ai_backend") != expected["backend"]
+                    or not isinstance(observed, str) or not observed
+                    or (context.host == "claude" and not observed.startswith("claude-"))
+                    or (expected["model"] is not None and observed != expected["model"])):
+                raise ValueError("Successful classifier metadata differs from approved selection")
+            expected["model"] = observed
+    return {"complete": True, "evidence": copy.deepcopy(evidence),
+            "classifier_model_by_id": {key: value["model"] for key, value in selections.items()},
+            "classifier_backend_by_id": {key: value["backend"] for key, value in selections.items()},
+            "backend_contract_by_id": contracts,
+            "classifier_chunk_size": CLASSIFIER_CHUNK_SIZE, "prefilter": enabled,
+            "prompt_sha256": hashlib.sha256(CLASSIFIER_PROMPT.encode("utf-8")).hexdigest(),
+            "output_schema": "classifier-exact-ids-v3"}
+
+
+def _provenance(group, project, extra=None, *, observed_model=None):
+    """Fingerprint input, evidence, and the actual selected classifier model."""
+    from runtime_context import current_runtime_context
+    from check_items_cli import CLASSIFIER_PROMPT
     context = current_runtime_context()
+    if context is None:
+        return None
+    extra = extra or {}
+    if extra.get("complete") is not True or "evidence" not in extra:
+        return None
+    requested = extra.get("classifier_model_by_id", {}).get(group.get("group_id"))
+    if requested is None:
+        requested = extra.get("classifier_model")
+    backend, model = _cache_ai_identity(context, requested)
+    if observed_model is not None:
+        model = observed_model
+    # Unknown native defaults cannot prove replay uses the same model.
+    if not isinstance(model, str) or not model:
+        return None
     semantic = {key: value for key, value in group.items() if not key.startswith("_")}
     values = {
         "input": semantic,
-        "vault": str(context.vault_path.resolve()) if context else "",
-        "project": str(context.canonical_project_root.resolve()) if context else project,
-        "algorithm": "check-items-v2",
+        "vault": str(context.vault_path.resolve()),
+        "project": str(context.canonical_project_root.resolve()),
+        "algorithm": "check-items-v3",
         "schema": SCHEMA_VERSION,
-        "backend": context.host if context else "unspecified",
-        "model": (context.config.get("codex_model", "default") if context.host == "codex"
-                  else context.config.get("summary_model", "haiku")) if context else "unspecified",
-        "evidence": extra or {},
+        "prompt": hashlib.sha256(CLASSIFIER_PROMPT.encode("utf-8")).hexdigest(),
+        "output_schema": "classifier-exact-ids-v3",
+        "shared_backend_contract": _classifier_contract([group]),
+        "classifier_policy": {"threshold": 30, "chunk_size": extra.get("classifier_chunk_size", 25),
+                              "prefilter": extra.get("prefilter", True)},
+        "backend": backend,
+        "model": model,
+        "evidence": extra,
     }
     return hashlib.sha256(json.dumps(values, sort_keys=True, separators=(",", ":"),
                                      ensure_ascii=False).encode()).hexdigest()
+
+
+def _agent_metadata_matches(group, fresh, extra=None):
+    from runtime_context import current_runtime_context
+    from check_items_cli import CLASSIFIER_PROMPT
+    context = current_runtime_context()
+    if context is None:
+        return False
+    extra = extra or {}
+    requested = extra.get("classifier_model_by_id", {}).get(group.get("group_id"))
+    requested = requested or extra.get("classifier_model")
+    backend, model = _cache_ai_identity(context, requested)
+    observed = fresh.get("ai_model")
+    known_observed = isinstance(observed, str) and bool(observed) and (backend != "claude" or observed.startswith("claude-"))
+    return (known_observed and fresh.get("ai_backend") == backend
+            and (model is None or observed == model)
+            and fresh.get("ai_prompt_version") == "check-items-classifier-v3"
+            and fresh.get("ai_prompt_sha256") == hashlib.sha256(CLASSIFIER_PROMPT.encode("utf-8")).hexdigest())
 
 
 def partition(
@@ -522,7 +628,8 @@ def partition(
             g["_reason"] = "heuristic_cached"
             needs.append(g)
             continue
-        if cached.get("provenance") != _provenance(g, project, provenance):
+        expected_provenance = _provenance(g, project, provenance)
+        if expected_provenance is None or cached.get("provenance") != expected_provenance:
             g["_reason"] = "provenance_changed"
             needs.append(g)
             continue
@@ -530,6 +637,8 @@ def partition(
         g["_cached_confidence"] = cached.get("confidence")
         g["_cached_evidence_citation"] = cached.get("evidence_citation")
         g["_cached_action_required"] = cached.get("action_required")
+        for field in ("ai_backend", "ai_model", "ai_prompt_version", "ai_prompt_sha256"):
+            g["_cached_" + field] = cached.get(field)
         known.append(g)
 
     return known, needs
@@ -647,7 +756,17 @@ def update_cache(
         key = entry.get("canonical_hash")
         fresh = fresh_by_hash.get(key)
         if fresh is not None and fresh.get("classifier_source") != "cache":
-            entry["provenance"] = _provenance(inputs[key], project, provenance)
+            approved = (fresh.get("classifier_source") != "agent"
+                        or _agent_metadata_matches(inputs[key], fresh, provenance))
+            observed_provenance = provenance
+            if (approved and fresh.get("classifier_source") == "agent" and provenance is not None
+                    and _provenance(inputs[key], project, provenance) is None):
+                import copy
+                observed_provenance = copy.deepcopy(provenance)
+                observed_provenance.setdefault("classifier_model_by_id", {})[inputs[key].get("group_id")] = fresh["ai_model"]
+            entry["provenance"] = (_provenance(inputs[key], project, observed_provenance,
+                                               observed_model=fresh.get("ai_model") if fresh.get("classifier_source") == "agent" else None)
+                                   if approved else None)
         elif fresh is not None and key in previous and "provenance" in previous[key]:
             entry["provenance"] = previous[key]["provenance"]
     run["groups"] = surviving
@@ -781,4 +900,6 @@ def _freeze_classification(fc: dict, now: float, prior: dict | None = None) -> d
         "action_required": fc.get("action_required"),
         "classified_ts": _resolve_replay_ts(fc, prior, now),
         "classifier_source": fc.get("classifier_source"),
+        **{field: fc.get(field) for field in
+           ("ai_backend", "ai_model", "ai_prompt_version", "ai_prompt_sha256")},
     }

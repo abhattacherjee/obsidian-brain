@@ -5,6 +5,58 @@ metadata:
   version: 1.3.0
 ---
 
+## Native runtime and installed resources
+
+Use the absolute path of this loaded `SKILL.md` as `OB_SKILL_PATH`. Read the
+reference for the invoking host when this skill has paired host references.
+Set `OB_HOST`, `OB_CLIENT`, `OB_SESSION_ID`, and `OB_CWD` from that native
+invocation. Use the selected host's own session ID. Keep curated note taxonomy
+separate from `agent_provider` and `agent_session_id` provenance.
+
+```bash
+OB_SKILL_PATH='<absolute path of this loaded SKILL.md>'
+OB_RESOURCE_ROOT=$(python3 -c 'import pathlib,sys; p=pathlib.Path(sys.argv[1]); assert p.is_absolute(); p=p.resolve(); assert p.name == "SKILL.md" and p.parent.parent.name == "skills"; print(p.parents[2])' "$OB_SKILL_PATH")
+python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" context < /dev/null
+```
+
+Use the returned `config_path`, `vault_path`, `index_path`, and `state_path`.
+Create the operation with this fixed literal request:
+
+```bash
+printf '{}' | python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'prepare'
+```
+
+Call `prepare` to create a private operation under native state. Retain its
+`operation_id` and `operation_dir`. Register approved helper output names with `artifact-store`;
+inputs are read through the immutable artifact manifest. Do not discover resources from the current directory or another plugin
+cache. Each shell invocation supplies the same explicit values; a previous
+shell's variables are not assumed to persist.
+
+Each data operation uses the installed launcher with a JSON request on stdin:
+
+```bash
+python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation '<fixed operation>' < "$REQUEST_PATH"
+```
+
+Map config JSON `vault_path`, `sessions_folder`, and `insights_folder` to the
+procedure variables `VAULT_PATH`/`VAULT`, `SESSIONS_FOLDER`/`SESS`, and
+`INSIGHTS_FOLDER`/`INS`. Use the canonical project returned in config JSON (and native `session` when available),
+not the basename of an unrelated shell working directory.
+
+Before preparing edits or requesting a summary of an existing note, call
+`note-read` and retain its exact `expected_revision`. Apply the proposed note
+with `note-apply` and that revision. A conflict leaves the current note intact;
+show the pending result and do not count the note as saved. New curated notes
+use `note-create`; they never overwrite a collision. Native memory discovery
+is unsupported for Codex until its adapter is verified; shared vault retrieval
+and wiki filing continue without borrowing another host's memory.
+
+Read `references/host-claude.md` or `references/host-codex.md` when present.
+All note writes described below use `note-create` or revision-bound `note-apply`,
+including bidirectional related links. Content is a JSON string, never shell code.
+Keep this rule when a later step uses the word Write or Edit.
+
+
 # vault-doctor — Audit and Repair the Obsidian Vault
 
 Audit and repair the Obsidian vault. Ships with 13 checks — 9 in the default sweep and 4 opt-in ones that must be named with `--check`. More can be added as separate modules under `scripts/vault_doctor_checks/` without changing this skill.
@@ -47,35 +99,32 @@ Parse the user's invocation into flags:
 - `--reconstruct` → set RECONSTRUCT=1 (session-coverage only: mark gaps resolvable for apply)
 - `--min-confidence <FLOAT>` → set MIN_CONFIDENCE (0.0–1.0 inclusive; default 0.0 keeps all; applies to both dry-run report and --apply); note: unresolved/WARN rows (confidence=0.0) are hidden at any threshold > 0 — drop the flag to audit them
 
-Locate the Python dispatcher by resolving the obsidian-brain install: prefer the local checkout registered in `known_marketplaces.json` (this also covers local dev sessions, deterministically rather than via `$PWD`), falling back to the newest allowlisted version directory in the plugin cache:
+Use the absolute loaded SKILL.md to select the installed resource root.
+
+Request for `doctor` (substitute the values as data):
+
+```json
+{
+  "argv": [
+    "--json",
+    "<selected doctor flags>"
+  ]
+}
+```
+
+Request for `doctor`:
+
+```json
+{
+  "argv": [
+    "--json",
+    "<selected doctor flags>"
+  ]
+}
+```
 
 ```bash
-DISPATCHER="$(python3 -c "
-import glob, json, os, re
-def _ob_doctor():
-    try:
-        for _m in json.load(open(os.path.expanduser('~/.claude/plugins/known_marketplaces.json'))).values():
-            _s = _m.get('source') if isinstance(_m, dict) else None
-            if not (isinstance(_s, dict) and _s.get('source') == 'directory'):
-                continue
-            _i = _m.get('installLocation') if isinstance(_m, dict) else None
-            if not (isinstance(_i, str) and os.path.isabs(_i)):
-                continue
-            _h = os.path.join(_i, 'hooks')
-            if os.path.isfile(os.path.join(_h, 'obsidian_utils.py')):
-                _v = os.path.join(os.path.dirname(_h), 'scripts', 'vault_doctor.py')
-                if os.path.isfile(_v):
-                    return _v
-    except Exception:
-        pass
-    _c = [_d for _d in glob.glob(os.path.expanduser('~/.claude/plugins/cache/*/obsidian-brain/*/scripts/vault_doctor.py')) if re.fullmatch('[0-9]+([.][0-9]+)*', _d.split('/')[-3])]
-    return max(_c, key=lambda _p: ([int(_n) for _n in _p.split('/')[-3].split('.')], _p), default='')
-print(_ob_doctor())
-")"
-if [[ -z "$DISPATCHER" || ! -f "$DISPATCHER" ]]; then
-    echo "ERROR: could not find scripts/vault_doctor.py" >&2
-    exit 1
-fi
+python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'doctor' < "$REQUEST_PATH"
 ```
 
 If the dispatcher cannot be located, tell the user:
@@ -88,16 +137,30 @@ Stop here if the dispatcher is missing.
 
 Always run with `--json` first so you can parse the output deterministically. Pass through only the flags the user provided:
 
+Request for `doctor` (substitute the values as data):
+
+```json
+{
+  "argv": [
+    "--json",
+    "<selected doctor flags>"
+  ]
+}
+```
+
+Request for `doctor`:
+
+```json
+{
+  "argv": [
+    "--json",
+    "<selected doctor flags>"
+  ]
+}
+```
+
 ```bash
-ARGS=()
-[[ -n "${CHECK:-}" ]] && ARGS+=(--check "$CHECK")
-[[ -n "${DAYS:-}" ]] && ARGS+=(--days "$DAYS")
-[[ -n "${PROJECT:-}" ]] && ARGS+=(--project "$PROJECT")
-[[ -n "${STRICT:-}" ]] && ARGS+=(--strict)
-[[ -n "${RECONSTRUCT:-}" ]] && ARGS+=(--reconstruct)
-[[ -n "${MIN_CONFIDENCE:-}" ]] && ARGS+=(--min-confidence "$MIN_CONFIDENCE")
-ARGS+=(--json)
-python3 "$DISPATCHER" "${ARGS[@]}"
+python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'doctor' < "$REQUEST_PATH"
 ```
 
 Capture stdout as the JSON report. Exit codes:
@@ -189,16 +252,30 @@ If the user DID pass `fix`:
 
 Re-run the dispatcher with `--apply` (do NOT pass `--yes` — let the dispatcher prompt per project interactively):
 
+Request for `doctor` (substitute the values as data):
+
+```json
+{
+  "argv": [
+    "--json",
+    "<selected doctor flags>"
+  ]
+}
+```
+
+Request for `doctor`:
+
+```json
+{
+  "argv": [
+    "--json",
+    "<selected doctor flags>"
+  ]
+}
+```
+
 ```bash
-ARGS=()
-[[ -n "${CHECK:-}" ]] && ARGS+=(--check "$CHECK")
-[[ -n "${DAYS:-}" ]] && ARGS+=(--days "$DAYS")
-[[ -n "${PROJECT:-}" ]] && ARGS+=(--project "$PROJECT")
-[[ -n "${STRICT:-}" ]] && ARGS+=(--strict)
-[[ -n "${RECONSTRUCT:-}" ]] && ARGS+=(--reconstruct)
-[[ -n "${MIN_CONFIDENCE:-}" ]] && ARGS+=(--min-confidence "$MIN_CONFIDENCE")
-ARGS+=(--apply)
-python3 "$DISPATCHER" "${ARGS[@]}"
+python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'doctor' < "$REQUEST_PATH"
 ```
 
 The dispatcher will prompt `Apply N fix(es) for project 'X' in check 'Y'? [y/N]` on stderr for each project. Relay each prompt to the user and pipe their response to the dispatcher's stdin.

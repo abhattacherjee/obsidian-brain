@@ -63,7 +63,7 @@
     "packageManager": "none (stdlib only)"
   },
   "diagram": {
-    "intro": "Claude lifecycle handlers and explicit-host native CLI entry points use a shared stdlib runtime. Bounded transcript adapters normalize visible records. Capture retains facts below publication thresholds, records immutable checkpoints, publishes revision-checked Markdown, then acknowledges publication. Task 4 is in progress; native Codex packaging and desktop hook dispatch acceptance remain pending.",
+    "intro": "Claude lifecycle handlers and explicit-host native CLI entry points use a shared stdlib runtime. Capture retains facts and immutable checkpoints before revision-checked note publication. On-demand AI runs only through the invoking native host. Task 4 is committed; Task 5 implementation is under validation. Task 6 packaging, the full host/client matrix and desktop hook dispatch acceptance remain pending. This is not a shipped parity claim.",
     "tiers": [
       {
         "arrowLabel": null,
@@ -295,7 +295,7 @@
           "files": [
             "hooks/obsidian_utils.py"
           ],
-          "purpose": "Builds a structured prompt and runs the Claude CLI in print mode with timeout+retry. Two-layer open-item dedup, model escalation on empty output, and conservative summary recovery (_normalize_summary). Returns (text, reason). Preparation records the exact note revision before any AI call. Publication checks that baseline, preserves manual edits, and does not hold vault ownership while AI runs."
+          "purpose": "Bound native summary/theme helpers call the shared AI backend with inline scrubbed input and the selected host context. Parallel workers receive that context explicitly. Summary publication binds the result to retained capture/source revisions and managed summary regions; manual prose survives and later capture remains queued when a stale result conflicts. Legacy unbound compatibility cannot silently select a native provider."
         },
         {
           "id": "write-vault-note",
@@ -491,6 +491,36 @@
             "hooks/brain_cli.py"
           ],
           "purpose": "Thin explicit-host CLI wrapper records its entry time before handler work. Start/resume rotate through at most eight registered sources within one second, then capture and read one bounded indexed context hint. Stop captures before the retro gate; capture failure cannot itself block. PreCompact captures and publishes an immutable snapshot. SessionEnd flushes with a 2.5-second work deadline; only this explicit event marks a session ended. turn_aborted marks interruption; task_complete ends a turn. Hooks do not invoke AI, scan the full vault, or rebuild the index. Task 4 is in progress; fixture subprocess checks are not desktop-native dispatch proof."
+        },
+        {
+          "id": "native-ai-backend",
+          "name": "ai_backend.py + native adapters",
+          "kind": "module",
+          "files": [
+            "hooks/ai_backend.py",
+            "hooks/ai_adapters/claude.py",
+            "hooks/ai_adapters/codex.py"
+          ],
+          "purpose": "Runs six analysis operations through the explicit invoking host only. Requests carry inline scrubbed input, source revision, bounded timeout and exact coverage options. Native subprocess input/output and deadlines are bounded; nested-job markers keep capture hooks from recording internal analysis. Strict JSON/schema and semantic checks reject malformed, missing, duplicate or foreign IDs. No provider fallback or model-written vault paths. AIResult.model is the observed actual model, or unknown; requested aliases are not execution evidence."
+        },
+        {
+          "id": "private-operation-state",
+          "name": "operation_state.py",
+          "kind": "module",
+          "files": [
+            "hooks/operation_state.py",
+            "hooks/skill_procedures.py"
+          ],
+          "purpose": "Authored skill stages receive an explicit UUID operation ID and owner-only jobs directory keyed by vault, host, native session and canonical project. Private artifacts stay outside the vault, reject symlinks and use SHA-registered manifests. Fixed shared handlers validate inputs and publish vault edits through the transaction service. Source revisions are captured before AI; stale sources retain user bytes and pending work."
+        },
+        {
+          "id": "native-session-lookup",
+          "name": "session_lookup.py",
+          "kind": "module",
+          "files": [
+            "hooks/session_lookup.py"
+          ],
+          "purpose": "Read-only bounded lookup verifies full host/native session identity in frontmatter before adopting an existing session note. Short display hashes, a changed date or another project worktree do not prove identity. Candidate overflow, ambiguous matches, unusable index or deadline expiry stays pending. It does not scan the whole vault, create an index or guess a host."
         }
       ]
     },
@@ -625,7 +655,7 @@
           "files": [
             "hooks/check_items_cache.py"
           ],
-          "purpose": "Classification cache with trusted-source allowlist {agent,prefilter,cache}. Replay requires matching semantic provenance: complete input group, selected vault, canonical project, algorithm/schema version, invoking backend/model, and optional explicit evidence fingerprint. Legacy entries without fingerprints miss. HEAD, source mtimes, bounded TTL and heuristic-source checks remain; cache replay inherits its original timestamp and fingerprint rather than renewing trust. Bound native contexts store the cache under versioned session_state_path(context)/cache, separate from vault coordination. Persistent OS cache ownership covers load/mutate/save without a vault lock. Timeout, lost token or replaced inode skips publication with a warning; a living holder cannot be stolen by age. Files are 0600 and directories 0700."
+          "purpose": "Replay requires matching complete input/evidence, vault and canonical project, local classifier prompt/policy, actual shared backend output schema, analysis instruction, validation policy and known backend/model identity. Successful observed full model IDs are retained. Claude haiku/sonnet/opus/fable aliases cannot authorize replay, including a prior observed alias resolution; unknown native defaults miss. Explicit known full model settings permit matching replay. Cache writes require ownership and do not publish incomplete classifications."
         },
         {
           "id": "check-items-cli",
@@ -634,7 +664,7 @@
           "files": [
             "hooks/check_items_cli.py"
           ],
-          "purpose": "Holds the semantic-merge and classifier prompts and the Claude CLI dispatch; valid classifications are DONE/NEEDS-ACTION/STALE/ACTIVE/REVIEW. Solves the timeout problem by chunking to <=25 groups/call (well under the 300s ceiling) so chunks stay on Haiku; strips json fences and validates the 6-field payload. _bridge_project_evidence() folds open_item_dedup's git-tag and changed-path ground truth (deep_analysis_pipeline / fold_tags_and_paths_into_completion_zone) into the completion-zone evidence text before the L2 prefilter decides sub-agent-vs-synthetic, so a tag/path-only item can classify DONE without ever reaching the sub-agent (#264). RC_NO_OUTPUT (6, #297 defect 1) distinguishes 'the sub-agent wrote nothing' from a malformed-JSON payload — the guard is content-based, never a bare Path.exists(). Per-chunk retry (CHUNK_MAX_ATTEMPTS=2, #297 defect 2): a chunk that still fails after 2 attempts degrades ONLY its own groups (omitted from the output, unclassified_groups incremented) while completed chunks are kept and every remaining chunk still dispatches; only an all-chunks-failed run returns non-zero. note_evidence_only_for(evidence, project) (#318) is the shared predicate both classification-record producers call — run_classifier's per-project stamp and SKILL.md Step 6's cache-merge replay — so a project whose ONLY real evidence is note_completions (the non-git evidence source) is capped at tier MED regardless of citation wording; it is value-aware (an empty-valued git key does not count as git evidence) via an explicit allowlist of git-derived keys, not a denylist of just note_completions.",
+          "purpose": "Inline semantic-merge and classifier requests use the invoking native backend. Classifier chunks must return every requested group ID exactly once; exhausted, cancelled or unavailable chunks publish no partial result. Validated results are atomically written as private JSON under the explicit session jobs namespace, never to a model-supplied path. Claude threshold aliases remain invocation policy; an explicit full classifier_model controls only Claude classification. Codex uses its native model/profile selection.",
           "overrideEnv": "CHECK_ITEMS_CLASSIFIER_CHUNK_SIZE"
         },
         {
@@ -2085,7 +2115,7 @@
     {
       "id": "classifier-cache-publication",
       "name": "Private classifier cache ownership and provenance",
-      "description": "Operational cache ownership is separate from vault publication and does not cover AI execution.",
+      "description": "Private cache publication uses OS ownership. Replay checks full evidence/input, invoking backend, independently known actual model and both local/shared schema and policy fingerprints. Claude aliases and unknown native defaults miss; observed successful full IDs remain execution evidence only.",
       "steps": [
         {
           "from": "runtime-context",
@@ -2158,6 +2188,33 @@
           "from": "db-coordination",
           "to": "native-lifecycle",
           "label": "rotating registered-source recovery; bounded batch, no full-vault scan"
+        }
+      ]
+    },
+    {
+      "id": "native-ai-analysis",
+      "name": "Native analysis and conditional publication",
+      "description": "Implemented Task 5 path under validation; Task 6 packaging and full parity acceptance remain pending.",
+      "steps": [
+        {
+          "from": "runtime-context",
+          "to": "native-ai-backend",
+          "label": "explicit invoking host + inline scrubbed input/source revision"
+        },
+        {
+          "from": "native-ai-backend",
+          "to": "private-operation-state",
+          "label": "bounded native execution + strict JSON/coverage + observed model"
+        },
+        {
+          "from": "private-operation-state",
+          "to": "note-transactions",
+          "label": "trusted result + pre-AI source SHA; conflict retains source"
+        },
+        {
+          "from": "note-transactions",
+          "to": "write-vault-note",
+          "label": "revision-checked summary/note publication"
         }
       ]
     }
@@ -2494,7 +2551,8 @@
       "Direct filesystem writes only — no MCP server, no REST API, no daemon; the vault works even when Obsidian is closed.",
       "Hooks are pure stdlib, deterministic, and always exit 0; they never import the index (indexing is a skill-side concern).",
       "Search indexing is derived and rebuildable. Durable coordination journals, capture facts and cursors are separate and survive index rebuilds.",
-      "Defense in depth on writes: path containment, atomic temp+rename, 0600/0700 perms, secret scrubbing, 1 MB stdin caps. The stdin-cap AST guard walks all three in-repo Python trees — hooks/, scripts/ and .claude/hooks/ — after #289 retired the opt-in OB_SCAN_RESOLVED_INSTALL walk over the resolved plugin-cache tree (a no-op in both configurations that occur, and upstream-dominated by this repo walk since every cache is populated from a release cut here). The five .claude/hooks/ PreToolUse gates read through a shared _read_hook_input() helper that fails CLOSED on every unusable input: a read error (non-UTF-8 or OSError), overflow past the cap, any parse failure including RecursionError, and a payload that parses but is not an object (or whose tool_input is not an object) all emit permissionDecision: deny at exit 0 — never a non-zero exit, which is a non-blocking error that lets the tool call proceed. #351 closed a class of bypasses where a global option ahead of the verb (git -C/-c/--no-pager, gh -R/--repo) skipped a gate's verb match entirely: a shared _GLOBAL_OPTS regex fragment is now spliced into each hook's verb pattern (_PUSH_VERB, _CHECKOUT_VERB, _COMMIT_VERB, _PR_CREATE_VERB, _PR_MERGE_VERB); gh -R/--repo is deliberately not descoped the way git -C is. prevent-direct-push alone splits a compound command into one invocation per push before any of that runs, and its quoted-span scanner (_quoted_spans) is what decides whether a given ;/&/| is a real separator or sits inside a closed quoted run; a bisect over the sorted span offsets keeps that split linear rather than quadratic in separators x spans. It additionally denies --mirror/--prune/--all/--branches outright (_all_ref_flags, prefix-matched against git's own abbreviation rules) and any refspec whose destination glob could match a protected ref (_branch_glob_refspecs, via fnmatch), decides a protected push or delete target on ref tokens anywhere in the argument list rather than adjacency to the remote (_protected_push_refs/_protected_delete_refs), and anchors its tag allowlist to a single ref token below the deletion gates (_is_tag_ref/_VERSION_TAG) instead of three unanchored substring tests that used to run ahead of it. Known gaps, all pre-existing and not regressions: three quoted spellings of a global-option token remain fail-open (pinned as strict xfail rows so a future fix can't pass silently), and those rows sample a wider class rather than bounding it - the executable and verb words themselves can be quoted or escaped (git \"push\", git p'u'sh, \"git\" push) and are not normalised, so a mangled verb skips the entry test on all five gates; a #-comment, an unbalanced quote inside one, a case ... ) pattern, or a heredoc body ahead of a git -C are blind spots in the shared _shell_scan scoping helper and now cost a fail-closed false deny on legitimate cross-repo -C work; and a mirror configured via remote.<name>.mirror rather than the --mirror flag is invisible to command text."
+      "Defense in depth on writes: path containment, atomic temp+rename, 0600/0700 perms, secret scrubbing, 1 MB stdin caps. The stdin-cap AST guard walks all three in-repo Python trees — hooks/, scripts/ and .claude/hooks/ — after #289 retired the opt-in OB_SCAN_RESOLVED_INSTALL walk over the resolved plugin-cache tree (a no-op in both configurations that occur, and upstream-dominated by this repo walk since every cache is populated from a release cut here). The five .claude/hooks/ PreToolUse gates read through a shared _read_hook_input() helper that fails CLOSED on every unusable input: a read error (non-UTF-8 or OSError), overflow past the cap, any parse failure including RecursionError, and a payload that parses but is not an object (or whose tool_input is not an object) all emit permissionDecision: deny at exit 0 — never a non-zero exit, which is a non-blocking error that lets the tool call proceed. #351 closed a class of bypasses where a global option ahead of the verb (git -C/-c/--no-pager, gh -R/--repo) skipped a gate's verb match entirely: a shared _GLOBAL_OPTS regex fragment is now spliced into each hook's verb pattern (_PUSH_VERB, _CHECKOUT_VERB, _COMMIT_VERB, _PR_CREATE_VERB, _PR_MERGE_VERB); gh -R/--repo is deliberately not descoped the way git -C is. prevent-direct-push alone splits a compound command into one invocation per push before any of that runs, and its quoted-span scanner (_quoted_spans) is what decides whether a given ;/&/| is a real separator or sits inside a closed quoted run; a bisect over the sorted span offsets keeps that split linear rather than quadratic in separators x spans. It additionally denies --mirror/--prune/--all/--branches outright (_all_ref_flags, prefix-matched against git's own abbreviation rules) and any refspec whose destination glob could match a protected ref (_branch_glob_refspecs, via fnmatch), decides a protected push or delete target on ref tokens anywhere in the argument list rather than adjacency to the remote (_protected_push_refs/_protected_delete_refs), and anchors its tag allowlist to a single ref token below the deletion gates (_is_tag_ref/_VERSION_TAG) instead of three unanchored substring tests that used to run ahead of it. Known gaps, all pre-existing and not regressions: three quoted spellings of a global-option token remain fail-open (pinned as strict xfail rows so a future fix can't pass silently), and those rows sample a wider class rather than bounding it - the executable and verb words themselves can be quoted or escaped (git \"push\", git p'u'sh, \"git\" push) and are not normalised, so a mangled verb skips the entry test on all five gates; a #-comment, an unbalanced quote inside one, a case ... ) pattern, or a heredoc body ahead of a git -C are blind spots in the shared _shell_scan scoping helper and now cost a fail-closed false deny on legitimate cross-repo -C work; and a mirror configured via remote.<name>.mirror rather than the --mirror flag is invisible to command text.",
+      "Native AI uses only the invoking host. Requested model aliases and observed actual model IDs are separate; unknown identity cannot authorize cache replay."
     ],
     "constraints": [
       "Python stdlib only — no pip dependencies (hooks run at session boundaries where install state is unknown).",

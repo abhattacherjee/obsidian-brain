@@ -3,6 +3,57 @@ name: check-items
 description: Triage open `- [ ]` items across your Obsidian vault with evidence-grounded AI classification. Auto-closes items shipped by merged PRs, surfaces items needing external action (e.g. `gh issue close`), hides stale items by default. Replaces the old token-overlap heuristic with a two-pass AI pipeline backed by a persistence cache. Use when: (1) sweeping a project for done work, (2) auditing what's still actionable, (3) recovering from /recall deferral fatigue.
 ---
 
+## Native runtime and installed resources
+
+Use the absolute path of this loaded `SKILL.md` as `OB_SKILL_PATH`. Read the
+reference for the invoking host when this skill has paired host references.
+Set `OB_HOST`, `OB_CLIENT`, `OB_SESSION_ID`, and `OB_CWD` from that native
+invocation. Use the selected host's own session ID. Keep curated note taxonomy
+separate from `agent_provider` and `agent_session_id` provenance.
+
+```bash
+OB_SKILL_PATH='<absolute path of this loaded SKILL.md>'
+OB_RESOURCE_ROOT=$(python3 -c 'import pathlib,sys; p=pathlib.Path(sys.argv[1]); assert p.is_absolute(); p=p.resolve(); assert p.name == "SKILL.md" and p.parent.parent.name == "skills"; print(p.parents[2])' "$OB_SKILL_PATH")
+python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" context < /dev/null
+```
+
+Use the returned `config_path`, `vault_path`, `index_path`, and `state_path`.
+Create the operation with this fixed literal request:
+
+```bash
+printf '{}' | python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'prepare'
+```
+
+Call `prepare` to create a private operation under native state. Retain its
+`operation_id` and `operation_dir`. Register approved helper output names with `artifact-store`;
+inputs are read through the immutable artifact manifest. Do not discover resources from the current directory or another plugin
+cache. Each shell invocation supplies the same explicit values; a previous
+shell's variables are not assumed to persist.
+
+Each data operation uses the installed launcher with a JSON request on stdin:
+
+```bash
+python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation '<fixed operation>' < "$REQUEST_PATH"
+```
+
+Map config JSON `vault_path`, `sessions_folder`, and `insights_folder` to the
+procedure variables `VAULT_PATH`/`VAULT`, `SESSIONS_FOLDER`/`SESS`, and
+`INSIGHTS_FOLDER`/`INS`. Use the canonical project returned in config JSON (and native `session` when available),
+not the basename of an unrelated shell working directory.
+
+Before preparing edits or requesting a summary of an existing note, call
+`note-read` and retain its exact `expected_revision`. Apply the proposed note
+with `note-apply` and that revision. A conflict leaves the current note intact;
+show the pending result and do not count the note as saved. New curated notes
+use `note-create`; they never overwrite a collision. Native memory discovery
+is unsupported for Codex until its adapter is verified; shared vault retrieval
+and wiki filing continue without borrowing another host's memory.
+
+Read `references/host-claude.md` or `references/host-codex.md` when present.
+All note writes described below use `note-create` or revision-bound `note-apply`,
+including bidirectional related links. Content is a JSON string, never shell code.
+Keep this rule when a later step uses the word Write or Edit.
+
 # /check-items
 
 ## Invocation
@@ -21,92 +72,23 @@ Arguments are order-independent and combinable: `/check-items all 30d --show-all
 
 ## Step 1 — Parse arguments and resolve scope
 
-Run this bash block. It parses `$ARGUMENTS` per the invocation contract above (positional project / `all` / `Nd`, plus the three flags). Output goes to a temp directory under `~/.claude/obsidian-brain/`; the printed path is captured in `$scope_path` and passed to every subsequent step as `"$scope_path"`.
+Run this bash block. It parses `$ARGUMENTS` per the invocation contract above (positional project / `all` / `Nd`, plus the three flags). Output goes to a temp directory under `<prepared operation_dir>/`; the printed path is captured in `$scope_path` and passed to every subsequent step as `"$scope_path"`.
 
 Each step below is a bash block; the embedded Python reads its inputs from `$1`, `$2`, … via `sys.argv`. Pass `"$scope_path"` captured here as the first arg, and any previous step's output path as subsequent args.
 
-```bash
-ARGUMENTS="${ARGUMENTS:-}"
-scope_path=$(python3 -c "
-import sys, os, glob, json, tempfile, difflib
-import glob, json, os, re, sys
-def _ob_hooks():
-    try:
-        for _m in json.load(open(os.path.expanduser('~/.claude/plugins/known_marketplaces.json'))).values():
-            _s = _m.get('source') if isinstance(_m, dict) else None
-            if not (isinstance(_s, dict) and _s.get('source') == 'directory'):
-                continue
-            _i = _m.get('installLocation') if isinstance(_m, dict) else None
-            if not (isinstance(_i, str) and os.path.isabs(_i)):
-                continue
-            _h = os.path.join(_i, 'hooks')
-            if os.path.isfile(os.path.join(_h, 'obsidian_utils.py')):
-                return _h
-    except Exception:
-        pass
-    _c = [_d for _d in glob.glob(os.path.expanduser('~/.claude/plugins/cache/*/obsidian-brain/*/hooks')) if re.fullmatch('[0-9]+([.][0-9]+)*', _d.split('/')[-2])]
-    return max(_c, key=lambda _p: ([int(_n) for _n in _p.split('/')[-2].split('.')], _p), default='hooks')
-sys.path.insert(0, _ob_hooks())
-from check_items_args import parse_scope
-from obsidian_utils import describe_plugin_install_divergence
+Request for `scope` (substitute the values as data):
 
-argv = sys.argv[1:]
-scope_obj = parse_scope(argv)
-if scope_obj.unknown_tokens:
-    # M2: reuse the project set parse_scope already computed instead of
-    # re-querying the vault index and re-walking every workspace root.
-    _all_projects = scope_obj.known_projects
-    _near = sorted(p for p in _all_projects
-                   if any(t.lower() in p.lower() or p.lower() in t.lower()
-                          for t in scope_obj.unknown_tokens))
-    for _t in scope_obj.unknown_tokens:
-        # difflib catches transpositions and single-character typos
-        # ('obsidian-brian' -> 'obsidian-brain'); the substring pass above
-        # only catches prefixes and truncations. Neither alone is enough.
-        for _c in difflib.get_close_matches(_t, sorted(_all_projects), n=3, cutoff=0.6):
-            if _c not in _near:
-                _near.append(_c)
-    _near = _near[:5]
-    print('ERROR: unrecognised argument(s): '
-          + ', '.join(repr(t) for t in scope_obj.unknown_tokens), file=sys.stderr)
-    if _near:
-        print('Did you mean: ' + ', '.join(_near), file=sys.stderr)
-    print('Valid forms: <project> | all | Nd | --show-all | --dry-run | --no-cache',
-          file=sys.stderr)
-    sys.exit(2)
-scope = {
-    'mode': scope_obj.mode,
-    'project': scope_obj.project,
-    'window_days': scope_obj.window_days,
-    'show_all': scope_obj.show_all,
-    'dry_run': scope_obj.dry_run,
-    'no_cache': scope_obj.no_cache,
+```json
+{
+  "operation_id": "<prepared id>",
+  "argv": [
+    "<user scope flags>"
+  ]
 }
+```
 
-workdir = tempfile.mkdtemp(prefix='check-items-', dir=os.path.expanduser('~/.claude/obsidian-brain'))
-os.chmod(workdir, 0o700)
-scope_path = os.path.join(workdir, 'scope.json')
-with open(scope_path, 'w') as f:
-    json.dump(scope, f)
-os.chmod(scope_path, 0o600)
-
-# #318 Task 7: warn (never fail) when installed obsidian-brain copies
-# disagree on version -- a diagnostic must never break the command it
-# diagnoses, so any failure here is swallowed. Printed to stderr, never
-# stdout: this whole block's stdout is captured as \$scope_path below, and
-# a second stdout line would corrupt that capture.
-try:
-    _skew = describe_plugin_install_divergence()
-    if _skew:
-        print('WARNING: ' + _skew, file=sys.stderr)
-except Exception:
-    pass
-
-print(scope_path)
-" $ARGUMENTS)
-
-echo "scope_path=$scope_path"
-cat "$scope_path"
+```bash
+python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'scope' < "$REQUEST_PATH"
 ```
 
 Save the printed `scope.json` path in `$scope_path`; pass it to every subsequent step as the first arg.
@@ -119,855 +101,142 @@ If the block exits 2, stop and show the user the stderr verbatim; do not fall th
 
 ## Step 2 — Collect open items (Stage 1)
 
+Request for `collect` (substitute the values as data):
+
+```json
+{
+  "operation_id": "<prepared id>",
+  "scope_path": "<registered scope.json>"
+}
+```
+
 ```bash
-raw_path=$(python3 -c "
-import sys, os, glob, json, itertools
-import glob, json, os, re, sys
-def _ob_hooks():
-    try:
-        for _m in json.load(open(os.path.expanduser('~/.claude/plugins/known_marketplaces.json'))).values():
-            _s = _m.get('source') if isinstance(_m, dict) else None
-            if not (isinstance(_s, dict) and _s.get('source') == 'directory'):
-                continue
-            _i = _m.get('installLocation') if isinstance(_m, dict) else None
-            if not (isinstance(_i, str) and os.path.isabs(_i)):
-                continue
-            _h = os.path.join(_i, 'hooks')
-            if os.path.isfile(os.path.join(_h, 'obsidian_utils.py')):
-                return _h
-    except Exception:
-        pass
-    _c = [_d for _d in glob.glob(os.path.expanduser('~/.claude/plugins/cache/*/obsidian-brain/*/hooks')) if re.fullmatch('[0-9]+([.][0-9]+)*', _d.split('/')[-2])]
-    return max(_c, key=lambda _p: ([int(_n) for _n in _p.split('/')[-2].split('.')], _p), default='hooks')
-sys.path.insert(0, _ob_hooks())
-from open_item_dedup import collect_open_items
-
-scope_path = sys.argv[1]
-scope = json.load(open(scope_path))
-config_path = os.path.expanduser('~/.claude/obsidian-brain-config.json')
-try:
-    config = json.load(open(config_path))
-    vault_path = config.get('vault_path')
-    if not vault_path:
-        raise ValueError('vault_path missing from config')
-except (OSError, json.JSONDecodeError, ValueError) as exc:
-    print(f'ERROR: obsidian-brain config not loadable ({exc}); run /obsidian-setup', file=sys.stderr)
-    sys.exit(1)
-sessions_folder = config.get('sessions_folder', 'claude-sessions')
-
-# Resolve project list from scope
-if scope['mode'] == 'vault':
-    # All projects: collect from all session notes without project filter.
-    # We use a sentinel to indicate vault-wide scan below.
-    projects = None
-elif scope['mode'] == 'project' and scope['project']:
-    projects = [scope['project']]
-else:
-    # current: derive project name from cwd git repo name
-    import subprocess
-    res = subprocess.run(
-        ['git', 'rev-parse', '--show-toplevel'],
-        capture_output=True, text=True
-    )
-    if res.returncode != 0:
-        print('ERROR: /check-items current-project mode requires running inside a git repo.\n'
-              'Use /check-items all (vault-wide) or /check-items <project>.', file=sys.stderr)
-        sys.exit(1)
-    cwd_proj = os.path.basename(res.stdout.strip()) if res.returncode == 0 else None
-    projects = [cwd_proj] if cwd_proj else None
-
-raw_items = []
-if projects is None:
-    # vault-wide: scan all session files, no project filter
-    # collect_open_items requires a project arg; use per-project discovery
-    sessions_dir = os.path.join(vault_path, sessions_folder)
-    if os.path.isdir(sessions_dir):
-        seen_projects = set()
-        for fname in os.listdir(sessions_dir):
-            if not fname.endswith('.md'):
-                continue
-            fpath = os.path.join(sessions_dir, fname)
-            try:
-                with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
-                    for line in itertools.islice(f, 20):
-                        if line.strip().startswith('project:'):
-                            proj = line.strip().split(':', 1)[1].strip().strip('\"').strip(\"'\")
-                            if proj:
-                                seen_projects.add(proj)
-                            break
-            except OSError:
-                continue
-        for proj in sorted(seen_projects):
-            items = collect_open_items(
-                vault_path=vault_path,
-                sessions_folder=sessions_folder,
-                project=proj,
-                max_sessions=50,
-            )
-            for fpath, line_num, item_text in items:
-                raw_items.append({
-                    'file': os.path.basename(fpath),
-                    'path': fpath,
-                    'line': line_num,
-                    'text': item_text,
-                    'project': proj,
-                })
-else:
-    for proj in projects:
-        if proj is None:
-            continue
-        items = collect_open_items(
-            vault_path=vault_path,
-            sessions_folder=sessions_folder,
-            project=proj,
-            max_sessions=50,
-        )
-        for fpath, line_num, item_text in items:
-            raw_items.append({
-                'file': os.path.basename(fpath),
-                'path': fpath,
-                'line': line_num,
-                'text': item_text,
-                'project': proj,
-            })
-
-out_path = os.path.join(os.path.dirname(scope_path), 'raw_items.json')
-with open(out_path, 'w') as f:
-    json.dump(raw_items, f, indent=2)
-os.chmod(out_path, 0o600)
-print(out_path)
-" "$scope_path")
-
-echo "raw_path=$raw_path"
+python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'collect' < "$REQUEST_PATH"
 ```
 
 ## Step 3 — Coarse-group + cache partition (Stage 2a + cache load)
 
 Convention: each step is a `bash` block. Steps 1-2 use `python3 -c "..."` with positional argv tokens (inputs passed as `sys.argv` args, e.g. `python3 -c "..." "$scope_path"`). Steps 3-10 use `python3 << 'PYEOF' ... PYEOF` heredoc with inputs passed via environment variables (e.g. `SCOPE_PATH="$scope_path" python3 << 'PYEOF' ... PYEOF`); the Python reads them via `os.environ["VAR_NAME"]` — never via `sys.argv`. Both patterns produce a runnable shell block — never paste raw `python3` blocks that rely on `sys.argv` without an argv-passing wrapper, and never use env-var heredoc style for Steps 1-2 which expect positional args.
 
+Request for `stage-01` (substitute the values as data):
+
+```json
+{
+  "operation_id": "<prepared id>",
+  "inputs": {
+  "RAW_PATH": "<registered RAW_PATH>",
+  "SCOPE_PATH": "<registered SCOPE_PATH>"
+}
+}
+```
+
 ```bash
-part_path=$(SCOPE_PATH="$scope_path" RAW_PATH="$raw_path" python3 << 'PYEOF'
-import sys, os, glob, json, subprocess
-import glob, json, os, re, sys
-def _ob_hooks():
-    try:
-        for _m in json.load(open(os.path.expanduser("~/.claude/plugins/known_marketplaces.json"))).values():
-            _s = _m.get("source") if isinstance(_m, dict) else None
-            if not (isinstance(_s, dict) and _s.get("source") == "directory"):
-                continue
-            _i = _m.get("installLocation") if isinstance(_m, dict) else None
-            if not (isinstance(_i, str) and os.path.isabs(_i)):
-                continue
-            _h = os.path.join(_i, "hooks")
-            if os.path.isfile(os.path.join(_h, "obsidian_utils.py")):
-                return _h
-    except Exception:
-        pass
-    _c = [_d for _d in glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")) if re.fullmatch("[0-9]+([.][0-9]+)*", _d.split("/")[-2])]
-    return max(_c, key=lambda _p: ([int(_n) for _n in _p.split("/")[-2].split(".")], _p), default="hooks")
-sys.path.insert(0, _ob_hooks())
-from open_item_dedup import find_duplicates, cross_project_dedup
-from check_items_cache import canonical_hash, load_cache, partition
-from obsidian_utils import get_workspace_roots
-
-scope_path = os.environ["SCOPE_PATH"]
-raw_path = os.environ["RAW_PATH"]
-scope = json.load(open(scope_path))
-raw_items = json.load(open(raw_path))
-
-# Build coarse groups per project using per-candidate find_duplicates loop.
-# find_duplicates(candidate_text, existing_items, threshold=5) is per-candidate.
-by_project = {}
-for it in raw_items:
-    by_project.setdefault(it.get("project", "unknown"), []).append(it)
-
-coarse_by_proj = {}
-for proj, items in by_project.items():
-    # Convert to the (fpath, line_num, item_text) tuples that find_duplicates expects
-    tuples = [(it["path"], it["line"], it["text"]) for it in items]
-    seen_grouped = set()
-    groups = []
-    for idx, (fpath, line_num, item_text) in enumerate(tuples):
-        if idx in seen_grouped:
-            continue
-        others = [(f, l, t) for j, (f, l, t) in enumerate(tuples) if j != idx]
-        dupes = find_duplicates(item_text, others)
-        members = [{"file": os.path.basename(fpath), "line": line_num, "text": item_text,
-                     "mtime": os.path.getmtime(fpath) if os.path.exists(fpath) else 0}]
-        for df, dl, dt, dc in dupes:
-            for j, (f2, l2, t2) in enumerate(tuples):
-                if os.path.abspath(f2) == os.path.abspath(df) and l2 == dl:
-                    seen_grouped.add(j)
-            members.append({"file": os.path.basename(df), "line": dl,
-                             "text": dt, "confidence": dc,
-                             "mtime": os.path.getmtime(df) if os.path.exists(df) else 0})
-        seen_grouped.add(idx)
-        import uuid
-        g = {
-            "group_id": str(uuid.uuid4())[:8],
-            "project": proj,
-            "representative": item_text,
-            "members": members,
-            "canonical_hash": canonical_hash(item_text),
-        }
-        groups.append(g)
-    coarse_by_proj[proj] = groups
-
-flat_groups = cross_project_dedup(coarse_by_proj) if scope["mode"] == "vault" else \
-              [g for v in coarse_by_proj.values() for g in v]
-
-# Cache partition (per project).
-cache = load_cache()
-known, needs = [], []
-heads = {}
-for proj, groups in coarse_by_proj.items():
-    repo_path = None
-    for _root in get_workspace_roots():
-        _candidate = os.path.join(_root, proj)
-        if os.path.isdir(os.path.join(_candidate, ".git")):
-            repo_path = _candidate
-            break
-    if not repo_path:
-        print(f"[check-items] no repo found for {proj} in {get_workspace_roots()}; forcing reclassify",
-              file=sys.stderr)
-        for g in groups:
-            g["_reason"] = "head_unavailable"  # ensure Step 6 includes these in to_classify
-        needs.extend(groups)
-        continue
-    head_proc = subprocess.run(
-        ["git", "-C", repo_path, "rev-parse", "HEAD"],
-        capture_output=True, text=True, timeout=10,
-    )
-    if head_proc.returncode != 0 or not head_proc.stdout.strip():
-        print(f"[check-items] no HEAD for {proj} ({repo_path}); forcing reclassify",
-              file=sys.stderr)
-        for g in groups:
-            g["_reason"] = "head_unavailable"  # ensure Step 6 includes these in to_classify
-        needs.extend(groups)
-        continue
-    head = head_proc.stdout.strip()
-    heads[proj] = head
-    k, n = partition(groups, cache, project=proj, head_sha=head, force=scope["no_cache"])
-    known.extend(k)
-    needs.extend(n)
-
-out = os.path.join(os.path.dirname(scope_path), "partition.json")
-with open(out, "w") as f:
-    json.dump({"flat_groups": flat_groups, "known": known, "needs": needs, "heads": heads}, f, indent=2)
-os.chmod(out, 0o600)
-print(out)
-PYEOF
-)
-
-echo "part_path=$part_path"
+python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'stage-01' < "$REQUEST_PATH"
 ```
 
 ## Step 4 — Semantic merge on needs-reclassification set (Stage 2b)
 
+Request for `stage-02` (substitute the values as data):
+
+```json
+{
+  "operation_id": "<prepared id>",
+  "inputs": {
+  "PART_PATH": "<registered PART_PATH>",
+  "SCOPE_PATH": "<registered SCOPE_PATH>"
+}
+}
+```
+
 ```bash
-merged_path=$(SCOPE_PATH="$scope_path" PART_PATH="$part_path" python3 << 'PYEOF'
-import sys, os, glob, json
-import glob, json, os, re, sys
-def _ob_hooks():
-    try:
-        for _m in json.load(open(os.path.expanduser("~/.claude/plugins/known_marketplaces.json"))).values():
-            _s = _m.get("source") if isinstance(_m, dict) else None
-            if not (isinstance(_s, dict) and _s.get("source") == "directory"):
-                continue
-            _i = _m.get("installLocation") if isinstance(_m, dict) else None
-            if not (isinstance(_i, str) and os.path.isabs(_i)):
-                continue
-            _h = os.path.join(_i, "hooks")
-            if os.path.isfile(os.path.join(_h, "obsidian_utils.py")):
-                return _h
-    except Exception:
-        pass
-    _c = [_d for _d in glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")) if re.fullmatch("[0-9]+([.][0-9]+)*", _d.split("/")[-2])]
-    return max(_c, key=lambda _p: ([int(_n) for _n in _p.split("/")[-2].split(".")], _p), default="hooks")
-sys.path.insert(0, _ob_hooks())
-from open_item_dedup import merge_groups_semantically, get_last_semantic_merge_mode
-
-scope_path = os.environ["SCOPE_PATH"]
-part_path = os.environ["PART_PATH"]
-data = json.load(open(part_path))
-needs = data["needs"]
-known = data["known"]
-
-# Run semantic merge only over needs-reclassification groups so that known
-# (already-classified) groups are never absorbed into a canonical group and
-# silently lose their _reason flag. Step 6 filters to groups with _reason set;
-# if a needs-group were merged into a known canonical, it would be skipped.
-needs_by_proj = {}
-for g in needs:
-    needs_by_proj.setdefault(g["project"], []).append(g)
-
-# merge_groups_semantically accepts dict {project: [groups]}; returns same shape.
-merged_needs_by_proj = merge_groups_semantically(needs_by_proj) if needs_by_proj else {}
-mode = get_last_semantic_merge_mode()
-
-# Splice known (untouched) back in after merge so Step 6 can iterate all groups.
-merged_by_proj = {}
-for proj, groups in merged_needs_by_proj.items():
-    merged_by_proj.setdefault(proj, []).extend(groups)
-for g in known:
-    merged_by_proj.setdefault(g["project"], []).append(g)
-
-out = os.path.join(os.path.dirname(scope_path), "merged.json")
-with open(out, "w") as f:
-    json.dump({"merged_by_proj": merged_by_proj, "mode": mode}, f, indent=2)
-os.chmod(out, 0o600)
-print(out)
-PYEOF
-)
-
-echo "merged_path=$merged_path"
+python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'stage-02' < "$REQUEST_PATH"
 ```
 
 
 ## Step 5 — Gather evidence (Stage 3)
 
+Request for `stage-03` (substitute the values as data):
+
+```json
+{
+  "operation_id": "<prepared id>",
+  "inputs": {
+  "MERGED_PATH": "<registered MERGED_PATH>",
+  "SCOPE_PATH": "<registered SCOPE_PATH>"
+}
+}
+```
+
 ```bash
-_step5_out=$(SCOPE_PATH="$scope_path" MERGED_PATH="$merged_path" python3 << 'PYEOF'
-import sys, os, glob, json, datetime
-import glob, json, os, re, sys
-def _ob_hooks():
-    try:
-        for _m in json.load(open(os.path.expanduser("~/.claude/plugins/known_marketplaces.json"))).values():
-            _s = _m.get("source") if isinstance(_m, dict) else None
-            if not (isinstance(_s, dict) and _s.get("source") == "directory"):
-                continue
-            _i = _m.get("installLocation") if isinstance(_m, dict) else None
-            if not (isinstance(_i, str) and os.path.isabs(_i)):
-                continue
-            _h = os.path.join(_i, "hooks")
-            if os.path.isfile(os.path.join(_h, "obsidian_utils.py")):
-                return _h
-    except Exception:
-        pass
-    _c = [_d for _d in glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")) if re.fullmatch("[0-9]+([.][0-9]+)*", _d.split("/")[-2])]
-    return max(_c, key=lambda _p: ([int(_n) for _n in _p.split("/")[-2].split(".")], _p), default="hooks")
-sys.path.insert(0, _ob_hooks())
-from open_item_dedup import deep_analysis_pipeline
-
-scope_path = os.environ["SCOPE_PATH"]
-merged_path = os.environ["MERGED_PATH"]
-scope = json.load(open(scope_path))
-data = json.load(open(merged_path))
-_config_path = os.path.expanduser("~/.claude/obsidian-brain-config.json")
-try:
-    config = json.load(open(_config_path))
-    vault_path = config.get("vault_path")
-    if not vault_path:
-        raise ValueError("vault_path missing from config")
-except (OSError, json.JSONDecodeError, ValueError) as exc:
-    print(f"ERROR: obsidian-brain config not loadable ({exc}); run /obsidian-setup", file=sys.stderr)
-    sys.exit(1)
-sessions_folder = config.get("sessions_folder", "claude-sessions")
-insights_folder = config.get("insights_folder", "claude-insights")
-
-# Collect session file basenames within window_days to scope evidence gathering.
-window_days = scope.get("window_days", 14)
-cutoff = (datetime.date.today() - datetime.timedelta(days=window_days)).isoformat()
-sessions_dir = os.path.join(vault_path, sessions_folder)
-basenames = []
-if os.path.isdir(sessions_dir):
-    for fname in sorted(os.listdir(sessions_dir), reverse=True):
-        if not fname.endswith(".md"):
-            continue
-        # Filenames are YYYY-MM-DD-* — date prefix determines recency
-        if len(fname) < 10 or fname[4] != "-" or fname[7] != "-":
-            continue
-        date_prefix = fname[:10]
-        if date_prefix < cutoff:
-            break  # sorted reverse-chronological; once below cutoff we're done
-        basenames.append(fname)
-
-projects = list(data["merged_by_proj"].keys()) if isinstance(data["merged_by_proj"], dict) else []
-output_path = os.path.join(os.path.dirname(scope_path), "pipeline_evidence.json")
-
-# deep_analysis_pipeline(basenames, projects_json, output_path, vault_path,
-#                        sessions_folder, insights_folder, db_path=None)
-# Returns "OK:<total>:<groups>:<N>" status string; data is written to output_path.
-status = deep_analysis_pipeline(
-    basenames=basenames,
-    projects_json=json.dumps(projects),
-    output_path=output_path,
-    vault_path=vault_path,
-    sessions_folder=sessions_folder,
-    insights_folder=insights_folder,
-)
-if not status.startswith("OK"):
-    print(f"WARNING: deep_analysis_pipeline returned: {status}", file=sys.stderr)
-
-# Read the written evidence from output_path for downstream use.
-# evidence_gaps (#318 Task 5 F14) is extracted alongside evidence here, not
-# dropped: it is deep_analysis_pipeline's ONLY record of which projects had
-# no git repo to draw evidence from, and it must reach Step 9's dashboard
-# artefact -- the stderr warning deep_analysis_pipeline already prints is
-# not something the user keeps.
-try:
-    pipeline_data = json.load(open(output_path))
-    evidence = pipeline_data.get("evidence", {})
-    evidence_gaps = pipeline_data.get("evidence_gaps", {})
-except (OSError, json.JSONDecodeError) as e:
-    print(f"WARNING: could not read pipeline output: {e}", file=sys.stderr)
-    evidence = {}
-    evidence_gaps = {}
-
-out = os.path.join(os.path.dirname(scope_path), "evidence.json")
-with open(out, "w") as f:
-    json.dump(evidence, f, default=str, indent=2)
-os.chmod(out, 0o600)
-
-gaps_out = os.path.join(os.path.dirname(scope_path), "gaps.json")
-with open(gaps_out, "w") as f:
-    json.dump(evidence_gaps, f, default=str, indent=2)
-os.chmod(gaps_out, 0o600)
-
-print(out)
-print(gaps_out)
-PYEOF
-)
-
-evidence_path=$(echo "$_step5_out" | sed -n '1p')
-gaps_path=$(echo "$_step5_out" | sed -n '2p')
-
-echo "evidence_path=$evidence_path"
-echo "gaps_path=$gaps_path"
+python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'stage-03' < "$REQUEST_PATH"
 ```
 
 `deep_analysis_pipeline` gathers per-project evidence for every project in `merged_by_proj`. For a project with a resolved local git repo, evidence is git-derived: commits, merged PRs, closed issues, releases, FTS-indexed vault mentions, and tags/changed paths folded in from recent commits. For a project with no local repo, `gather_note_completion_evidence()` (#318) is the only evidence source: it flags an item when a strictly newer session's own `## Summary` reports it done (mirroring `/recall`'s `contradicted_by` signal), gated on the same completion-phrase guard the heuristic classifier uses so a bare co-mention can never fabricate DONE evidence. Both write into the same per-project bucket (`note_completions` alongside the git-derived keys) — Step 6's classifier and Step 7's `assign_tier` treat a project whose ONLY real evidence is `note_completions` as capped at tier MED regardless of citation wording, via `note_evidence_only_for()` (`hooks/check_items_cli.py`), never HIGH.
 
-## Step 6 — Classify (Stage 4) with fallback chain
+## Step 6 — Classify (Stage 4)
+
+Request for `stage-04` (substitute the values as data):
+
+```json
+{
+  "operation_id": "<prepared id>",
+  "inputs": {
+  "EVIDENCE_PATH": "<registered EVIDENCE_PATH>",
+  "MERGED_PATH": "<registered MERGED_PATH>",
+  "SCOPE_PATH": "<registered SCOPE_PATH>"
+}
+}
+```
 
 ```bash
-classifications_path=$(SCOPE_PATH="$scope_path" MERGED_PATH="$merged_path" EVIDENCE_PATH="$evidence_path" python3 << 'PYEOF'
-import sys, os, glob, json
-import glob, json, os, re, sys
-def _ob_hooks():
-    try:
-        for _m in json.load(open(os.path.expanduser("~/.claude/plugins/known_marketplaces.json"))).values():
-            _s = _m.get("source") if isinstance(_m, dict) else None
-            if not (isinstance(_s, dict) and _s.get("source") == "directory"):
-                continue
-            _i = _m.get("installLocation") if isinstance(_m, dict) else None
-            if not (isinstance(_i, str) and os.path.isabs(_i)):
-                continue
-            _h = os.path.join(_i, "hooks")
-            if os.path.isfile(os.path.join(_h, "obsidian_utils.py")):
-                return _h
-    except Exception:
-        pass
-    _c = [_d for _d in glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")) if re.fullmatch("[0-9]+([.][0-9]+)*", _d.split("/")[-2])]
-    return max(_c, key=lambda _p: ([int(_n) for _n in _p.split("/")[-2].split(".")], _p), default="hooks")
-sys.path.insert(0, _ob_hooks())
-from open_item_dedup import (
-    classify_groups_with_agent, classify_groups_heuristic, get_last_classifier_mode
-)
-from check_items_cli import note_evidence_only_for
-
-scope_path = os.environ["SCOPE_PATH"]
-merged_path = os.environ["MERGED_PATH"]
-evidence_path = os.environ["EVIDENCE_PATH"]
-data = json.load(open(merged_path))
-evidence = json.load(open(evidence_path))
-
-# Filter to needs-reclassification only (groups with _reason set).
-all_merged = [g for v in data["merged_by_proj"].values() for g in v] \
-             if isinstance(data["merged_by_proj"], dict) \
-             else data["merged_by_proj"]
-to_classify = [g for g in all_merged if g.get("_reason")]
-
-primary = classify_groups_with_agent(to_classify, evidence)
-mode = get_last_classifier_mode()
-
-# Provenance travels with each verdict: Step 7 refuses to auto-check a
-# heuristic one, Step 10 refuses to cache it.
-for c in primary:
-    c.setdefault("classifier_source", "agent")
-
-# Gap-fill. classify_groups_with_agent may return a PARTIAL list when only
-# some chunks failed (#297). Fill exactly the groups it did not cover rather
-# than discarding the agent's good work. On total failure primary == [], so
-# this degenerates to the old whole-set heuristic fallback.
-_done_ids = {c.get("group_id") for c in primary}
-_missing = [g for g in to_classify if g.get("group_id") not in _done_ids]
-if _missing:
-    for c in classify_groups_heuristic(_missing, evidence):
-        c["classifier_source"] = "heuristic"
-        primary.append(c)
-
-# Merge cached classifications (known_unchanged) with fresh.
-classifications = list(primary)
-for g in all_merged:
-    if g.get("_cached_classification"):
-        classifications.append({
-            "group_id": g.get("group_id"),
-            "classification": g["_cached_classification"],
-            "confidence": g.get("_cached_confidence", "LOW"),
-            "canonical_text": g.get("representative", ""),
-            "evidence_citation": g.get("_cached_evidence_citation"),
-            "action_required": g.get("_cached_action_required"),
-            "project": g.get("project"),
-            "classifier_source": "cache",
-            "note_evidence_only": note_evidence_only_for(evidence, g.get("project", "")),
-        })
-
-out = os.path.join(os.path.dirname(scope_path), "classifications.json")
-with open(out, "w") as f:
-    json.dump({"classifications": classifications, "classifier_mode": mode}, f, indent=2)
-os.chmod(out, 0o600)
-print(out)
-PYEOF
-)
-
-echo "classifications_path=$classifications_path"
+python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'stage-04' < "$REQUEST_PATH"
 ```
 
 ## Step 7 — Apply tier rules + present review (Stage 5)
 
+Request for `stage-05` (substitute the values as data):
+
+```json
+{
+  "operation_id": "<prepared id>",
+  "inputs": {
+  "CLASSIFICATIONS_PATH": "<registered CLASSIFICATIONS_PATH>",
+  "SCOPE_PATH": "<registered SCOPE_PATH>"
+}
+}
+```
+
 ```bash
-buckets_path=$(SCOPE_PATH="$scope_path" CLASSIFICATIONS_PATH="$classifications_path" python3 << 'PYEOF'
-import sys, os, glob, json
-import glob, json, os, re, sys
-def _ob_hooks():
-    try:
-        for _m in json.load(open(os.path.expanduser("~/.claude/plugins/known_marketplaces.json"))).values():
-            _s = _m.get("source") if isinstance(_m, dict) else None
-            if not (isinstance(_s, dict) and _s.get("source") == "directory"):
-                continue
-            _i = _m.get("installLocation") if isinstance(_m, dict) else None
-            if not (isinstance(_i, str) and os.path.isabs(_i)):
-                continue
-            _h = os.path.join(_i, "hooks")
-            if os.path.isfile(os.path.join(_h, "obsidian_utils.py")):
-                return _h
-    except Exception:
-        pass
-    _c = [_d for _d in glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")) if re.fullmatch("[0-9]+([.][0-9]+)*", _d.split("/")[-2])]
-    return max(_c, key=lambda _p: ([int(_n) for _n in _p.split("/")[-2].split(".")], _p), default="hooks")
-sys.path.insert(0, _ob_hooks())
-from open_item_dedup import assign_tier, partition_for_review
-
-scope_path = os.environ["SCOPE_PATH"]
-classifications_path = os.environ["CLASSIFICATIONS_PATH"]
-scope = json.load(open(scope_path))
-data = json.load(open(classifications_path))
-for item in data["classifications"]:
-    item["tier"] = assign_tier(item.get("evidence_citation"),
-                               item.get("canonical_text"),
-                               item.get("classification"),
-                               item.get("classifier_source"),
-                               item.get("note_evidence_only", False))
-
-buckets = partition_for_review(data["classifications"], show_all=scope["show_all"])
-
-mode = data.get("classifier_mode", "ok")
-if mode != "ok":
-    _deg = sum(1 for i in data["classifications"]
-               if i.get("classifier_source") == "heuristic")
-    print(f"\n!! CLASSIFIER DEGRADED (mode={mode}) — {_deg} of "
-          f"{len(data['classifications'])} verdict(s) come from the "
-          f"token-overlap heuristic, not evidence.", file=sys.stderr)
-    print("   Heuristic citations read 'token X near completion phrase Y'. "
-          "That is co-occurrence, NOT proof the item is done.", file=sys.stderr)
-    print("   A citation reading 'DONE rejected — ... but <cue> governs it' is "
-          "the #299 conditional guard: the co-occurrence was a pending or "
-          "forward-looking reference, so the item stayed open.", file=sys.stderr)
-    print("   They are capped at tier MED and are never preselected. "
-          "Verify each one manually before accepting.", file=sys.stderr)
-
-# Format: HIGH first, MED next, LOW (only if show_all). DONE preselected [x],
-# NEEDS-ACTION [ ] with action_required command surfaced. REVIEW always [ ]
-# (never auto-checked — assign_tier caps REVIEW at MED, so it never sorts
-# into the HIGH+DONE preselected group either). Same cap applies to any
-# verdict whose classifier_source is not agent/prefilter/cache (#297) — a
-# heuristic verdict can never reach HIGH, so it can never be preselected.
-print("\n=== Review ===", file=sys.stderr)
-for item in sorted(buckets["review"],
-                   key=lambda x: ("HIGH MED LOW".split().index(x.get("tier", "LOW")),
-                                  x.get("classification"))):
-    mark = "[x]" if item["classification"] == "DONE" and item["tier"] == "HIGH" else "[ ]"
-    _marker = " [heuristic]" if item.get("classifier_source") == "heuristic" else ""
-    print(f"  {mark} ({item['classification']}/{item['tier']}) {item['canonical_text']}{_marker}", file=sys.stderr)
-    print(f"      evidence: {item.get('evidence_citation')}", file=sys.stderr)
-    if item.get("action_required"):
-        print(f"      action:   {item['action_required']}", file=sys.stderr)
-
-out = os.path.join(os.path.dirname(scope_path), "buckets.json")
-with open(out, "w") as f:
-    json.dump(buckets, f, indent=2)
-os.chmod(out, 0o600)
-print(out)
-PYEOF
-)
-
-echo "buckets_path=$buckets_path"
+python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'stage-05' < "$REQUEST_PATH"
 ```
 
 If `scope.dry_run` is true OR the user types `none` at the confirm prompt: skip Step 8 (Edit + cascade) and go straight to Step 9 (dashboard). The dashboard is ALWAYS written.
 
 ## Step 8 — Apply confirmed checkoffs (Stage 6) + cascade (Stage 7)
 
-For each item the user kept selected (default-selected for HIGH+DONE, opt-in for everything else):
+Send the group IDs explicitly kept selected by the user. The fixed operation
+reads the protected preview and merged members, checks every exact source SHA
+captured before AI, verifies each grouped checkbox text, and applies primary
+and sibling checkoffs through the shared transaction boundary. A stale source
+remains pending; never re-read it after AI to approve a replacement revision.
+Only selected groups are stamped `applied=True`. No raw Edit tool writes run.
 
-1. Read the target line via Read tool.
-2. Verify the line matches the preview (memory `feedback_open_item_checkoff_verify_before_edit`).
-3. If mismatch: surface the diff, ABORT this item (do not flip), continue with the next.
-4. If match: use Edit tool to flip `- [ ]` → `- [x]` on that line only. After a successful flip, append `[full_file_path, line_number]` to a `source_skips` tracking list.
-
-After the user-confirmed batch, write the source-skips tracking list to a tempfile and run cascade via `cascade_group_members` (which consumes the Step-3/Step-4 grouping output directly, so textually-divergent siblings clustered by distinctive tokens are also flipped — not just text-search re-discovery matches):
-
-```bash
-# Write source_skips JSON — list of [full_path, line_number] pairs for lines
-# the SKILL already primary-flipped above.  Replace the contents below with the
-# actual list collected in the primary-flip loop.
-_skips_file=$(python3 -c "
-import tempfile, os, json, sys
-d = os.path.expanduser('~/.claude/obsidian-brain')
-os.makedirs(d, mode=0o700, exist_ok=True)
-fd, path = tempfile.mkstemp(dir=d, prefix='check-items-source-skips-', suffix='.json')
-with os.fdopen(fd, 'w') as f:
-    json.dump(sys.argv[1:], f)   # placeholder — SKILL replaces with real list
-os.chmod(path, 0o600)
-print(path)
-")
-# ^^^ In practice, Claude writes the actual skips list by passing them as
-# the JSON-serialised content written to $_skips_file after the primary-flip loop.
-
-SCOPE_PATH="$scope_path" BUCKETS_PATH="$buckets_path" MERGED_PATH="$merged_path" SKIPS_FILE="$_skips_file" python3 << 'PYEOF'
-import sys, os, glob, json, re, tempfile
-import glob, json, os, re, sys
-def _ob_hooks():
-    try:
-        for _m in json.load(open(os.path.expanduser("~/.claude/plugins/known_marketplaces.json"))).values():
-            _s = _m.get("source") if isinstance(_m, dict) else None
-            if not (isinstance(_s, dict) and _s.get("source") == "directory"):
-                continue
-            _i = _m.get("installLocation") if isinstance(_m, dict) else None
-            if not (isinstance(_i, str) and os.path.isabs(_i)):
-                continue
-            _h = os.path.join(_i, "hooks")
-            if os.path.isfile(os.path.join(_h, "obsidian_utils.py")):
-                return _h
-    except Exception:
-        pass
-    _c = [_d for _d in glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")) if re.fullmatch("[0-9]+([.][0-9]+)*", _d.split("/")[-2])]
-    return max(_c, key=lambda _p: ([int(_n) for _n in _p.split("/")[-2].split(".")], _p), default="hooks")
-sys.path.insert(0, _ob_hooks())
-from open_item_dedup import cascade_group_members, parse_cascade_skipped_total
-
-scope_path = os.environ["SCOPE_PATH"]
-buckets_path = os.environ["BUCKETS_PATH"]
-merged_path = os.environ["MERGED_PATH"]
-skips_file = os.environ.get("SKIPS_FILE", "")
-
-_config_path = os.path.expanduser("~/.claude/obsidian-brain-config.json")
-try:
-    config = json.load(open(_config_path))
-    vault_path = config.get("vault_path")
-    if not vault_path:
-        raise ValueError("vault_path missing from config")
-except (OSError, json.JSONDecodeError, ValueError) as exc:
-    print(f"ERROR: obsidian-brain config not loadable ({exc}); run /obsidian-setup", file=sys.stderr)
-    sys.exit(1)
-sessions_folder = config.get("sessions_folder", "claude-sessions")
-sessions_dir = os.path.join(vault_path, sessions_folder)
-
-# #340: source_skips now decides which groups cascade, not just how the report
-# renders, so a spelling difference between the path the primary-flip loop
-# recorded and os.path.join(sessions_dir, basename) (a symlinked vault, a
-# trailing slash) would silently cancel the cascade. Compare real paths.
-def _skip_key(path, line):
-    return (os.path.realpath(str(path)), int(line))
-
-buckets = json.load(open(buckets_path))
-scope = json.load(open(scope_path))
-
-# Load merged groups so we can resolve group_id → members with full paths.
-# Members in merged.json store basename only; resolve to full path via sessions_dir.
-try:
-    merged_data = json.load(open(merged_path))
-    groups_by_id = {}
-    for _gs in merged_data.get("merged_by_proj", {}).values():
-        for _g in _gs:
-            groups_by_id[_g.get("group_id")] = _g
-except (OSError, json.JSONDecodeError) as exc:
-    print(
-        f"[check-items] FATAL: cannot load merged.json ({exc}) — skipping cascade to avoid corrupt cache",
-        file=sys.stderr,
-    )
-    sys.exit(1)
-
-# Load source_skips: set of (full_path, line_number) pairs already primary-flipped.
-source_skips = set()
-if skips_file and os.path.exists(skips_file):
-    try:
-        raw_skips = json.load(open(skips_file))
-        for entry in raw_skips or []:
-            if isinstance(entry, list) and len(entry) == 2:
-                source_skips.add(_skip_key(entry[0], entry[1]))
-    except (OSError, json.JSONDecodeError, ValueError) as exc:
-        print(
-            f"[check-items] WARNING: source_skips load failed ({exc}); no item "
-            f"will be stamped applied and NO sibling cascade runs this run -- "
-            f"the checkoffs from steps 1-4 are on disk, but the report will "
-            f"show them open. Re-run /check-items to cascade.",
-            file=sys.stderr,
-        )
-        source_skips = set()
-
-# #318 Task 6: stamp applied=True on each buckets record whose own occurrence
-# is a member of source_skips -- i.e. was actually Read-Verified-Edited by
-# the primary-flip loop above (steps 1-4), not merely classified. Covers
-# every classification (DONE, NEEDS-ACTION, REVIEW), not just DONE -- a
-# user-opted-in REVIEW checkoff is just as much "actually flipped" as a
-# preselected DONE one. Step 9's dashboard (check_items_report._body)
-# renders `- [x]` from THIS field, not from classification, so a DONE item
-# the user deselected (never reached source_skips) must stay unchecked.
-for b in buckets["review"]:
-    gid = b.get("group_id")
-    merged_group = groups_by_id.get(gid) if gid else None
-    if not merged_group:
-        continue
-    for m in merged_group.get("members", []) or []:
-        basename = m.get("file", "")
-        line_num = m.get("line")
-        if not basename or line_num is None:
-            continue
-        full_path = os.path.join(sessions_dir, basename)
-        try:
-            key = _skip_key(full_path, line_num)
-        except (TypeError, ValueError):
-            continue
-        if key in source_skips:
-            b["applied"] = True
-            break
-
-# #340: a non-empty source_skips that stamps nothing means every recorded path
-# failed to match a group member -- the cascade below would then silently do
-# nothing, which prints exactly like "the user deselected everything".
-_stamped = sum(1 for b in buckets["review"] if b.get("applied"))
-if source_skips and not _stamped:
-    print(
-        f"[check-items] WARNING: {len(source_skips)} primary flip(s) recorded "
-        f"but none matched a grouped item, so no sibling cascade runs and the "
-        f"report shows them open. Recorded paths must be under {sessions_dir}.",
-        file=sys.stderr,
-    )
-
-# M3: atomic temp+rename for a REWRITE of a file downstream steps depend
-# on (repo rule -- see write_vault_note()/save_cache()'s pattern), not a
-# plain in-place open("w"), which can leave buckets_path truncated or
-# half-written if this process is killed mid-write.
-def _atomic_write_json(path, data):
-    _dir = os.path.dirname(path) or "."
-    _fd, _tmp = tempfile.mkstemp(dir=_dir, prefix=os.path.basename(path) + ".", suffix=".tmp")
-    with os.fdopen(_fd, "w") as f:
-        json.dump(data, f, indent=2)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(_tmp, path)
-    os.chmod(path, 0o600)
-
-# Persist the applied stamps: Step 9 reads buckets_path fresh for its
-# classifications argument, so the in-memory mutation above is invisible
-# downstream unless written back here.
-_atomic_write_json(buckets_path, buckets)
-
-# Build groups_to_cascade: DONE items from buckets["review"] that have members
-# in merged.json AND were stamped applied above. Resolve member basenames to
-# full paths.
-#
-# #340: only a group whose own occurrence the user actually flipped cascades.
-# Cascading every DONE group ignored the user's choices (a deselected DONE, or
-# a MED DONE they never opted into, was checked off anyway), and each such
-# cascade-only flip rendered `- [ ]` in Step 9's report while the vault said
-# `- [x]`. Gating on the stamp makes every cascaded group one the report
-# already renders checked.
-groups_to_cascade = []
-for b in buckets["review"]:
-    if b.get("classification") != "DONE":
-        continue
-    if not b.get("applied"):
-        continue
-    gid = b.get("group_id")
-    merged_group = groups_by_id.get(gid) if gid else None
-    if not merged_group:
-        continue
-    raw_members = merged_group.get("members", []) or []
-    if not raw_members:
-        continue
-    resolved_members = []
-    for m in raw_members:
-        basename = m.get("file", "")
-        line_num = m.get("line")
-        if not basename or line_num is None:
-            continue
-        full_path = os.path.realpath(os.path.join(sessions_dir, basename))
-        resolved_members.append({"file": full_path, "line": line_num, "text": m.get("text", "")})
-    if resolved_members:
-        groups_to_cascade.append({"members": resolved_members})
-
-summary = cascade_group_members(groups_to_cascade, source_skips)
-print(f"[cascade] {summary}")
-
-# Extract count from summary for downstream use.
-m = re.search(r"Cascaded (\d+)", summary)
-cascade_total = int(m.group(1)) if m else 0
-print(f"cascaded_total={cascade_total}")
-
-# #320 F1/F2: `summary` can carry Skipped/WRITE FAILED lines beyond the bare
-# count above -- surface them as distinct fields instead of letting them
-# disappear once cascade_total is extracted, and treat a lost write as a
-# hard failure rather than a silent success (0 exit code, "nothing to do").
-skipped_lines = [
-    ln for ln in summary.splitlines()
-    if ln.startswith("Skipped ") or ln.startswith("WRITE FAILED")
-]
-# #320 R1 (Gemini): the doc below (Output format section) promises
-# cascade_skipped_total sums every Skipped AND WRITE FAILED line -- the
-# inline parsing here previously only summed Skipped lines, silently
-# diverging from that doc. parse_cascade_skipped_total() (hooks/
-# open_item_dedup.py) is the single source of truth for both this script
-# and its unit tests, so the two can no longer drift apart.
-cascade_skipped_total = parse_cascade_skipped_total(summary)
-for ln in skipped_lines:
-    print(f"[cascade-skip] {ln}")
-print(f"cascade_skipped_total={cascade_skipped_total}")
-
-# #318 I1: persist cascaded/skipped to a sibling file (same directory,
-# chmod, and write style as buckets_path above) so Step 9's block can read
-# them mechanically instead of the driving agent copying printed numbers
-# across steps. Written BEFORE the WRITE FAILED check below so Step 9 still
-# gets an accurate count even when this run reports non-zero -- the
-# confirmed primary-flip checkoffs and any successful cascade flips are
-# still on disk either way.
-cascade_summary_path = os.path.join(os.path.dirname(scope_path), "cascade_summary.json")
-_atomic_write_json(cascade_summary_path, {"cascaded": cascade_total, "skipped": cascade_skipped_total})
-
-if "WRITE FAILED" in summary:
-    print(
-        "[cascade] FATAL: a verified checkoff flip failed to save to disk "
-        "-- do not report this run as fully successful",
-        file=sys.stderr,
-    )
-    sys.exit(1)
-PYEOF
-
-# #320 F2: if the block above exited non-zero (WRITE FAILED), STOP here --
-# do not report the run as fully successful. Tell the user which file(s)
-# lost a verified flip (see the printed [cascade-skip] WRITE FAILED line
-# and stderr) and that they should re-run /check-items to retry the
-# cascade once the underlying disk/permission issue is resolved. The
-# confirmed checkoffs from steps 1-4 above are still on disk; only the
-# cascade to sibling copies failed to save.
-
-# Clean up source-skips tempfile.
-rm -f "$_skips_file"
+```json
+{
+  "operation_id": "<prepared id>",
+  "reviewed_group_ids": ["<user-selected group ID>"]
+}
 ```
 
-**Note on primary-flip loop tracking:** After each successful Edit in steps 1–4, append the flipped item's full file path and line number as `[path, line]` to a Python list, then write that list as JSON to `$_skips_file` before running the cascade block. This prevents the cascade from double-flipping lines the SKILL already handled. `batch_cascade_checkoff` is retained for ad-hoc text-search use outside this SKILL flow. `source_skips` has a second consumer now (#318 Task 6): the cascade block above also uses it to stamp `applied=True` on each buckets record it corresponds to, and rewrites `buckets_path` with that stamp before Step 9 runs. Only stamped DONE groups cascade (#340), so a DONE item the user deselected stays unchecked everywhere, siblings included.
+```bash
+python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'apply-reviewed' < "$REQUEST_PATH"
+```
+
+The operation updates the same buckets and cascade summary artifacts used by
+Step 9. A pending or failed result is reported before continuing. Already
+published files in a partial CAS result remain published; do not call the run
+fully successful. The legacy `stage-06` skip-tracking procedure remains an
+internal compatibility operation; new native review uses `apply-reviewed`.
 
 **Reading `cascade_total` and `cascade_skipped_total`:** Step 9 reads both mechanically from `cascade_summary.json` (written above, alongside `buckets_path`) — nothing to carry forward by hand. Still surface both to the terminal Output format's `Cascaded:` and `Skipped:` lines from this block's own printed `[cascade]`/`cascade_skipped_total=` output. If the python block above exited non-zero, its `WRITE FAILED` line is the reason — report it to the user verbatim rather than proceeding as if the cascade fully succeeded.
 
@@ -975,143 +244,25 @@ rm -f "$_skips_file"
 
 (Implemented in Task 22.) Every argument below is derived mechanically from files already on disk by this step's own block — #318 I1: before this fix, `classifications`/`merges`/`evidence_gaps` were prose instructions with no executable block behind them, the same "written, tested, and unreachable unless a model complies" shape as F14. `write_check_items_dashboard()`'s path convention: `<vault>/<check_items_folder>/check-items-<scope>-<YYYY-MM-DD>.md` (folder configurable, default `claude-check-items`).
 
+Request for `stage-07` (substitute the values as data):
+
+```json
+{
+  "operation_id": "<prepared id>",
+  "inputs": {
+  "BUCKETS_PATH": "<registered BUCKETS_PATH>",
+  "CLASSIFICATIONS_PATH": "<registered CLASSIFICATIONS_PATH>",
+  "GAPS_PATH": "<registered GAPS_PATH>",
+  "MERGED_PATH": "<registered MERGED_PATH>",
+  "PART_PATH": "<registered PART_PATH>",
+  "RAW_PATH": "<registered RAW_PATH>",
+  "SCOPE_PATH": "<registered SCOPE_PATH>"
+}
+}
+```
+
 ```bash
-report_path=$(SCOPE_PATH="$scope_path" RAW_PATH="$raw_path" PART_PATH="$part_path" MERGED_PATH="$merged_path" CLASSIFICATIONS_PATH="$classifications_path" BUCKETS_PATH="$buckets_path" GAPS_PATH="$gaps_path" python3 << 'PYEOF'
-import sys, os, glob, json, re, subprocess, datetime
-import glob, json, os, re, sys
-def _ob_hooks():
-    try:
-        for _m in json.load(open(os.path.expanduser("~/.claude/plugins/known_marketplaces.json"))).values():
-            _s = _m.get("source") if isinstance(_m, dict) else None
-            if not (isinstance(_s, dict) and _s.get("source") == "directory"):
-                continue
-            _i = _m.get("installLocation") if isinstance(_m, dict) else None
-            if not (isinstance(_i, str) and os.path.isabs(_i)):
-                continue
-            _h = os.path.join(_i, "hooks")
-            if os.path.isfile(os.path.join(_h, "obsidian_utils.py")):
-                return _h
-    except Exception:
-        pass
-    _c = [_d for _d in glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")) if re.fullmatch("[0-9]+([.][0-9]+)*", _d.split("/")[-2])]
-    return max(_c, key=lambda _p: ([int(_n) for _n in _p.split("/")[-2].split(".")], _p), default="hooks")
-sys.path.insert(0, _ob_hooks())
-from open_item_dedup import merge_records_from_groups
-from check_items_report import write_check_items_dashboard
-
-scope_path = os.environ["SCOPE_PATH"]
-raw_path = os.environ["RAW_PATH"]
-part_path = os.environ["PART_PATH"]
-merged_path = os.environ["MERGED_PATH"]
-classifications_path = os.environ["CLASSIFICATIONS_PATH"]
-buckets_path = os.environ["BUCKETS_PATH"]
-gaps_path = os.environ["GAPS_PATH"]
-
-_config_path = os.path.expanduser("~/.claude/obsidian-brain-config.json")
-try:
-    config = json.load(open(_config_path))
-    vault_path = config.get("vault_path")
-    if not vault_path:
-        raise ValueError("vault_path missing from config")
-except (OSError, json.JSONDecodeError, ValueError) as exc:
-    print(f"ERROR: obsidian-brain config not loadable ({exc}); run /obsidian-setup", file=sys.stderr)
-    sys.exit(1)
-
-scope = json.load(open(scope_path))
-
-# scope_name: mirrors Step 2's own project-name resolution exactly, so the
-# dashboard filename/frontmatter always names what Step 2 actually scanned.
-if scope["mode"] == "vault":
-    scope_name = "vault"
-elif scope["mode"] == "project" and scope["project"]:
-    scope_name = scope["project"]
-else:
-    res = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True)
-    scope_name = os.path.basename(res.stdout.strip()) if res.returncode == 0 and res.stdout.strip() else "unknown"
-
-date_str = datetime.date.today().isoformat()
-window_days = scope.get("window_days", 14)
-dry_run = bool(scope.get("dry_run", False))
-
-raw_count = len(json.load(open(raw_path)))
-group_count = len(json.load(open(part_path)).get("flat_groups", []))
-
-merged_data = json.load(open(merged_path))
-semantic_merge_mode = merged_data.get("mode", "ok")
-# merge_records_from_groups accepts the {project: [groups]} dict form
-# merged_by_proj already is -- no flattening needed here.
-merges = merge_records_from_groups(merged_data.get("merged_by_proj", {}))
-
-classifier_mode = json.load(open(classifications_path)).get("classifier_mode", "ok")
-
-# #318 Task 6 / I1: classifications is buckets["review"] reloaded fresh from
-# buckets_path -- the same file Step 8's cascade block rewrote with `applied`
-# stamps -- never a copy captured earlier in the run, or every checkbox would
-# silently revert to reading from classification instead of fact.
-buckets = json.load(open(buckets_path))
-classifications = buckets.get("review", [])
-# applied (run total) is derived the SAME way check_items_report._body now
-# reconciles it against the per-record data (#318 I2): the count of records
-# actually stamped applied=True, not a separately-tracked tally that could
-# silently drift from what Step 8 actually flipped.
-applied = sum(1 for c in classifications if c.get("applied"))
-
-try:
-    evidence_gaps = json.load(open(gaps_path))
-except (OSError, json.JSONDecodeError) as exc:
-    # N2: None, not {} -- write_check_items_dashboard() treats None as the
-    # argument being OMITTED (a true no-op: no section, no frontmatter
-    # key). {} is a real, evaluated-and-clean result and would stamp
-    # `evidence_gaps: 0`, asserting coverage that never actually happened
-    # because this file could not be read at all.
-    print(f"WARNING: could not read {gaps_path}: {exc} -- evidence_gaps "
-          f"omitted from this report", file=sys.stderr)
-    evidence_gaps = None
-
-# cascade_summary.json is written by Step 8's cascade block, AFTER computing
-# cascaded/skipped but before its own WRITE FAILED check, so it exists even
-# on a failed cascade run. It does NOT exist when Step 8 was skipped
-# entirely (dry_run or the user typed "none") -- 0/0 is correct there, since
-# nothing was cascaded. N3: it can ALSO be missing when Step 8 ran, flipped
-# some primary items, then died before reaching this write (an uncaught
-# exception, or the earlier "cannot load merged.json" FATAL) -- 0/0 is
-# silently WRONG in that case, so it's still the fallback (a report must
-# still get written) but the quiet-and-wrong case is now named on stderr
-# instead of reading identically to "nothing happened, nothing to cascade".
-cascade_summary_path = os.path.join(os.path.dirname(scope_path), "cascade_summary.json")
-try:
-    cascade_summary = json.load(open(cascade_summary_path))
-    cascaded = cascade_summary.get("cascaded", 0)
-    skipped = cascade_summary.get("skipped", 0)
-except (OSError, json.JSONDecodeError) as exc:
-    print(f"WARNING: could not read {cascade_summary_path}: {exc} -- "
-          f"cascaded/skipped default to 0, which is WRONG if Step 8 ran "
-          f"and died before writing this file (correct only if Step 8 was "
-          f"skipped entirely)", file=sys.stderr)
-    cascaded, skipped = 0, 0
-
-report_path = write_check_items_dashboard(
-    vault_path=vault_path,
-    scope_name=scope_name,
-    date_str=date_str,
-    window_days=window_days,
-    raw_count=raw_count,
-    group_count=group_count,
-    classifications=classifications,
-    applied=applied,
-    cascaded=cascaded,
-    merges=merges,
-    semantic_merge_mode=semantic_merge_mode,
-    classifier_mode=classifier_mode,
-    dry_run=dry_run,
-    skipped=skipped,
-    evidence_gaps=evidence_gaps,
-)
-print(report_path)
-PYEOF
-)
-
-echo "report_path=$report_path"
+python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'stage-07' < "$REQUEST_PATH"
 ```
 
 `report_path` is the dashboard note's full path — surface it to the user in the terminal Output format's `Report:` line.
@@ -1120,144 +271,21 @@ N5: this block has no top-level `try` around its core inputs (`raw_path`/`part_p
 
 ## Step 10 — Persist cache updates
 
+Request for `stage-08` (substitute the values as data):
+
+```json
+{
+  "operation_id": "<prepared id>",
+  "inputs": {
+  "CLASSIFICATIONS_PATH": "<registered CLASSIFICATIONS_PATH>",
+  "PARTITION_PATH": "<registered PARTITION_PATH>",
+  "SCOPE_PATH": "<registered SCOPE_PATH>"
+}
+}
+```
+
 ```bash
-SCOPE_PATH="$scope_path" CLASSIFICATIONS_PATH="$classifications_path" PARTITION_PATH="$part_path" python3 << 'PYEOF'
-import sys, os, glob, json, time
-import glob, json, os, re, sys
-def _ob_hooks():
-    try:
-        for _m in json.load(open(os.path.expanduser("~/.claude/plugins/known_marketplaces.json"))).values():
-            _s = _m.get("source") if isinstance(_m, dict) else None
-            if not (isinstance(_s, dict) and _s.get("source") == "directory"):
-                continue
-            _i = _m.get("installLocation") if isinstance(_m, dict) else None
-            if not (isinstance(_i, str) and os.path.isabs(_i)):
-                continue
-            _h = os.path.join(_i, "hooks")
-            if os.path.isfile(os.path.join(_h, "obsidian_utils.py")):
-                return _h
-    except Exception:
-        pass
-    _c = [_d for _d in glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")) if re.fullmatch("[0-9]+([.][0-9]+)*", _d.split("/")[-2])]
-    return max(_c, key=lambda _p: ([int(_n) for _n in _p.split("/")[-2].split(".")], _p), default="hooks")
-sys.path.insert(0, _ob_hooks())
-from check_items_cache import locked_cache, update_cache, canonical_hash
-
-scope_path = os.environ["SCOPE_PATH"]
-classifications_path = os.environ["CLASSIFICATIONS_PATH"]
-partition_path = os.environ["PARTITION_PATH"]
-scope = json.load(open(scope_path))
-data = json.load(open(classifications_path))
-part = json.load(open(partition_path))
-
-# Re-derive project list for cache update; HEAD shas are reused from Step 3 (#305).
-all_groups = part["flat_groups"]
-
-# Build a lookup from merged.json so we can attach members + mtime to each
-# fresh classification. members are required by partition() for mtime
-# invalidation; empty members causes every group to look mtime_changed next run.
-merged_path_for_step10 = os.path.join(os.path.dirname(scope_path), "merged.json")
-try:
-    merged_data = json.load(open(merged_path_for_step10))
-    all_merged = merged_data
-except (OSError, json.JSONDecodeError) as exc:
-    print(
-        f"[check-items] FATAL: cannot load merged.json ({exc}) — skipping cache update to avoid corrupt cache",
-        file=sys.stderr,
-    )
-    sys.exit(1)
-
-groups_by_id = {}
-for _proj, _gs in all_merged.get("merged_by_proj", {}).items():
-    for _g in _gs:
-        groups_by_id[_g.get("group_id")] = _g
-
-fresh_classifications = []
-for c in data["classifications"]:
-    gid = c.get("group_id")
-    group = groups_by_id.get(gid, {})
-    fresh_classifications.append({
-        "canonical_hash": group.get("canonical_hash") or canonical_hash(c.get("canonical_text", "")),
-        "canonical_text": c.get("canonical_text", ""),
-        "members": group.get("members", []),  # file/line/mtime preserved for mtime invalidation
-        "classification": c.get("classification"),
-        "confidence": c.get("confidence"),
-        "evidence_citation": c.get("evidence_citation"),
-        # #297: a missing classifier_source must not be laundered into a
-        # trusted value here — update_cache's allowlist only persists
-        # agent/prefilter/cache, so an absent source now correctly falls
-        # through to "" and gets refused rather than silently cached as if
-        # it were agent-derived.
-        "classifier_source": c.get("classifier_source", ""),
-        # #302: this stamp is authoritative only for freshly-derived
-        # verdicts. For classifier_source == "cache" replays (Step 6),
-        # _freeze_classification (called from update_cache) ignores this
-        # value and inherits the prior on-disk entry's classified_ts
-        # instead — but only when such an entry still exists and carries
-        # its own classified_ts. If not (see the "no prior on-disk" warning
-        # branch inside _freeze_classification), this stamp IS used as-is
-        # and the TTL restarts. In the normal case a replayed verdict's TTL
-        # keeps measuring from its last real verification, not its last read.
-        "classified_ts": int(time.time()),
-        "_group_project": group.get("project", "unknown"),  # carried for fresh_by_proj attribution
-    })
-
-# Group by project for per-project update_cache calls.
-groups_by_proj = {}
-for g in all_groups:
-    groups_by_proj.setdefault(g.get("project", "unknown"), []).append(g)
-fresh_by_proj = {}
-for fc in fresh_classifications:
-    # Derive project from the looked-up group (groups_by_id[gid]["project"]), not hash matching,
-    # so same canonical text in multiple projects is attributed correctly.
-    proj = fc.pop("_group_project", "unknown")
-    fresh_by_proj.setdefault(proj, []).append(fc)
-
-# #305: reuse the HEAD captured at Step 3 rather than re-deriving it here. A
-# commit landing between Step 3 and Step 10 would otherwise stamp a mid-run
-# HEAD onto verdicts that were actually derived against the OLD head —
-# laundering them as verified-current when they were never checked against
-# this newer commit.
-heads = part.get("heads", {})
-# #306: locked_cache() serializes the whole load-mutate-save cycle behind a
-# lock, so a concurrent run on a different project (same shared
-# cross-project cache file) cannot overwrite this run's update with a stale
-# snapshot. It loads, yields the cache to mutate below, and saves + releases
-# once this block exits.
-#
-# #323 F3: two paths previously skipped the save entirely and left the run
-# looking clean anyway — a body exception, or save_cache() itself raising
-# (a full or read-only disk) — with nothing telling the driving agent to
-# notice. Both are now caught here and reported explicitly rather than
-# left as a bare traceback. #323 F6: `update_cache()` mutates `cache` IN
-# PLACE and its return value is deliberately left unassigned below —
-# locked_cache() saves its OWN `cache` binding, so reassigning that name to
-# update_cache's return value here would be invisible to it the day
-# update_cache() stops returning the same object it was given (see
-# locked_cache()'s docstring).
-try:
-    with locked_cache() as cache:
-        for proj, proj_groups in groups_by_proj.items():
-            head = heads.get(proj)
-            if not head:
-                print(f"[check-items] no head captured at Step 3 for {proj}; skipping cache update",
-                      file=sys.stderr)
-                continue
-            update_cache(
-                cache=cache,
-                project=proj,
-                all_groups=proj_groups,
-                fresh_classifications=fresh_by_proj.get(proj, []),
-                head_sha=head,
-            )
-except Exception as exc:
-    # stdout, not stderr: skills/standup/SKILL.md documents stderr as
-    # ignorable, and this line must actually be noticed.
-    print(f"cache NOT updated: {exc}")
-    sys.exit(1)
-
-print("cache updated")
-PYEOF
+python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'stage-08' < "$REQUEST_PATH"
 ```
 
 **#323 F3 — if the block above printed `cache NOT updated: <reason>` and exited non-zero:** STOP here — do not summarise this run as clean, and do not report `Cached: N reused, M fresh` (from Step 7) as if it were the final state. Report the `cache NOT updated: ...` line to the user verbatim. This run's classifications are lost (fail-safe: every group re-derives from scratch next run, at the cost of re-classification tokens, never incorrect output) — but any checkoffs already applied in Step 8 are on disk and unaffected.
@@ -1282,5 +310,11 @@ PYEOF
 ## Notes
 
 - All sub-agent prompts live in `hooks/check_items_cli.py` (the semantic-merge and classifier prompt constants). Do NOT inline those prompts in this SKILL.md.
-- The cache file is at `~/.claude/obsidian-brain/check-items-classifications.json` (0o600). Safe to delete for a full reset.
+- The cache file is at `<native state_path>/check-items-classifications.json` (0o600). Safe to delete for a full reset.
 - `/recall` no longer surfaces checkoff candidates. If you used to invoke `/recall → "skip"`, just run `/check-items` directly.
+
+Native classification publishes only when every requested group has one valid
+result. Cancellation, unavailable AI, or exhausted chunks leave the operation
+pending. They never become a heuristic success, dashboard, or cache update.
+Cache replay begins after full evidence is gathered; Step 10 verifies the same
+full input, evidence, prompt, policy, backend, and actual model before stamping.

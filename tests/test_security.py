@@ -363,7 +363,7 @@ class TestStdinCap:
         return aliases
 
     @classmethod
-    def _consumption_sites(cls, tree, aliases):
+    def _consumption_sites(cls, tree, aliases, outbound_registrations=()):
         """Yield ``(node, size_arg_or_None, kind)`` for every construct that
         drains stdin.
 
@@ -379,6 +379,8 @@ class TestStdinCap:
         """
         for node in ast.walk(tree):
             if isinstance(node, ast.Call):
+                if node in outbound_registrations:
+                    continue
                 if isinstance(node.func, ast.Attribute) and cls._is_stdin_expr(
                     node.func.value, aliases
                 ):
@@ -440,6 +442,36 @@ class TestStdinCap:
             return left + right if isinstance(arg.op, ast.Add) else left - right
         return None
 
+    @staticmethod
+    def _outbound_registrations(tree, path):
+        # One proven write-only native subprocess registration is not a read.
+        if str(path) != "hooks/ai_backend.py":
+            return set()
+        function = next((node for node in tree.body if isinstance(node, ast.FunctionDef)
+                         and node.name == "_run_bounded"), None)
+        if function is None:
+            return set()
+        owns_pipe = any(isinstance(node, ast.Assign)
+                        and [ast.unparse(target) for target in node.targets] == ["process"]
+                        and isinstance(node.value, ast.Call)
+                        and ast.unparse(node.value.func) == "subprocess.Popen"
+                        and any(keyword.arg == "stdin" and ast.unparse(keyword.value) == "subprocess.PIPE"
+                                for keyword in node.value.keywords)
+                        for node in ast.walk(function))
+        owns_selector = any(isinstance(node, ast.With)
+                            and any(ast.unparse(item.context_expr) == "selectors.DefaultSelector()"
+                                    and item.optional_vars is not None
+                                    and ast.unparse(item.optional_vars) == "selector"
+                                    for item in node.items)
+                            for node in ast.walk(function))
+        if not owns_pipe or not owns_selector:
+            return set()
+        return {node for node in ast.walk(function) if isinstance(node, ast.Call)
+                and ast.unparse(node.func) == "selector.register"
+                and not node.keywords
+                and [ast.unparse(arg) for arg in node.args]
+                == ["process.stdin", "selectors.EVENT_WRITE", "'input'"]}
+
     @classmethod
     def _all_stdin_reads(cls):
         """``[(path, lineno, bound_or_None, kind)]`` for the whole codebase."""
@@ -448,7 +480,7 @@ class TestStdinCap:
             tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
             consts = cls._int_constants(tree)
             aliases = cls._stdin_aliases(tree)
-            for node, size_arg, kind in cls._consumption_sites(tree, aliases):
+            for node, size_arg, kind in cls._consumption_sites(tree, aliases, cls._outbound_registrations(tree, path)):
                 bound = cls._resolve_bound(size_arg, consts) if size_arg else None
                 found.append((str(path), node.lineno, bound, kind))
         return found
@@ -552,6 +584,24 @@ class TestStdinCap:
             "since that file's cap stops being verified while the suite stays "
             "green."
         )
+
+    def test_only_owned_native_write_pipe_registration_is_excluded(self):
+        path = Path("hooks/ai_backend.py")
+        source = path.read_text()
+        tree = ast.parse(source)
+        excluded = self._outbound_registrations(tree, path)
+        assert len(excluded) == 1
+        assert list(self._consumption_sites(tree, self._stdin_aliases(tree), excluded)) == []
+        for mutated in (source.replace("stdin=subprocess.PIPE", "stdin=sys.stdin", 1),
+                        source.replace('selectors.EVENT_WRITE, "input"', 'selectors.EVENT_READ, "input"', 1)):
+            changed = ast.parse(mutated)
+            assert not self._outbound_registrations(changed, path)
+            assert list(self._consumption_sites(changed, self._stdin_aliases(changed)))
+        changed = ast.parse(source + "\njson.load(sys.stdin)\n")
+        assert len(list(self._consumption_sites(changed, self._stdin_aliases(changed),
+                                               self._outbound_registrations(changed, path)))) == 1
+        assert not self._outbound_registrations(tree, Path("hooks/new_writer.py"))
+
 
 class TestFilePermissions:
     """M1, M2: Files use 0o600 permissions."""

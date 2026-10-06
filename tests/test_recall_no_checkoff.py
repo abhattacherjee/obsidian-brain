@@ -38,7 +38,7 @@ def test_recall_skill_md_has_check_items_nudge():
 
 def test_recall_skill_md_task_manifest_is_three_tasks():
     text = SKILL_PATH.read_text(encoding="utf-8")
-    task_create_lines = [l for l in text.splitlines() if l.lstrip().startswith("TaskCreate:")]
+    task_create_lines = [l for l in text.splitlines() if l.lstrip().startswith("Native progress task:")]
     assert len(task_create_lines) == 3, \
         f"expected 3 task-manifest entries, got {len(task_create_lines)}: {task_create_lines}"
 
@@ -47,4 +47,5 @@ def test_recall_skill_md_preserves_summarization_path():
     text = SKILL_PATH.read_text(encoding="utf-8")
     assert "### Step 2 — Summarize unsummarized notes" in text
     assert "### Step 3 — Build context brief" in text
-    assert "Haiku" in text and ("parallel" in text.lower() or "Parallel" in text)
+    assert "parallel native pipelines" in text
+    assert "Haiku" in (SKILL_PATH.parent / "references" / "host-claude.md").read_text()

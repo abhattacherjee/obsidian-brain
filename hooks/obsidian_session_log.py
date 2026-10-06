@@ -209,6 +209,8 @@ def main() -> None:
 
 
 def _run(context=None, payload=None) -> None:
+    if os.environ.get("OBSIDIAN_BRAIN_NESTED_AI") == "1":
+        return
     from runtime_context import current_runtime_context, using_runtime_context
     if context is not None:
         with using_runtime_context(context):

@@ -5,6 +5,57 @@ metadata:
   version: 1.0.0
 ---
 
+## Native runtime and installed resources
+
+Use the absolute path of this loaded `SKILL.md` as `OB_SKILL_PATH`. Read the
+reference for the invoking host when this skill has paired host references.
+Set `OB_HOST`, `OB_CLIENT`, `OB_SESSION_ID`, and `OB_CWD` from that native
+invocation. Use the selected host's own session ID. Keep curated note taxonomy
+separate from `agent_provider` and `agent_session_id` provenance.
+
+```bash
+OB_SKILL_PATH='<absolute path of this loaded SKILL.md>'
+OB_RESOURCE_ROOT=$(python3 -c 'import pathlib,sys; p=pathlib.Path(sys.argv[1]); assert p.is_absolute(); p=p.resolve(); assert p.name == "SKILL.md" and p.parent.parent.name == "skills"; print(p.parents[2])' "$OB_SKILL_PATH")
+python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" context < /dev/null
+```
+
+Use the returned `config_path`, `vault_path`, `index_path`, and `state_path`.
+Create the operation with this fixed literal request:
+
+```bash
+printf '{}' | python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'prepare'
+```
+
+Call `prepare` to create a private operation under native state. Retain its
+`operation_id` and `operation_dir`. Register approved helper output names with `artifact-store`;
+inputs are read through the immutable artifact manifest. Do not discover resources from the current directory or another plugin
+cache. Each shell invocation supplies the same explicit values; a previous
+shell's variables are not assumed to persist.
+
+Each data operation uses the installed launcher with a JSON request on stdin:
+
+```bash
+python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation '<fixed operation>' < "$REQUEST_PATH"
+```
+
+Map config JSON `vault_path`, `sessions_folder`, and `insights_folder` to the
+procedure variables `VAULT_PATH`/`VAULT`, `SESSIONS_FOLDER`/`SESS`, and
+`INSIGHTS_FOLDER`/`INS`. Use the canonical project returned in config JSON (and native `session` when available),
+not the basename of an unrelated shell working directory.
+
+Before preparing edits or requesting a summary of an existing note, call
+`note-read` and retain its exact `expected_revision`. Apply the proposed note
+with `note-apply` and that revision. A conflict leaves the current note intact;
+show the pending result and do not count the note as saved. New curated notes
+use `note-create`; they never overwrite a collision. Native memory discovery
+is unsupported for Codex until its adapter is verified; shared vault retrieval
+and wiki filing continue without borrowing another host's memory.
+
+Read `references/host-claude.md` or `references/host-codex.md` when present.
+All note writes described below use `note-create` or revision-bound `note-apply`,
+including bidirectional related links. Content is a JSON string, never shell code.
+Keep this rule when a later step uses the word Write or Edit.
+
 # Vault Import — Backfill Historical Sessions
 
 Discover historical Claude Code sessions, summarize them via parallel sub-agents, and write structured session notes to the Obsidian vault. Skips sessions already present in the vault.
@@ -24,37 +75,14 @@ Follow these steps exactly. Do not skip steps or reorder them.
 
 Run:
 
+Request for `config` (substitute the values as data):
+
+```json
+{}
+```
+
 ```bash
-cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-python3 -c '
-import sys, os
-import glob, json, os, re, sys
-def _ob_hooks():
-    try:
-        for _m in json.load(open(os.path.expanduser("~/.claude/plugins/known_marketplaces.json"))).values():
-            _s = _m.get("source") if isinstance(_m, dict) else None
-            if not (isinstance(_s, dict) and _s.get("source") == "directory"):
-                continue
-            _i = _m.get("installLocation") if isinstance(_m, dict) else None
-            if not (isinstance(_i, str) and os.path.isabs(_i)):
-                continue
-            _h = os.path.join(_i, "hooks")
-            if os.path.isfile(os.path.join(_h, "obsidian_utils.py")):
-                return _h
-    except Exception:
-        pass
-    _c = [_d for _d in glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")) if re.fullmatch("[0-9]+([.][0-9]+)*", _d.split("/")[-2])]
-    return max(_c, key=lambda _p: ([int(_n) for _n in _p.split("/")[-2].split(".")], _p), default="hooks")
-sys.path.insert(0, _ob_hooks())
-from obsidian_utils import load_config
-c = load_config()
-if not c.get("vault_path"):
-    print("ERROR: vault_path not configured", file=sys.stderr)
-    sys.exit(1)
-print("VAULT=" + c["vault_path"])
-print("SESS=" + c.get("sessions_folder", "claude-sessions"))
-print("INS=" + c.get("insights_folder", "claude-insights"))
-'
+python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'config' < "$REQUEST_PATH"
 ```
 
 Parse each output line as KEY=VALUE, splitting on the first `=`.
@@ -98,50 +126,34 @@ Store as `TIME_RANGE` and `PROJECT_FILTER` (empty string if no filter).
 
 ### Step 4 — Discover sessions
 
-Use the `/context:search` skill's underlying search script (was `conversation-search`) to find sessions matching the time range and project filter.
+Select `source_host` explicitly (Claude or Codex). The installed native
+registry discovers only that host's historical transcript roots. It reports a
+bounded discovery limit as pending; choose a narrower root/date window rather
+than silently dropping records. An explicit `source_root` may narrow the scan.
 
-The script lives in the `context@claude-code-skills` plugin. Run this as one block. It finds the script from `~/.claude/plugins/installed_plugins.json`, falls back to the old `~/.claude/skills/conversation-search/` path, and stops if neither exists:
+Request for `import-list` (substitute the values as data):
 
-```bash
-SEARCH=$(python3 - <<'PY'
-import json, os
-home = os.path.expanduser("~")
-cands = []
-try:
-    with open(os.path.join(home, ".claude/plugins/installed_plugins.json")) as f:
-        for e in json.load(f).get("plugins", {}).get("context@claude-code-skills", []):
-            if e.get("installPath"):
-                cands.append(os.path.join(e["installPath"], "skills/search/scripts/search-conversations.sh"))
-except (OSError, ValueError):
-    pass
-cands.append(os.path.join(home, ".claude/skills/conversation-search/scripts/search-conversations.sh"))
-for c in cands:
-    if os.path.isfile(c):
-        print(c)
-        break
-PY
-)
-if [ -z "$SEARCH" ]; then
-  echo "vault-import: search-conversations.sh not found. Install the context plugin (context@claude-code-skills) and retry." >&2
-else
-  AFTER=$(python3 -c 'import datetime,sys; print((datetime.date.today()-datetime.timedelta(days=int(sys.argv[1]))).isoformat())' <TIME_RANGE_NUMBER>)
-  bash "$SEARCH" list --after "$AFTER" --limit 100000 --json <PROJECT_ARGS> | python3 -c '
-import glob, json, os, sys
-for e in json.load(sys.stdin):
-    sid = e["sessionId"]
-    hits = glob.glob(os.path.expanduser("~/.claude/projects/*/" + sid + ".jsonl"))
-    print(json.dumps({"session_id": sid, "session_path": hits[0] if hits else "",
-                      "project": e.get("projectPath", ""), "date": (e.get("created") or e.get("modified") or "")[:10],
-                      "git_branch": e.get("gitBranch", ""), "message_count": e.get("messageCount", 0)}))
-'
-fi
+```json
+{
+  "source_host": "<explicit source host>",
+  "days": 30,
+  "project": "<optional source project>"
+}
 ```
 
-Replace `<TIME_RANGE_NUMBER>` with the number of days (`7d` becomes `7`). Replace `<PROJECT_ARGS>` with `--project <PROJECT_FILTER>` when a project filter is set, else remove it. The script can take a few minutes on a large history, so give the call a long timeout.
+```bash
+python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'import-list' < "$REQUEST_PATH"
+```
 
-If the block prints the "not found" message, stop and show it to the user. Do not scan `~/.claude/projects/` by hand and do not skip this step.
+The operation prints one JSON object per source with full `session_id`,
+`session_path`, original project path, date, and source host. Unknown branch
+and message counts stay unknown. Missing transcripts are skipped explicitly.
 
-The block prints one JSON object per line. Each is a session with `session_id`, `session_path` (empty if the transcript file is gone, so skip those), `project` (a path; use its last component as the project name), `date`, `git_branch` and `message_count`.
+Before requesting any summary, run `import-read` with `operation_id`,
+`source_host`, `source_path`, and the full `source_session_id`. It normalizes
+visible native records and stores immutable `import-source.json`. Unknown or
+partial rows leave the operation pending. Use the normalized records as AI
+input. AI remains on the invoking host; origin metadata remains on the source.
 
 If no sessions are found, tell the user:
 
@@ -151,23 +163,11 @@ Stop here if no sessions found.
 
 ### Step 5 — Filter already-imported sessions
 
-Check the vault for existing session notes that match discovered session IDs.
-
-Run:
-
-```bash
-grep -rl "session_id:" "$VAULT_PATH/$SESSIONS_FOLDER/" 2>/dev/null | xargs grep -l "<SESSION_ID>" 2>/dev/null
-```
-
-More efficiently, build a single grep command:
-
-```bash
-for f in "$VAULT_PATH/$SESSIONS_FOLDER/"*.md; do
-  awk 'NR==1 { if ($0 != "---") exit; next } $0 == "---" { exit } { print }' "$f" 2>/dev/null
-done | grep "^session_id:" | awk '{print $2}'
-```
-
-The `awk` reads each note's whole frontmatter, from the opening `---` to the closing one, so `session_id` is found however deep it sits (#312). Collect all session IDs already in the vault into a set called `EXISTING_IDS`. Remove any session from the discovered list whose `session_id` is in `EXISTING_IDS`.
+Run `import-read` for each discovered source before generating a summary.
+The trusted helper queries the selected index for the full provider/native ID,
+verifies the complete bounded frontmatter, and returns `skipped` only for a
+proven identity match. It never scans the entire vault or adopts a hash alone.
+Treat a capped, ambiguous, or timed-out lookup as pending.
 
 Store the remaining sessions as `PENDING_SESSIONS` and the count of skipped sessions as `SKIPPED_COUNT`.
 
@@ -183,11 +183,12 @@ Otherwise, report:
 
 ### Step 6 — Summarize sessions with parallel sub-agents
 
-**This is the performance-critical step. Use parallel sub-agents to maximize throughput.**
+Summarize each source with the invoking host's native AI. Use independent
+helpers when available; retain pending failures rather than switching hosts.
 
-For each session in `PENDING_SESSIONS`, delegate to a `/context:shield` sub-agent with this prompt:
+For each session in `PENDING_SESSIONS`, use a native analysis helper with this prompt:
 
-> Read the Claude Code session transcript at `<SESSION_PATH>`. Extract and return a structured summary with these exact sections:
+> Read the immutable normalized records from `<registered import-source.json>` for the explicitly selected source host. Extract and return a structured summary with these exact sections:
 >
 > - **Summary:** 2-3 sentence overview of what was accomplished
 > - **Key Decisions:** Bulleted list of architectural or design choices made
@@ -258,32 +259,28 @@ Generate the filename using the same convention as other session notes:
 
 Final filename: `YYYY-MM-DD-<slug>-<hash>.md`
 
-Write each note by running the note-writer CLI once **per session**, piping that session's full note (frontmatter + body) in on stdin. It creates `$SESSIONS_FOLDER` if needed (idempotent across repeated calls in this loop — only the first call actually creates it) and writes each file atomically at mode `0o600` — no `mkdir`/`chmod` needed. **Two rules for the heredoc terminator, both load-bearing.** (1) It must stay **quoted** (`<<'OB_NOTE_EOF_<eof4>'`) — do not drop the quotes in a future edit. (2) It must be **unique per invocation**: substitute the same 4 random hex characters for `<eof4>` in BOTH the `<<'OB_NOTE_EOF_<eof4>'` opener and the terminator line, then confirm that **no line of the content you are about to emit is exactly that terminator** — if one is, pick different hex characters and re-check. **Never** replace this with a fixed delimiter. Quoting stops `$`/backtick expansion but does NOT stop early termination: a line equal to the terminator at column 0 ends the heredoc there, silently truncating the content AND handing everything after it to the shell as commands to execute. Notes written by this plugin routinely quote these very blocks, so a fixed terminator is a live hazard, not a theoretical one. **Self-check before you emit the block: if the terminator still contains `<` or `>`, you have not substituted it.** Stop and substitute it — the literal `<eof4>` form appears at column 0 inside these SKILL.md blocks themselves, so a note quoting one of them collides all over again, and nothing on the shell side can catch that. The `HOOKS=` line below checks the marketplace-registered directory-source install location FIRST (#278 — on a local checkout that is what loads, not the released cache), and only falls back to the plugin cache, where it sorts versions **numerically** (a plain `max()` is lexicographic and picks `3.9.0` over `3.10.0`, resolving to a cache with no `note_writer.py`); the `test -f` line turns a stale/incomplete cache into the documented `ERROR:` shape instead of a raw Python `can't open file` message. An unquoted delimiter lets the shell expand `$` variables and backtick commands embedded in imported session content, silently corrupting it:
+Send the complete note or update as a JSON string to the fixed operation.
+The launcher writes atomically at mode `0o600`. Existing notes require their
+pre-analysis source revision. Content never becomes shell code.
+
+Request for `note-create` (substitute the values as data):
+
+```json
+{
+  "operation_id": "<prepared id>",
+  "folder": "<selected folder>",
+  "filename": "<filename.md>",
+  "content": "<complete frontmatter + body>"
+}
+```
 
 ```bash
-cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-HOOKS=$(python3 -c "
-import glob, json, os, re
-def _ob_hooks():
-    try:
-        for _m in json.load(open(os.path.expanduser('~/.claude/plugins/known_marketplaces.json'))).values():
-            _s = _m.get('source') if isinstance(_m, dict) else None
-            if not (isinstance(_s, dict) and _s.get('source') == 'directory'):
-                continue
-            _i = _m.get('installLocation') if isinstance(_m, dict) else None
-            if not (isinstance(_i, str) and os.path.isabs(_i)):
-                continue
-            _h = os.path.join(_i, 'hooks')
-            if os.path.isfile(os.path.join(_h, 'obsidian_utils.py')):
-                return _h
-    except Exception:
-        pass
-    _c = [_d for _d in glob.glob(os.path.expanduser('~/.claude/plugins/cache/*/obsidian-brain/*/hooks')) if re.fullmatch('[0-9]+([.][0-9]+)*', _d.split('/')[-2])]
-    return max(_c, key=lambda _p: ([int(_n) for _n in _p.split('/')[-2].split('.')], _p), default='hooks')
-print(_ob_hooks())
-")
-test -f "$HOOKS/note_writer.py" || { echo "ERROR: note_writer.py not found under $HOOKS - resolution checks the marketplace registered install location first, then falls back to the plugin cache; neither path produced a hooks directory containing it. Verify the obsidian-brain install resolved at $HOOKS is complete (git pull for a directory-source checkout, or run /plugin marketplace update for a cache install), then retry." >&2; exit 1; }
-python3 "$HOOKS/note_writer.py" write "$VAULT_PATH" "$SESSIONS_FOLDER" "<filename>" <<'OB_NOTE_EOF_<eof4>'
+python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'note-create' < "$REQUEST_PATH"
+```
+
+Preserve this note content as the JSON `content` string:
+
+```markdown
 ---
 type: claude-session
 ...
@@ -291,12 +288,11 @@ type: claude-session
 
 # <Session Title>
 ...
-OB_NOTE_EOF_<eof4>
 ```
 
 On success this prints `OK: <absolute path>`. On failure it prints `ERROR: <reason>` to stderr and exits non-zero for THAT session only — record it under `<FAILED_COUNT>`/`<Failed sessions>` in Step 8 and continue importing the remaining sessions; one failed write must not abort the whole import loop.
 
-**One exception: an `ERROR:` containing `note already exists` counts as SKIPPED, not failed.** It means this session was imported by an earlier run, which is the normal outcome of a re-import — increment `<SKIPPED_COUNT>` and move on. Do NOT pass `--overwrite` to make it go away: that would silently replace an existing note, which is exactly what the flag exists to prevent.
+**One exception: an `ERROR:` containing `note already exists` counts as SKIPPED, not failed.** It means this session was imported by an earlier run, which is the normal outcome of a re-import — increment `<SKIPPED_COUNT>` and move on. Do not overwrite a collision: that would silently replace an existing note, which is exactly what the flag exists to prevent.
 
 ### Step 8 — Report results
 
@@ -320,3 +316,9 @@ If any sessions failed, list them:
 Offer follow-up:
 
 > Run `/vault-import <longer range>` to go further back, or open Obsidian to browse the imported sessions.
+
+Deduplication uses full `(agent_provider, agent_session_id)` within the selected
+vault. A four-character filename hash alone never proves identity. Multiple
+matching identities or a bounded lookup failure remain pending. New import
+notes retain original date/project, source provider/full native ID, and
+`author_host` from the invoking host.

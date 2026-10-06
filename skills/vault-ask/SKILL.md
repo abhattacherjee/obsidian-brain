@@ -5,6 +5,57 @@ metadata:
   version: 1.0.0
 ---
 
+## Native runtime and installed resources
+
+Use the absolute path of this loaded `SKILL.md` as `OB_SKILL_PATH`. Read the
+reference for the invoking host when this skill has paired host references.
+Set `OB_HOST`, `OB_CLIENT`, `OB_SESSION_ID`, and `OB_CWD` from that native
+invocation. Use the selected host's own session ID. Keep curated note taxonomy
+separate from `agent_provider` and `agent_session_id` provenance.
+
+```bash
+OB_SKILL_PATH='<absolute path of this loaded SKILL.md>'
+OB_RESOURCE_ROOT=$(python3 -c 'import pathlib,sys; p=pathlib.Path(sys.argv[1]); assert p.is_absolute(); p=p.resolve(); assert p.name == "SKILL.md" and p.parent.parent.name == "skills"; print(p.parents[2])' "$OB_SKILL_PATH")
+python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" context < /dev/null
+```
+
+Use the returned `config_path`, `vault_path`, `index_path`, and `state_path`.
+Create the operation with this fixed literal request:
+
+```bash
+printf '{}' | python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'prepare'
+```
+
+Call `prepare` to create a private operation under native state. Retain its
+`operation_id` and `operation_dir`. Register approved helper output names with `artifact-store`;
+inputs are read through the immutable artifact manifest. Do not discover resources from the current directory or another plugin
+cache. Each shell invocation supplies the same explicit values; a previous
+shell's variables are not assumed to persist.
+
+Each data operation uses the installed launcher with a JSON request on stdin:
+
+```bash
+python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation '<fixed operation>' < "$REQUEST_PATH"
+```
+
+Map config JSON `vault_path`, `sessions_folder`, and `insights_folder` to the
+procedure variables `VAULT_PATH`/`VAULT`, `SESSIONS_FOLDER`/`SESS`, and
+`INSIGHTS_FOLDER`/`INS`. Use the canonical project returned in config JSON (and native `session` when available),
+not the basename of an unrelated shell working directory.
+
+Before preparing edits or requesting a summary of an existing note, call
+`note-read` and retain its exact `expected_revision`. Apply the proposed note
+with `note-apply` and that revision. A conflict leaves the current note intact;
+show the pending result and do not count the note as saved. New curated notes
+use `note-create`; they never overwrite a collision. Native memory discovery
+is unsupported for Codex until its adapter is verified; shared vault retrieval
+and wiki filing continue without borrowing another host's memory.
+
+Read `references/host-claude.md` or `references/host-codex.md` when present.
+All note writes described below use `note-create` or revision-bound `note-apply`,
+including bidirectional related links. Content is a JSON string, never shell code.
+Keep this rule when a later step uses the word Write or Edit.
+
 # Vault Ask
 
 Synthesizes a reasoned answer to the user's question by searching session, insight and wiki notes in the Obsidian vault, plus this host's memory files, and citing sources. Returns a grounded answer, not a list of matches. Answers that draw on 3 or more qualifying notes can be saved as wiki pages (#383), which later asks find first.
@@ -21,57 +72,25 @@ Follow these steps exactly. Do not skip steps or reorder them.
 
 Run:
 
-```bash
-cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-python3 -c '
-import sys, os
-import glob, json, os, re, sys
-def _ob_hooks():
-    try:
-        for _m in json.load(open(os.path.expanduser("~/.claude/plugins/known_marketplaces.json"))).values():
-            _s = _m.get("source") if isinstance(_m, dict) else None
-            if not (isinstance(_s, dict) and _s.get("source") == "directory"):
-                continue
-            _i = _m.get("installLocation") if isinstance(_m, dict) else None
-            if not (isinstance(_i, str) and os.path.isabs(_i)):
-                continue
-            _h = os.path.join(_i, "hooks")
-            if os.path.isfile(os.path.join(_h, "obsidian_utils.py")):
-                return _h
-    except Exception:
-        pass
-    _c = [_d for _d in glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")) if re.fullmatch("[0-9]+([.][0-9]+)*", _d.split("/")[-2])]
-    return max(_c, key=lambda _p: ([int(_n) for _n in _p.split("/")[-2].split(".")], _p), default="hooks")
-sys.path.insert(0, _ob_hooks())
-from obsidian_utils import load_config, indexed_folders
-c = load_config()
-if not c.get("vault_path"):
-    print("ERROR: vault_path not configured", file=sys.stderr)
-    sys.exit(1)
-project = os.path.basename(os.getcwd()).lower().replace(" ", "-")
-# WIKI comes from the validated folder list, never the raw config key.
-try:
-    folders = indexed_folders(c, strict=True)
-    norm = os.path.normpath(c["wiki_folder"]) if c.get("wiki_folder") else ""
-    wiki = norm if norm in folders else ""
-except Exception as exc:
-    print("WARNING: wiki turned off: " + str(exc), file=sys.stderr)
-    wiki = ""
-print("VAULT=" + c["vault_path"])
-print("SESS=" + c.get("sessions_folder", "claude-sessions"))
-print("INS=" + c.get("insights_folder", "claude-insights"))
-print("PROJECT=" + project)
-print("WIKI=" + wiki)
-print("HOOKS=" + _ob_hooks())
-'
+Request for `config` (substitute the values as data):
+
+```json
+{}
 ```
 
-Parse each output line as KEY=VALUE, splitting on the first `=`. An empty `WIKI` means the wiki is turned off: skip Step 2b and the filing gate in Step 8. `WIKI` comes from `indexed_folders(config, strict=True)`; when that raises (an invalid `wiki_folder`), WIKI= is printed empty with a `WARNING: wiki turned off` line on stderr, and the wiki steps are skipped. `HOOKS` is the plugin's hooks directory; paste it literally where later commands say `<hooks_dir>`.
+```bash
+python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'config' < "$REQUEST_PATH"
+```
+
+Read the returned config JSON. An empty validated `wiki_folder` means the wiki
+is turned off: skip Step 2b and the filing gate in Step 8. Invalid wiki folders
+produce a warning and are omitted by `indexed_folders`; retrieval continues in
+the valid configured folders. The installed hooks live under `OB_RESOURCE_ROOT`.
 
 Check that `wiki.py` is installed (the memory search in Step 4 needs it even when `WIKI` is empty):
 
 ```bash
-HOOKS='<hooks_dir>'
+HOOKS="$OB_RESOURCE_ROOT/hooks"
 test -f "$HOOKS/wiki.py" && echo "WIKI_OK" || echo "WIKI_MISSING"
 ```
 
@@ -115,18 +134,29 @@ Store the extracted terms as `SEARCH_TERMS`. Keep the original question for use 
 
 Skip this step when `WIKI` is empty.
 
-**How to call `wiki.py`.** Every call takes a JSON payload. First make sure the private directory exists: run `mkdir -m 700 -p ~/.claude/obsidian-brain`. Then write the payload with the Write tool to `~/.claude/obsidian-brain/wiki-payload-<8 random hex>.json`, run the command with the file on stdin, then delete the file. Never build the JSON in a shell string: questions and answers contain quotes.
+**How to call the wiki operations.** Each fixed `wiki-*` operation receives
+its JSON payload under `data`. Call `prepare` for private operation state and
+`artifact-store` to register any scratch payload or helper output. Never build
+the JSON in a shell string: questions and answers contain quotes. Native state
+uses private directories at mode `0o700` and files at mode `0o600`.
 
-```bash
-mkdir -m 700 -p ~/.claude/obsidian-brain
-python3 '<hooks_dir>/wiki.py' lookup < ~/.claude/obsidian-brain/wiki-payload-<hex>.json; rm -f ~/.claude/obsidian-brain/wiki-payload-<hex>.json
+Request for `wiki-lookup` (substitute the values as data):
+
+```json
+{
+  "data": "<the wiki JSON payload described in this step>"
+}
 ```
 
-`wiki.py` prints one JSON object. Exit 0 is success. Exit 1 means it refused: show its `ERROR:` line. Exit 2 is a usage error or a crash: show stderr. The commands below are written as `python3 "<hooks_dir>/wiki.py" <command>`, always with a payload file on stdin.
+```bash
+python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'wiki-lookup' < "$REQUEST_PATH"
+```
 
-1. Run `python3 "<hooks_dir>/wiki.py" lookup` with `{"question": "<original question>"}`. It searches wiki pages with `search_vault` (reranked; the hits are logged as accesses) and returns up to 3 `candidates` (`path`, `question`, `updated`, `rank`).
+`wiki.py` prints one JSON object. Exit 0 is success. Exit 1 means it refused: show its `ERROR:` line. Exit 2 is a usage error or a crash: show stderr. The commands below use fixed `wiki-*` operations with JSON data on stdin.
+
+1. Run `the fixed `wiki-lookup` operation` with `{"question": "<original question>"}`. It searches wiki pages with `search_vault` (reranked; the hits are logged as accesses) and returns up to 3 `candidates` (`path`, `question`, `updated`, `rank`).
 2. Decide whether a candidate asks the **same question** as the user (same intent, not just shared words). If none does, continue with Step 3.
-3. If one does, run `python3 "<hooks_dir>/wiki.py" stale` with `{"page": "<its path>"}`. It returns `stale`, `reasons` and `memory_paths` (`{name: path}` for each memory file the page cites that this host has). Each reason is `changed: <note>` (a source's content changed), `missing: <note>` (a source is gone or unreadable), `newer: <note>` (a newer note matches the question) or `unverifiable: <page>` (the page's fingerprint is missing or bad, so it counts as stale). Memory files use the same forms with a `memory:` prefix: `changed: memory:<project-dir>/<file>.md` (the file changed), `missing: memory:<project-dir>/<file>.md` (this host listed its memory files and that one is gone) and `unverifiable: memory:<project-dir>/<file>.md` (no fingerprint, a host with no memory files, or the file or its folder could not be read).
+3. If one does, run `the fixed `wiki-stale` operation` with `{"page": "<its path>"}`. It returns `stale`, `reasons` and `memory_paths` (`{name: path}` for each memory file the page cites that this host has). Each reason is `changed: <note>` (a source's content changed), `missing: <note>` (a source is gone or unreadable), `newer: <note>` (a newer note matches the question) or `unverifiable: <page>` (the page's fingerprint is missing or bad, so it counts as stale). Memory files use the same forms with a `memory:` prefix: `changed: memory:<project-dir>/<file>.md` (the file changed), `missing: memory:<project-dir>/<file>.md` (this host listed its memory files and that one is gone) and `unverifiable: memory:<project-dir>/<file>.md` (no fingerprint, a host with no memory files, or the file or its folder could not be read).
    - **`stale` itself fails** (exit 1 or 2, or no JSON): treat the page as not fresh. Do not answer from it. Continue with Step 3 as if no candidate matched, and in Step 8 do not update that page.
    - **Fresh:** read the page and present its answer. Cite it as `[[<page file name>]]` and say "From the wiki (updated `<updated>`)". Skip Steps 3–7. In Step 8, save nothing.
    - **Stale, and the page is not marked reviewed:** continue with Steps 3–7. Add the page's `sources` to `CANDIDATE_FILES`. Add each path in `memory_paths` to `CANDIDATE_FILES` as type `claude-memory`, and keep its name for citing. Step 8 refreshes the page without asking and tells the user why, using `reasons`.
@@ -138,39 +168,18 @@ python3 '<hooks_dir>/wiki.py' lookup < ~/.claude/obsidian-brain/wiki-payload-<he
 
 Before spawning search agents, try the vault index for instant results. Join `SEARCH_TERMS` into a single space-separated string (`SEARCH_TERMS_JOINED`). Then run:
 
+Request for `search` (substitute the values as data):
+
+```json
+{
+  "query": "<query>",
+  "project": "<project or null>",
+  "limit": 20
+}
+```
+
 ```bash
-python3 -c '
-import sys, os, json, glob
-import glob, json, os, re, sys
-def _ob_hooks():
-    try:
-        for _m in json.load(open(os.path.expanduser("~/.claude/plugins/known_marketplaces.json"))).values():
-            _s = _m.get("source") if isinstance(_m, dict) else None
-            if not (isinstance(_s, dict) and _s.get("source") == "directory"):
-                continue
-            _i = _m.get("installLocation") if isinstance(_m, dict) else None
-            if not (isinstance(_i, str) and os.path.isabs(_i)):
-                continue
-            _h = os.path.join(_i, "hooks")
-            if os.path.isfile(os.path.join(_h, "obsidian_utils.py")):
-                return _h
-    except Exception:
-        pass
-    _c = [_d for _d in glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")) if re.fullmatch("[0-9]+([.][0-9]+)*", _d.split("/")[-2])]
-    return max(_c, key=lambda _p: ([int(_n) for _n in _p.split("/")[-2].split(".")], _p), default="hooks")
-sys.path.insert(0, _ob_hooks())
-from obsidian_utils import load_config, indexed_folders
-from vault_index import ensure_index, search_vault
-c = load_config()
-db = ensure_index(c["vault_path"], indexed_folders(c))
-results = search_vault(
-    db,
-    sys.argv[1],
-    project=sys.argv[2] if len(sys.argv) > 2 and sys.argv[2] != "None" else None,
-    limit=15,
-)
-print(json.dumps(results))
-' "$SEARCH_TERMS_JOINED" "$PROJECT"
+python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'search' < "$REQUEST_PATH"
 ```
 
 If the output is a non-empty JSON array with 5+ results: extract the `path` field from each result and use those file paths as `CANDIDATE_FILES`. Skip the Grep searches in Step 4, but still run its memory search, then go to Step 5.
@@ -211,33 +220,20 @@ Collect all file paths returned.
 
 Check each call before you use its output. It succeeded only if it exited 0 and stderr has the `vault_scan: N match(es), M file(s) scanned, K skipped (...)` summary line; then stdout is the file list, and an empty stdout means no match. Anything else is a failure, not "no match": show the `ERROR:` line (or the whole stderr if there is none) to the user and stop. If K is more than 0, add this line to what you show the user: "K note(s) were not searched (see the breakdown) — run /vault-doctor".
 
-```bash
-cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-HOOKS=$(python3 -c "
-import glob, json, os, re
-def _ob_hooks():
-    try:
-        for _m in json.load(open(os.path.expanduser('~/.claude/plugins/known_marketplaces.json'))).values():
-            _s = _m.get('source') if isinstance(_m, dict) else None
-            if not (isinstance(_s, dict) and _s.get('source') == 'directory'):
-                continue
-            _i = _m.get('installLocation') if isinstance(_m, dict) else None
-            if not (isinstance(_i, str) and os.path.isabs(_i)):
-                continue
-            _h = os.path.join(_i, 'hooks')
-            if os.path.isfile(os.path.join(_h, 'obsidian_utils.py')):
-                return _h
-    except Exception:
-        pass
-    _c = [_d for _d in glob.glob(os.path.expanduser('~/.claude/plugins/cache/*/obsidian-brain/*/hooks')) if re.fullmatch('[0-9]+([.][0-9]+)*', _d.split('/')[-2])]
-    return max(_c, key=lambda _p: ([int(_n) for _n in _p.split('/')[-2].split('.')], _p), default='hooks')
-print(_ob_hooks())
-")
-test -f "$HOOKS/vault_scan.py" || { echo "ERROR: vault_scan.py not found under $HOOKS - resolution checks the marketplace registered install location first, then falls back to the plugin cache; neither path produced a hooks directory containing it. Verify the obsidian-brain install resolved at $HOOKS is complete (git pull for a directory-source checkout, or run /plugin marketplace update for a cache install), then retry." >&2; exit 1; }
-python3 "$HOOKS/vault_scan.py" grep '<vault_path>' '<sessions_folder>' '<insights_folder>' '<wiki_folder>' --pattern='<term>' --ignore-case
+Request for `grep` (substitute the values as data):
+
+```json
+{
+  "pattern": "<pattern>",
+  "ignore_case": true
+}
 ```
 
-**Memory search.** The memory search runs on every ask that reaches Step 3 (a fresh wiki answer from Step 2b stops before it, by design), even when Step 3 skipped the Grep searches. Skip it only on `WIKI_MISSING`. For each term in `SEARCH_TERMS`, write `{"pattern": "<term>"}` to a payload file (as in Step 2b) and run `python3 "<hooks_dir>/wiki.py" memgrep`. It prints `{"host": ..., "matches": [{"name": ..., "path": ...}], "skipped": [{"path": ..., "error": ...}]}`: `matches` are this host's memory files that contain the term (case-insensitive, a fixed string, not a regex), and `skipped` are files or folders that could not be read. Add each `path` in `matches` to `CANDIDATE_FILES` as type `claude-memory`, and keep its `name` for citing. When `skipped` is non-empty, show one line: "N memory file(s) could not be read" with the first `path` (count each path once across all terms). When `host` is not `claude-code`, say once that this host has no memory files. On exit 1 or 2, show the `ERROR:` line and continue without memory files.
+```bash
+python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'grep' < "$REQUEST_PATH"
+```
+
+**Memory search.** The memory search runs on every ask that reaches Step 3 (a fresh wiki answer from Step 2b stops before it, by design), even when Step 3 skipped the Grep searches. Skip it only on `WIKI_MISSING`. For each term in `SEARCH_TERMS`, write `{"pattern": "<term>"}` to a payload file (as in Step 2b) and run `the fixed `wiki-memgrep` operation`. It prints `{"host": ..., "matches": [{"name": ..., "path": ...}], "skipped": [{"path": ..., "error": ...}]}`: `matches` are this host's memory files that contain the term (case-insensitive, a fixed string, not a regex), and `skipped` are files or folders that could not be read. Add each `path` in `matches` to `CANDIDATE_FILES` as type `claude-memory`, and keep its `name` for citing. When `skipped` is non-empty, show one line: "N memory file(s) could not be read" with the first `path` (count each path once across all terms). When `host` is not `claude-code`, say once that this host has no memory files. On exit 1 or 2, show the `ERROR:` line and continue without memory files.
 
 Combine results from all three agents and the memory search. Deduplicate by file path. Store as `CANDIDATE_FILES`.
 
@@ -262,30 +258,18 @@ Score each file in `CANDIDATE_FILES` using these rules:
 
 To get each note's `type` and `date` without reading the full file, run one `vault_scan.py meta` call over all of `CANDIDATE_FILES` (one quoted path per file):
 
+Request for `metadata` (substitute the values as data):
+
+```json
+{
+  "paths": [
+    "<relative vault note>"
+  ]
+}
+```
+
 ```bash
-cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-HOOKS=$(python3 -c "
-import glob, json, os, re
-def _ob_hooks():
-    try:
-        for _m in json.load(open(os.path.expanduser('~/.claude/plugins/known_marketplaces.json'))).values():
-            _s = _m.get('source') if isinstance(_m, dict) else None
-            if not (isinstance(_s, dict) and _s.get('source') == 'directory'):
-                continue
-            _i = _m.get('installLocation') if isinstance(_m, dict) else None
-            if not (isinstance(_i, str) and os.path.isabs(_i)):
-                continue
-            _h = os.path.join(_i, 'hooks')
-            if os.path.isfile(os.path.join(_h, 'obsidian_utils.py')):
-                return _h
-    except Exception:
-        pass
-    _c = [_d for _d in glob.glob(os.path.expanduser('~/.claude/plugins/cache/*/obsidian-brain/*/hooks')) if re.fullmatch('[0-9]+([.][0-9]+)*', _d.split('/')[-2])]
-    return max(_c, key=lambda _p: ([int(_n) for _n in _p.split('/')[-2].split('.')], _p), default='hooks')
-print(_ob_hooks())
-")
-test -f "$HOOKS/vault_scan.py" || { echo "ERROR: vault_scan.py not found under $HOOKS - resolution checks the marketplace registered install location first, then falls back to the plugin cache; neither path produced a hooks directory containing it. Verify the obsidian-brain install resolved at $HOOKS is complete (git pull for a directory-source checkout, or run /plugin marketplace update for a cache install), then retry." >&2; exit 1; }
-python3 "$HOOKS/vault_scan.py" meta '<vault_path>' '<file_1>' '<file_2>'
+python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'metadata' < "$REQUEST_PATH"
 ```
 
 It prints one JSON object per file, one per line, with `path`, `type`, `date`, `project`, `session_id`, `source_session_note`, `tags`, `title`, `snippet` and `error`. Read `type` and `date` from it. The call succeeded only if it exited 0 and printed one JSON row per file you passed. Otherwise show the `ERROR:` line (or the whole stderr) to the user and stop. A `vault_scan: obsidian_utils unavailable: ...` line on stderr is a warning, not a failure. Do not use a fixed-line `Read` for this: frontmatter can run past line 40 (/emerge notes close their fence as deep as line 461), so a fixed line limit silently drops fields. `meta` parses the whole frontmatter block. If a row has a non-null `error`, keep the file but give it no type or recency points. Do not pass memory files to `vault_scan.py meta`: they are outside the vault. They already have type `claude-memory` and get no recency points. Paste each value inside single quotes as shown. If a value itself contains a `'`, write it as `'\''`.
@@ -307,32 +291,18 @@ For each file, extract:
 
 **Snapshot-aware reading.** If a ranked file has `type: claude-snapshot`, also resolve its parent session via the `source_session_note` frontmatter wikilink and include the parent session body in the synthesis pool — the snapshot alone only captures a mid-session fragment. If a ranked file has `type: claude-session` and has associated snapshots, fetch those snapshot summaries via the shared helper and include them alongside the session body:
 
+Request for `snapshots` (substitute the values as data):
+
+```json
+{
+  "source_session_id": "<full source native ID>",
+  "date": "<date>",
+  "project": "<project>"
+}
+```
+
 ```bash
-python3 -c '
-import sys, os, json, glob
-import glob, json, os, re, sys
-def _ob_hooks():
-    try:
-        for _m in json.load(open(os.path.expanduser("~/.claude/plugins/known_marketplaces.json"))).values():
-            _s = _m.get("source") if isinstance(_m, dict) else None
-            if not (isinstance(_s, dict) and _s.get("source") == "directory"):
-                continue
-            _i = _m.get("installLocation") if isinstance(_m, dict) else None
-            if not (isinstance(_i, str) and os.path.isabs(_i)):
-                continue
-            _h = os.path.join(_i, "hooks")
-            if os.path.isfile(os.path.join(_h, "obsidian_utils.py")):
-                return _h
-    except Exception:
-        pass
-    _c = [_d for _d in glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")) if re.fullmatch("[0-9]+([.][0-9]+)*", _d.split("/")[-2])]
-    return max(_c, key=lambda _p: ([int(_n) for _n in _p.split("/")[-2].split(".")], _p), default="hooks")
-sys.path.insert(0, _ob_hooks())
-from pathlib import Path
-from obsidian_utils import fetch_snapshot_summaries
-snaps = fetch_snapshot_summaries(Path(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4])
-print(json.dumps([{"hhmmss": s["hhmmss"], "trigger": s["trigger"], "summary": s["summary"]} for s in snaps]))
-' "$SESSIONS_DIR" "$SESSION_ID" "$DATE" "$PROJECT"
+python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'snapshots' < "$REQUEST_PATH"
 ```
 
 The goal is that an answer synthesized from a session hit reflects the full session arc (pre-compact + post-compact), not only the tail transcript.
@@ -374,16 +344,16 @@ Display the synthesized answer from Step 7 in the conversation first. A failed s
 
 Then decide whether to save it as a wiki page. Skip all of this when `WIKI` is empty, or when Step 2b answered from a fresh page.
 
-1. **Count.** Run `python3 "<hooks_dir>/wiki.py" count` with `{"sources": [<every note cited in Sources, by file name>], "memory_sources": [<every memory file cited in Sources, by its memgrep name>]}`. It returns `count`, `qualifying`, `other` and `rejected`. Only 3 or more qualifying notes can be filed: insights, error-fixes, decisions, retros, sessions, migrated memory notes and memory files count; a snapshot counts as its parent session.
+1. **Count.** Run `the fixed `wiki-count` operation` with `{"sources": [<every note cited in Sources, by file name>], "memory_sources": [<every memory file cited in Sources, by its memgrep name>]}`. It returns `count`, `qualifying`, `other` and `rejected`. Only 3 or more qualifying notes can be filed: insights, error-fixes, decisions, retros, sessions, migrated memory notes and memory files count; a snapshot counts as its parent session.
    - **Rejected names:** `file` refuses a payload that lists any name from `rejected` (unresolved or ambiguous). Drop every rejected name from the `sources` or `memory_sources` list before filing, and tell the user which names were dropped and why. Never file with a rejected name in `sources` or `memory_sources`.
    - **Below 3:** save nothing and say nothing about the wiki. Exception: on a stale refresh from Step 2b, tell the user the page could not be refreshed because the fresh answer has fewer than 3 qualifying sources (give the count); the old page stays as is.
-2. **Write the page body.** Run `python3 "<hooks_dir>/wiki.py" rule` and rewrite the answer under that rule. Keep the `### Sources` section, every `[[wikilink]]` and every `memory:` line exactly. The chat answer keeps its normal style; only the page uses the rule.
+2. **Write the page body.** Run `the fixed `wiki-rule` operation` and rewrite the answer under that rule. Keep the `### Sources` section, every `[[wikilink]]` and every `memory:` line exactly. The chat answer keeps its normal style; only the page uses the rule.
 3. **Choose the action.** Before you choose an update path for a candidate page, Read the candidate page and check `reviewed:` in its frontmatter. It is reviewed unless the value is absent, empty, `false`, `no`, `off` or `0`.
    - **Stale refresh** (from Step 2b, page not reviewed, or the user chose "Refresh and overwrite my edits"): file with `"update": "<page path>"` (plus `"override_reviewed": true` only when the user chose to overwrite). Do not ask. Tell the user the page was refreshed and why.
    - **Reviewed page, user chose "Save the fresh answer as a new page":** file a new page, without `update` and without `override_reviewed`. The reviewed page stays untouched.
    - **`--caller` run:** run `lookup` with the question. If a candidate asks the same question and is not reviewed, file with `update`; if that candidate is reviewed, save nothing and name the page. Otherwise file a new page with `"filed_by": "auto"` and `"caller": "<CALLER>"`. Do not ask. Print one line naming the page saved or updated.
    - **User-typed run:** ask with AskUserQuestion. Options: "Save as a new wiki page", "Update existing page [[…]]" (only when `lookup` found a same-question candidate that is not reviewed), "Skip". Skip saves nothing.
-4. **File.** Run `python3 "<hooks_dir>/wiki.py" file` with:
+4. **File.** Run `the fixed `wiki-file` operation` with:
 
    ```json
    {"question": "<original question>", "body": "<page body from step 2>",
@@ -420,3 +390,8 @@ Use `/vault-ask` when the user wants to know _what_ their notes say, not _which_
 - **Question is ambiguous (multiple interpretations):** Answer each interpretation with a subheading, or ask the user to clarify before proceeding.
 - **No matching tags, only content matches:** That is fine — tag matches are bonus scoring, not required.
 - **Config exists but vault path is invalid:** Warn the user and suggest running `/obsidian-setup` again.
+
+A native session summary is stale when `capture_revision` differs from
+`summary_revision`, or no `summary_revision` exists. Label it stale explicitly.
+Use unchanged raw capture facts as evidence; do not present its old summary as fresh.
+Failed or cancelled AI leaves the operation pending and preserves the note.

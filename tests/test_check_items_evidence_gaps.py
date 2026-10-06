@@ -10,6 +10,7 @@ directly, never a real git/gh invocation).
 
 from __future__ import annotations
 
+from tests.native_pipeline_test_adapter import private_pipeline_output, run_native_pipeline
 import json as _json
 import os
 import re
@@ -54,7 +55,7 @@ def _run_pipeline(tmp_path, project_paths, fake_run=None):
         ["Ship the widget"],
     )
 
-    output_path = str(tmp_path / "pipeline-out.json")
+    output_path = str(private_pipeline_output(tmp_path, "pipeline-out.json"))
 
     fake_vi = MagicMock()
     fake_vi.ensure_index.return_value = str(tmp_path / "vault.db")
@@ -67,7 +68,7 @@ def _run_pipeline(tmp_path, project_paths, fake_run=None):
          patch.dict("sys.modules", {"vault_index": fake_vi}), \
          patch.object(oid, "_resolve_project_paths", return_value=project_paths):
 
-        result = oid.deep_analysis_pipeline(
+        result = run_native_pipeline(
             basenames=[],
             projects_json=_json.dumps(["notes-only"]),
             output_path=output_path,

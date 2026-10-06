@@ -10,7 +10,6 @@ from pathlib import Path
 _PRIVATE = {
     'hooks/brain_cli.py': {'main'},
     'hooks/check_items_cache.py': {'save_cache', '_try_create_lock'},
-    'hooks/check_items_cli.py': {'run_semantic_merge', '_dispatch_classifier_chunk', 'run_classifier'},
     'hooks/deep_cli.py': {'run_pipeline', '_load_acted_items', '_save_acted_items'},
     'hooks/emerge_cli.py': {'run_emerge_themes', 'run_build_note'},
     'hooks/hook_bootstrap.py': {'log_import_failure'},
@@ -69,6 +68,8 @@ def _readonly_flags(node):
 
 def _writes(node):
     name = ast.unparse(node.func)
+    if name in {'_publish_private_json', '_write_private', '_publish_config'}:
+        return True
     if name in {'os.rename', 'os.replace', 'os.unlink', 'os.remove', 'os.write', 'shutil.move'}:
         return True
     if name == 'os.open':
@@ -105,6 +106,70 @@ def _allowed(file, function, node):
     name = ast.unparse(node.func)
     if file == 'hooks/note_transactions.py':
         return True
+    if file == 'hooks/check_items_cli.py' and function in {'run_semantic_merge', 'run_classifier'}:
+        return (name == '_publish_private_json' and len(node.args) == 2
+                and ast.unparse(node.args[0]) == 'output_path'
+                and ast.unparse(node.args[1]) in {'result.data', 'ordered'})
+    if file == 'hooks/operation_state.py' and function == '_store_artifact_locked':
+        return (name == '_write_private' and len(node.args) == 3
+                and ast.unparse(node.args[0]) in {'path', 'manifest_path'}
+                and ast.unparse(node.args[2]) == 'context')
+    if file == 'hooks/ai_backend.py' and function == '_run_bounded':
+        return (name == 'os.write' and len(node.args) == 2
+                and ast.unparse(node.args[0]) == 'pipe.fileno()'
+                and ast.unparse(node.args[1]) == 'payload[:65536]')
+    if file == 'hooks/ai_adapters/codex.py' and function == '_send':
+        return (name == 'os.write' and [ast.unparse(arg) for arg in node.args]
+                == ['self.process.stdin.fileno()', 'payload'])
+    if file == 'hooks/ai_adapters/codex.py' and function in {'request', 'initialize'}:
+        return name == 'self.process.stdin.write'
+    if file == 'hooks/ai_adapters/codex.py' and function == 'execute':
+        if name == 'os.open':
+            return (len(node.args) == 3 and ast.unparse(node.args[0]) == 'path'
+                    and ast.unparse(node.args[1]) == 'os.O_WRONLY | os.O_CREAT | os.O_EXCL'
+                    and isinstance(node.args[2], ast.Constant) and node.args[2].value == 0o600)
+        if name == 'os.fdopen':
+            return [ast.unparse(arg) for arg in node.args] == ['fd', "'w'"]
+        if name == 'stream.write':
+            return [ast.unparse(arg) for arg in node.args] == ['text']
+        return False
+    if file == 'hooks/operation_state.py' and function == '_operation_lock':
+        return (name == 'os.open' and len(node.args) == 3
+                and ast.unparse(node.args[0]) == 'path'
+                and ast.unparse(node.args[1]) == "os.O_RDWR | os.O_CREAT | getattr(os, 'O_NOFOLLOW', 0)"
+                and isinstance(node.args[2], ast.Constant) and node.args[2].value == 0o600)
+    if file == 'hooks/operation_state.py' and function == '_write_private':
+        if name == 'os.fdopen':
+            return [ast.unparse(arg) for arg in node.args] == ['descriptor', "'wb'"]
+        if name == 'stream.write':
+            return [ast.unparse(arg) for arg in node.args] == ['content']
+        if name == 'os.replace':
+            return [ast.unparse(arg) for arg in node.args] == ['temporary', 'path']
+        if name == 'os.unlink':
+            return [ast.unparse(arg) for arg in node.args] == ['temporary']
+        return False
+    if file == 'hooks/skill_procedures.py' and function == '_configure':
+        return (name == '_publish_config' and [ast.unparse(arg) for arg in node.args]
+                == ['context', 'config', 'expected'])
+    if file == 'hooks/skill_procedures.py' and function == '_publish_config':
+        if name == 'os.fdopen':
+            return [ast.unparse(arg) for arg in node.args] == ['descriptor', "'w'"]
+        if name == 'os.replace':
+            return [ast.unparse(arg) for arg in node.args] == ['temporary', 'path']
+        if name == 'os.unlink':
+            return [ast.unparse(arg) for arg in node.args] == ['temporary']
+        return False
+    if file == 'hooks/skill_procedures.py' and function == 'run_operation':
+        return name == 'stderr.write'
+    if file == 'hooks/check_items_cli.py' and function == '_publish_private_json':
+        if name == 'os.replace':
+            return [ast.unparse(arg) for arg in node.args] == ['temporary', 'destination']
+        if name == 'os.unlink':
+            return [ast.unparse(arg) for arg in node.args] == ['temporary']
+        if name == 'os.fdopen':
+            return (len(node.args) == 2 and ast.unparse(node.args[0]) == 'descriptor'
+                    and isinstance(node.args[1], ast.Constant) and node.args[1].value == 'w')
+        return False
     if file == 'hooks/obsidian_retro_gate.py' and function == 'native_decision':
         # This function owns only its private decision journal.
         if name == 'os.open':
@@ -216,3 +281,117 @@ def test_retro_journal_exception_is_private_and_cannot_publish_notes():
     violations = _violations(source, 'hooks/obsidian_retro_gate.py')
     assert len(violations) == 1
     assert violations[0][-1] == 'Path(note_path).write_text'
+
+
+def test_classifier_private_publication_requires_jobs_json_and_rejects_note_writes():
+    root = Path(__file__).resolve().parents[1]
+    tree = ast.parse((root / 'hooks/check_items_cli.py').read_text())
+    function = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                    and node.name == '_publish_private_json')
+    source = ast.unparse(function)
+    assert "jobs = session_state_path(context) / 'jobs'" in source
+    assert 'destination.resolve().relative_to(jobs.resolve())' in source
+    assert "destination.suffix != '.json'" in source
+    assert 'context.state_path.resolve().is_relative_to(context.vault_path.resolve())' in source
+    assert 'destination.is_symlink()' in source
+    assert 'stat.S_ISREG(details.st_mode)' in source
+    assert 'details.st_uid != os.getuid()' in source
+    assert 'stat.S_IMODE(details.st_mode) != 384' in source
+    assert not _violations(source, 'hooks/check_items_cli.py')
+    violations = _violations(source + '\n    Path(note_path).write_text("bypass")\n',
+                             'hooks/check_items_cli.py')
+    assert len(violations) == 1
+    assert violations[0][-1] == 'Path(note_path).write_text'
+
+
+def test_native_pipe_exceptions_cannot_write_a_file_descriptor():
+    root = Path(__file__).resolve().parents[1]
+    tree = ast.parse((root / 'hooks/ai_backend.py').read_text())
+    function = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                    and node.name == '_run_bounded')
+    source = ast.unparse(function)
+    assert "selector.register(process.stdin, selectors.EVENT_WRITE, 'input')" in source
+    assert "if key.data == 'input':" in source
+    assert not _violations(source, 'hooks/ai_backend.py')
+    assert _violations(source + '\n    os.write(note_fd, payload)\n', 'hooks/ai_backend.py')
+    for name in ('request', 'initialize'):
+        source = f'def {name}():\n    self.process.stdin.write(payload)\n    Path(note_path).write_text(payload)\n'
+        assert len(_violations(source, 'hooks/ai_adapters/codex.py')) == 1
+
+
+def test_codex_wire_files_require_private_directory_outside_vault():
+    root = Path(__file__).resolve().parents[1]
+    tree = ast.parse((root / 'hooks/ai_adapters/codex.py').read_text())
+    function = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                    and node.name == 'execute')
+    source = ast.unparse(function)
+    assert 'metadata = directory.lstat()' in source
+    assert 'not stat.S_ISDIR(metadata.st_mode)' in source
+    assert 'metadata.st_uid != os.geteuid()' in source
+    assert 'stat.S_IMODE(metadata.st_mode) != 448' in source
+    assert 'directory.resolve().is_relative_to(context.vault_path.resolve())' in source
+    assert "schema_path, output_path = (directory / 'schema.json', directory / 'result.json')" in source
+    assert not _violations(source, 'hooks/ai_adapters/codex.py')
+    assert _violations(source + '\n    Path(note_path).write_text(prompt)\n',
+                       'hooks/ai_adapters/codex.py')
+
+
+def test_operation_artifact_boundary_and_exact_write_calls():
+    root = Path(__file__).resolve().parents[1]
+    tree = ast.parse((root / 'hooks/operation_state.py').read_text())
+    functions = {node.name: ast.unparse(node) for node in tree.body
+                 if isinstance(node, ast.FunctionDef)}
+    directory = functions['operation_directory']
+    assert 'selected_state == vault or vault in selected_state.parents' in directory
+    assert "root = session_state_path(context) / 'jobs'" in directory
+    assert 'directory.stat().st_uid != os.getuid()' in directory
+    assert '_no_symlinks(path)' in functions['_artifact']
+    assert "path = _artifact(context, operation_id, name)" in functions['_store_artifact_locked']
+    lock = functions['_operation_lock']
+    assert "path = directory / '.operation.lock'" in lock
+    assert 'stat.S_ISREG(info.st_mode)' in lock
+    assert 'info.st_uid != os.getuid()' in lock
+    for name in ('_write_private', '_operation_lock'):
+        source = functions[name]
+        assert not _violations(source, 'hooks/operation_state.py')
+        assert _violations(source + '\n    Path(note_path).write_text("bypass")\n',
+                           'hooks/operation_state.py')
+    assert _violations('def writer():\n    _write_private(vault_note, content)\n', 'hooks/new_writer.py')
+    assert _violations('def writer():\n    _publish_private_json(vault_note, content)\n', 'hooks/new_writer.py')
+
+
+def test_config_private_exception_is_bound_to_selected_config_and_cas():
+    root = Path(__file__).resolve().parents[1]
+    tree = ast.parse((root / 'hooks/skill_procedures.py').read_text())
+    function = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                    and node.name == '_publish_config')
+    assert [arg.arg for arg in function.args.args] == ['context', 'value', 'expected_revision']
+    source = ast.unparse(function)
+    assert 'path = Path(context.config_path)' in source
+    assert "if path.suffix != '.json':" in source
+    assert 'path.resolve().is_relative_to(context.vault_path.resolve())' in source
+    assert source.count('_no_symlinks(path)') == 2
+    assert 'stat.S_ISREG(details.st_mode)' in source
+    assert 'details.st_uid != os.getuid()' in source
+    assert 'stat.S_IMODE(details.st_mode) != 384' in source
+    assert 'hashlib.sha256(raw).hexdigest() != expected_revision' in source
+    assert not _violations(source, 'hooks/skill_procedures.py')
+    assert _violations(source + '\n    Path(note_path).write_text("bypass")\n',
+                       'hooks/skill_procedures.py')
+    assert _violations('def writer():\n    _publish_config(context, data, revision)\n',
+                       'hooks/new_writer.py')
+
+
+def test_native_rpc_send_exception_is_only_deadline_bounded_stdin():
+    root = Path(__file__).resolve().parents[1]
+    tree = ast.parse((root / 'hooks/ai_adapters/codex.py').read_text())
+    owners = [(owner.name, node) for owner in tree.body if isinstance(owner, ast.ClassDef)
+              for node in owner.body if isinstance(node, ast.FunctionDef) and node.name == '_send']
+    assert len(owners) == 1 and owners[0][0] == 'NativeRpc'
+    source = ast.unparse(owners[0][1])
+    assert 'selector.register(self.process.stdin, selectors.EVENT_WRITE)' in source
+    assert 'remaining = self.deadline - time.monotonic()' in source
+    assert 'if remaining <= 0:' in source
+    assert 'payload = payload[written:]' in source
+    assert not _violations(source, 'hooks/ai_adapters/codex.py')
+    assert _violations(source + '\n    os.write(note_fd, payload)\n', 'hooks/ai_adapters/codex.py')

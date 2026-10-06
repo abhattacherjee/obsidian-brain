@@ -5,6 +5,61 @@ metadata:
   version: 1.4.0
 ---
 
+## Native runtime and installed resources
+
+For fresh setup, ask for the vault path FIRST and validate that it exists. Set
+`OB_VAULT` to that explicit path before any command below. For upgrades, select
+the already configured vault. No temporary or fake vault is used for bootstrap.
+
+Use the absolute path of this loaded `SKILL.md` as `OB_SKILL_PATH`. Read the
+reference for the invoking host when this skill has paired host references.
+Set `OB_HOST`, `OB_CLIENT`, `OB_SESSION_ID`, and `OB_CWD` from that native
+invocation. Use the selected host's own session ID. Keep curated note taxonomy
+separate from `agent_provider` and `agent_session_id` provenance.
+
+```bash
+OB_SKILL_PATH='<absolute path of this loaded SKILL.md>'
+OB_RESOURCE_ROOT=$(python3 -c 'import pathlib,sys; p=pathlib.Path(sys.argv[1]); assert p.is_absolute(); p=p.resolve(); assert p.name == "SKILL.md" and p.parent.parent.name == "skills"; print(p.parents[2])' "$OB_SKILL_PATH")
+python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --vault "$OB_VAULT" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" context < /dev/null
+```
+
+Use the returned `config_path`, `vault_path`, `index_path`, and `state_path`.
+Create the operation with this fixed literal request:
+
+```bash
+printf '{}' | python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --vault "$OB_VAULT" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'prepare'
+```
+
+Call `prepare` to create a private operation under native state. Retain its
+`operation_id` and `operation_dir`. Register approved helper output names with `artifact-store`;
+inputs are read through the immutable artifact manifest. Do not discover resources from the current directory or another plugin
+cache. Each shell invocation supplies the same explicit values; a previous
+shell's variables are not assumed to persist.
+
+Each data operation uses the installed launcher with a JSON request on stdin:
+
+```bash
+python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --vault "$OB_VAULT" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation '<fixed operation>' < "$REQUEST_PATH"
+```
+
+Map config JSON `vault_path`, `sessions_folder`, and `insights_folder` to the
+procedure variables `VAULT_PATH`/`VAULT`, `SESSIONS_FOLDER`/`SESS`, and
+`INSIGHTS_FOLDER`/`INS`. Use the canonical project returned in config JSON (and native `session` when available),
+not the basename of an unrelated shell working directory.
+
+Before preparing edits or requesting a summary of an existing note, call
+`note-read` and retain its exact `expected_revision`. Apply the proposed note
+with `note-apply` and that revision. A conflict leaves the current note intact;
+show the pending result and do not count the note as saved. New curated notes
+use `note-create`; they never overwrite a collision. Native memory discovery
+is unsupported for Codex until its adapter is verified; shared vault retrieval
+and wiki filing continue without borrowing another host's memory.
+
+Read `references/host-claude.md` or `references/host-codex.md` when present.
+All note writes described below use `note-create` or revision-bound `note-apply`,
+including bidirectional related links. Content is a JSON string, never shell code.
+Keep this rule when a later step uses the word Write or Edit.
+
 # Obsidian Brain Setup
 
 Configure the obsidian-brain plugin for first use. This skill validates prerequisites, creates vault folders, installs dashboard templates, writes the config file, and verifies everything works.
@@ -21,48 +76,17 @@ Follow these steps exactly. Do not skip steps or reorder them.
 
 Check for existing config:
 
-```bash
-cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-python3 -c '
-import sys, os
-import glob, json, os, re, sys
-def _ob_hooks():
-    try:
-        for _m in json.load(open(os.path.expanduser("~/.claude/plugins/known_marketplaces.json"))).values():
-            _s = _m.get("source") if isinstance(_m, dict) else None
-            if not (isinstance(_s, dict) and _s.get("source") == "directory"):
-                continue
-            _i = _m.get("installLocation") if isinstance(_m, dict) else None
-            if not (isinstance(_i, str) and os.path.isabs(_i)):
-                continue
-            _h = os.path.join(_i, "hooks")
-            if os.path.isfile(os.path.join(_h, "obsidian_utils.py")):
-                return _h
-    except Exception:
-        pass
-    _c = [_d for _d in glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")) if re.fullmatch("[0-9]+([.][0-9]+)*", _d.split("/")[-2])]
-    return max(_c, key=lambda _p: ([int(_n) for _n in _p.split("/")[-2].split(".")], _p), default="hooks")
-sys.path.insert(0, _ob_hooks())
-from obsidian_utils import load_config
-c = load_config()
-vp = c.get("vault_path", "")
-if vp:
-    sess = c.get("sessions_folder", "claude-sessions")
-    ins = c.get("insights_folder", "claude-insights")
-    dash = c.get("dashboards_folder", "claude-dashboards")
-    chk = c.get("check_items_folder", "claude-check-items")
-    print(f"EXISTING")
-    print(f"VAULT={vp}")
-    print(f"SESS={sess}")
-    print(f"INS={ins}")
-    print(f"DASH={dash}")
-    print(f"CHK={chk}")
-else:
-    print("NO_CONFIG")
-'
+Request for `config` (substitute the values as data):
+
+```json
+{}
 ```
 
-**If the output starts with `EXISTING`**, parse each subsequent line as KEY=VALUE, splitting on the first `=`. Extract `VAULT_PATH` and present:
+```bash
+python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --vault "$OB_VAULT" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'config' < "$REQUEST_PATH"
+```
+
+**If the config JSON names an existing vault**, read fields from the returned JSON. Extract `VAULT_PATH` and present:
 
 > **Existing obsidian-brain installation detected.**
 > - Vault path: `<vault_path from config>`
@@ -86,46 +110,13 @@ If **reconfigure**: store `MODE=reconfigure`. Proceed to Step 2 (Ask for vault p
 
 If **cancel**: stop here.
 
-**If the output is `NO_CONFIG`**: store `MODE=fresh`. Proceed to Step 2 (Ask for vault path) — first-time setup.
+**If no native vault was configured before this invocation**: store `MODE=fresh`. Proceed to Step 2 (Ask for vault path) — first-time setup.
 
-### Step 1.5 — Permission pre-flight check
+### Step 1.5 — Native permissions
 
-Before any out-of-workspace writes, test whether Claude Code can write to `~/.claude/`:
-
-```bash
-echo "test" > ~/.claude/.obsidian-brain-canary 2>&1 && rm -f ~/.claude/.obsidian-brain-canary && echo "OK" || echo "FAIL"
-```
-
-If **OK**: proceed silently to Step 2.
-
-If **FAIL**: present the following message using AskUserQuestion:
-
-> **Heads up — setup needs write access outside this project directory.**
->
-> Obsidian Brain writes config to `~/.claude/` and notes to your Obsidian vault. Your current Claude Code permissions block writes outside the working directory.
->
-> Choose how to fix this:
->
-> 1. **Switch permission mode (recommended)** — Press `Shift+Tab` to switch to "accept edits" mode for this session. Or use `/config` to change `permissions.defaultMode` permanently. Then re-run `/obsidian-setup`.
->
-> 2. **Whitelist paths permanently** — Add `$HOME/.claude` and your vault's parent directory to `sandbox.filesystem.allowWrite` in `~/.claude/settings.json`. **Use absolute paths** — `~` is not expanded inside JSON string values:
->    ```json
->    {
->      "sandbox": {
->        "filesystem": {
->          "allowWrite": ["/Users/you/.claude", "/Users/you/Documents/vault-parent"]
->        }
->      }
->    }
->    ```
->    Replace `/Users/you` with your actual home directory (run `echo $HOME` to find it). Then re-run `/obsidian-setup`.
->
-> 3. **I'll handle it myself** — Continue setup and approve or fix writes as they come up.
-
-**Behavior per option:**
-- **Option 1:** Print the instruction, then stop. User changes mode and re-runs `/obsidian-setup`.
-- **Option 2:** Print the JSON snippet with absolute paths. In upgrade mode (`MODE=upgrade`), substitute the known vault parent path from the existing config. In fresh mode, show only the `$HOME/.claude` entry with a note that the vault parent must be added after the user provides the vault path. Then stop. User edits settings and re-runs.
-- **Option 3:** Continue with setup as normal. Writes may fail and the user deals with each one.
+Follow the invoking host reference for permission and hook trust. Select the
+vault before bootstrapping a fresh context. Report a permission refusal and
+preserve pending work; use the host's native permission controls.
 
 ### Step 2 — Ask for vault path
 
@@ -169,7 +160,7 @@ echo "test" > "$VAULT_PATH/.obsidian-brain-canary" 2>&1 && rm -f "$VAULT_PATH/.o
 
 If **FAIL**, tell the user:
 
-> **Cannot write to your vault at `$VAULT_PATH`.** This is likely a sandbox restriction. Add your vault's parent directory to `sandbox.filesystem.allowWrite` in `~/.claude/settings.json`, or switch to "accept edits" mode (`Shift+Tab`), then re-run `/obsidian-setup`.
+> **Cannot write to your vault at `$VAULT_PATH`.** Follow the invoking host reference to grant native write access, then re-run `/obsidian-setup`.
 
 Stop here if FAIL.
 
@@ -489,7 +480,8 @@ if (Object.keys(statsByProject).length > 0) {
 
 **If `MODE=fresh` or `MODE=reconfigure`:**
 
-Write `~/.claude/obsidian-brain-config.json` with this exact structure:
+Call `config-read` to retain the exact configuration revision. Submit the
+following settings through `configure` with that revision:
 
 ```json
 {
@@ -510,13 +502,11 @@ Write `~/.claude/obsidian-brain-config.json` with this exact structure:
 
 Replace `<VAULT_PATH value from Step 2>` with the actual vault path. Ensure the file is valid JSON.
 
-First run `mkdir -p ~/.claude` to ensure the directory exists.
+The trusted configuration operation creates its native private directory.
 
 After writing the config file, restrict permissions so only the current user can read it:
 
-```bash
-chmod 600 ~/.claude/obsidian-brain-config.json
-```
+The trusted configuration operation publishes at mode `0o600`.
 
 After writing the config, inspect the final `snapshot_on_clear` and `snapshot_on_compact` values. If either is `False` (for instance, when migrating from an older config), warn the user:
 
@@ -540,43 +530,16 @@ If FAIL, warn that vault writes are not working and ask the user to check permis
 
 Build (or rebuild) the SQLite FTS5 index for fast vault search and context-driven insight loading:
 
+Request for `reindex` (substitute the values as data):
+
+```json
+{
+  "full": false
+}
+```
+
 ```bash
-python3 -c '
-import sys, os, json, glob
-import glob, json, os, re, sys
-def _ob_hooks():
-    try:
-        for _m in json.load(open(os.path.expanduser("~/.claude/plugins/known_marketplaces.json"))).values():
-            _s = _m.get("source") if isinstance(_m, dict) else None
-            if not (isinstance(_s, dict) and _s.get("source") == "directory"):
-                continue
-            _i = _m.get("installLocation") if isinstance(_m, dict) else None
-            if not (isinstance(_i, str) and os.path.isabs(_i)):
-                continue
-            _h = os.path.join(_i, "hooks")
-            if os.path.isfile(os.path.join(_h, "obsidian_utils.py")):
-                return _h
-    except Exception:
-        pass
-    _c = [_d for _d in glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")) if re.fullmatch("[0-9]+([.][0-9]+)*", _d.split("/")[-2])]
-    return max(_c, key=lambda _p: ([int(_n) for _n in _p.split("/")[-2].split(".")], _p), default="hooks")
-sys.path.insert(0, _ob_hooks())
-from obsidian_utils import load_config, indexed_folders
-from vault_index import rebuild_index
-try:
-    # fresh=True: Step 7 may have just rewritten the config this session.
-    cfg = load_config(fresh=True)
-    # An unreadable config falls back to defaults (vault_path ""); its
-    # default folders would make the rebuild prune every custom folder.
-    if cfg.get("vault_path") != sys.argv[1]:
-        raise ValueError("config vault_path %r does not match %r (config unreadable or changed)" % (cfg.get("vault_path"), sys.argv[1]))
-    folders = indexed_folders(cfg, strict=True)
-except ValueError as exc:
-    print(f"ERROR: {exc}", file=sys.stderr)
-    sys.exit(1)
-counts = rebuild_index(sys.argv[1], folders)
-print(json.dumps(counts))
-' "$VAULT_PATH"
+python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --vault "$OB_VAULT" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'reindex' < "$REQUEST_PATH"
 ```
 
 Parse the JSON output. If successful, store `N = counts["inserted"]` for the success message.
@@ -591,47 +554,25 @@ Phase 2 theme clustering can use `numpy` (vectorized TF-IDF) and `scipy` (agglom
 
 **Idempotent detection.** Load the current config + installed status:
 
+Request for `dependencies` (substitute the values as data):
+
+```json
+{}
+```
+
 ```bash
-cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-python3 -c '
-import sys, os, json
-import glob, json, os, re, sys
-def _ob_hooks():
-    try:
-        for _m in json.load(open(os.path.expanduser("~/.claude/plugins/known_marketplaces.json"))).values():
-            _s = _m.get("source") if isinstance(_m, dict) else None
-            if not (isinstance(_s, dict) and _s.get("source") == "directory"):
-                continue
-            _i = _m.get("installLocation") if isinstance(_m, dict) else None
-            if not (isinstance(_i, str) and os.path.isabs(_i)):
-                continue
-            _h = os.path.join(_i, "hooks")
-            if os.path.isfile(os.path.join(_h, "obsidian_utils.py")):
-                return _h
-    except Exception:
-        pass
-    _c = [_d for _d in glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")) if re.fullmatch("[0-9]+([.][0-9]+)*", _d.split("/")[-2])]
-    return max(_c, key=lambda _p: ([int(_n) for _n in _p.split("/")[-2].split(".")], _p), default="hooks")
-sys.path.insert(0, _ob_hooks())
-from obsidian_utils import check_optional_deps, load_config
-cfg = load_config()
-status = check_optional_deps()
-print("NUMPY=" + ("1" if status["numpy"] else "0"))
-print("SCIPY=" + ("1" if status["scipy"] else "0"))
-print("PROMPTED=" + ("1" if cfg.get("optional_deps_prompted") else "0"))
-print("DECLINED=" + ",".join(cfg.get("optional_deps_declined", [])))
-'
+python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --vault "$OB_VAULT" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'dependencies' < "$REQUEST_PATH"
 ```
 
 Parse each line as `KEY=VALUE`.
 
 **Decision tree:**
 
-1. If `NUMPY=1` and `SCIPY=1` → both installed; skip the prompt entirely. Log one line `[setup] numpy + scipy available — theme clustering will use fast paths.` and continue to Step 9.
-2. If `PROMPTED=1` AND every missing package appears in `DECLINED` AND this run was NOT invoked with `--deps` → user already declined; skip the prompt silently. Continue to Step 9.
+1. If `numpy` and `scipy` are both true → both installed; skip the prompt entirely. Log one line `[setup] numpy + scipy available — theme clustering will use fast paths.` and continue to Step 9.
+2. If `optional_deps_prompted` is true AND every missing package appears in `optional_deps_declined` AND this run was NOT invoked with `--deps` → user already declined; skip the prompt silently. Continue to Step 9.
 3. Otherwise → show the prompt below.
 
-**Prompt the user** using AskUserQuestion:
+**Prompt the user** using native user decision tool:
 
 > Optional performance dependencies for Phase 2 theme clustering:
 >
@@ -648,134 +589,47 @@ Parse each line as `KEY=VALUE`.
 
 - **Install:** run `python3 -m pip install --user` for every missing package. Report success/failure for each. After install, update config:
 
-```bash
-cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-python3 -c '
-import sys, os, json, tempfile
-import glob, json, os, re, sys
-def _ob_hooks():
-    try:
-        for _m in json.load(open(os.path.expanduser("~/.claude/plugins/known_marketplaces.json"))).values():
-            _s = _m.get("source") if isinstance(_m, dict) else None
-            if not (isinstance(_s, dict) and _s.get("source") == "directory"):
-                continue
-            _i = _m.get("installLocation") if isinstance(_m, dict) else None
-            if not (isinstance(_i, str) and os.path.isabs(_i)):
-                continue
-            _h = os.path.join(_i, "hooks")
-            if os.path.isfile(os.path.join(_h, "obsidian_utils.py")):
-                return _h
-    except Exception:
-        pass
-    _c = [_d for _d in glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")) if re.fullmatch("[0-9]+([.][0-9]+)*", _d.split("/")[-2])]
-    return max(_c, key=lambda _p: ([int(_n) for _n in _p.split("/")[-2].split(".")], _p), default="hooks")
-sys.path.insert(0, _ob_hooks())
-from pathlib import Path
+Request for `configure` (substitute the values as data):
 
-cfg_path = Path.home() / ".claude" / "obsidian-brain-config.json"
-try:
-    cfg = json.loads(cfg_path.read_text())
-except FileNotFoundError:
-    cfg = {}
-cfg["optional_deps_prompted"] = True
-declined = set(cfg.get("optional_deps_declined", []))
-for pkg in ("numpy", "scipy"):
-    try:
-        __import__(pkg)
-        declined.discard(pkg)
-    except ImportError:
-        pass
-cfg["optional_deps_declined"] = sorted(declined)
-fd, tmp_path = tempfile.mkstemp(prefix=".obsidian-brain-config-", suffix=".json.tmp", dir=os.path.dirname(cfg_path))
-try:
-    with os.fdopen(fd, "w") as f:
-        json.dump(cfg, f, indent=2)
-        f.flush()
-        os.fsync(f.fileno())
-    os.chmod(tmp_path, 0o600)
-    os.replace(tmp_path, cfg_path)
-except Exception:
-    try:
-        os.unlink(tmp_path)
-    except OSError:
-        pass
-    raise
-print("OK")
-'
+```json
+{
+  "expected_revision": "<config-read SHA256>",
+  "settings": {
+    "<setting>": "<value>"
+  }
+}
+```
+
+```bash
+python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --vault "$OB_VAULT" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'configure' < "$REQUEST_PATH"
 ```
 
 If pip itself is missing or the install fails (restricted environments, e.g. Homebrew-managed Python), print the failure and continue — all features still work.
 
 - **Skip:** write both flags with every missing package added to `optional_deps_declined`:
 
+Request for `configure` (substitute the values as data):
+
+```json
+{
+  "expected_revision": "<config-read SHA256>",
+  "settings": {
+    "<setting>": "<value>"
+  }
+}
+```
+
 ```bash
-cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-python3 - <<'PY'
-import json, os, tempfile
-from pathlib import Path
-cfg_path = Path.home() / ".claude" / "obsidian-brain-config.json"
-try:
-    cfg = json.loads(cfg_path.read_text())
-except FileNotFoundError:
-    cfg = {}
-cfg["optional_deps_prompted"] = True
-missing = []
-for pkg in ("numpy", "scipy"):
-    try:
-        __import__(pkg)
-    except ImportError:
-        missing.append(pkg)
-declined = sorted(set(cfg.get("optional_deps_declined", [])) | set(missing))
-cfg["optional_deps_declined"] = declined
-fd, tmp_path = tempfile.mkstemp(prefix=".obsidian-brain-config-", suffix=".json.tmp", dir=os.path.dirname(cfg_path))
-try:
-    with os.fdopen(fd, "w") as f:
-        json.dump(cfg, f, indent=2)
-        f.flush()
-        os.fsync(f.fileno())
-    os.chmod(tmp_path, 0o600)
-    os.replace(tmp_path, cfg_path)
-except Exception:
-    try:
-        os.unlink(tmp_path)
-    except OSError:
-        pass
-    raise
-print("OK")
-PY
+python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --vault "$OB_VAULT" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'configure' < "$REQUEST_PATH"
 ```
 
 - **Not now:** write neither flag. The next `/obsidian-setup` run will re-prompt.
 
-### Step 9 — Configure skill-kit:extract nudge (idempotent)
+### Step 9 — Native extraction nudge
 
-Check if the skill-kit:extract-to-compress nudge (rule file and name keep the old `claudeception` spelling) is already configured **globally** (in `~/.claude/`, not the project `.claude/`):
-
-```bash
-test -f ~/.claude/hookify.claudeception-compress-nudge.local.md && echo "EXISTS" || echo "MISSING"
-```
-
-If EXISTS, skip this step — the nudge is already configured.
-
-If MISSING, write the hookify rule file directly to `~/.claude/` using the Write tool:
-
-**File: `~/.claude/hookify.claudeception-compress-nudge.local.md`**
-
-```markdown
----
-name: claudeception-compress-nudge
-enabled: true
-event: stop
-pattern: Result:\s*PASS|\.claude/skills/[^/]+/SKILL\.md|created skill|skill file written|extracted knowledge
-action: warn
----
-
-💡 **skill-kit:extract (was claudeception) extracted knowledge from this session.** Run `/compress` to save it to your Obsidian vault.
-```
-
-**Important:** This rule MUST be in `~/.claude/` (global), not the project's `.claude/` directory. The nudge should trigger in any project where skill-kit:extract runs, not just obsidian-brain.
-
-This is a soft nudge — a non-blocking suggestion, not automatic execution.
+Follow the invoking host reference. The Claude hookify integration remains in
+its Claude reference. Codex reports this integration unsupported until a
+native nudge adapter is verified; no Claude global rule is written for Codex.
 
 ### Step 10 — Print success message
 
@@ -796,7 +650,7 @@ This is a soft nudge — a non-blocking suggestion, not automatic execution.
 > **Obsidian Brain setup complete!**
 >
 > - Vault path: `<VAULT_PATH>`
-> - Config written to: `~/.claude/obsidian-brain-config.json`
+> - Config written to: `<native config_path>`
 > - Folders created: `claude-sessions/`, `claude-insights/`, `claude-dashboards/`, `claude-wiki/`
 > - Dashboards installed: `sessions-overview.md`, `project-index.md`, `weekly-review.md`, `learning-velocity.md`, `decision-timeline.md`, `open-items.md`
 > - skill-kit:extract nudge: configured (run `/compress` reminder after knowledge extraction)
