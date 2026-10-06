@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Shared runtime context, revision-checked vault writes, host-native AI adapters, Codex plugin packaging, and paired Claude Code/Codex tests (#272). Native current-client binding and installed Codex Desktop lifecycle acceptance remain pending; this does not certify full parity.
+
 ### Fixed
 - The repo's PR-base hook (`.claude/hooks/enforce-pr-base-branch.py`) now lets a `release/*` or `hotfix/*` PR merge into `develop` as well as `main`. It denied every release back-merge, so each one had to go around the gate. Any other base is still denied. This matches git-flow's `check-pr-base` hook.
 
