@@ -526,18 +526,23 @@ class TestStdinCap:
             "hooks/wiki.py",
             # #272: the shared host CLI reads one bounded native JSON payload.
             "hooks/brain_cli.py",
+            # #272: bound legacy hooks read their native payload before dispatch.
+            "hooks/native_lifecycle.py",
         ):
             assert expected in paths, f"stdin read in {expected} no longer discovered"
         # Exact, not >=. What >= permits is SUBSTITUTION: an existing read
         # reformatted past the AST extractor at the same moment a new entry
-        # point lands keeps the total at 16 and the suite green, while the
+        # point lands keeps the total at 17 and the suite green, while the
         # reformatted file's cap silently stops being verified. Every one of
-        # the 16 is named above, so a new entry point should fail here and be
+        # the 17 is named above, so a new entry point should fail here and be
         # added deliberately. (tests/test_hooks_resolver_drift.py makes the
         # same call for the same reason.)
         found = self._all_stdin_reads()
-        assert len(found) == 16, (
-            f"expected exactly 16 stdin read sites, found {len(found)}: "
+        native_bounds = [bound for path, _, bound, _ in found
+                         if path == "hooks/native_lifecycle.py"]
+        assert native_bounds == [1_000_001]
+        assert len(found) == 17, (
+            f"expected exactly 17 stdin read sites, found {len(found)}: "
             + ", ".join(f"{path}:{lineno}" for path, lineno, _, _ in sorted(found)[:5])
             + " ... . A RISE means a new stdin entry point landed — name it in the "
             "list above, deliberately, because a new place the process reads "
@@ -2102,9 +2107,10 @@ class TestDecisionTimeIsBounded:
     # observed taking 4:00 idle and 6:09 with several agents running, and a
     # loaded machine is exactly when a hook feels slow to a human -- so the
     # budget has to be set loose enough to survive load, which blunts it.
-    # Measuring an honest baseline command in the SAME run and subtracting it
-    # cancels most of that: interpreter start-up, git calls and scheduler
-    # contention move the baseline and the sample together.
+    # Subtracting an independent wall baseline amplifies startup and git-wait
+    # jitter when useful work is only a few milliseconds. Child Python CPU
+    # around the real hook measures guard growth; the tests above still bound
+    # the whole hook's wall time, including subprocess waits.
     #
     # And it only fires once the input is already big enough to blow it. The
     # quadratic term this class failed to catch was visible as a RATIO at
@@ -2130,12 +2136,18 @@ class TestDecisionTimeIsBounded:
         work_dir, env = TestHookBlockingPathsFire._repo(tmp_path)
 
         def measure(command):
+            # Child CPU measures Python guard work without parent scheduling,
+            # pipe I/O, or git waits. Whole-hook wall budgets above stay intact.
+            wrapper = (
+                "import runpy,sys,time; start=time.process_time();\n"
+                "try: runpy.run_path(sys.argv[1],run_name='__main__')\n"
+                "finally: print('HOOK_CPU_MS='+str((time.process_time()-start)*1000),file=sys.stderr)"
+            )
             best = None
             for _ in range(_GROWTH_REPS):
-                start = time.perf_counter()
                 try:
                     proc = subprocess.run(
-                        [sys.executable,
+                        [sys.executable, "-c", wrapper,
                          str(work_dir / ".claude/hooks/prevent-direct-push.py")],
                         input=json.dumps({"tool_name": "Bash",
                                           "tool_input": {"command": command}}),
@@ -2149,12 +2161,16 @@ class TestDecisionTimeIsBounded:
                     f"prevent-direct-push exited {proc.returncode}: "
                     f"{proc.stderr[-400:]!r}"
                 )
-                elapsed = (time.perf_counter() - start) * 1000
+                marker = [line for line in proc.stderr.splitlines()
+                          if line.startswith("HOOK_CPU_MS=")]
+                assert len(marker) == 1, "child hook CPU measurement missing"
+                elapsed = float(marker[0].partition("=")[2])
+                assert elapsed >= 0
                 best = elapsed if best is None else min(best, elapsed)
             return best
 
-        # The fixed cost of getting in and out of the hook at all, measured
-        # here rather than assumed, so load moves it with the samples.
+        # Remove the fixed Python cost of loading the same hook, measured in
+        # each child rather than inferred from parent wall time.
         baseline = measure("git pu" + "sh origin feature/probe")
         assert baseline is not None, "the baseline command itself timed out"
 
@@ -2166,10 +2182,14 @@ class TestDecisionTimeIsBounded:
                     f"prevent-direct-push did not finish {unit!r} at {kb}KB "
                     f"within {self.SUBPROCESS_TIMEOUT_S}s -- superlinear "
                     f"growth over separator or quote density (the fixed code "
-                    f"costs single-digit milliseconds of work here)"
+                    f"costs bounded Python CPU work here)"
                 )
             works.append((kb, max(elapsed - baseline, 0.0)))
 
+        self._assert_linear_growth(works, baseline, unit)
+
+    @staticmethod
+    def _assert_linear_growth(works, baseline, unit):
         for (kb_a, work_a), (kb_b, work_b) in zip(works, works[1:]):
             if work_a < _GROWTH_MIN_WORK_MS:
                 continue  # noise, not signal -- see _GROWTH_MIN_WORK_MS
@@ -2178,11 +2198,16 @@ class TestDecisionTimeIsBounded:
                 f"prevent-direct-push work grew {ratio:.2f}x for {unit!r} "
                 f"when the input doubled from {kb_a}KB to {kb_b}KB "
                 f"({work_a:.1f}ms -> {work_b:.1f}ms over a {baseline:.1f}ms "
-                f"baseline), past the {_GROWTH_MAX_RATIO}x bound. Linear "
+                f"CPU baseline), past the {_GROWTH_MAX_RATIO}x bound. Linear "
                 f"work doubles; quadratic work quadruples."
             )
 
-
+    def test_growth_guard_rejects_quadratic_work(self):
+        # A quadratic guard quadruples work when input doubles, even when
+        # every cell remains under the separate whole-hook stall ceiling.
+        self._assert_linear_growth([(128, 8.0), (256, 16.0), (512, 32.0)], 10.0, "linear")
+        with pytest.raises(AssertionError, match="work grew 4.00x"):
+            self._assert_linear_growth([(128, 8.0), (256, 32.0), (512, 128.0)], 10.0, "quadratic")
 def _hook_regex_constants(hook):
     """Every regex constant a hook builds, folded out of its source.
 

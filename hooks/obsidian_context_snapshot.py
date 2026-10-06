@@ -196,6 +196,9 @@ def _run(context=None, payload=None) -> None:
         with using_runtime_context(context):
             return _run(payload=payload)
     context = current_runtime_context()
+    if context is not None:
+        from native_lifecycle import emit_bound
+        return emit_bound(context, "pre_compact", payload)
     # 1. Read hook input from stdin
     try:
         if payload is None:

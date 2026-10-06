@@ -65,6 +65,16 @@ If the output is empty or errors, tell the user:
 
 Stop here if config is missing.
 
+### Step 1b — Recover retained native facts
+
+Before finding or summarizing notes, run the shared recovery command. Select the invoking host and client explicitly: `claude` / `claude-code`, `codex` / `codex-cli`, or `codex` / `codex-desktop`. Use the installed skill's adjacent `hooks` resource path. Pass the authoritative native session ID with `--session-id` when the native tool environment does not supply it. Do not derive identity or client from an old transcript.
+
+```bash
+python3 "<hooks_dir>/brain_cli.py" --host "<host>" --client "<client>" --resource-root "<plugin_root>" --vault "$VAULT" recover < /dev/null
+```
+
+Recovery processes at most eight registered sources within one second. It can retain facts from an active session; it does not finalize that session. Read the JSON `status`, `pending_sources`, `loss_of_input`, and `warnings`. When recovery remains pending or unavailable, say so and continue reading the notes already saved. If `loss_of_input` is true, report lost source input even when `status` is `complete`. Do not claim complete recovery from a partial result. Recovery uses no AI; summaries remain a separate step.
+
 **Create the task manifest** for the full `/recall` flow:
 
 ```

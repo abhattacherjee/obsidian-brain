@@ -46,6 +46,47 @@ _REGION = re.compile(
     r"<!-- obsidian-brain:(capture|summary):start -->\n(.*?)"
     r"<!-- obsidian-brain:\1:end -->", re.DOTALL,
 )
+_METADATA_KEYS = frozenset({
+    "type", "date", "project", "tags", "session_id", "source_session",
+    "agent_provider", "agent_session_id", "capture_state", "capture_completeness",
+    "capture_revision", "summary_revision", "parent_session", "source_revision", "trigger",
+})
+
+
+def _frontmatter(document):
+    if not (document or "").startswith("---\n"):
+        return None
+    end = document.find("\n---\n", 4)
+    if end < 0:
+        raise ValueError("The note has incomplete frontmatter")
+    return document[4:end], end + 5
+
+
+def _metadata_changes(changes):
+    if "metadata" not in changes:
+        return {}
+    values = json.loads(changes["metadata"])
+    if not isinstance(values, dict) or not set(values).issubset(_METADATA_KEYS):
+        raise ValueError("Unknown managed metadata field")
+    if any(not isinstance(value, (str, list)) for value in values.values()):
+        raise ValueError("Managed metadata must contain strings or string lists")
+    if any(isinstance(value, list) and any(not isinstance(item, str) for item in value)
+           for value in values.values()):
+        raise ValueError("Managed metadata lists must contain strings")
+    return values
+
+
+def _metadata_lines(document):
+    frontmatter = _frontmatter(document)
+    result = {}
+    if frontmatter:
+        for line in frontmatter[0].splitlines():
+            match = re.match(r"^([a-z_]+):(?:[ \t]*(.*))$", line)
+            if match and match[1] in _METADATA_KEYS:
+                if match[1] in result:
+                    raise ValueError("The note has duplicate managed metadata")
+                result[match[1]] = line
+    return result
 
 
 def _fault(point):
@@ -194,15 +235,24 @@ def _read(path):
 
 
 def _regions(document):
-    return {match.group(1): _digest(match.group(2))
-            for match in _REGION.finditer(document or "")}
+    result = {match.group(1): _digest(match.group(2))
+              for match in _REGION.finditer(document or "")}
+    result.update({"metadata:" + key: _digest(line)
+                   for key, line in _metadata_lines(document).items()})
+    return result
 
 
 def _record_read(connection, path, document):
     revision = _digest(document) if document is not None else None
     if revision is not None:
+        try:
+            regions = _regions(document)
+        except ValueError:
+            # A repair still needs the exact source hash when its metadata is
+            # malformed. No region-level permission can be inferred from it.
+            regions = {}
         connection.execute("INSERT OR IGNORE INTO revisions VALUES (?, ?, ?)",
-                           (str(path), revision, json.dumps(_regions(document))))
+                           (str(path), revision, json.dumps(regions)))
     return revision
 
 
@@ -234,7 +284,7 @@ def record_raw_read(context, path, raw):
             revision = hashlib.sha256(raw).hexdigest()
             try:
                 regions = _regions(raw.decode("utf-8"))
-            except UnicodeDecodeError:
+            except (UnicodeDecodeError, ValueError):
                 regions = {}
             connection.execute("INSERT OR IGNORE INTO revisions VALUES (?, ?, ?)",
                                (str(path), revision, json.dumps(regions)))
@@ -252,12 +302,27 @@ def _render(document, changes):
             raise ValueError("A document replacement cannot also change regions")
         return changes["document"]
     result = document or ""
+    metadata = _metadata_changes(changes)
+    if metadata:
+        existing_fields = _metadata_lines(result)
+        frontmatter = _frontmatter(result)
+        lines = frontmatter[0].splitlines() if frontmatter else []
+        for key, value in metadata.items():
+            rendered = key + ": " + json.dumps(value, ensure_ascii=False)
+            if key in existing_fields:
+                lines[lines.index(existing_fields[key])] = rendered
+            else:
+                lines.append(rendered)
+        remainder = result[frontmatter[1]:] if frontmatter else result
+        result = "---\n" + "\n".join(lines) + "\n---\n" + remainder
     existing = list(_REGION.finditer(result))
     if result.count("<!-- obsidian-brain:") != 2 * len(existing):
         raise ValueError("The note has incomplete or unknown managed regions")
     if len({match.group(1) for match in existing}) != len(existing):
         raise ValueError("The note has duplicate managed regions")
     for region, content in changes.items():
+        if region == "metadata":
+            continue
         if region not in {"capture", "summary"}:
             raise ValueError("Unknown managed region")
         if "<!-- obsidian-brain:" in content:
@@ -349,6 +414,9 @@ def _apply_one(context, connection, mutation):
             before = json.loads(baseline[0])
             now = _regions(current)
             checks = set(mutation.managed_changes)
+            if "metadata" in checks:
+                checks.remove("metadata")
+                checks.update("metadata:" + key for key in _metadata_changes(mutation.managed_changes))
             if "summary" in checks:
                 checks.add("capture")
             valid = current is not None and all(before.get(region) == now.get(region) for region in checks)

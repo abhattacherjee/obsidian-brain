@@ -84,6 +84,27 @@ def test_index_rebuild_does_not_remove_durable_checkpoint(context, monkeypatch):
     assert "hello" in note.read_text()
 
 
+def test_recovery_after_project_change_reuses_original_operation(context, monkeypatch):
+    note = context.vault_path / "session.md"
+
+    def crash(point):
+        if point == "after_replace":
+            raise RuntimeError("injected crash")
+
+    monkeypatch.setattr(note_transactions, "_fault", crash)
+    with pytest.raises(RuntimeError, match="injected crash"):
+        capture.publish_events(context, "source", "generation", 100,
+                               [("event", "retained fact")], note)
+    monkeypatch.setattr(note_transactions, "_fault", lambda point: None)
+    root = context.worktree / "resumed-project"
+    root.mkdir()
+    resumed = replace(context, canonical_project_root=root, worktree=root)
+    result = capture.recover_pending(resumed, 8, time.monotonic() + 1)
+    assert result.status == "complete"
+    assert capture.read_cursor(resumed, "source", "generation") == 100
+    assert note.read_text().count("retained fact") == 1
+
+
 def test_expired_recovery_deadline_retains_pending_work(context, monkeypatch):
     def crash(point):
         if point == "after_checkpoint":

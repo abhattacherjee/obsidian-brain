@@ -214,6 +214,9 @@ def _run(context=None, payload=None) -> None:
         with using_runtime_context(context):
             return _run(payload=payload)
     context = current_runtime_context()
+    if context is not None:
+        from native_lifecycle import emit_bound
+        return emit_bound(context, "session_end", payload)
     global _LAST_PROJECT, _LAST_SESSION_ID
     # Reset so a stale value from a prior invocation in the same process does
     # not bleed into this run's EXCEPTION telemetry.

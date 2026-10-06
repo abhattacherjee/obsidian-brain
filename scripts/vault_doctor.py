@@ -52,6 +52,13 @@ def _load_config(args) -> dict:
     sessions = args.sessions_folder or env_sessions
     insights = args.insights_folder or env_insights
 
+    from runtime_context import current_runtime_context
+    native = current_runtime_context()
+    if native is not None:
+        vault = vault or str(native.vault_path)
+        sessions = sessions or native.config.get("sessions_folder", "claude-sessions")
+        insights = insights or native.config.get("insights_folder", "claude-insights")
+
     if not vault or not sessions or not insights:
         # Fall back to config file only for values not yet resolved.
         # Read directly (bypass obsidian_utils.load_config's session cache,
@@ -313,6 +320,28 @@ def _print_report_human(issues_by_check: dict, min_confidence: float = 0.0,
                 print(f"      reason:   {i.reason}", file=sys.stderr)
 
 
+def _recover_runtime_pending():
+    """Native doctor calls recover facts before independent diagnostic scans."""
+    import time
+    from runtime_context import current_runtime_context
+    context = current_runtime_context()
+    if context is None:
+        return None
+    try:
+        from capture import recover_registered
+        result = recover_registered(context, max_sources=8, deadline=time.monotonic() + 1,
+                                    include_active=True)
+        output = {name: getattr(result, name) for name in (
+            "status", "applied_revision", "pending_sources", "loss_of_input", "warnings")}
+    except Exception as exc:
+        output = {"status": "unavailable", "pending_sources": 1,
+                  "loss_of_input": False, "warnings": [str(exc)]}
+    if output["status"] != "complete" or output["pending_sources"] or output["loss_of_input"]:
+        label = "capture source input lost" if output["loss_of_input"] else "capture recovery pending"
+        print("[vault_doctor] " + label + ": " + json.dumps(output), file=sys.stderr)
+    return output
+
+
 def main() -> int:
     args = _build_parser().parse_args()
 
@@ -331,6 +360,8 @@ def main() -> int:
         return 3
 
     cfg = _load_config(args)
+    recovery = _recover_runtime_pending()
+    recovery_pending = bool(recovery and (recovery["status"] != "complete" or recovery["pending_sources"] or recovery["loss_of_input"]))
 
     if args.check:
         try:
@@ -428,6 +459,8 @@ def main() -> int:
                 for issues in issues_by_check.values() for i in issues
             ],
         }
+        if recovery is not None:
+            payload["capture_recovery"] = recovery
         # Conditionally add confidence-filter metadata — only present when the
         # flag was used (threshold > 0.0), so existing consumers are byte-identical
         # to prior schema. Mirrors the conditional-row-extras pattern from #98.
@@ -455,6 +488,10 @@ def main() -> int:
                             crashed_checks=crashed_checks)
 
     if total_issues == 0:
+        if recovery_pending:
+            detail = "capture source input was lost" if recovery["loss_of_input"] else "capture recovery remains pending"
+            print("vault_doctor: diagnostics found no issues; " + detail, file=sys.stderr)
+            return 2
         if crashed_checks:
             # NOT clean: one or more checks never finished scanning. Saying
             # "clean" would be a literal falsehood — and exit 2 (not 0) so
@@ -482,7 +519,7 @@ def main() -> int:
     if not args.apply:
         # Issues found, not applied (dry-run default). A crashed check still
         # forces exit 2 — the report above is incomplete.
-        return 2 if crashed_checks else 1
+        return 2 if (crashed_checks or recovery_pending) else 1
 
     # --apply: per-project confirmation
     backup_root = os.path.expanduser(
@@ -553,7 +590,7 @@ def main() -> int:
         print(f"[vault_doctor] repair scope failed: {exc}", file=sys.stderr)
         return 2
 
-    return 2 if (any_errors or crashed_checks) else 1
+    return 2 if (any_errors or crashed_checks or recovery_pending) else 1
 
 
 if __name__ == "__main__":

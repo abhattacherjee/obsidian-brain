@@ -51,6 +51,22 @@ _VAULT_WRITERS = {
 }
 
 
+def _readonly_flags(node):
+    allowed = {"O_RDONLY", "O_DIRECTORY", "O_NOFOLLOW", "O_NONBLOCK", "O_CLOEXEC"}
+    if isinstance(node, ast.Constant):
+        return node.value == 0
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+        return _readonly_flags(node.left) and _readonly_flags(node.right)
+    if isinstance(node, ast.Attribute):
+        return isinstance(node.value, ast.Name) and node.value.id == "os" and node.attr in allowed
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "getattr":
+        return (len(node.args) == 3 and not node.keywords and isinstance(node.args[0], ast.Name)
+                and node.args[0].id == "os" and isinstance(node.args[1], ast.Constant)
+                and node.args[1].value in allowed and isinstance(node.args[2], ast.Constant)
+                and node.args[2].value == 0)
+    return False
+
+
 def _writes(node):
     name = ast.unparse(node.func)
     if name in {'os.rename', 'os.replace', 'os.unlink', 'os.remove', 'os.write', 'shutil.move'}:
@@ -62,7 +78,11 @@ def _writes(node):
                 flags = ast.unparse(keyword.value)
         if any(flag in flags for flag in ('O_WRONLY', 'O_RDWR', 'O_CREAT', 'O_APPEND', 'O_TRUNC')):
             return True
-        return flags not in {'os.O_RDONLY', '0', 'os.O_RDONLY | os.O_DIRECTORY'}
+        flag_node = node.args[1] if len(node.args) > 1 else None
+        for keyword in node.keywords:
+            if keyword.arg == 'flags':
+                flag_node = keyword.value
+        return not _readonly_flags(flag_node)
     if name.endswith(('.write_text', '.write_bytes', '.write', '.writelines', '.rename', '.unlink')):
         return True
     if name in {'open', 'io.open', 'os.fdopen'} or name.endswith('.open'):
@@ -85,6 +105,17 @@ def _allowed(file, function, node):
     name = ast.unparse(node.func)
     if file == 'hooks/note_transactions.py':
         return True
+    if file == 'hooks/obsidian_retro_gate.py' and function == 'native_decision':
+        # This function owns only its private decision journal.
+        if name == 'os.open':
+            return (len(node.args) == 3 and not node.keywords
+                    and ast.unparse(node.args[0]) == "str(directory / (key + '.json'))"
+                    and ast.unparse(node.args[1]) == 'os.O_CREAT | os.O_EXCL | os.O_WRONLY'
+                    and isinstance(node.args[2], ast.Constant) and node.args[2].value == 0o600)
+        if name == 'os.fdopen':
+            return (len(node.args) == 2 and ast.unparse(node.args[0]) == 'descriptor'
+                    and isinstance(node.args[1], ast.Constant) and node.args[1].value == 'w')
+        return False
     if file == 'hooks/brain_cli.py' and function == 'main':
         return name in {'stdout.write', 'stderr.write'}
     if function in _PRIVATE.get(file, set()):
@@ -157,3 +188,31 @@ def test_doctor_backup_exception_cannot_write_note():
 def test_scanner_rejects_computed_open_modes():
     source = 'def writer():\n    open(path, mode)\n    os.open(path, flags)\n'
     assert len(_violations(source, 'hooks/new_writer.py')) == 2
+
+
+def test_scanner_accepts_readonly_flag_expressions_but_rejects_unknown_and_write_flags():
+    source = '''def reader():
+    os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | os.O_CLOEXEC)
+    os.open(path, flags=os.O_RDONLY | os.O_DIRECTORY)
+    os.open(path, os.O_RDONLY | unknown_flags)
+    os.open(path, os.O_RDONLY | getattr(os, "O_WRONLY", 0))
+'''
+    violations = _violations(source, 'hooks/new_reader.py')
+    assert [row[2] for row in violations] == [4, 5]
+
+
+def test_retro_journal_exception_is_private_and_cannot_publish_notes():
+    root = Path(__file__).resolve().parents[1]
+    tree = ast.parse((root / 'hooks/obsidian_retro_gate.py').read_text())
+    function = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                    and node.name == 'native_decision')
+    assert [arg.arg for arg in function.args.args] == ['context', 'data']
+    source = ast.unparse(function)
+    assert "directory = session_state_path(context) / 'retro-decisions'" in source
+    assert 'directory.chmod(448)' in source
+    assert 'key = hashlib.sha256(' in source
+    assert not _violations(source, 'hooks/obsidian_retro_gate.py')
+    source += '\n    Path(note_path).write_text("bypass")\n'
+    violations = _violations(source, 'hooks/obsidian_retro_gate.py')
+    assert len(violations) == 1
+    assert violations[0][-1] == 'Path(note_path).write_text'

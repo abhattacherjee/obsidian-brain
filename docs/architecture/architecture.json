@@ -63,7 +63,7 @@
     "packageManager": "none (stdlib only)"
   },
   "diagram": {
-    "intro": "Claude lifecycle handlers and on-demand skills use a shared stdlib runtime. Vault publication records revisions and operation journals before atomic Markdown writes. Capture retains immutable checkpoints and acknowledges source cursors only after publication. Native Codex lifecycle packaging remains pending; these shared services do not certify parity.",
+    "intro": "Claude lifecycle handlers and explicit-host native CLI entry points use a shared stdlib runtime. Bounded transcript adapters normalize visible records. Capture retains facts below publication thresholds, records immutable checkpoints, publishes revision-checked Markdown, then acknowledges publication. Task 4 is in progress; native Codex packaging and desktop hook dispatch acceptance remain pending.",
     "tiers": [
       {
         "arrowLabel": null,
@@ -149,7 +149,9 @@
       "Vault OS ownership precedes session ownership. A living holder is never stolen by age; process death releases OS ownership.",
       "Atomic note publication follows a durable prepared operation. Cursor acknowledgment follows verified applied publication.",
       "Managed capture/summary hashes protect manual edits. Deferred AI receives an exact pre-generation source revision and runs without vault ownership.",
-      "Search-index rebuilds leave the durable coordination database intact. Classification caches use separate private OS ownership and semantic provenance."
+      "Search-index rebuilds leave the durable coordination database intact. Classification caches use separate private OS ownership and semantic provenance.",
+      "capture_revision is SHA256 of the normalized managed capture region. applied_revision hashes the whole published note. summary_revision will identify the capture revision summarized; it is not a full-note hash.",
+      "Native lifecycle fixture subprocesses exercise the shared handlers. They do not prove desktop conversation hook dispatch or shipped Codex parity."
     ]
   },
   "layers": [
@@ -219,7 +221,7 @@
       "id": "shared-core",
       "name": "Shared Core (obsidian_utils)",
       "color": "#22D3EE",
-      "description": "Shared stdlib modules resolve explicit host context, read transcripts, scrub secrets, prepare deferred summaries, and publish vault changes through a revision-checked transaction boundary. The registered lifecycle handlers remain Claude-specific; native Codex lifecycle packaging is still pending.",
+      "description": "Shared stdlib modules resolve explicit host context, normalize bounded native transcripts, retain capture facts, scrub secrets, prepare deferred summaries, and publish revision-checked vault changes. Task 4 native handlers are in progress; registered plugin packaging and final live acceptance remain pending.",
       "components": [
         {
           "id": "runtime-context",
@@ -235,7 +237,7 @@
             "hooks/runtime_adapters/codex.py",
             "hooks/brain_cli.py"
           ],
-          "purpose": "Resolves an explicitly selected host and client. Native payload IDs take precedence over that host's tool environment; another host's IDs are never used. Resolves Git worktree roots, installed resources, config, shared index and separate host state. Config selection is CLI, OBSIDIAN_BRAIN_CONFIG, then native home. Existing shared indexes are preserved; new defaults are qualified by the resolved vault. The context CLI reads bounded JSON. Codex lifecycle dispatch and plugin packaging remain pending under #272."
+          "purpose": "Resolves an explicitly selected host and client. Native payload IDs take precedence over that host's tool environment; another host's IDs are never used. Resolves Git worktree roots, installed resources, config, shared index and separate host state. Config selection is CLI, OBSIDIAN_BRAIN_CONFIG, then native home. Existing shared indexes are preserved; new defaults are qualified by the resolved vault. The context CLI reads bounded JSON. brain_cli provides explicit-host context, capture, recover, and hook commands. Native lifecycle handlers are under implementation; plugin packaging and final live acceptance remain pending under #272."
         },
         {
           "id": "load-config",
@@ -459,7 +461,36 @@
           "files": [
             "hooks/capture.py"
           ],
-          "purpose": "Retains scrubbed capture facts and an immutable checkpoint body before note publication. Event identity includes host/native session, source, generation and event ID; facts remain together when a session resumes in another worktree. Source ownership-marker text is escaped after scrubbing. Checkpoint ready phase freezes the selected expected revision before the note operation is prepared. A later checkpoint may advance its baseline only when an earlier recorded publication proves the current capture hash. Recovery never changes a ready operation payload or overwrites a manual capture edit. Applied publication precedes cursor acknowledgment. Historical pending rows without immutable bodies stay pending with a warning."
+          "purpose": "Retains scrubbed capture facts and an immutable checkpoint body before note publication. Event identity includes host/native session, source, generation and event ID; facts remain together when a session resumes in another worktree. Source ownership-marker text is escaped after scrubbing. Checkpoint ready phase freezes the selected expected revision before the note operation is prepared. A later checkpoint may advance its baseline only when an earlier recorded publication proves the current capture hash. Recovery never changes a ready operation payload or overwrites a manual capture edit. Applied publication precedes cursor acknowledgment. Historical pending rows without immutable bodies stay pending with a warning. source_sessions retains selected source descriptors, cursors, native state, completeness, first date, and message count; native_events retains scrubbed normalized facts before any message-threshold publication. The registered-source recovery queue rotates through a bounded batch without a full-vault scan. PreCompact writes immutable snapshots identified by native session, capture-region revision, and trigger, with a stable parent-session link. Native compact/clear trigger and snapshot toggles are explicit. Snapshots default to the legacy sessions folder and preserve their parent link."
+        },
+        {
+          "id": "native-transcripts",
+          "name": "Native transcript adapters",
+          "kind": "module",
+          "hosts": [
+            "claude",
+            "codex"
+          ],
+          "files": [
+            "hooks/transcripts/__init__.py",
+            "hooks/transcripts/claude.py",
+            "hooks/transcripts/codex.py"
+          ],
+          "purpose": "Shared bounded strict-JSONL reader verifies selected native identity and source containment, retains malformed or incomplete offsets, and detects source rotation/truncation with generations and anchors. SourceCursor carries bounded parser state; SourceRecord carries visible user/assistant messages, explicit tool names with unknown category, and fixed control records. Codex native message mirrors are deduplicated by ID or cross-kind occurrence proof, while distinct human repeats survive. Reasoning, encrypted content, environment, developer instructions, and HookPrompt are excluded. A full fork selects a matching child session_meta within the bounded batch and excludes proven parent-owned records. Ambiguous inherited facts and missing child metadata stay pending within the bounded search. Read-only native provenance verified the observed synthetic fork starts with its child session_meta at byte 0, ordinal 30; a larger inherited prefix is not an observed acceptance blocker. Shared reader qualifies byte-offset fallback identities by source generation."
+        },
+        {
+          "id": "native-lifecycle",
+          "name": "Native lifecycle dispatch",
+          "kind": "module",
+          "hosts": [
+            "claude",
+            "codex"
+          ],
+          "files": [
+            "hooks/native_lifecycle.py",
+            "hooks/brain_cli.py"
+          ],
+          "purpose": "Thin explicit-host CLI wrapper records its entry time before handler work. Start/resume rotate through at most eight registered sources within one second, then capture and read one bounded indexed context hint. Stop captures before the retro gate; capture failure cannot itself block. PreCompact captures and publishes an immutable snapshot. SessionEnd flushes with a 2.5-second work deadline; only this explicit event marks a session ended. turn_aborted marks interruption; task_complete ends a turn. Hooks do not invoke AI, scan the full vault, or rebuild the index. Task 4 is in progress; fixture subprocess checks are not desktop-native dispatch proof."
         }
       ]
     },
@@ -1109,7 +1140,7 @@
             "hooks/note_transactions.py",
             "hooks/capture.py"
           ],
-          "purpose": "Beside the selected index: .<index-name>.coordination/state.sqlite3 with identity, revisions, operations, capture_events, checkpoints and cursors. Search-index rebuilds do not remove it. Persistent lock inodes arbitrate writers; directories are 0700 and files 0600. Capture checkpoint bodies and prepared operation payloads survive process death so notes and source cursors converge without guessing success."
+          "purpose": "Beside the selected index: .<index-name>.coordination/state.sqlite3 with identity, revisions, operations, capture_events, checkpoints and cursors. Search-index rebuilds do not remove it. Persistent lock inodes arbitrate writers; directories are 0700 and files 0600. Capture checkpoint bodies and prepared operation payloads survive process death so notes and source cursors converge without guessing success. source_sessions and native_events retain below-threshold native facts separately from note publication. recovery_positions rotates host-qualified source registry reads so later sources are not starved."
         },
         {
           "id": "db-private-state",
@@ -2082,6 +2113,53 @@
           "label": "OS-owned load/mutate/save; skip save on timeout or lost token/inode"
         }
       ]
+    },
+    {
+      "id": "native-capture-lifecycle",
+      "name": "Bounded native capture lifecycle (Task 4 in progress)",
+      "description": "Retain native facts and source state before visible publication; recover only registered sources. Plugin packaging and desktop-native execution acceptance remain pending.",
+      "steps": [
+        {
+          "from": "runtime-context",
+          "to": "native-lifecycle",
+          "label": "explicit host/client/native identity; wrapper-entry deadline"
+        },
+        {
+          "from": "native-lifecycle",
+          "to": "native-transcripts",
+          "label": "selected native source; bounded cursor and parser state"
+        },
+        {
+          "from": "native-transcripts",
+          "to": "capture-checkpoints",
+          "label": "visible records, fixed controls, generation-qualified fallback IDs"
+        },
+        {
+          "from": "capture-checkpoints",
+          "to": "db-coordination",
+          "label": "retain scrubbed native_events and source_sessions even below threshold"
+        },
+        {
+          "from": "capture-checkpoints",
+          "to": "note-transactions",
+          "label": "qualifying facts → immutable capture checkpoint → revision-checked publication"
+        },
+        {
+          "from": "note-transactions",
+          "to": "db-vault",
+          "label": "managed capture SHA is logical revision; full-note SHA is applied revision"
+        },
+        {
+          "from": "native-lifecycle",
+          "to": "capture-checkpoints",
+          "label": "PreCompact immutable snapshot; explicit SessionEnd ended; interruption independent of completeness"
+        },
+        {
+          "from": "db-coordination",
+          "to": "native-lifecycle",
+          "label": "rotating registered-source recovery; bounded batch, no full-vault scan"
+        }
+      ]
     }
   ],
   "types": [
@@ -2270,6 +2348,56 @@
         "pending_sources",
         "loss_of_input",
         "warnings"
+      ]
+    },
+    {
+      "name": "SourceCursor",
+      "file": "hooks/transcripts/__init__.py",
+      "kind": "type",
+      "fields": [
+        "generation",
+        "offset",
+        "source_identity",
+        "anchor_digest",
+        "parser_state",
+        "historical",
+        "known_size",
+        "exhausted"
+      ]
+    },
+    {
+      "name": "SourceRecord",
+      "file": "hooks/transcripts/__init__.py",
+      "kind": "type",
+      "fields": [
+        "source_id",
+        "role",
+        "text",
+        "sequence",
+        "timestamp",
+        "kind",
+        "tool_name",
+        "tool_category",
+        "turn_id"
+      ]
+    },
+    {
+      "name": "TranscriptBatch",
+      "file": "hooks/transcripts/__init__.py",
+      "kind": "type",
+      "fields": [
+        "status",
+        "records",
+        "source_generation",
+        "consumed_offset",
+        "warnings",
+        "metadata",
+        "source_identity",
+        "anchor_digest",
+        "source_complete",
+        "loss_of_input",
+        "parser_state",
+        "source_size"
       ]
     }
   ],

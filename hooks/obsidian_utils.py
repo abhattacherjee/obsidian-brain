@@ -253,7 +253,7 @@ def _reap_stale_retro_sentinels() -> int:
     return reaped
 
 
-def mark_retro_classification_pending(session_id: str, retro_path: str) -> str:
+def mark_retro_classification_pending(session_id: str, retro_path: str, turn_id=None) -> str:
     """Write a retro-classification-pending sentinel atomically.
 
     Sentinel location: ~/.claude/obsidian-brain/retro-gate/<sanitized_sid>.json
@@ -288,6 +288,9 @@ def mark_retro_classification_pending(session_id: str, retro_path: str) -> str:
 
     if session_id.strip() == "unknown":
         return "Failed: refusing to arm retro gate — session_id is \"unknown\" (unresolved session); gate NOT armed, Stop hook will not enforce classification for this session"
+
+    if turn_id is not None and (not isinstance(turn_id, str) or not turn_id.strip() or len(turn_id) > 512):
+        return "Failed: refusing to arm retro gate — turn_id must be a nonempty native turn ID"
 
     sanitized = _retro_sentinel_key(session_id)
     if not sanitized:
@@ -335,6 +338,8 @@ def mark_retro_classification_pending(session_id: str, retro_path: str) -> str:
         "retro_path": retro_path,
         "created_at": time.time(),
     }
+    if turn_id is not None:
+        payload["turn_id"] = turn_id
     tmp_path = None
     try:
         fd, tmp_path = tempfile.mkstemp(

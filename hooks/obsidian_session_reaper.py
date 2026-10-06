@@ -482,3 +482,16 @@ def reap_orphaned_sessions(
             timeout=False,
             wall_ms=0.0,
         )
+
+
+def reap_registered_sessions(context, max_sources=8, deadline=None):
+    """Recover registered sources with shared cursors; never finalize active ones."""
+    from runtime_context import using_runtime_context
+    from capture import CaptureResult, recover_registered
+    deadline = time.monotonic() + 1 if deadline is None else deadline
+    with using_runtime_context(context):
+        try:
+            return recover_registered(context, max_sources=max_sources, deadline=deadline, include_active=False)
+        except Exception as exc:
+            print(f"[obsidian-brain] registered-source recovery failed: {exc}", file=sys.stderr)
+            return CaptureResult("unavailable", pending_sources=1, warnings=(str(exc),))

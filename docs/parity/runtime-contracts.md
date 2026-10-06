@@ -53,7 +53,7 @@ evidence.
 | Native AI execution | Observed | CLI used the user's configured `gpt-6.1-sol`; desktop used its existing task settings. Both ran synthetic identity checks |
 | Desktop lifecycle | Partly observed | Authorized temporary desktop task's tool ID matched rollout metadata; task archived after the check. Desktop hook-manager access remains denied by computer-use tooling |
 | Nested Claude inside Codex | Startup observed | Claude Code `2.1.289` emitted a different native session ID while inheriting the Codex thread ID; the isolated probe timed out after 45 seconds without completion |
-| Cold startup and bounded recovery | Pending | Final runtime handlers do not exist yet; measure their interpreter startup, writer work, recovery bounds, and end deadline after implementation |
+| Cold startup and bounded recovery | Pending | Task 4 handlers are in progress; fixture subprocess checks exercise them. Measure final native interpreter startup, writer work, recovery bounds, and end deadline before acceptance |
 
 ## CLI execution evidence
 
@@ -84,6 +84,40 @@ written `timeout-completed` afterward. Native exit completed without that
 marker. The logged `handler_elapsed_ms` covers handler work before log writing;
 it excludes interpreter startup, fsync, and the deliberate sleep. It is not a
 measurement of the final capture implementation's deadline.
+
+## Shared capture implementation (Task 4 in progress)
+
+The shared transcript reader and native adapters normalize visible records with
+bounded byte reads and parser state. Reasoning, encrypted content, environment,
+developer instructions, and internal HookPrompt are excluded. Stable native IDs
+identify message mirrors. Byte-offset fallback IDs include the source generation,
+so a rotated source cannot reuse another source's identity.
+
+A full fork can select a later child `session_meta` within the bounded batch.
+Proven parent-owned records are excluded; ambiguous inherited history and missing
+child metadata stay pending within the bounded search. Read-only provenance
+verified the observed synthetic fork starts with its child `session_meta` at byte
+0, ordinal 30. A larger inherited prefix is not an observed acceptance blocker.
+Synthetic full-prefix tests exercise the defensive parser behavior.
+
+`source_sessions` retains source descriptors, cursor state, native state,
+completeness, first date, and message count. `native_events` retains scrubbed facts
+below publication thresholds. Registered-source recovery rotates through a bounded
+batch without scanning the full vault. Start/resume recovers before capture;
+Stop captures before the retro gate; PreCompact captures and writes an immutable
+snapshot in the legacy sessions folder by default, with explicit compact/clear
+triggers and snapshot toggles; explicit SessionEnd flushes and marks the session
+ended. `task_complete`
+ends a turn; `turn_aborted` marks interruption. Completeness is a separate field.
+
+`capture_revision` is SHA256 of the normalized managed capture region.
+`applied_revision` is SHA256 of the whole published note. Deferred summaries will
+bind `summary_revision` to the logical capture revision they summarized.
+
+The explicit-host CLI wrapper records its entry time before handler work. Hooks
+perform no AI calls, full-vault scans, or index rebuilds. Fixture subprocess checks
+exercise this integration. They do not establish native desktop hook dispatch;
+that live gate and plugin packaging remain pending.
 
 ## Sources
 

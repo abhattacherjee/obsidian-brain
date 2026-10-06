@@ -34,6 +34,25 @@ def test_new_note_operation_is_idempotent(context):
     assert first.revision == second.revision
 
 
+def test_managed_metadata_preserves_user_fields_and_detects_manual_edits(context):
+    note = context.vault_path / "session.md"
+    note.write_text('---\ntype: claude-session\nmy_field: keep\n---\nUser prose.\n')
+    baseline = read_revision(context, note)
+    first = apply_mutations(context, [NoteMutation(note, baseline, {
+        "capture": "first fact", "metadata": json.dumps({"agent_provider": "codex", "capture_state": "active"})
+    }, "metadata-first")])
+    assert first.status == "applied"
+    assert "my_field: keep" in note.read_text()
+    assert "User prose." in note.read_text()
+    baseline = read_revision(context, note)
+    note.write_text(note.read_text().replace('capture_state: "active"', 'capture_state: "manual"'))
+    result = apply_mutations(context, [NoteMutation(note, baseline, {
+        "metadata": json.dumps({"capture_state": "ended"})
+    }, "metadata-stale")])
+    assert result.status == "conflict"
+    assert 'capture_state: "manual"' in note.read_text()
+
+
 def test_stale_document_revision_preserves_manual_edit(context):
     note = context.vault_path / "n.md"
     note.write_text("original\n")

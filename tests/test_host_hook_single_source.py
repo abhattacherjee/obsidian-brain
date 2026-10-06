@@ -22,7 +22,13 @@ def _hook_env():
 
 
 def test_codex_policy_hooks_use_one_source():
-    assert not list((ROOT / ".codex/hooks").rglob("*.py"))
+    wrappers = list((ROOT / ".codex/hooks").rglob("*.py"))
+    assert {path.name for path in wrappers} <= {"lifecycle.py"}
+    for wrapper in wrappers:
+        source = wrapper.read_text()
+        assert "from brain_cli import main" in source
+        assert source.index("STARTED_AT = time.monotonic()") < source.index("from brain_cli import main")
+        assert "capture_checkpoint" not in source and "decision" not in source
     claude = json.loads((ROOT / ".claude/settings.json").read_text())
     codex = json.loads((ROOT / ".codex/hooks.json").read_text())
     claude_groups = claude["hooks"]["PreToolUse"]

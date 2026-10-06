@@ -138,10 +138,9 @@ def resolve_runtime_context(host: str, client: str, payload: Mapping[str, object
     transcript_value = overrides.get("transcript_path", payload.get("transcript_path"))
     transcript = _path(transcript_value) if transcript_value else None
     if transcript is not None:
-        transcript_root = native_home / ("sessions" if host == "codex" else "projects")
-        try:
-            transcript.relative_to(transcript_root.resolve())
-        except ValueError as exc:
-            raise RuntimeContextError("transcript_outside_host", "The transcript is outside the selected host's storage.") from exc
+        transcript_roots = ([native_home / "sessions", native_home / "archived_sessions"]
+                            if host == "codex" else [native_home / "projects"])
+        if not any(transcript.is_relative_to(root.resolve()) for root in transcript_roots):
+            raise RuntimeContextError("transcript_outside_host", "The transcript is outside the selected host's storage.")
     return RuntimeContext(host, client, sid, project, worktree, transcript, vault, config_path,
                           MappingProxyType(copy.deepcopy(config)), resources, index, state)

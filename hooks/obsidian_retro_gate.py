@@ -63,6 +63,44 @@ _BLOCK_REASON = (
 # ---------------------------------------------------------------------------
 
 
+def native_decision(context, data):
+    """Block once per verified host/session/turn, with a session fallback."""
+    import hashlib
+    from note_transactions import session_state_path
+    session_id = context.native_session_id
+    pending = get_retro_classification_pending(session_id)
+    if pending is None:
+        return None
+    if data.get("stop_hook_active") is True:
+        clear_retro_classification_pending(session_id)
+        return None
+    if time.time() - pending.get("created_at", 0) > RETRO_GATE_TTL_SECONDS:
+        clear_retro_classification_pending(session_id)
+        return None
+    turn = data.get("turn_id")
+    turn = turn if isinstance(turn, str) and turn else None
+    pending_turn = pending.get("turn_id")
+    if pending_turn and turn and pending_turn != turn:
+        return None
+    key = hashlib.sha256(json.dumps([
+        context.host, session_id, turn or "session", pending.get("created_at"),
+        pending.get("retro_path"),
+    ], sort_keys=True).encode("utf-8")).hexdigest()
+    directory = session_state_path(context) / "retro-decisions"
+    directory.mkdir(mode=0o700, exist_ok=True)
+    directory.chmod(0o700)
+    try:
+        descriptor = os.open(str(directory / (key + ".json")), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        return None
+    with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+        json.dump({"host": context.host, "session_key": context.session_key,
+                   "turn_key": hashlib.sha256((turn or "session").encode()).hexdigest()}, stream)
+        stream.flush()
+        os.fsync(stream.fileno())
+    return {"decision": "block", "reason": _BLOCK_REASON}
+
+
 def main(context=None, payload=None) -> None:
     """Read stdin, check sentinel, block or pass through."""
     from runtime_context import current_runtime_context, using_runtime_context
@@ -70,6 +108,9 @@ def main(context=None, payload=None) -> None:
         with using_runtime_context(context):
             return main(payload=payload)
     context = current_runtime_context()
+    if context is not None:
+        from native_lifecycle import emit_bound
+        return emit_bound(context, "stop", payload)
     try:
         if payload is None:
             raw = sys.stdin.read(1_000_000)
