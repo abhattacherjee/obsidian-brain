@@ -56,40 +56,119 @@ jobs:
             exit 1
           fi
 
-  # ── Python tests — runs on all PRs ───────────────────────────
-  python-tests:
-    # Local four-worker coverage takes about 20 minutes; allow startup headroom.
-    timeout-minutes: 35
+  # Whole test files stay together so both invoking hosts remain paired.
+  coverage-shards:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5]
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
-      - name: Install test dependencies
-        run: python -m pip install -r requirements-dev.txt
-      - name: Run tests with coverage
-        run: PYTHONPATH=hooks:tests pytest -p parity_collection_plugin --parity-matrix docs/parity/capabilities.json tests/ -n 4 -o addopts=--tb=short -q --basetemp="$RUNNER_TEMP/pytest-coverage" --tb=short --cov=hooks --cov-report=term-missing --cov-fail-under=90
+      - run: python -m pip install -r requirements-dev.txt
+      - name: Run coverage shard
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/shard-data"
+          python scripts/ci-checks/test_shards.py list --count 6 --index "${{ matrix.shard }}" --manifest "$RUNNER_TEMP/shard-data/manifest.json" > "$RUNNER_TEMP/shard-files"
+          mapfile -t TEST_FILES < "$RUNNER_TEMP/shard-files"
+          PYTHONUNBUFFERED=1 PYTHONPATH=hooks:tests pytest -p parity_collection_plugin --parity-matrix docs/parity/capabilities.json "${TEST_FILES[@]}" -n 4 --deselect=tests/test_security.py::TestDecisionTimeIsBounded:: --deselect=tests/test_security.py::TestPatternDecisionTimeIsBounded:: -o addopts=--tb=short -q --basetemp="$RUNNER_TEMP/pytest-coverage" --cov=hooks --cov-report= --cov-fail-under=0
+          if [[ "${{ matrix.shard }}" == 0 ]]; then
+            PYTHONUNBUFFERED=1 PYTHONPATH=hooks:tests pytest -p parity_collection_plugin --parity-matrix docs/parity/capabilities.json tests/test_security.py::TestDecisionTimeIsBounded tests/test_security.py::TestPatternDecisionTimeIsBounded -p no:xdist -o addopts=--tb=short -q --basetemp="$RUNNER_TEMP/pytest-coverage-timing" --cov=hooks --cov-append --cov-report= --cov-fail-under=0
+          fi
+          cp .coverage "$RUNNER_TEMP/shard-data/.coverage"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: coverage-shard-${{ matrix.shard }}
+          path: ${{ runner.temp }}/shard-data/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
 
-  # ── Python 3.9 floor — macOS system python3 is 3.9 (GH #371) ─
-  # hooks.json and the skill snippets run bare `python3`, so the plugin must
-  # import and pass on the macOS system python3 (3.9). No coverage
-  # gate here; the 3.12 job above owns that.
-  python-tests-py39:
-    # Local four-worker Python 3.9 takes about 24 minutes.
-    timeout-minutes: 35
+  # Preserve the required check name and enforce the full combined threshold.
+  python-tests:
+    needs: coverage-shards
+    if: always() && github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every coverage shard
+        env:
+          SHARD_RESULT: ${{ needs.coverage-shards.result }}
+        run: test "$SHARD_RESULT" = success
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r requirements-dev.txt
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: coverage-shard-*
+          path: ${{ runner.temp }}/coverage-artifacts
+          merge-multiple: false
+      - name: Require complete partition and combined 90% coverage
+        run: python scripts/ci-checks/test_shards.py coverage --count 6 --prefix coverage-shard --artifacts "$RUNNER_TEMP/coverage-artifacts"
+
+  # Python 3.9 remains a full test gate without a second coverage measurement.
+  py39-shards:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
         with:
           python-version: '3.9'
-      - name: Install test dependencies
-        run: python -m pip install -r requirements-dev.txt
-      - name: Run tests on Python 3.9
-        run: PYTHONPATH=hooks:tests pytest -p parity_collection_plugin --parity-matrix docs/parity/capabilities.json tests/ -n 4 -o addopts=--tb=short -q --basetemp="$RUNNER_TEMP/pytest-py39" --tb=short
+      - run: python -m pip install -r requirements-dev.txt
+      - name: Run Python 3.9 shard
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/shard-data"
+          python scripts/ci-checks/test_shards.py list --count 4 --index "${{ matrix.shard }}" --manifest "$RUNNER_TEMP/shard-data/manifest.json" > "$RUNNER_TEMP/shard-files"
+          mapfile -t TEST_FILES < "$RUNNER_TEMP/shard-files"
+          PYTHONUNBUFFERED=1 PYTHONPATH=hooks:tests pytest -p parity_collection_plugin --parity-matrix docs/parity/capabilities.json "${TEST_FILES[@]}" -n 4 --deselect=tests/test_security.py::TestDecisionTimeIsBounded:: --deselect=tests/test_security.py::TestPatternDecisionTimeIsBounded:: -o addopts=--tb=short -q --basetemp="$RUNNER_TEMP/pytest-py39"
+          if [[ "${{ matrix.shard }}" == 0 ]]; then
+            PYTHONUNBUFFERED=1 PYTHONPATH=hooks:tests pytest -p parity_collection_plugin --parity-matrix docs/parity/capabilities.json tests/test_security.py::TestDecisionTimeIsBounded tests/test_security.py::TestPatternDecisionTimeIsBounded -p no:xdist -o addopts=--tb=short -q --basetemp="$RUNNER_TEMP/pytest-py39-timing"
+          fi
+      - uses: actions/upload-artifact@v7
+        with:
+          name: py39-shard-${{ matrix.shard }}
+          path: ${{ runner.temp }}/shard-data/manifest.json
+          if-no-files-found: error
+          retention-days: 7
+
+  python-tests-py39:
+    needs: py39-shards
+    if: always() && github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every Python 3.9 shard
+        env:
+          SHARD_RESULT: ${{ needs.py39-shards.result }}
+        run: test "$SHARD_RESULT" = success
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.9'
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: py39-shard-*
+          path: ${{ runner.temp }}/py39-artifacts
+          merge-multiple: false
+      - name: Require complete Python 3.9 partition
+        run: python scripts/ci-checks/test_shards.py validate --count 4 --prefix py39-shard --artifacts "$RUNNER_TEMP/py39-artifacts"
 
   # ── DB-pollution guard — blocks bare ensure_index() in tests (GH #46) ─
   no-default-db-check:
