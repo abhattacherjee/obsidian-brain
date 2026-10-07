@@ -1,6 +1,7 @@
 """Partition full test files and require complete artifacts before coverage."""
 import argparse
 import json
+import re
 from pathlib import Path
 
 
@@ -68,7 +69,23 @@ def combine_coverage(root, artifacts, count, prefix='shard'):
                                  data_file=str(root / '.coverage-combined'))
     combined.combine(data_paths=[str(path) for path in data_files], strict=True, keep=True)
     combined.save()
-    total = combined.report()
+    # source_pkgs also measures synthetic modules used by collection controls.
+    # Real installed copies must have mapped back to hooks via coverage:paths.
+    # Only the direct scratch helper path is allowed outside the checkout.
+    checkout = root.resolve()
+    fixtures = []
+    for filename in sorted(combined.get_data().measured_files()):
+        path = Path(filename).resolve()
+        if checkout == path or checkout in path.parents:
+            continue
+        if not re.fullmatch(r'.*/pytest-coverage/popen-gw[0-9]+/test_[^/]+/skill_procedures\.py',
+                            path.as_posix()):
+            raise ValueError(f'Unexpected coverage source outside checkout: {filename}')
+        fixtures.append(filename)
+    for filename in fixtures:
+        print(f'Excluded synthetic collection fixture: {filename}')
+    print(f'Excluded {len(fixtures)} synthetic collection fixture module(s)')
+    total = combined.report(include=[str(checkout) + '/*'])
     if total < 90:
         raise ValueError(f'Combined coverage {total:.2f}% is below 90%')
     print(f'Combined coverage: {total:.2f}% (required 90%)')

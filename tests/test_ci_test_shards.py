@@ -109,3 +109,64 @@ def test_combined_coverage_enforces_ninety_percent(corpus, monkeypatch, complete
     else:
         with pytest.raises(ValueError, match='below 90%'):
             shards.combine_coverage(root, artifacts, 2)
+
+
+@pytest.mark.parametrize('outside', [
+    'pytest-coverage/popen-gw0/test_reflection0/skill_procedures.py',
+    'pytest-coverage/popen-gw0/test_reflection0/other.py',
+    'pytest-coverage/popen-gw0/test_install0/hooks/skill_procedures.py',
+    'other/skill_procedures.py',
+])
+def test_only_direct_synthetic_collection_helpers_are_excluded(corpus, monkeypatch,
+                                                              capsys, outside):
+    root, artifacts = corpus
+    hooks = root / 'hooks'
+    hooks.mkdir()
+    source = hooks / 'skill_procedures.py'
+    source.write_text('value = 1\n')
+    (root / 'setup.cfg').write_text(
+        '[coverage:run]\nsource = hooks\n[coverage:report]\nfail_under = 90\n')
+    monkeypatch.chdir(root)
+    missing = root.parent / outside
+    for index in range(2):
+        data = coverage.CoverageData(basename=str(artifacts / f'shard-{index}/.coverage'))
+        data.add_lines({str(source): [1], str(missing): [1]})
+        data.write()
+    if outside == 'pytest-coverage/popen-gw0/test_reflection0/skill_procedures.py':
+        assert shards.combine_coverage(root, artifacts, 2) == 100
+        assert 'Excluded 1 synthetic collection fixture module(s)' in capsys.readouterr().out
+    else:
+        with pytest.raises(ValueError, match='Unexpected coverage source outside checkout'):
+            shards.combine_coverage(root, artifacts, 2)
+
+
+def test_missing_checkout_source_still_fails(corpus, monkeypatch):
+    root, artifacts = corpus
+    (root / 'hooks').mkdir()
+    (root / 'setup.cfg').write_text(
+        '[coverage:run]\nsource = hooks\n[coverage:report]\nfail_under = 90\n')
+    monkeypatch.chdir(root)
+    for index in range(2):
+        data = coverage.CoverageData(basename=str(artifacts / f'shard-{index}/.coverage'))
+        data.add_lines({str(root / 'hooks/missing.py'): [1]})
+        data.write()
+    with pytest.raises(coverage.exceptions.NoSource):
+        shards.combine_coverage(root, artifacts, 2)
+
+
+def test_installed_production_copy_is_mapped_and_counted(corpus, monkeypatch):
+    root, artifacts = corpus
+    hooks = root / 'hooks'
+    hooks.mkdir()
+    source = hooks / 'skill_procedures.py'
+    source.write_text('first = 1\nsecond = 2\n')
+    installed = root.parent / 'pytest-coverage/popen-gw0/test_install0/installed plugin with spaces/hooks'
+    (root / 'setup.cfg').write_text(
+        '[coverage:run]\nsource = hooks\n[coverage:paths]\nhooks =\n    hooks\n'
+        '    */installed plugin with spaces/hooks\n[coverage:report]\nfail_under = 90\n')
+    monkeypatch.chdir(root)
+    for index in range(2):
+        data = coverage.CoverageData(basename=str(artifacts / f'shard-{index}/.coverage'))
+        data.add_lines({str(installed / 'skill_procedures.py'): [index + 1]})
+        data.write()
+    assert shards.combine_coverage(root, artifacts, 2) == 100
