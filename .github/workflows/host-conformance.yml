@@ -27,6 +27,8 @@ jobs:
           gh pr view "$PR_NUMBER" --repo "$GH_REPOSITORY" --json body --jq .body > "$RUNNER_TEMP/parity-pr-body.md"
           python scripts/ci-checks/check-codex-impact.py --body-file "$RUNNER_TEMP/parity-pr-body.md"
   collection:
+    # The complete Linux inventory and collection take about five minutes.
+    timeout-minutes: 15
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6

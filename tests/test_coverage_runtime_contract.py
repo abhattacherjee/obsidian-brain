@@ -56,7 +56,7 @@ def test_declared_dependencies_support_python39_subprocess_coverage():
     requirements = [Requirement(line) for line in (ROOT / 'requirements-dev.txt').read_text().splitlines()
                     if line.strip() and not line.startswith('#')]
     by_name = {requirement.name: requirement for requirement in requirements}
-    assert set(by_name) == {'pytest', 'pytest-cov', 'coverage'}
+    assert set(by_name) == {'pytest', 'pytest-cov', 'coverage', 'pytest-xdist'}
     # These compatible releases are available on Python 3.9. Older coverage
     # lacks the subprocess patch, so silently accepting it would lose evidence.
     assert Version('7.10.6') in by_name['coverage'].specifier
@@ -65,3 +65,6 @@ def test_declared_dependencies_support_python39_subprocess_coverage():
     assert Version('7.1.0') in by_name['pytest-cov'].specifier
     assert Version('6.3.0') not in by_name['pytest-cov'].specifier
     assert Version('8.4.2') in by_name['pytest'].specifier
+    # xdist 3.8 supports the Python 3.9 floor and the worker controls.
+    assert Version('3.8.0') in by_name['pytest-xdist'].specifier
+    assert Version('3.7.0') not in by_name['pytest-xdist'].specifier

@@ -11,7 +11,7 @@ PLUGIN = Path(__file__).with_name('parity_collection_plugin.py')
 
 
 def _collect(tmp_path, test_source, fixture_source='', helper_files=None,
-             launcher_contract=None, changed_launcher_bytes=False, execute=False):
+             launcher_contract=None, changed_launcher_bytes=False, execute=False, parallel=False, coverage=False):
     matrix = {'capabilities':[
         {'id':'writer.cas','required':True,'calls':['apply_mutations'],
          'hosts':{host:{'status':'supported'} for host in ('claude','codex')}},
@@ -46,9 +46,15 @@ def _collect(tmp_path, test_source, fixture_source='', helper_files=None,
             source_path.write_text(source_path.read_text() + '\n# Changed after review\n')
     command = [sys.executable,'-m','pytest','-q','-p','parity_collection_plugin',
                '--parity-matrix',str(tmp_path/'matrix.json'),str(tmp_path)]
+    if parallel:
+        # Each worker must apply the guards, including the runtime checks.
+        command.extend(["-n", "2", "--dist=each", "--max-worker-restart=0",
+                        "--basetemp=" + str(tmp_path / "worker-temp")])
+    if coverage:
+        command.extend(["--cov=sample", "--cov-fail-under=90"])
     if not execute:
         command.insert(3, '--collect-only')
-    # This launches only pytest collection; fixtures and test bodies never run.
+    # Execute only disposable scratch tests when a runtime control requests it.
     env = dict(__import__('os').environ, PYTHONPATH=__import__('os').pathsep.join([
         str(PLUGIN.parent), str(Path.cwd() / 'hooks')]))
     env.update(HOME=str(tmp_path / 'home'), CODEX_HOME=str(tmp_path / 'home/.codex'),
@@ -71,12 +77,13 @@ def _collect(tmp_path, test_source, fixture_source='', helper_files=None,
                     pytrace=False)
 
 
-def test_oversized_test_id_fails_before_verbose_output(tmp_path):
+@pytest.mark.parametrize("parallel", [False, True])
+def test_oversized_test_id_fails_before_verbose_output(tmp_path, parallel):
     source = ('@pytest.mark.parametrize("value", [b"x" * 20_000])\n'
               'def test_large(value):\n    assert len(value) == 20_000\n')
-    result = _collect(tmp_path, source)
+    result = _collect(tmp_path, source, execute=parallel, parallel=parallel)
     assert result.returncode != 0
-    assert 'test ID exceeds 4096 bytes' in result.stderr
+    assert 'test ID exceeds 4096 bytes' in result.stdout + result.stderr
     assert len(result.stdout + result.stderr) < 4096
 
 
@@ -104,13 +111,15 @@ def test_test_id_limit_counts_utf8_bytes_at_boundary(tmp_path, byte_length):
         assert nodeid in result.stdout
     else:
         assert result.returncode != 0
-        assert 'test ID exceeds 4096 bytes' in result.stderr
+        assert 'test ID exceeds 4096 bytes' in result.stdout + result.stderr
         assert len(result.stdout + result.stderr) < 4096
 
 
-def test_unannotated_new_writer_fails_collection(tmp_path):
-    result = _collect(tmp_path,'def test_new():\n    apply_mutations(ctx, edits)\n')
-    assert result.returncode != 0 and 'needs host fixture' in result.stderr
+@pytest.mark.parametrize("parallel", [False, True])
+def test_unannotated_new_writer_fails_collection(tmp_path, parallel):
+    result = _collect(tmp_path,'def test_new():\n    apply_mutations(ctx, edits)\n',
+                      execute=parallel, parallel=parallel)
+    assert result.returncode != 0 and 'needs host fixture' in result.stdout + result.stderr
 
 
 def test_container_attribute_cannot_crash_or_hide_writer_collection(tmp_path):
@@ -283,9 +292,10 @@ def test_unused_host_label_cannot_replace_selected_context(tmp_path):
     assert result.returncode != 0 and 'selected_host_context fixture is required' in result.stderr
 
 
+@pytest.mark.parametrize("parallel", [False, True])
 @pytest.mark.parametrize('wrong_host,inactive', [(False, False), (True, False),
                                                (False, True)])
-def test_actual_active_context_must_match_invoking_host(tmp_path, wrong_host, inactive):
+def test_actual_active_context_must_match_invoking_host(tmp_path, wrong_host, inactive, parallel):
     fixture = '''from pathlib import Path
 from runtime_context import resolve_runtime_context, using_runtime_context
 @pytest.fixture
@@ -311,13 +321,16 @@ def selected_host_context(host, tmp_path):
     source = ('@pytest.mark.parametrize("host",["claude","codex"])\n'
               'def test_new(host,selected_host_context):\n'
               '    if False:\n        apply_mutations(selected_host_context, edits)\n')
-    result = _collect(tmp_path, source, fixture, execute=True)
+    result = _collect(tmp_path, source, fixture, execute=True, parallel=parallel)
     if wrong_host:
         assert result.returncode != 0 and 'does not match invoking host' in result.stdout, result.stdout + result.stderr
     elif inactive:
         assert result.returncode != 0 and 'context is not active' in result.stdout, result.stdout + result.stderr
-    else:
-        assert result.returncode == 0 and '2 passed' in result.stdout, result.stdout + result.stderr
+    if parallel and (wrong_host or inactive):
+        expected = '2 failed, 2 passed' if wrong_host else '4 failed'
+        assert expected in result.stdout, result.stdout + result.stderr
+    if not wrong_host and not inactive:
+        assert result.returncode == 0 and ('4 passed' if parallel else '2 passed') in result.stdout, result.stdout + result.stderr
 
 
 @pytest.mark.parametrize('source,parameters,helper', [
@@ -672,3 +685,12 @@ def test_late_api_import_failure_is_not_hidden_by_guard(tmp_path):
     result = _collect(tmp_path, source, helper_files={
         'capture.py': 'raise ImportError("synthetic import failure")\n'}, execute=True)
     assert result.returncode == 0 and '1 passed' in result.stdout, result.stdout + result.stderr
+
+
+def test_parallel_coverage_still_rejects_below_ninety_percent(tmp_path):
+    result = _collect(tmp_path, 'from sample import covered\ndef test_value():\n    assert covered() == 1\n',
+                      helper_files={'sample.py': 'def covered():\n    return 1\ndef uncovered():\n    a = 2\n    b = 3\n    return a + b\n'},
+                      execute=True, parallel=True, coverage=True)
+    assert result.returncode != 0
+    assert '2 passed' in result.stdout, result.stdout + result.stderr
+    assert 'Required test coverage of 90%' in result.stdout + result.stderr

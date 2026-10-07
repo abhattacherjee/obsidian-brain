@@ -460,18 +460,28 @@ def _scope(item, capabilities, launchers=(), errors=None):
                              if calls.intersection(entry.get('calls', []))}
 
 
+def _collection_rejection(config, items, message):
+    # xdist transports collection reports, but drops a worker's UsageError.
+    # Clear IDs before either pytest or xdist can print unbounded parameters.
+    items.clear()
+    if hasattr(config, 'workerinput'):
+        from _pytest.reports import CollectReport
+        config.hook.pytest_collectreport(report=CollectReport(
+            nodeid='parity-contract', outcome='failed', longrepr=message, result=[]))
+    raise pytest.UsageError(message)
+
+
 def pytest_collection_modifyitems(config, items):
     # Large automatic IDs can stall CI logs and overflow Linux subprocess env.
     for item in items:
         if len(item.nodeid.encode('utf-8')) > 4096:
             # Pytest prints collected items even when this hook raises.
-            items.clear()
-            raise pytest.UsageError(
+            _collection_rejection(config, items,
                 f'{item.nodeid[:160]}: test ID exceeds 4096 bytes; '
                 'give large parameters explicit short ids.')
     path = config.getoption('--parity-matrix')
     if not path:
-        raise pytest.UsageError('Parity capability matrix is required for collection.')
+        _collection_rejection(config, items, 'Parity capability matrix is required for collection.')
     matrix = json.loads(Path(path).read_text())
     entries = matrix['capabilities']
     by_id = {entry['id']: entry for entry in entries}
@@ -532,7 +542,7 @@ def pytest_collection_modifyitems(config, items):
     if report:
         Path(report).write_text(json.dumps({'collected': len(items), 'errors': errors}, indent=2) + '\n')
     if errors:
-        raise pytest.UsageError('\n'.join(errors))
+        _collection_rejection(config, items, '\n'.join(errors))
 
 
 IDENTITY_ORIGINALS = {}
