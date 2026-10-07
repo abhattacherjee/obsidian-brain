@@ -86,6 +86,7 @@ jobs:
       - uses: actions/upload-artifact@v7
         with:
           name: coverage-shard-${{ matrix.shard }}
+          overwrite: true
           path: ${{ runner.temp }}/shard-data/
           include-hidden-files: true
           if-no-files-found: error
@@ -144,6 +145,7 @@ jobs:
       - uses: actions/upload-artifact@v7
         with:
           name: py39-shard-${{ matrix.shard }}
+          overwrite: true
           path: ${{ runner.temp }}/shard-data/manifest.json
           if-no-files-found: error
           retention-days: 7
