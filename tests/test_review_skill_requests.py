@@ -43,7 +43,7 @@ REVIEWED_REQUEST_KEYS = {
     '_deep_pipeline': frozenset('operation_id stdin'.split()),
     '_deep_present': frozenset('operation_id pipeline_path classifications_path'.split()),
     '_dependencies': frozenset(''.split()),
-    '_dev_install': frozenset('mode cache_path'.split()),
+    '_dev_install': frozenset('mode cache_path source_path'.split()),
     '_doctor': frozenset('argv'.split()),
     '_emerge_build': frozenset('operation_id themes_path analysis_path'.split()),
     '_emerge_themes': frozenset('operation_id days'.split()),
@@ -562,3 +562,84 @@ def test_native_install_environment_uses_only_frozen_invoking_home(context):
     assert base == before
     with pytest.raises(ValueError, match='frozen native home'):
         selected_native_environment(replace(context, native_home=None), base)
+
+
+@pytest.mark.parametrize('mode', ['install', 'restore'])
+def test_installed_dev_test_forwards_verified_external_source(context, tmp_path, monkeypatch, mode):
+    from dataclasses import replace
+    from types import SimpleNamespace
+    import subprocess
+    cache = context.native_home / 'plugins/cache/fixture/obsidian-brain/3.8.1'
+    cache.mkdir(parents=True)
+    loaded = replace(context, resource_root=cache)
+    source = tmp_path / 'external source with spaces'
+    (source / 'hooks').mkdir(parents=True)
+    (source / 'hooks/obsidian_utils.py').write_text('# synthetic source')
+    (source / 'scripts').mkdir()
+    (source / 'scripts/test-dev-skill.sh').write_text('# synthetic driver')
+    (source / 'skills/recall').mkdir(parents=True)
+    (source / 'skills/recall/SKILL.md').write_text('# synthetic skill')
+    calls = []
+    def child(command, **kwargs):
+        calls.append((command, kwargs))
+        return SimpleNamespace(returncode=0)
+    monkeypatch.setattr(subprocess, 'run', child)
+    payload = {'mode': mode, 'source_path': str(source)}
+    if loaded.host == 'codex':
+        payload['cache_path'] = str(cache)
+    assert procedures.run_operation(loaded, 'dev-test', 'dev-install', payload, io.StringIO(), io.StringIO()) == 0
+    command, options = calls[0]
+    assert command[1] == str(cache / 'scripts/test-dev-skill.sh')
+    assert command[command.index('--source') + 1] == str(source)
+    assert options['env']['CODEX_HOME' if loaded.host == 'codex' else 'CLAUDE_CONFIG_DIR'] == str(loaded.native_home)
+
+
+@pytest.mark.parametrize('shape', ['missing', 'relative', 'in-home', 'incomplete', 'symlink', 'non-string', 'parent-traversal'])
+def test_installed_dev_test_invalid_source_never_launches_child(context, tmp_path, monkeypatch, shape):
+    from dataclasses import replace
+    import subprocess
+    cache = context.native_home / 'plugins/cache/fixture/obsidian-brain/3.8.1'
+    cache.mkdir(parents=True)
+    loaded = replace(context, resource_root=cache)
+    source = tmp_path / 'external source'
+    source.mkdir()
+    payload = {'mode': 'install'}
+    if loaded.host == 'codex':
+        payload['cache_path'] = str(cache)
+    if shape == 'relative': payload['source_path'] = 'relative-source'
+    elif shape == 'in-home': payload['source_path'] = str(cache)
+    elif shape == 'incomplete': payload['source_path'] = str(source)
+    elif shape == 'non-string': payload['source_path'] = 42
+    elif shape == 'parent-traversal': payload['source_path'] = str(source / '..' / 'external source')
+    elif shape == 'symlink':
+        link = tmp_path / 'source-link'
+        link.symlink_to(source, target_is_directory=True)
+        payload['source_path'] = str(link)
+    def no_child(*args, **kwargs):
+        raise AssertionError('Invalid source launched a child')
+    monkeypatch.setattr(subprocess, 'run', no_child)
+    assert procedures.run_operation(loaded, 'dev-test', 'dev-install', payload, io.StringIO(), io.StringIO()) != 0
+
+
+@pytest.mark.parametrize('mode', ['install', 'restore'])
+def test_external_loaded_dev_test_keeps_source_default(context, monkeypatch, mode):
+    # The paired context starts with an empty resource directory.
+    source = context.resource_root
+    for name in ('hooks/obsidian_utils.py', 'scripts/test-dev-skill.sh', 'skills/recall/SKILL.md'):
+        path = source / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('# synthetic external runtime source')
+    import subprocess
+    from types import SimpleNamespace
+    calls = []
+    def child(command, **kwargs):
+        calls.append(command)
+        return SimpleNamespace(returncode=0)
+    monkeypatch.setattr(subprocess, 'run', child)
+    payload = {'mode': mode}
+    if context.host == 'codex':
+        cache = context.native_home / 'plugins/cache/fixture/obsidian-brain/3.8.1'
+        cache.mkdir(parents=True)
+        payload['cache_path'] = str(cache)
+    assert procedures.run_operation(context, 'dev-test', 'dev-install', payload, io.StringIO(), io.StringIO()) == 0
+    assert calls[0][calls[0].index('--source') + 1] == str(context.resource_root)

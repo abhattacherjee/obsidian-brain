@@ -1283,7 +1283,26 @@ def _dev_install(context, payload):
     if operation not in {'install', 'restore', 'status'}:
         raise ValueError('Unsupported developer installation mode.')
     script = context.resource_root / 'scripts' / 'test-dev-skill.sh'
-    command = ['bash', str(script), operation, '--host', context.host, '--source', str(context.resource_root)]
+    source = context.resource_root
+    if 'source_path' in payload:
+        requested_source = payload.get('source_path')
+        if not isinstance(requested_source, str) or not Path(requested_source).is_absolute():
+            raise ValueError('Developer source_path must be an explicit absolute directory.')
+        source = Path(requested_source)
+        if '..' in source.parts or any(path.is_symlink() for path in (source, *source.parents)):
+            raise ValueError('Developer source_path cannot traverse parents or symbolic links.')
+        source = source.resolve()
+    if operation != 'status' or 'source_path' in payload:
+        if context.native_home is not None:
+            native_home = context.native_home.resolve()
+            if source == native_home or native_home in source.parents:
+                raise ValueError('Installed dev-test requires source_path outside the selected native home.')
+        if (not (source / 'hooks/obsidian_utils.py').is_file()
+                or not (source / 'scripts/test-dev-skill.sh').is_file()
+                or not (source / 'skills').is_dir()
+                or not any((source / 'skills').iterdir())):
+            raise ValueError('Developer source_path is not an obsidian-brain runtime source.')
+    command = ['bash', str(script), operation, '--host', context.host, '--source', str(source)]
     from runtime_context import selected_native_environment
     environment = selected_native_environment(context, os.environ)
     if context.host == 'codex':

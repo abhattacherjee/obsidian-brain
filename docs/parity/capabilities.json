@@ -1197,14 +1197,14 @@
     {
       "source": "hooks/skill_procedures.py",
       "expression": "subprocess.run(['git', '-C', repo_path, 'rev-parse', 'HEAD'], capture_output=True, text=True, timeout=10)",
-      "source_sha256": "13cb8dc360bad7ada4954cc11e4ad707dc12e288a5d468792f220f4eaa9fac20",
+      "source_sha256": "1e6b13f214b73addd098857b1ee4ed8232835233568a02a4bcf0f171b7efae82",
       "scope": "support",
       "reason": "Bounded or disposable-repository Git metadata/setup. The enclosing native operation keeps its separate host contract."
     },
     {
       "source": "hooks/skill_procedures.py",
       "expression": "subprocess.run(command, env=environment, stdin=subprocess.DEVNULL, timeout=120)",
-      "source_sha256": "13cb8dc360bad7ada4954cc11e4ad707dc12e288a5d468792f220f4eaa9fac20",
+      "source_sha256": "1e6b13f214b73addd098857b1ee4ed8232835233568a02a4bcf0f171b7efae82",
       "capability": "installation.fresh_upgrade"
     },
     {

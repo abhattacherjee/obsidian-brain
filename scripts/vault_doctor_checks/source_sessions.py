@@ -456,7 +456,18 @@ def _find_jsonl_anywhere(
                 if (header.get('type') == 'session_meta' and
                         sid in (metadata.get('id'), metadata.get('session_id'))):
                     if metadata.get('id') and metadata.get('session_id') and metadata['id'] != metadata['session_id']:
-                        raise ValueError('Conflicting native source IDs')
+                        from transcripts.codex import _identifier, _replay_history_boundary
+                        if not _identifier(metadata['id']):
+                            raise ValueError('Conflicting native source IDs')
+                        try:
+                            boundary = _replay_history_boundary(metadata, metadata['id'])
+                        except ValueError as exc:
+                            raise ValueError('Conflicting native source IDs') from exc
+                        if boundary is None:
+                            raise ValueError('Conflicting native source IDs')
+                        # A verified child carries its parent's alias, not its identity.
+                        if sid != metadata['id']:
+                            continue
                     matches.append(str(path))
             except (OSError, json.JSONDecodeError, AttributeError):
                 continue

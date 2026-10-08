@@ -404,3 +404,85 @@ def test_native_project_scheduling_hint_cannot_certify_or_change_project(selecte
     assert session_coverage.scan(str(actor.vault_path),'claude-sessions','claude-insights',9999,
         project=actor.canonical_project_root.name,reconstruct=True)==[]
     assert source.read_bytes()==raw and not list((actor.vault_path/'claude-sessions').iterdir())
+
+
+def _codex_spawn_metadata():
+    return {'id': 'canonical-child', 'session_id': 'canonical-parent',
+            'forked_from_id': 'canonical-parent', 'parent_thread_id': 'canonical-parent',
+            'subagent_history_start_ordinal': 25,
+            'source': {'subagent': {'thread_spawn': {'parent_thread_id': 'canonical-parent',
+                'depth': 1, 'agent_path': '/root/import_analysis'}}}}
+
+
+@pytest.mark.parametrize('selected', ['canonical-parent', 'canonical-child'])
+def test_doctor_lookup_uses_canonical_spawn_id_without_parent_alias(selected_host_context, monkeypatch, selected):
+    home = Path(os.environ['CODEX_HOME']) / 'sessions'
+    home.mkdir(parents=True)
+    child, parent = home / 'child.jsonl', home / 'parent.jsonl'
+    child.write_text(json.dumps({'type': 'session_meta', 'payload': _codex_spawn_metadata()}) + '\n')
+    parent.write_text(json.dumps({'type': 'session_meta', 'payload': {
+        'id': 'canonical-parent', 'session_id': 'canonical-parent'}}) + '\n')
+    before = {p: p.read_bytes() for p in (child, parent)}
+    original_rglob = Path.rglob
+    monkeypatch.setattr(Path, 'rglob', lambda path, pattern: iter((child, parent))
+                        if path == home else original_rglob(path, pattern))
+    assert source_sessions._find_jsonl_anywhere(selected, provider='codex') == (
+        parent if selected == 'canonical-parent' else child)
+    assert {p: p.read_bytes() for p in before} == before
+    assert current_runtime_context() is selected_host_context
+
+
+@pytest.mark.parametrize('damage', ['fork-parent', 'thread-parent', 'spawn-parent',
+    'missing-spawn', 'missing-fork', 'missing-boundary', 'negative-boundary',
+    'bool-boundary', 'text-boundary'])
+@pytest.mark.parametrize('selected', ['canonical-parent', 'canonical-child'])
+def test_doctor_lookup_refuses_unverified_spawn_aliases(selected_host_context, damage, selected):
+    metadata = _codex_spawn_metadata()
+    if damage == 'fork-parent':
+        metadata['forked_from_id'] = 'different-parent'
+    elif damage == 'thread-parent':
+        metadata['parent_thread_id'] = 'different-parent'
+    elif damage == 'spawn-parent':
+        metadata['source']['subagent']['thread_spawn']['parent_thread_id'] = 'different-parent'
+    elif damage == 'missing-spawn':
+        metadata['source'] = {'subagent': 'review'}
+    elif damage == 'missing-fork':
+        del metadata['forked_from_id']
+    elif damage == 'missing-boundary':
+        del metadata['subagent_history_start_ordinal']
+    else:
+        metadata['subagent_history_start_ordinal'] = {
+            'negative-boundary': -1, 'bool-boundary': True, 'text-boundary': '25'}[damage]
+    home = Path(os.environ['CODEX_HOME']) / 'sessions'
+    home.mkdir(parents=True)
+    path = home / 'malformed-child.jsonl'
+    path.write_text(json.dumps({'type': 'session_meta', 'payload': metadata}) + '\n')
+    before = path.read_bytes()
+    with pytest.raises(ValueError, match='Conflicting native source IDs'):
+        source_sessions._find_jsonl_anywhere(selected, provider='codex')
+    assert path.read_bytes() == before
+
+
+def test_doctor_lookup_still_refuses_duplicate_canonical_parent(selected_host_context):
+    home = Path(os.environ['CODEX_HOME']) / 'sessions'
+    home.mkdir(parents=True)
+    for name in ('first', 'second'):
+        (home / (name + '.jsonl')).write_text(json.dumps({'type': 'session_meta',
+            'payload': {'id': 'canonical-parent', 'session_id': 'canonical-parent'}}) + '\n')
+    before = {p: p.read_bytes() for p in home.iterdir()}
+    with pytest.raises(ValueError, match='Multiple native sources match the full source ID'):
+        source_sessions._find_jsonl_anywhere('canonical-parent', provider='codex')
+    assert {p: p.read_bytes() for p in before} == before
+
+
+def test_doctor_lookup_refuses_nonstring_spawn_child_id(selected_host_context):
+    metadata = _codex_spawn_metadata()
+    metadata['id'] = 42
+    home = Path(os.environ['CODEX_HOME']) / 'sessions'
+    home.mkdir(parents=True)
+    path = home / 'invalid-id.jsonl'
+    path.write_text(json.dumps({'type': 'session_meta', 'payload': metadata}) + '\n')
+    before = path.read_bytes()
+    with pytest.raises(ValueError, match='Conflicting native source IDs'):
+        source_sessions._find_jsonl_anywhere('canonical-parent', provider='codex')
+    assert path.read_bytes() == before

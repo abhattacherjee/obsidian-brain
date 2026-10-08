@@ -93,6 +93,15 @@ for install, status and restore. Refuse a missing or unverified selection;
 never choose the highest version or infer the current frontend from the path.
 Omit `cache_path` for Claude.
 
+For install and restore from an installed skill, obtain an explicit verified
+external obsidian-brain checkout or runtime package from the operator. Pass its
+absolute path as `source_path`. It must exist outside the selected native home
+and cannot traverse symlinks or parent directories. Verify the source commit
+or package before selecting it. Never infer a source from cwd or select another
+installation. The loaded skill still runs its own installed launcher. A skill
+loaded from an external checkout may omit `source_path` and use that checkout.
+Status does not require an external source.
+
 On Python 3.9, Codex config validation accepts tables, dotted keys, strings,
 booleans, finite numbers, and one-line arrays or inline tables. Unsupported
 multiline values, dates, and arrays of tables leave config and cache unchanged.
@@ -100,13 +109,14 @@ Use Python 3.11 or later for those TOML forms. No extra package is required.
 
 ### Step 2 — Install dev version
 
-This works from any directory — it locates the obsidian-brain checkout itself, it does not require the cwd to be inside it. Run:
+This works from any directory. Use the verified external source selected above; cwd does not select it. Run:
 
 Request for `dev-install`:
 
 ```json
 {
   "mode": "install",
+  "source_path": "<verified external obsidian-brain source; omit only when loaded from that checkout>",
   "cache_path": "<explicit verified Codex installed cache path; omit for Claude>"
 }
 ```
@@ -135,13 +145,14 @@ Stop here.
 
 ### Step 3 — Restore original
 
-This works from any directory — it locates the obsidian-brain checkout itself, it does not require the cwd to be inside it. Run:
+This works from any directory. Use the verified external source selected above; cwd does not select it. Run:
 
 Request for `dev-install` (substitute the values as data):
 
 ```json
 {
   "mode": "restore",
+  "source_path": "<same verified external source used for install>",
   "cache_path": "<same explicit verified Codex cache path; omit for Claude>"
 }
 ```
@@ -166,7 +177,7 @@ Stop here.
 
 ### Step 4 — Show status
 
-This works from any directory — it locates the obsidian-brain checkout itself, it does not require the cwd to be inside it. Run:
+This works from any directory and uses the loaded launcher. No external source is needed. Run:
 
 Request for `dev-install` (substitute the values as data):
 
