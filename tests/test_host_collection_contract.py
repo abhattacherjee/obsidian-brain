@@ -59,6 +59,15 @@ def _collect(tmp_path, test_source, fixture_source='', helper_files=None,
         str(PLUGIN.parent), str(Path.cwd() / 'hooks')]))
     env.update(HOME=str(tmp_path / 'home'), CODEX_HOME=str(tmp_path / 'home/.codex'),
                CLAUDE_CONFIG_DIR=str(tmp_path / 'home/.claude'))
+    if coverage:
+        # This child measures synthetic sample.py for its own failing gate.
+        # Keep both modern and legacy coverage startup out of the outer data.
+        for name in tuple(env):
+            if name.startswith('COV_CORE_') or name in {
+                    'COVERAGE_PROCESS_CONFIG', 'COVERAGE_PROCESS_START',
+                    'COVERAGE_RCFILE', 'COVERAGE_FILE'}:
+                env.pop(name, None)
+        env['COVERAGE_FILE'] = str(tmp_path / '.coverage-child')
     for name in ('OBSIDIAN_BRAIN_CONFIG', 'OBSIDIAN_BRAIN_STATE_DIR', 'OBSIDIAN_BRAIN_DB',
                  'CODEX_THREAD_ID', 'CLAUDE_CODE_SESSION_ID'):
         env.pop(name, None)
@@ -687,10 +696,105 @@ def test_late_api_import_failure_is_not_hidden_by_guard(tmp_path):
     assert result.returncode == 0 and '1 passed' in result.stdout, result.stdout + result.stderr
 
 
-def test_parallel_coverage_still_rejects_below_ninety_percent(tmp_path):
+def test_parallel_coverage_still_rejects_below_ninety_percent(tmp_path, monkeypatch):
+    import coverage
+    hook = str(PLUGIN.parent.parent / 'hooks/native_entry.py')
+    outer_path = tmp_path / '.coverage-outer'
+    outer_data = coverage.CoverageData(basename=str(outer_path))
+    outer_data.add_lines({hook: [1]})
+    outer_data.write()
+    outer_bytes = outer_path.read_bytes()
+    monkeypatch.setenv('COVERAGE_FILE', str(outer_path))
+    active = coverage.Coverage.current()
+    def hook_lines():
+        if active is None:
+            return None
+        data = active.get_data()
+        return {filename: tuple(sorted(data.lines(filename) or []))
+                for filename in data.measured_files()}
+    before = hook_lines()
     result = _collect(tmp_path, 'from sample import covered\ndef test_value():\n    assert covered() == 1\n',
                       helper_files={'sample.py': 'def covered():\n    return 1\ndef uncovered():\n    a = 2\n    b = 3\n    return a + b\n'},
                       execute=True, parallel=True, coverage=True)
     assert result.returncode != 0
     assert '2 passed' in result.stdout, result.stdout + result.stderr
     assert 'Required test coverage of 90%' in result.stdout + result.stderr
+    assert outer_path.read_bytes() == outer_bytes
+    assert hook_lines() == before, 'Child coverage changed the active outer hook data'
+    child_data = coverage.CoverageData(basename=str(tmp_path / '.coverage-child'))
+    child_data.read()
+    assert str(tmp_path / 'sample.py') in child_data.measured_files()
+    assert hook not in child_data.measured_files()
+
+
+def test_definition_cache_reuses_unread_parameters_but_keeps_skill_bindings(tmp_path, monkeypatch):
+    import importlib.util
+    from types import SimpleNamespace
+    spec = importlib.util.spec_from_file_location('cached_collection_scope', PLUGIN)
+    plugin = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(plugin)
+    path = tmp_path / 'test_case.py'
+    path.write_text('from skill_procedures import run_operation\n'
+                    'def helper(skill):\n    run_operation(ctx, skill, op, payload)\n'
+                    'def test_new(skill):\n    helper(skill)\n')
+    item = SimpleNamespace(path=path, originalname='test_new', name='test_new', nodeid='first',
+                           config=SimpleNamespace(rootpath=tmp_path),
+                           callspec=SimpleNamespace(params={'skill': 'one', 'unused': 'first'}),
+                           _fixtureinfo=SimpleNamespace(name2fixturedefs={}))
+    capabilities = [{'id': 'skill.dispatch', 'calls': ['skill_procedures.run_operation']},
+                    {'id': 'skill.one', 'calls': []}, {'id': 'skill.two', 'calls': []}]
+    cache = {}
+    calls = []
+    original = plugin._extend_aliases
+    def counted(*args, **kwargs):
+        calls.append(1)
+        return original(*args, **kwargs)
+    monkeypatch.setattr(plugin, '_extend_aliases', counted)
+    assert plugin._scope(item, capabilities, analysis_cache=cache) == {'skill.dispatch', 'skill.one'}
+    first_count = len(calls)
+    item.callspec.params['unused'] = 'second'
+    assert plugin._scope(item, capabilities, analysis_cache=cache) == {'skill.dispatch', 'skill.one'}
+    assert len(calls) == first_count, 'Identical definition analysis was repeated'
+    item.callspec.params['skill'] = 'two'
+    assert plugin._scope(item, capabilities, analysis_cache=cache) == {'skill.dispatch', 'skill.two'}
+    assert len(calls) > first_count
+
+
+def test_definition_cache_replays_failed_launcher_for_each_item_and_changed_matrix(tmp_path):
+    import importlib.util
+    from types import SimpleNamespace
+    spec = importlib.util.spec_from_file_location('cached_launcher_scope', PLUGIN)
+    plugin = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(plugin)
+    path = tmp_path / 'test_case.py'
+    path.write_text('import subprocess\ndef test_new():\n    subprocess.run(["private-control"])\n')
+    item = SimpleNamespace(path=path, originalname='test_new', name='test_new', nodeid='first',
+                           config=SimpleNamespace(rootpath=tmp_path),
+                           callspec=SimpleNamespace(params={}),
+                           _fixtureinfo=SimpleNamespace(name2fixturedefs={}))
+    cache, errors = {}, []
+    assert plugin._scope(item, [], errors=errors, analysis_cache=cache) == set()
+    item.nodeid = 'second'
+    assert plugin._scope(item, [], errors=errors, analysis_cache=cache) == set()
+    assert len(errors) == 2
+    assert errors[0].startswith('first: launcher contract missing')
+    assert errors[1].startswith('second: launcher contract missing')
+    launchers = [{'source': 'test_case.py', 'expression': "subprocess.run(['private-control'])",
+                  'source_sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
+                  'scope': 'structural', 'reason': 'private control'}]
+    errors.clear()
+    assert plugin._scope(item, [], launchers, errors, cache) == set()
+    assert errors == []
+    launchers[0]['source_sha256'] = 'changed'
+    assert plugin._scope(item, [], launchers, errors, cache) == set()
+    assert errors and errors[0].startswith('second: launcher contract missing')
+
+
+def test_cached_definition_does_not_waive_missing_invoking_host(tmp_path):
+    result = _collect(tmp_path,
+        '@pytest.mark.parametrize("case", [1, 2])\n'
+        'def test_new(host, selected_host_context, case):\n'
+        '    apply_mutations(selected_host_context, [])\n',
+        '@pytest.fixture(params=["claude"])\ndef host(request):\n    return request.param\n')
+    assert result.returncode != 0
+    assert 'missing invoking host' in result.stderr

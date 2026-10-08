@@ -14,6 +14,11 @@ storage and execution are selected by explicit host adapters.
   but full parity has not shipped. Current-client binding and native Desktop
   dispatch remain unverified. See [acceptance evidence](docs/parity/acceptance-evidence.md).
 - Native Codex context requires `codex-cli` or `codex-desktop` explicitly.
+  The launcher declares `OB_CLIENT` before starting the native client; registered
+  hooks pass that value as `--client`. CLI launches require
+  `OB_CLIENT=codex-cli codex --no-daemon`. Registered capture refuses shared-server
+  ancestors, unreadable ancestry, and Desktop dispatch. Verify hook process
+  ancestry and arguments independently before claiming native binding.
   Do not infer the current frontend from a thread's creation metadata or a
   daemon's environment. Missing identity skips native hook capture; no source is retained.
 - Keep host-specific instructions in this file. Put shared rules in

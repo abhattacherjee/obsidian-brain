@@ -484,6 +484,9 @@
     "hooks/native_lifecycle.py": [
       "OBSIDIAN_BRAIN_NESTED_AI"
     ],
+    "hooks/native_entry.py": [
+      "OB_CLIENT"
+    ],
     "hooks/obsidian_context_snapshot.py": [
       "OBSIDIAN_BRAIN_NESTED_AI"
     ],

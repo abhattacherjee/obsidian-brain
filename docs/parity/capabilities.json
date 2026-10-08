@@ -1092,6 +1092,27 @@
   ],
   "launchers": [
     {
+      "source": "tests/test_native_entry_binding.py",
+      "expression": "subprocess.run(['/usr/bin/codesign', '--force', '--sign', '-', str(executable)], stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10)",
+      "source_sha256": "905778a5ae5f97f16afe05e4e10a7945c34e6d611bb4297cde2066d8497f6176",
+      "scope": "structural",
+      "reason": "Private copied-Python argv controls only: macOS ad-hoc signs the disposable fixture executable, then Python launches that fixture to inspect actual kernel argv boundaries. No native client, model, credentials, installed binaries or live stores are used. This is synthetic launcher validation, not native acceptance."
+    },
+    {
+      "source": "tests/test_native_entry_binding.py",
+      "expression": "subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10)",
+      "source_sha256": "905778a5ae5f97f16afe05e4e10a7945c34e6d611bb4297cde2066d8497f6176",
+      "scope": "structural",
+      "reason": "Private copied-Python argv controls only: macOS ad-hoc signs the disposable fixture executable, then Python launches that fixture to inspect actual kernel argv boundaries. No native client, model, credentials, installed binaries or live stores are used. This is synthetic launcher validation, not native acceptance."
+    },
+    {
+      "source": "tests/test_native_entry_binding.py",
+      "expression": "subprocess.run(command, shell=True, env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=5)",
+      "source_sha256": "905778a5ae5f97f16afe05e4e10a7945c34e6d611bb4297cde2066d8497f6176",
+      "scope": "structural",
+      "reason": "Disposable installed-entry recorder checks the four Codex descriptor shell expansions, including missing and invalid pre-launch declarations and paths with spaces. It launches no native client, model, hook runtime or live store; this check does not certify native dispatch."
+    },
+    {
       "source": "hooks/ai_backend.py",
       "expression": "subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=cwd, env=env, start_new_session=True, umask=63)",
       "source_sha256": "283581712f348a22b633488af460011d408c60f264419e1aa24885fc4f256036",
@@ -1301,7 +1322,7 @@
     {
       "source": "tests/test_host_collection_contract.py",
       "expression": "subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60, cwd=tmp_path, env=env)",
-      "source_sha256": "18dc3c69a8ad5ffb97565c01bb2f49e07391ed99ae2a2f327950f0cdcfe1333c",
+      "source_sha256": "b2ed4b95dff91a98e742aa872eae822fbf9ed5a32d6c997068544d556245987d",
       "scope": "structural",
       "reason": "Isolated pytest collection negative controls; validates the contract gate itself without a native plugin invocation."
     },
@@ -1371,7 +1392,7 @@
     {
       "source": "tests/test_host_skill_contracts.py",
       "expression": "subprocess.run(['bash', '-c', block], env=environment, cwd=selected_host_context.worktree, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=5)",
-      "source_sha256": "e82ca46b7074ad74775ee443cad0faec3f1633076fb78ec6238438063c638a58",
+      "source_sha256": "5063c49027f47eeb9e96816f1f4a51d62a6e51fa4caa989a85a66eff08690689",
       "capability": "skill.dispatch"
     },
     {
@@ -1620,7 +1641,7 @@
       "source": "tests/test_snapshot_e2e.py",
       "expression": "subprocess.run(command, input=json.dumps({'session_id': context.native_session_id, 'cwd': str(context.worktree), 'transcript_path': str(context.transcript_path), 'trigger': 'manual'}), env=dict(os.environ, CLAUDE_CODE_SESSION_ID='foreign-inherited-id', CODEX_THREAD_ID='foreign-inherited-thread'), cwd=context.worktree, capture_output=True, text=True, timeout=10)",
       "capability": "capture.normalization",
-      "source_sha256": "2e76c0b84286372f05a56fb45b141922257486af586b5578d7378527fbebac0d"
+      "source_sha256": "68e558a376bed2bfecbd67272df0b42610163c97feb7e0b9c20c999a7246e694"
     },
     {
       "source": "tests/test_vault_doctor_audit_historic_repairs.py",
@@ -1954,7 +1975,7 @@
     {
       "source": "tests/conftest.py",
       "expression": "original(args, *positional, **kwargs)",
-      "source_sha256": "53e7a930fe709a86ab4fe9df5e1db213f12a3b485bd2bc9ee0a844a6931903b3",
+      "source_sha256": "ada0ed25eff9056f6e173557cf839b1d702359b1c04786752f31cbaf3184aa99",
       "scope": "support",
       "reason": "Autouse test transport guard rejects unmocked claude/codex commands before forwarding non-native subprocesses. This guard proves no client capability; actual process callers retain their own actor contracts."
     },
@@ -1998,6 +2019,20 @@
       "source_sha256": "f3936bab0adde04b6bcf20e202f2605c0c758590ca51f75db7d6f270ad04b93b",
       "scope": "support",
       "reason": "Runs only the copied installer in disposable home/cache/config with metadata-only native inventory. No installed client, AI, source capture or live vault runs; validates Python 3.9 stdlib packaging and exact backup restoration."
+    },
+    {
+      "source": "tests/test_ci_test_shards.py",
+      "expression": "subprocess.run(['bash', '-c', prefix + block + tail], cwd=tmp_path, env=environment, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=20)",
+      "source_sha256": "fb99c6a899af1f1bbeff5962c009e25ee326e43e3ef48e2e8f5b5cc2d271a3d2",
+      "scope": "structural",
+      "reason": "Private preflight shell control: executes the production parallel, serial, coverage and token blocks with a disposable phase driver, controlled exits, fake coverage bytes and a private token. It runs no native client or live service and proves no client capability."
+    },
+    {
+      "source": "tests/test_ci_test_shards.py",
+      "expression": "subprocess.run(['bash', '-c', command], cwd=tmp_path, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=20)",
+      "source_sha256": "fb99c6a899af1f1bbeff5962c009e25ee326e43e3ef48e2e8f5b5cc2d271a3d2",
+      "scope": "structural",
+      "reason": "Private preflight token control: runs the production startup invalidation stanza against a disposable seeded token, then returns controlled failure or interruption exit codes. It kills no process, touches no live approval token and proves no client capability."
     }
   ]
 }

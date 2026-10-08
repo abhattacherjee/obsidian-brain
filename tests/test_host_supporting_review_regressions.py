@@ -120,7 +120,7 @@ def test_packaged_lifecycle_events_match_selected_host_descriptor(selected_host_
         if selected_host_context.host == 'claude':
             assert command[command.index('--client') + 1] == 'claude-code'
         else:
-            assert '--client' not in command
+            assert command[command.index('--client') + 1] == '${OB_CLIENT:-}'
 
 
 def test_registered_identity_scenario_accepts_only_full_frozen_actor(selected_host_context, host_identity_scenario):

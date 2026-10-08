@@ -84,9 +84,13 @@ invent `OB_CLIENT` or use another frontend's identity. Packaging and trust-scree
 checks alone do not make the skills or capture ready for installed Codex use. `.codex-plugin/plugin.json`
 selects `hooks/codex-hooks.json`.
 
-**Codex automatic capture is off.** Those hooks skip events and retain no source
-until current CLI/Desktop frontend binding is verified. Trusting the hooks does
-not certify parity. Skills require the actual invoking client/session and the
+Codex CLI launchers must declare the client before launch and disable the shared
+server: `OB_CLIENT=codex-cli codex --no-daemon`. Registered hooks require an
+observed `codex --no-daemon` process in their ancestry. Shared-server ancestors,
+unreadable ancestry, and Desktop capture skip without retaining a source.
+Ancestry only permits or refuses capture; it never chooses the client.
+This launch contract still needs native dispatch evidence. Trusting the hooks
+does not certify parity. Skills require the actual invoking client/session and the
 loaded `SKILL.md` root. Stop when that client binding is unavailable. Run
 `/obsidian-setup` under the selected host; do not borrow another host's config.
 

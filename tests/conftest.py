@@ -249,8 +249,21 @@ def sample_jsonl(tmp_path):
     return jsonl_path
 
 
+@pytest.fixture(scope="session")
+def _private_sink_root(tmp_path_factory):
+    """Keep test sinks outside paths a test may treat as its vault."""
+    return tmp_path_factory.mktemp("ob-test-state")
+
+
+@pytest.fixture
+def _private_sink_state(_private_sink_root):
+    """Allocate a private test directory without scanning numbered siblings."""
+    import tempfile
+    return Path(tempfile.mkdtemp(prefix="case-", dir=_private_sink_root))
+
+
 @pytest.fixture(autouse=True)
-def _isolate_summarizer_sink_globally(tmp_path_factory, monkeypatch):
+def _isolate_summarizer_sink_globally(_private_sink_state, monkeypatch):
     """Belt-and-suspenders: redirect summarizer_metrics.METRICS_PATH to a tmp
     path for every test in the suite. Prevents accidental pollution of
     ~/.claude/obsidian-brain-summarizer-metrics.jsonl when a future test
@@ -260,12 +273,14 @@ def _isolate_summarizer_sink_globally(tmp_path_factory, monkeypatch):
         import summarizer_metrics
     except ImportError:
         return  # sink module not present in some test contexts
-    safe_path = tmp_path_factory.mktemp("metrics") / "summarizer-metrics.jsonl"
+    safe_path = _private_sink_state / "metrics"
+    safe_path.mkdir(mode=0o700)
+    safe_path = safe_path / "summarizer-metrics.jsonl"
     monkeypatch.setattr(summarizer_metrics, "METRICS_PATH", safe_path)
 
 
 @pytest.fixture(autouse=True)
-def _isolate_secure_dir_globally(tmp_path_factory, monkeypatch):
+def _isolate_secure_dir_globally(_private_sink_state, monkeypatch):
     """Point obsidian-brain's secure dir (and its lock subdir) at a throwaway
     per-test location so no test writes to the real ~/.claude/obsidian-brain/
     (notably the cross-plugin dedup lock files written by claim_hook_run).
@@ -284,7 +299,8 @@ def _isolate_secure_dir_globally(tmp_path_factory, monkeypatch):
     paths so that tests checking `x.startswith(_SECURE_DIR)` still hold."""
     import obsidian_utils
     import hooks.obsidian_utils as qualified_utils
-    secure = tmp_path_factory.mktemp("ob-secure")
+    secure = _private_sink_state / "ob-secure"
+    secure.mkdir(mode=0o700)
     for module in (obsidian_utils, qualified_utils):
         monkeypatch.setattr(module, "_SECURE_DIR", str(secure))
         monkeypatch.setattr(module, "_LOCK_DIR", str(secure / "locks"))
@@ -316,7 +332,7 @@ def _isolate_secure_dir_globally(tmp_path_factory, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def _isolate_vault_index_db_globally(tmp_path_factory, monkeypatch):
+def _isolate_vault_index_db_globally(_private_sink_state, monkeypatch):
     """Redirect the default index DB to a per-test tmp path so an un-isolated
     in-process call (e.g. deep_analysis_pipeline / obsidian_utils indexing with
     no db_path) cannot reach the production DB. The _connect() guard is the
@@ -325,12 +341,14 @@ def _isolate_vault_index_db_globally(tmp_path_factory, monkeypatch):
     Tests that pass an explicit db_path are unaffected (they ignore the env).
     Subprocess tests inherit OBSIDIAN_BRAIN_DB when they copy the parent environment (os.environ.copy()), which the existing subprocess tests do.
     """
-    db = tmp_path_factory.mktemp("vidx") / "test-vault.db"
+    db = _private_sink_state / "vidx"
+    db.mkdir(mode=0o700)
+    db = db / "test-vault.db"
     monkeypatch.setenv("OBSIDIAN_BRAIN_DB", str(db))
 
 
 @pytest.fixture(autouse=True)
-def _isolate_acted_items_path_globally(tmp_path_factory, monkeypatch):
+def _isolate_acted_items_path_globally(_private_sink_state, monkeypatch):
     """Redirect deep_cli._ACTED_ITEMS_PATH to a per-test tmp file so tests that
     call run_batch_edit never read/write/remove the REAL
     ~/.claude/obsidian-brain/deep-acted-items.json. That real-state mutation
@@ -343,7 +361,9 @@ def _isolate_acted_items_path_globally(tmp_path_factory, monkeypatch):
         import deep_cli
     except ImportError:
         return  # module not present in some test contexts
-    acted = tmp_path_factory.mktemp("acted") / "deep-acted-items.json"
+    acted = _private_sink_state / "acted"
+    acted.mkdir(mode=0o700)
+    acted = acted / "deep-acted-items.json"
     monkeypatch.setattr(deep_cli, "_ACTED_ITEMS_PATH", str(acted))
 
 

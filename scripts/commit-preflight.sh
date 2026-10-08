@@ -19,6 +19,10 @@ set -e
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PROJECT_HASH=$(python3 -c "import hashlib, sys; print(hashlib.md5(sys.argv[1].encode()).hexdigest()[:8])" "$(realpath "$PROJECT_DIR")")
 TOKEN_FILE="/tmp/.preflight-token-${PROJECT_HASH}"
+# Invalidate the previous result before any check can fail or be interrupted.
+# __PREFLIGHT_INVALIDATE_START__
+rm -f "$TOKEN_FILE"
+# __PREFLIGHT_INVALIDATE_END__
 TOKEN_EXPIRY_SECONDS=300  # Token valid for 5 minutes
 # The HEAD this preflight ran at. require-preflight allows a commit only
 # while HEAD still matches, so a call another hook denies does not spend
@@ -289,18 +293,63 @@ echo "🧪 Running tests..."
 
 # __HARDEN_TEST_START__
 if [ -d "tests" ]; then
-    if command -v pytest &>/dev/null; then
-        echo "🧪 Running pytest with coverage..."
-        if PYTHONPATH=tests:hooks:scripts pytest tests/ -v --tb=short --cov=hooks --cov-report=term-missing --cov-fail-under=90 -p parity_collection_plugin --parity-matrix docs/parity/capabilities.json; then
+    PREFLIGHT_TEST_PYTHON="$(command -v python3)"
+    if "$PREFLIGHT_TEST_PYTHON" - <<'PY'
+import importlib
+import sys
+
+missing = []
+for name in ("pytest", "pytest_cov", "xdist", "coverage"):
+    try:
+        importlib.import_module(name)
+    except ImportError:
+        missing.append(name)
+if missing:
+    print("Test dependencies unavailable in " + sys.executable + ": " + ", ".join(missing), file=sys.stderr)
+    sys.exit(1)
+PY
+    then
+        echo "🧪 Running parallel tests and serial timing controls with coverage..."
+        # __PARALLEL_COVERAGE_START__
+        if (
+            TEST_RUN_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ob-preflight-tests.XXXXXXXX")" || exit 1
+            echo "Test receipts: $TEST_RUN_DIR"
+            mkdir -p "$TEST_RUN_DIR/artifacts/local-0" || exit 1
+            export COVERAGE_FILE="$TEST_RUN_DIR/.coverage"
+            "$PREFLIGHT_TEST_PYTHON" scripts/ci-checks/test_shards.py list \
+                --root "$PROJECT_DIR" --count 1 --index 0 \
+                --manifest "$TEST_RUN_DIR/artifacts/local-0/manifest.json" \
+                > "$TEST_RUN_DIR/test-files.txt" || exit 1
+            PYTHONPATH=tests:hooks:scripts "$PREFLIGHT_TEST_PYTHON" -m pytest tests/ \
+                -v --tb=short -n 4 --dist=load --max-worker-restart=0 \
+                --deselect=tests/test_security.py::TestDecisionTimeIsBounded:: \
+                --deselect=tests/test_security.py::TestPatternDecisionTimeIsBounded:: \
+                --basetemp="$TEST_RUN_DIR/pytest-coverage" \
+                --cov=hooks --cov-report= --cov-fail-under=0 \
+                -p parity_collection_plugin --parity-matrix docs/parity/capabilities.json || exit 1
+            PYTHONPATH=tests:hooks:scripts "$PREFLIGHT_TEST_PYTHON" -m pytest \
+                tests/test_security.py::TestDecisionTimeIsBounded \
+                tests/test_security.py::TestPatternDecisionTimeIsBounded \
+                -v --tb=short -p no:xdist \
+                --basetemp="$TEST_RUN_DIR/pytest-coverage-timing" \
+                --cov=hooks --cov-append --cov-report= --cov-fail-under=0 \
+                -p parity_collection_plugin --parity-matrix docs/parity/capabilities.json || exit 1
+            cp "$COVERAGE_FILE" "$TEST_RUN_DIR/artifacts/local-0/.coverage" || exit 1
+            "$PREFLIGHT_TEST_PYTHON" scripts/ci-checks/test_shards.py coverage \
+                --root "$PROJECT_DIR" --count 1 --prefix local \
+                --artifacts "$TEST_RUN_DIR/artifacts" || exit 1
+        ); then
             CHECKS_RUN="${CHECKS_RUN}tests,"
         else
             echo "❌ Tests failed or coverage below 90%"
             CHECKS_PASSED=false
         fi
+        # __PARALLEL_COVERAGE_END__
     else
-        echo "❌ tests/ directory exists but pytest is not installed"
-        echo "   Install with: pip install pytest pytest-cov"
-        CHECKS_PASSED=false
+        echo "❌ Required test dependencies are missing; tests did not start"
+        echo "   Install with: $PREFLIGHT_TEST_PYTHON -m pip install -r requirements-dev.txt"
+        rm -f "$TOKEN_FILE"
+        exit 1
     fi
 else
     echo "⏭️  No test directory — skipping tests"

@@ -320,20 +320,33 @@ def test_historical_import_rejects_source_changed_after_analysis(tmp_vault, tmp_
 
 
 @pytest.mark.parametrize('skill', sorted(skill_procedures.SKILLS))
-def test_missing_current_client_stops_before_skill_launch(selected_host_context, tmp_path, skill):
+@pytest.mark.parametrize('declaration', [None, '', 'cli', 'claude-code', 'codex-cli', 'codex-desktop'])
+def test_skill_client_guard_uses_claude_constant_and_declared_codex_client(
+        selected_host_context, skill, declaration):
     import os
     import re
     import subprocess
     source = (ROOT / 'skills' / skill / 'SKILL.md').read_text()
     block = re.search(r'```bash\n(.*?)\n```', source, re.S).group(1)
-    environment = dict(os.environ)
+    # Execute the real guard alone; no native operation or AI can run.
+    block = block.split('OB_SKILL_PATH=', 1)[0] + "printf '%s' \"$OB_CLIENT\""
+    environment = dict(os.environ, OB_HOST=selected_host_context.host)
     environment.pop('OB_CLIENT', None)
+    if declaration is not None:
+        environment['OB_CLIENT'] = declaration
     result = subprocess.run(['bash', '-c', block], env=environment,
                             cwd=selected_host_context.worktree, stdin=subprocess.DEVNULL,
                             capture_output=True, text=True, timeout=5)
-    assert result.returncode != 0
-    assert 'Current native client binding is unavailable' in result.stderr
-    assert not result.stdout
+    valid = (declaration in (None, 'claude-code') if selected_host_context.host == 'claude'
+             else declaration in ('codex-cli', 'codex-desktop'))
+    if valid:
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == ('claude-code' if selected_host_context.host == 'claude' else declaration)
+        assert not result.stderr
+    else:
+        assert result.returncode != 0
+        assert 'Current native client binding is unavailable' in result.stderr
+        assert not result.stdout
     assert not list(selected_host_context.vault_path.iterdir())
     assert 'infer the frontend from transcript creation' in source
     assert 'OB_CLIENT=codex-cli' not in block

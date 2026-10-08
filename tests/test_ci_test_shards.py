@@ -170,3 +170,104 @@ def test_installed_production_copy_is_mapped_and_counted(corpus, monkeypatch):
         data.add_lines({str(installed / 'skill_procedures.py'): [index + 1]})
         data.write()
     assert shards.combine_coverage(root, artifacts, 2) == 100
+
+
+@pytest.mark.parametrize('failure', ['list', 'worker', 'serial', 'copy', 'coverage', None])
+def test_local_parallel_gate_never_records_token_after_failed_phase(tmp_path, failure):
+    """Execute the real shell control flow with isolated phase exit controls."""
+    import os
+    import shlex
+    import subprocess
+    import sys
+
+    source = (Path(__file__).resolve().parents[1] / 'scripts/commit-preflight.sh').read_text()
+    block = source.split('# __PARALLEL_COVERAGE_START__', 1)[1].split(
+        '# __PARALLEL_COVERAGE_END__', 1)[0]
+    tail = source.split('# __HARDEN_TEST_END__', 1)[1]
+    driver = tmp_path / 'phase-driver'
+    driver.write_text('#!' + sys.executable + '\n' + '''
+import json, os, pathlib, sys
+args = sys.argv[1:]
+phase = ('list' if 'list' in args else 'coverage' if 'coverage' in args
+         else 'worker' if '-n' in args else 'serial')
+with open(os.environ['PHASE_LOG'], 'a') as handle:
+    handle.write(json.dumps({'phase': phase, 'args': args}) + '\\n')
+if phase == os.environ.get('FAIL_PHASE'):
+    sys.exit(1)
+if phase == 'serial' and os.environ.get('FAIL_PHASE') == 'copy':
+    pathlib.Path(os.environ['COVERAGE_FILE']).unlink()
+    sys.exit(0)
+if phase == 'list':
+    pathlib.Path(args[args.index('--manifest') + 1]).write_text('{}')
+elif phase in ('worker', 'serial'):
+    pathlib.Path(os.environ['COVERAGE_FILE']).write_bytes(b'controlled coverage')
+''')
+    driver.chmod(0o700)
+    token = tmp_path / 'token.json'
+    log = tmp_path / 'phases.jsonl'
+    prefix = '\n'.join([
+        'CHECKS_PASSED=true', 'CHECKS_RUN=""', 'STAGED_FILES=probe',
+        'TOKEN_HEAD=controlled-head', 'TOKEN_EXPIRY_SECONDS=300',
+        'PROJECT_DIR=' + shlex.quote(str(tmp_path)),
+        'TOKEN_FILE=' + shlex.quote(str(token)),
+        'PREFLIGHT_TEST_PYTHON=' + shlex.quote(str(driver)),
+    ]) + '\n'
+    environment = dict(os.environ, TMPDIR=str(tmp_path), PHASE_LOG=str(log),
+                       FAIL_PHASE=failure or '')
+    result = subprocess.run(['bash', '-c', prefix + block + tail],
+                            cwd=tmp_path, env=environment, stdin=subprocess.DEVNULL,
+                            capture_output=True, text=True, timeout=20)
+    calls = [json.loads(line) for line in log.read_text().splitlines()]
+    expected = ['list', 'worker', 'serial', 'coverage']
+    if failure:
+        expected = (['list', 'worker', 'serial'] if failure == 'copy'
+                    else expected[:expected.index(failure) + 1])
+        assert result.returncode != 0, result.stdout + result.stderr
+        assert not token.exists()
+        assert 'PREFLIGHT FAILED' in result.stdout
+    else:
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert json.loads(token.read_text())['checks_run'] == 'tests'
+    assert [call['phase'] for call in calls] == expected
+    if failure == 'list':
+        return  # No pytest phase may start after failed manifest preparation.
+    worker = calls[1]['args']
+    assert worker[worker.index('-n') + 1] == '4'
+    assert '--dist=load' in worker and '--max-worker-restart=0' in worker
+    assert 'tests/' in worker
+    timing = ['tests/test_security.py::TestDecisionTimeIsBounded',
+              'tests/test_security.py::TestPatternDecisionTimeIsBounded']
+    assert all('--deselect=' + name + '::' in worker for name in timing)
+    if len(calls) >= 3:
+        serial = calls[2]['args']
+        assert all(name in serial for name in timing)
+        assert 'no:xdist' in serial and '--cov-append' in serial
+        assert '-n' not in serial
+    for call in calls[1:3]:
+        if call['phase'] not in ('worker', 'serial'):
+            continue
+        assert '-m' in call['args'] and 'pytest' in call['args']
+        assert 'parity_collection_plugin' in call['args']
+        assert 'docs/parity/capabilities.json' in call['args']
+
+
+@pytest.mark.parametrize('interrupted', [False, True])
+def test_new_preflight_invalidates_previous_token_before_checks(tmp_path, interrupted):
+    """A killed or failed new run must not leave an older approval usable."""
+    import shlex
+    import subprocess
+
+    source = (Path(__file__).resolve().parents[1] / 'scripts/commit-preflight.sh').read_text()
+    invalidation = source.split('# __PREFLIGHT_INVALIDATE_START__', 1)[1].split(
+        '# __PREFLIGHT_INVALIDATE_END__', 1)[0]
+    assert source.index('# __PREFLIGHT_INVALIDATE_START__') < source.index('TOKEN_HEAD=')
+    token = tmp_path / 'previous-token.json'
+    token.write_text(json.dumps({'head': 'unchanged', 'expires': 9999999999}))
+    status = 137 if interrupted else 1
+    command = 'TOKEN_FILE=' + shlex.quote(str(token)) + '\n' + invalidation
+    command += '\nexit ' + str(status)  # Interrupt only this private synthetic shell.
+    result = subprocess.run(['bash', '-c', command], cwd=tmp_path,
+                            stdin=subprocess.DEVNULL, capture_output=True,
+                            text=True, timeout=20)
+    assert result.returncode == status
+    assert not token.exists(), 'A previous approval survived the new run starting'

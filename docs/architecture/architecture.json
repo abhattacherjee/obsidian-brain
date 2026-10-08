@@ -215,7 +215,7 @@
             "hooks/codex-hooks.json",
             "hooks/native_entry.py"
           ],
-          "purpose": "Claude hooks/hooks.json and Codex hooks/codex-hooks.json select native_entry.py for SessionStart, Stop, PreCompact and SessionEnd. Claude binds claude-code explicitly. Codex current-client binding is not certified; unresolved binding emits an honest diagnostic rather than guessing a frontend."
+          "purpose": "Claude hooks/hooks.json and Codex hooks/codex-hooks.json select native_entry.py for SessionStart, Stop, PreCompact and SessionEnd. Claude binds claude-code explicitly. Codex passes the pre-launch declaration and requires verified CLI ancestry with --no-daemon; shared-server, Desktop, missing or conflicting identity skips before runtime access. Native delivery still requires acceptance evidence."
         }
       ]
     },

@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/native_entry.py\" --host codex --event session_start"
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/native_entry.py\" --host codex --require-cli-launcher --client \"${OB_CLIENT:-}\" --event session_start"
           }
         ],
         "matcher": "startup|resume|clear|compact"
@@ -16,7 +16,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/native_entry.py\" --host codex --event stop"
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/native_entry.py\" --host codex --require-cli-launcher --client \"${OB_CLIENT:-}\" --event stop"
           }
         ]
       }
@@ -26,7 +26,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/native_entry.py\" --host codex --event pre_compact"
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/native_entry.py\" --host codex --require-cli-launcher --client \"${OB_CLIENT:-}\" --event pre_compact"
           }
         ]
       }
@@ -36,7 +36,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/native_entry.py\" --host codex --event session_end",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/native_entry.py\" --host codex --require-cli-launcher --client \"${OB_CLIENT:-}\" --event session_end",
             "timeout": 3
           }
         ]

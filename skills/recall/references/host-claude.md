@@ -1,7 +1,12 @@
 # Claude invocation
 
-Select `OB_HOST=claude`, `OB_CLIENT=claude-code`, and the authoritative
-`CLAUDE_CODE_SESSION_ID` as `OB_SESSION_ID`. An inherited `CODEX_THREAD_ID`
+Use `OB_HOST=claude` and the fixed host client `OB_CLIENT=claude-code`.
+Claude Code has one frontend; this constant matches its hook registration.
+No pre-launch declaration is required. If an inherited `OB_CLIENT` is present
+and differs from `claude-code`, including an empty value, stop with
+"Current native client binding is unavailable". Never overwrite a conflicting
+declaration. Use the authoritative `CLAUDE_CODE_SESSION_ID` as `OB_SESSION_ID`.
+An inherited `CODEX_THREAD_ID`
 does not identify this Claude session. Use the absolute loaded skill path and
 native working directory; do not search marketplace caches.
 

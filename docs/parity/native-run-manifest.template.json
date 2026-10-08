@@ -1,0 +1,123 @@
+{
+  "schema": 1,
+  "run_id": null,
+  "candidate_sha": null,
+  "client": null,
+  "platform": null,
+  "source_checkout": null,
+  "installed_resource_root": null,
+  "verified_native_cache_path": null,
+  "sandbox_root": null,
+  "native_home": null,
+  "config_path": null,
+  "vault_path": null,
+  "index_path": null,
+  "state_path": null,
+  "project_path": null,
+  "evidence_root": null,
+  "fixture_manifest_path": null,
+  "native_launch_record_path": null,
+  "declared_client_launch": {
+    "binding_method": null,
+    "decision_source": null,
+    "client": null,
+    "declared_before_launch": false,
+    "declared_by": null,
+    "launch_receipt_path": null,
+    "inherited_value_receipt_path": null
+  },
+  "authorization_source": null,
+  "execution_environment": {
+    "type": null,
+    "identity": null,
+    "provided_by": null,
+    "access_method": null,
+    "authentication_method": null,
+    "native_client_available": false,
+    "other_provider_absent": false,
+    "inventory_receipt_path": null,
+    "ready": false
+  },
+  "desktop_isolation": {
+    "method": null,
+    "operator": null,
+    "supported_launch_receipt_path": null,
+    "shared_codex_home_for_x1": null,
+    "ready": false
+  },
+  "isolation_audit": {
+    "observer": null,
+    "protected_paths_manifest": null,
+    "before_receipt_path": null,
+    "after_receipt_path": null,
+    "predeclared_housekeeping": [],
+    "positive_control_receipt_path": null
+  },
+  "native_origin_observer": {
+    "method": null,
+    "operator": null,
+    "coverage": null,
+    "positive_control_receipt_path": null,
+    "ready": false,
+    "methods": [
+      {
+        "method": null,
+        "independent_collector": null,
+        "covered_cases": [],
+        "covered_assertions": [],
+        "coverage_limits": null,
+        "positive_controls": [],
+        "receipt_paths": [],
+        "ready": false
+      }
+    ]
+  },
+  "case_readiness": [],
+  "hook_no_ai_scan_observer": {
+    "method": null,
+    "operator": null,
+    "permissions": null,
+    "coverage_limits": null,
+    "covered_assertions": [],
+    "positive_controls": [],
+    "positive_control_receipt_path": null,
+    "ready": false
+  },
+  "baseline_release": {
+    "tag": "v3.8.1",
+    "sha": "9e640475ecb9e205b924cfd99937bf5e954cd0fa",
+    "verification_receipt_path": null,
+    "agreed_change_allowlist_path": null
+  },
+  "dashboard_environment": {
+    "provided_by": null,
+    "obsidian_version": null,
+    "dataview_version": null,
+    "ready": false
+  },
+  "requirement_snapshot_path": null,
+  "ai_inventory_path": null,
+  "expected_package_version": "3.8.1",
+  "observed_client_version": null,
+  "observed_python_version": null,
+  "native_binding_provenance_path": null,
+  "fork_note_policy": null,
+  "retired_source_policy": null,
+  "platform_scope_decision_path": null,
+  "shared_fixture_group": null,
+  "approved_actions": {
+    "fixture_writes": false,
+    "selected_scratch_cache_install_restore": false,
+    "synthetic_native_analysis": false,
+    "private_copy_fault_injection": false
+  },
+  "notes": [
+    "Fill absolute sandbox paths and launch selections before starting the native client.",
+    "Set candidate_sha explicitly; client declares a target, not proof of native hook binding.",
+    "Claude binding_method is fixed-claude-client; record the accepted host-constant decision and reject conflicting inherited declarations. Codex binding_method is operator-launch-declaration; require the trusted pre-launch receipt.",
+    "case_readiness entries name case_id, required_assertions, observer_method_refs, readiness_receipts and blockers. Missing F.5 coverage alone does not block independently proven unrelated cases; no synthetic evidence becomes native.",
+    "Populate approved_actions from the operator's actual execution authorization.",
+    "Never insert authentication values or copied personal conversations.",
+    "Null policy fields block only policy-dependent assertions; they do not waive requirements."
+  ]
+}

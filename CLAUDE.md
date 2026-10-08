@@ -39,6 +39,14 @@ python3 hooks/brain_cli.py --host "$OB_HOST" --client "$OB_CLIENT" --resource-ro
    and stderr says no source was retained. Bound SessionEnd handlers append one
    private outcome log entry, including pending, skipped, and failed captures.
    Bootstrap failures without a verified context report only to stderr.
+   Codex launchers declare `OB_CLIENT` before startup. Registered commands pass
+   it explicitly as `--client`; missing, invalid, or conflicting values skip
+   capture before reading the payload. CLI launchers use
+   `OB_CLIENT=codex-cli codex --no-daemon`. Registered capture requires that
+   isolated CLI in actual process ancestry and refuses shared-server ancestors,
+   unreadable ancestry, and Desktop dispatch. Ancestry never chooses a client.
+   An independent hook ancestry/argument observation is still required for
+   acceptance; the declaration alone does not prove current-event binding.
 2. **Skills** use the loaded `skills/*/SKILL.md`, explicit runtime context, and
    named operations in `hooks/skill_procedures.py`. The loaded skill and imported
    runtime must belong to the same installation. Paired host references contain

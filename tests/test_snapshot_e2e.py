@@ -1,4 +1,5 @@
 """Real native child capture feeds the invoking host's recall summary pipeline."""
+import io
 import json
 import os
 from pathlib import Path
@@ -46,7 +47,8 @@ def selected_host_context(selected_host_context, host):
         yield selected
 
 
-def test_snapshot_e2e_pipeline(selected_host_context, monkeypatch):
+@pytest.mark.parametrize("skill", ["recall", "standup"])
+def test_snapshot_e2e_pipeline(selected_host_context, monkeypatch, skill):
     context = selected_host_context
     before_source = context.transcript_path.read_bytes()
     def child(event):
@@ -86,18 +88,26 @@ def test_snapshot_e2e_pipeline(selected_host_context, monkeypatch):
     def execute(ctx, operation, request):
         assert ctx is context
         seen.append(operation)
-        return ai_backend.AIResult('ok', summary, request.input_revision,
+        data = {1: summary} if operation == 'session_summaries' else summary
+        return ai_backend.AIResult('ok', data, request.input_revision,
                                    backend=context.host, model='actual-synthetic-model')
     monkeypatch.setattr(ai_backend, 'execute_ai', execute)
+    from skill_procedures import run_operation
+    stdout, stderr = io.StringIO(), io.StringIO()
+    result = run_operation(context, skill, 'upgrade-batch', {
+        'paths': queue['unsummarized'],
+        'project': context.canonical_project_root.name,
+    }, stdout, stderr)
+    assert result == 0, stderr.getvalue()
+    upgrades = json.loads(stdout.getvalue())
+    assert {row['path'] for row in upgrades} == {str(snapshot), str(session)}
+    assert all(row['status'].startswith('Upgraded ') for row in upgrades), upgrades
     for path in (snapshot, session):
-        status = obsidian_utils.upgrade_unsummarized_note(str(path), str(context.vault_path),
-                            'claude-sessions', context.canonical_project_root.name)[0]
-        assert status.startswith('Upgraded '), status
         fields = path.read_text()
         assert obsidian_utils.parse_frontmatter_field(fields, 'status') == 'summarized'
         assert obsidian_utils.parse_frontmatter_field(fields, 'summary_revision') == obsidian_utils.parse_frontmatter_field(fields, 'capture_revision')
         assert 'Keep all synthetic facts.' in fields
-    assert sorted(seen) == ['session_summary', 'snapshot_summary']
+    assert seen == ['snapshot_summary', 'session_summaries']
     brief = obsidian_utils.build_context_brief(str(context.vault_path), 'claude-sessions',
                         'claude-insights', context.canonical_project_root.name)
     assert 'Native pipeline summary.' in brief

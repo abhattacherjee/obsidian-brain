@@ -13,6 +13,7 @@ HOSTS = frozenset({'claude', 'codex'})
 MODULES = {}
 NODE_ANALYSIS = {}
 IMPORT_TARGETS = {}
+BINDING_NAMES = {}
 SOURCE_FILES = {}
 RESOLVED_PATHS = {}
 
@@ -178,6 +179,7 @@ def pytest_configure(config):
     MODULES.clear()
     NODE_ANALYSIS.clear()
     IMPORT_TARGETS.clear()
+    BINDING_NAMES.clear()
     config.addinivalue_line('markers', 'host_only(host, reason, capability): declared native-format exception')
 
 
@@ -204,11 +206,14 @@ def _calls(node, imports=None, bindings=None):
                 yield call.func.attr
 
 
-def _scope(item, capabilities, launchers=(), errors=None):
+def _scope(item, capabilities, launchers=(), errors=None, analysis_cache=None):
     def reject(message):
         if errors is None:
             raise pytest.UsageError(message)
         errors.append(message)
+    # Cache only pure definition analysis. Matrix contents are part of the key,
+    # so a changed contract cannot reuse a previous validation result.
+    matrix_key = hashlib.sha256(json.dumps([capabilities, launchers], sort_keys=True).encode()).digest()
     root = _resolved(Path(str(item.config.rootpath)))
     search = [Path(str(item.path)).parent, root, root / 'hooks', root / 'scripts',
               root / 'tests']
@@ -337,6 +342,32 @@ def _scope(item, capabilities, launchers=(), errors=None):
             continue
         seen.add(identity)
         imports, definitions, constants = module(path)
+        definition_key = (_resolved(path), name)
+        if definition_key not in BINDING_NAMES:
+            BINDING_NAMES[definition_key] = frozenset(
+                node.id for definition in definitions.get(name, [])
+                for node in _node_analysis(definition)[0]
+                if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load))
+        # Unread parameters cannot affect aliases, calls or child arguments.
+        # Every string read by this definition keeps its exact value.
+        effective_bindings = tuple(sorted((key, value) for key, value in bindings.items()
+                                         if key in BINDING_NAMES[definition_key]))
+        cache_key = (root, tuple(search), definition_key, effective_bindings,
+                     SOURCE_FILES[_resolved(path)][2], matrix_key)
+        cached = analysis_cache.get(cache_key) if analysis_cache is not None else None
+        if cached is not None:
+            children, found_calls, found_scope, diagnostics = cached
+            pending.extend((child_path, child_name, dict(child_bindings))
+                           for child_path, child_name, child_bindings in children)
+            calls.update(found_calls)
+            launcher_scope.update(found_scope)
+            for diagnostic in diagnostics:
+                reject(f'{item.nodeid}: {diagnostic}')
+            continue
+        previous_calls, previous_scope = calls, launcher_scope
+        calls, launcher_scope = set(), set()
+        pending_start = len(pending)
+        error_start = len(errors) if errors is not None else 0
         for definition in definitions.get(name, []):
             local_bindings = dict(constants, **bindings)
             imports = dict(imports)
@@ -456,6 +487,16 @@ def _scope(item, capabilities, launchers=(), errors=None):
                 elif (contract.get('scope') not in {'support', 'structural'}
                       or not contract.get('reason')):
                     reject(f'{item.nodeid}: launcher exemption needs a reviewed reason')
+        if analysis_cache is not None:
+            diagnostics = tuple(message.removeprefix(item.nodeid + ': ')
+                                for message in (errors[error_start:] if errors is not None else ()))
+            children = tuple((child_path, child_name, tuple(sorted(child_bindings.items())))
+                             for child_path, child_name, child_bindings in pending[pending_start:])
+            analysis_cache[cache_key] = (children, frozenset(calls),
+                                         frozenset(launcher_scope), diagnostics)
+        previous_calls.update(calls)
+        previous_scope.update(launcher_scope)
+        calls, launcher_scope = previous_calls, previous_scope
     return launcher_scope | {entry['id'] for entry in capabilities
                              if calls.intersection(entry.get('calls', []))}
 
@@ -486,8 +527,9 @@ def pytest_collection_modifyitems(config, items):
     entries = matrix['capabilities']
     by_id = {entry['id']: entry for entry in entries}
     errors, paired = [], {}
+    analysis_cache = {}
     for item in items:
-        scope = _scope(item, entries, matrix.get('launchers', []), errors)
+        scope = _scope(item, entries, matrix.get('launchers', []), errors, analysis_cache)
         if not scope:
             continue
         marker = item.get_closest_marker('host_only')
