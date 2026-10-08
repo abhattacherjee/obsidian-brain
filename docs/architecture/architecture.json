@@ -3,7 +3,7 @@
   "displayName": "Obsidian Brain",
   "version": "3.8.1",
   "tagline": "A plugin that stores session capture and curated knowledge in an Obsidian vault. Shared runtime logic serves Claude and Codex; installed client certification requires separate native evidence.",
-  "lastUpdated": "2026-10-06",
+  "lastUpdated": "2026-10-08",
   "repository": "https://github.com/abhattacherjee/obsidian-brain",
   "defaultBranch": "main",
   "techStack": {
@@ -1303,7 +1303,7 @@
             "scripts/dev-test/loaded_resource_root.py",
             "scripts/dev-test/validate-host-contracts.py"
           ],
-          "purpose": "Validates loaded roots and complete runtime packages before atomic cache publication; exact-byte rollback protects failed installs and version synchronization, including architecture HTML embedded metadata. Installed metadata proof does not certify current-client binding."
+          "purpose": "Validates loaded roots and complete runtime packages before atomic cache publication. Codex backups and temporary packages stay outside plugins in owned, private recovery storage on the cache filesystem. Exact-byte rollback preserves permissions; legacy backups remain restorable. Version synchronization includes architecture HTML embedded metadata. Installed metadata proof does not certify current-client binding."
         },
         {
           "id": "runtime-gates-tools",

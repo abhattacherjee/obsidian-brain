@@ -368,6 +368,48 @@ def native_hooks_inventory(source, home):
         sys.path.pop(0)
 
 
+def _recovery_paths(home, cache):
+    """Keep recoverable runtimes outside native plugin discovery."""
+    identity = hashlib.sha256(str(cache.absolute()).encode()).hexdigest()
+    root = home / '.obsidian-brain-dev-install' / identity
+    return root / 'backup', root / 'config.json'
+
+
+def _move_owned_tree(source, target):
+    """Preserve root permissions when moving read-only directories across parents."""
+    _package_tree._owned_path(source)
+    mode = stat.S_IMODE(source.stat().st_mode)
+    changed = not mode & stat.S_IWUSR
+    if changed:
+        source.chmod(mode | stat.S_IWUSR)
+    try:
+        os.rename(source, target)
+    except BaseException:
+        if changed:
+            source.chmod(mode)
+        raise
+    if changed:
+        try:
+            target.chmod(mode)
+        except BaseException:
+            os.rename(target, source)
+            source.chmod(mode)
+            raise
+
+
+def _private_recovery_directory(home, cache):
+    root = _recovery_paths(home, cache)[0].parent
+    _no_links(root)
+    for path in (root.parent, root):
+        path.mkdir(mode=0o700, exist_ok=True)
+        info = path.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
+            raise ValueError('Installer recovery directory is not private and owned')
+    if root.stat().st_dev != cache.parent.stat().st_dev:
+        raise ValueError('Installer recovery must be on the cache filesystem')
+    return root
+
+
 def _select(home, config, cache_path=None):
     if cache_path is not None:
         chosen = Path(cache_path).absolute()
@@ -375,7 +417,8 @@ def _select(home, config, cache_path=None):
         relative = chosen.relative_to((home / 'plugins/cache').absolute())
         if (len(relative.parts) != 3 or relative.parts[1] != 'obsidian-brain'
                 or not re.fullmatch(r'\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.+-]+)?', relative.parts[2])
-                or not (chosen.is_dir() or chosen.with_name(chosen.name + '.bak').is_dir())):
+                or not (chosen.is_dir() or chosen.with_name(chosen.name + '.bak').is_dir()
+                        or _recovery_paths(home, chosen)[0].is_dir())):
             raise ValueError('Explicit cache path is not an installed plugin version')
         return 'obsidian-brain@' + relative.parts[0], chosen
     raise ValueError('Codex dev install requires an explicit native installed --cache-path')
@@ -417,8 +460,13 @@ def run(mode, source, home, fault=lambda point: None, cache_path=None):
     original = config_path.read_bytes() if config_path.exists() else b''
     parsed = _toml(original)
     key, cache = _select(home, parsed, cache_path)
-    backup = cache.with_name(cache.name + '.bak')
-    config_record = backup.with_name(backup.name + '.config.json')
+    backup, config_record = _recovery_paths(home, cache)
+    legacy_backup = cache.with_name(cache.name + '.bak')
+    legacy_record = legacy_backup.with_name(legacy_backup.name + '.config.json')
+    if legacy_backup.exists() or legacy_record.exists():
+        if backup.exists() or config_record.exists():
+            raise ValueError('Both legacy and private backups exist; explicit recovery required')
+        backup, config_record = legacy_backup, legacy_record
     if mode == 'status':
         print(json.dumps({'host': 'codex', 'version': cache.name, 'dev_active': backup.exists()}))
         return 0
@@ -427,33 +475,38 @@ def run(mode, source, home, fault=lambda point: None, cache_path=None):
     if not (source / 'hooks/obsidian_utils.py').is_file():
         raise ValueError('Source is not an obsidian-brain checkout')
     _no_links(cache)
-    with _ownership(cache.parent / '.dev-install.lock'):
+    recovery = _private_recovery_directory(home, cache)
+    with _ownership(recovery / '.dev-install.lock'):
         if config_path.exists() and config_path.read_bytes() != original:
             raise ValueError('Native configuration changed during preparation')
         if mode == 'restore':
             if not backup.is_dir() or not config_record.is_file():
                 print('No complete backup recovery record found; nothing to restore.', file=sys.stderr)
                 return 4
+            _package_tree._owned_path(backup)
             _validate_restore_backup(backup)
             _no_links(config_record)
+            record_info = config_record.stat()
+            if record_info.st_uid != os.geteuid() or record_info.st_mode & 0o077:
+                raise ValueError('Backup configuration record is not private and owned')
             record = json.loads(config_record.read_text())
             if record['key'] != key:
                 raise ValueError('Backup belongs to another plugin selection')
             restored_config = _patch_entry(original, key, record['entry'].encode() if record['entry'] is not None else None)
-            parked = cache.with_name(cache.name + '.restore.partial')
+            parked = recovery / 'restore.partial'
             if parked.exists():
                 raise ValueError('A prior interrupted restore needs recovery')
             had_cache = cache.exists()
             if had_cache:
-                os.rename(cache, parked)
+                _move_owned_tree(cache, parked)
             try:
-                os.rename(backup, cache)
+                _move_owned_tree(backup, cache)
                 _atomic(config_path, restored_config)
             except BaseException:
                 if cache.exists():
-                    os.rename(cache, backup)
+                    _move_owned_tree(cache, backup)
                 if had_cache:
-                    os.rename(parked, cache)
+                    _move_owned_tree(parked, cache)
                 raise
             if had_cache:
                 _package_tree.remove_owned_tree(parked)
@@ -462,6 +515,9 @@ def run(mode, source, home, fault=lambda point: None, cache_path=None):
             return 0
         if backup.exists() or config_record.exists():
             raise ValueError('Backup already exists; restore before another install')
+        failed = recovery / 'failed.partial'
+        if failed.exists():
+            raise ValueError('A prior failed install needs recovery')
         validate_native_cache(home, key, native_hooks_inventory(source, home), cache)
         _, old_entry, _ = _selection_block(original, key)
         if old_entry is None:
@@ -479,7 +535,7 @@ def run(mode, source, home, fault=lambda point: None, cache_path=None):
                 replacement = old_entry.rstrip(b'\r\n') + b'\nenabled = true\n'
 
         updated = _patch_entry(original, key, replacement)
-        stage = Path(tempfile.mkdtemp(prefix='.dev-package-', dir=cache.parent))
+        stage = Path(tempfile.mkdtemp(prefix='.dev-package-', dir=recovery))
         swapped = False
         try:
             _snapshot(source, stage)
@@ -487,7 +543,7 @@ def run(mode, source, home, fault=lambda point: None, cache_path=None):
             _atomic(config_record, json.dumps({'key': key, 'entry': old_entry.decode() if old_entry is not None else None,
                 'original_config_sha256': hashlib.sha256(original).hexdigest(),
                 'installed_config_sha256': hashlib.sha256(updated).hexdigest()}).encode())
-            os.rename(cache, backup)
+            _move_owned_tree(cache, backup)
             os.rename(stage, cache)
             swapped = True
             fault('after_cache_swap')
@@ -498,12 +554,11 @@ def run(mode, source, home, fault=lambda point: None, cache_path=None):
             validate_native_cache(home, key, native_hooks_inventory(source, home), cache)
         except BaseException:
             if swapped:
-                failed = cache.with_name(cache.name + '.failed.partial')
-                os.rename(cache, failed)
-                os.rename(backup, cache)
+                _move_owned_tree(cache, failed)
+                _move_owned_tree(backup, cache)
                 _package_tree.remove_owned_tree(failed)
             elif backup.exists() and not cache.exists():
-                os.rename(backup, cache)
+                _move_owned_tree(backup, cache)
             # Restore our selected entry while preserving unrelated concurrent edits.
             if config_path.exists():
                 current = config_path.read_bytes()

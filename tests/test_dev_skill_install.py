@@ -163,10 +163,12 @@ def test_install_preserves_existing_check_modules(tmp_path: Path) -> None:
 
 
 def test_install_creates_backup_before_writing(tmp_path: Path) -> None:
-    """The install branch backs up the cache to <version>.bak before mutating."""
+    """The install branch preserves the released cache before mutating."""
     proc = _run_install(tmp_path)
     assert proc.returncode == 0
-    backup_dir = tmp_path / "home" / native_folder() / "plugins" / "cache" / "claude-code-skills" / "obsidian-brain" / "2.3.0.bak"
+    from tests.native_install_test_helpers import backup_path
+    home = tmp_path / "home"
+    backup_dir = backup_path(home, home / native_folder() / "plugins/cache/claude-code-skills/obsidian-brain/2.3.0")
     assert backup_dir.is_dir()
     # Backup retains the released hook content (not the fake repo content).
     backup_hook = backup_dir / "hooks" / "obsidian_utils.py"

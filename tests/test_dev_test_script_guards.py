@@ -149,7 +149,11 @@ def _codex_guard_case(name, tmp_path, monkeypatch, **parameters):
     config = home / '.codex/config.toml'
     original = _tree_bytes(cache)
     original_config = config.read_bytes()
-    backup = cache.with_name(cache.name + '.bak')
+    from tests.native_install_test_helpers import backup_path
+    backup = backup_path(home, cache)
+    if name in {'test_restore_refuses_to_promote_an_incomplete_backup',
+                'test_bak_only_cache_reports_instead_of_exiting_silently'}:
+        backup = cache.with_name(cache.name + '.bak')
     mode = 'install'
     expect = 'refused'
     if name == 'test_sentinel_guard_rejects_non_checkout':
@@ -1497,7 +1501,8 @@ def test_restore_rejects_backup_damaged_after_install(tmp_path, host, selected_h
         config = None
     installed = run('install')
     assert installed.returncode == 0, installed.stderr
-    backup = cache.with_name(cache.name + '.bak')
+    from tests.native_install_test_helpers import backup_path
+    backup = backup_path(home, cache)
     if shape == 'missing-hooks-file':
         (backup / 'hooks/obsidian_utils.py').unlink()
     else:

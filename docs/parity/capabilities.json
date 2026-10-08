@@ -1262,25 +1262,25 @@
       "source": "tests/test_dev_skill_install.py",
       "expression": "subprocess.run(['bash', str(repo / 'scripts' / 'test-dev-skill.sh'), 'install', '--host', context.host, '--source', str(repo), '--cache-path', str(home / native_folder() / 'plugins/cache/claude-code-skills/obsidian-brain/2.3.0')], env=env, capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL)",
       "capability": "installation.fresh_upgrade",
-      "source_sha256": "83ef322a026631e8f010a2bf41189819dc61337f8135b33ed8b3d8ee7394338a"
+      "source_sha256": "0c9ef3731db582c4d68d8eb1c5492a22439e1c6deba5d3faad00d4702b7c8ee5"
     },
     {
       "source": "tests/test_dev_skill_install.py",
       "expression": "subprocess.run(['bash', str(repo / 'scripts' / 'test-dev-skill.sh'), 'install', '--host', context.host, '--source', str(repo), '--cache-path', str(home / native_folder() / 'plugins/cache/claude-code-skills/obsidian-brain/2.3.0')], env=env, capture_output=True, text=True, timeout=10, stdin=subprocess.DEVNULL)",
       "capability": "installation.fresh_upgrade",
-      "source_sha256": "83ef322a026631e8f010a2bf41189819dc61337f8135b33ed8b3d8ee7394338a"
+      "source_sha256": "0c9ef3731db582c4d68d8eb1c5492a22439e1c6deba5d3faad00d4702b7c8ee5"
     },
     {
       "source": "tests/test_dev_test_script_guards.py",
       "expression": "subprocess.run([_BASH, str(script), cmd, '--host', context.host, '--source', str(script.parent.parent)], env=env, capture_output=True, text=True, timeout=10, stdin=subprocess.DEVNULL)",
       "capability": "installation.rollback",
-      "source_sha256": "dcad93802236b9e26438c6fe70114b91f466ddb929cb2854272907dd799c9efb"
+      "source_sha256": "afaa6dc46b882d0ef868375114c3b72776457bb71a692fa11e3061ba751cb703"
     },
     {
       "source": "tests/test_dev_test_script_guards.py",
       "expression": "subprocess.run([_BASH, str(SCRIPT_PATH), mode, '--host', context.host, '--source', str(source), '--cache-path', str(cache)], env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)",
       "capability": "installation.rollback",
-      "source_sha256": "dcad93802236b9e26438c6fe70114b91f466ddb929cb2854272907dd799c9efb"
+      "source_sha256": "afaa6dc46b882d0ef868375114c3b72776457bb71a692fa11e3061ba751cb703"
     },
     {
       "source": "tests/test_hook_dedup_guard.py",
@@ -2016,7 +2016,7 @@
     {
       "source": "tests/test_host_package_install.py",
       "expression": "subprocess.run([sys.executable, '-S', '-c', driver, str(public_script), mode, str(source), str(cache)], env=environment, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)",
-      "source_sha256": "e59ae90e09ac468f38130a289a7d2863d423ddc378f0f0b4fda7d2eea2d258f1",
+      "source_sha256": "96a0c86dd4247004bbac5d3af689c2e380feba993ccfae57980c154cbc6e4326",
       "scope": "support",
       "reason": "Runs only the copied installer in disposable home/cache/config with metadata-only native inventory. No installed client, AI, source capture or live vault runs; validates Python 3.9 stdlib packaging and exact backup restoration."
     },
@@ -2079,7 +2079,7 @@
     {
       "source": "tests/test_readonly_dev_install.py",
       "expression": "subprocess.run(['bash', str(source / 'scripts/test-dev-skill.sh'), 'restore', '--host', selected_host_context.host, '--source', str(source), '--cache-path', str(cache)], env=metadata_environment(home), stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)",
-      "source_sha256": "0308581eb2add3c23020526cdbde0da747eab8f1a168863d1cb6d6213854530a",
+      "source_sha256": "e98f9fc524f7da5227ba418ba879ea283795c47faa6ee34d33e85ccf9e31fcb9",
       "scope": "support",
       "reason": "Runs only the copied restore script against a disposable private home and read-only partial cache, with metadata-only native inventory. Checks exact backup restoration and unchanged source permissions. No installed native client, AI, live configuration or vault runs; the enclosing paired test retains its host context."
     }

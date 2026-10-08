@@ -49,7 +49,8 @@ def test_readonly_source_install_and_readonly_partial_restore(tmp_path, selected
     source_before = inventory(source)
     result = _run_install(tmp_path, home)
     assert result.returncode == 0, result.stderr
-    backup = cache.with_name(cache.name + '.bak')
+    from tests.native_install_test_helpers import backup_path
+    backup = backup_path(home, cache)
     assert inventory(backup) == original
     assert inventory(source) == source_before
     for p in (cache, *cache.rglob('*')):

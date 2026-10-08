@@ -25,8 +25,7 @@ version = load('version_sync')
 def metadata_only_transport(monkeypatch):
     def inventory(source, home):
         caches = [path for path in (home / 'plugins/cache').glob('*/obsidian-brain/*')
-                  if path.is_dir() and not path.name.endswith('.bak')
-                  and ((path / '.claude-plugin/plugin.json').is_file()
+                  if path.is_dir() and ((path / '.claude-plugin/plugin.json').is_file()
                        or (path / '.codex-plugin/plugin.json').is_file())]
         return {'data': [{'errors': [], 'hooks': [
             {'pluginId': 'obsidian-brain@' + cache.parent.parent.name,
@@ -90,7 +89,9 @@ def test_codex_install_recursive_runtime_and_restore_plugin_entry(package):
 @pytest.mark.parametrize('point', ['after_snapshot', 'after_cache_swap', 'after_config_swap'])
 def test_codex_install_failure_rolls_back_both_resources(package, point):
     source, home, cache, config = package
+    cache.chmod(0o555)
     original = config.read_bytes()
+    original_modes = {str(p.relative_to(cache)): p.stat().st_mode & 0o7777 for p in [cache, *cache.rglob('*')]}
     def fail(at):
         if at == point:
             raise OSError('synthetic injected failure')
@@ -98,7 +99,8 @@ def test_codex_install_failure_rolls_back_both_resources(package, point):
         installer.run('install', source, home, fault=fail, cache_path=cache)
     assert config.read_bytes() == original
     assert (cache / 'released.txt').read_text() == 'original exact bytes'
-    assert not cache.with_name(cache.name + '.bak').exists()
+    assert not installer._recovery_paths(home, cache)[0].exists()
+    assert {str(p.relative_to(cache)): p.stat().st_mode & 0o7777 for p in [cache, *cache.rglob('*')]} == original_modes
 
 
 def test_restore_preserves_unrelated_config_edits(package):
@@ -519,10 +521,123 @@ raise SystemExit(module.main())
         assert result.returncode == 0, result.stderr
         if mode == 'install':
             installed = True
-            assert cache.with_name(cache.name + '.bak').is_dir()
+            assert installer._recovery_paths(home, cache)[0].is_dir()
             assert installer._toml(config.read_bytes())['plugins']['obsidian-brain@synthetic-market']['enabled'] is True
         elif mode == 'restore':
             installed = False
     assert config.read_bytes() == original
     assert (cache / 'released.txt').read_text() == 'original exact bytes'
     assert not cache.with_name(cache.name + '.bak').exists()
+
+
+@pytest.mark.parametrize('failure', [None, 'after_snapshot', 'after_cache_swap', 'after_config_swap'])
+def test_native_discovery_never_sees_backup_or_staged_runtime(package, monkeypatch, failure):
+    source, home, cache, config = package
+    original = config.read_bytes()
+    original_bytes = {str(p.relative_to(cache)): p.read_bytes() for p in cache.rglob('*') if p.is_file()}
+    original_modes = {str(p.relative_to(cache)): p.stat().st_mode & 0o7777 for p in [cache, *cache.rglob('*')]}
+    def inventory(source, home):
+        # Native discovery scans every descriptor, including .bak/dot directories.
+        roots = [p.parent.parent for p in (home / 'plugins/cache').rglob('plugin.json')
+                 if p.parent.name in {'.claude-plugin', '.codex-plugin'}]
+        roots = set(roots)
+        assert roots == {cache}, 'Backup/staging must not enter native discovery'
+        return {'data': [{'errors': [], 'hooks': [{'pluginId': 'obsidian-brain@synthetic-market',
+            'sourcePath': str(installer._selected_hooks(p)[0])} for p in roots]}]}
+    monkeypatch.setattr(installer, 'native_hooks_inventory', inventory)
+    def inspect(point):
+        inventory(source, home)
+        if point == failure:
+            raise OSError('synthetic rollback control')
+    if failure is None:
+        assert installer.run('install', source, home, fault=inspect, cache_path=cache) == 0
+        inventory(source, home)
+        assert installer.run('restore', source, home, cache_path=cache) == 0
+    else:
+        with pytest.raises(OSError, match='synthetic rollback'):
+            installer.run('install', source, home, fault=inspect, cache_path=cache)
+    inventory(source, home)
+    assert config.read_bytes() == original
+    assert {str(p.relative_to(cache)): p.read_bytes() for p in cache.rglob('*') if p.is_file()} == original_bytes
+    assert {str(p.relative_to(cache)): p.stat().st_mode & 0o7777 for p in [cache, *cache.rglob('*')]} == original_modes
+
+
+def test_restore_accepts_existing_legacy_backup(package):
+    source, home, cache, config = package
+    original = config.read_bytes()
+    installer.run('install', source, home, cache_path=cache)
+    backup, record = installer._recovery_paths(home, cache)
+    legacy = cache.with_name(cache.name + '.bak')
+    backup.rename(legacy)
+    record.rename(legacy.with_name(legacy.name + '.config.json'))
+    assert installer.run('restore', source, home, cache_path=cache) == 0
+    assert config.read_bytes() == original
+    assert (cache / 'released.txt').read_text() == 'original exact bytes'
+    assert not legacy.exists()
+
+
+@pytest.mark.parametrize('shape', ['public', 'symlink', 'stale-failed'])
+def test_private_recovery_refuses_unsafe_paths_before_swap(package, shape):
+    source, home, cache, config = package
+    original = config.read_bytes()
+    recovery = installer._recovery_paths(home, cache)[0].parent
+    recovery.parent.mkdir(mode=0o700)
+    if shape == 'public':
+        recovery.parent.chmod(0o755)
+    elif shape == 'symlink':
+        recovery.symlink_to(cache, target_is_directory=True)
+    else:
+        recovery.mkdir(mode=0o700)
+        (recovery / 'failed.partial').mkdir(mode=0o700)
+        (recovery / 'failed.partial/keep').write_text('owned recovery evidence')
+    with pytest.raises(ValueError):
+        installer.run('install', source, home, cache_path=cache)
+    assert config.read_bytes() == original
+    assert (cache / 'released.txt').read_text() == 'original exact bytes'
+    if shape == 'stale-failed':
+        assert (recovery / 'failed.partial/keep').read_text() == 'owned recovery evidence'
+
+
+@pytest.mark.parametrize('boundary', ['foreign-owner', 'different-volume'])
+def test_recovery_requires_same_volume_and_owner(package, monkeypatch, boundary):
+    source, home, cache, config = package
+    original = config.read_bytes()
+    recovery = installer._recovery_paths(home, cache)[0].parent
+    if boundary == 'foreign-owner':
+        actual_uid = os.geteuid()
+        monkeypatch.setattr(installer.os, 'geteuid', lambda: actual_uid + 1)
+    else:
+        actual_stat = Path.stat
+        def stat_result(path, *args, **kwargs):
+            result = actual_stat(path, *args, **kwargs)
+            if path == recovery:
+                fields = list(result)
+                fields[2] += 1
+                return os.stat_result(fields)
+            return result
+        monkeypatch.setattr(Path, 'stat', stat_result)
+    with pytest.raises(ValueError, match='owned|filesystem'):
+        installer.run('install', source, home, cache_path=cache)
+    assert config.read_bytes() == original
+    assert (cache / 'released.txt').read_text() == 'original exact bytes'
+
+
+def test_readonly_move_mode_failure_restores_active_cache(package, monkeypatch):
+    source, home, cache, config = package
+    cache.chmod(0o555)
+    original = config.read_bytes()
+    original_modes = {str(p.relative_to(cache)): p.stat().st_mode & 0o7777 for p in [cache, *cache.rglob('*')]}
+    backup, record = installer._recovery_paths(home, cache)
+    actual_chmod = Path.chmod
+    def fail_target_mode(path, mode, *args, **kwargs):
+        if path == backup:
+            raise OSError('synthetic target chmod failure')
+        return actual_chmod(path, mode, *args, **kwargs)
+    monkeypatch.setattr(Path, 'chmod', fail_target_mode)
+    with pytest.raises(OSError, match='synthetic target chmod failure'):
+        installer.run('install', source, home, cache_path=cache)
+    assert config.read_bytes() == original
+    assert (cache / 'released.txt').read_text() == 'original exact bytes'
+    assert {str(p.relative_to(cache)): p.stat().st_mode & 0o7777 for p in [cache, *cache.rglob('*')]} == original_modes
+    assert not backup.exists()
+    assert not record.exists()
