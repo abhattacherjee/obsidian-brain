@@ -31,7 +31,7 @@ def _check_workflow_timing_owner(tmp_path, job, block):
     import sys
 
     root = Path(__file__).resolve().parents[1]
-    count, owner = (6, 4) if job == 'coverage-shards' else (4, 0)
+    count, owner = (6, None) if job == 'coverage-shards' else (4, 0)
     binaries = tmp_path / 'bin'
     binaries.mkdir()
     driver = binaries / 'driver'
@@ -97,7 +97,7 @@ fi
         if job == 'coverage-shards':
             expected = b'parallel\nserial\n' if index == owner else b'parallel\n'
             assert (work / 'shard-data/.coverage').read_bytes() == expected
-    assert serial_indices == [owner]
+    assert serial_indices == ([] if owner is None else [owner])
 
 
 @pytest.mark.parametrize('job', ['coverage-shards', 'py39-shards'])
@@ -105,16 +105,132 @@ def test_workflow_runs_timing_classes_once_on_the_measured_owner(tmp_path, job):
     _check_workflow_timing_owner(tmp_path, job, _workflow_shard_block(job))
 
 
-@pytest.mark.parametrize('mutation', ['wrong-owner', 'missing-serial'])
-def test_workflow_timing_controls_reject_lost_or_moved_tests(tmp_path, mutation):
+def test_workflow_rejects_duplicate_serial_tests_on_an_ordinary_shard(tmp_path):
     block = _workflow_shard_block('coverage-shards')
-    if mutation == 'wrong-owner':
-        block = block.replace('== 4', '== 0', 1)
-    else:
-        block = '\n'.join('  :' if 'pytest ' in line and 'no:xdist' in line else line
-                          for line in block.splitlines())
+    serial = next(line for line in _workflow_shard_block('coverage-timing').splitlines()
+                  if 'pytest ' in line)
+    block += '\n' + serial + '\n'
     with pytest.raises(AssertionError, match='Wrong timing owner'):
         _check_workflow_timing_owner(tmp_path, 'coverage-shards', block)
+
+
+def _check_dedicated_timing_command(tmp_path, block):
+    import os
+    import subprocess
+    import sys
+
+    binaries = tmp_path / 'bin'
+    binaries.mkdir()
+    driver = binaries / 'pytest'
+    driver.write_text('#!' + sys.executable + '\n' + '''
+import json, pathlib, sys
+pathlib.Path('argv.json').write_text(json.dumps(sys.argv[1:]))
+pathlib.Path('.coverage').write_bytes(b'timing coverage')
+''')
+    driver.chmod(0o700)
+    env = dict(os.environ, PATH=str(binaries) + os.pathsep + os.environ['PATH'],
+               RUNNER_TEMP=str(tmp_path))
+    result = subprocess.run(['bash', '-c', block], cwd=tmp_path, env=env,
+                            stdin=subprocess.DEVNULL, capture_output=True,
+                            text=True, timeout=20)
+    assert result.returncode == 0, result.stdout + result.stderr
+    args = json.loads((tmp_path / 'argv.json').read_text())
+    assert [arg for arg in args if arg.startswith('tests/')] == [
+        'tests/test_security.py::TestDecisionTimeIsBounded',
+        'tests/test_security.py::TestPatternDecisionTimeIsBounded']
+    assert 'no:xdist' in args and '-n' not in args
+    assert '--cov=hooks' in args and '--cov-append' not in args
+    assert 'parity_collection_plugin' in args
+    assert 'docs/parity/capabilities.json' in args
+    assert '--junitxml=' + str(tmp_path / 'timing-data/serial-timing.xml') in args
+    assert (tmp_path / 'timing-data/.coverage').read_bytes() == b'timing coverage'
+
+
+def test_workflow_dedicated_timing_job_executes_exact_serial_tests(tmp_path):
+    _check_dedicated_timing_command(tmp_path, _workflow_shard_block('coverage-timing'))
+
+
+@pytest.mark.parametrize('mutation', ['missing-serial', 'wrong-selector', 'xdist',
+                                   'missing-coverage', 'append', 'missing-plugin',
+                                   'missing-copy'])
+def test_dedicated_timing_command_controls_reject_broken_runs(tmp_path, mutation):
+    block = _workflow_shard_block('coverage-timing')
+    changes = {'wrong-selector': ('TestPatternDecisionTimeIsBounded', 'OtherTests'),
+               'xdist': ('-p no:xdist', '-n 4'),
+               'missing-coverage': ('--cov=hooks', ''),
+               'append': ('--cov=hooks', '--cov=hooks --cov-append'),
+               'missing-plugin': ('-p parity_collection_plugin', '')}
+    if mutation in changes:
+        block = block.replace(*changes[mutation], 1)
+    else:
+        block = '\n'.join(':' if ('pytest ' in line if mutation == 'missing-serial'
+                                  else 'cp .coverage' in line) else line
+                          for line in block.splitlines())
+    with pytest.raises((AssertionError, FileNotFoundError)):
+        _check_dedicated_timing_command(tmp_path, block)
+
+
+@pytest.mark.parametrize('ordinary,timing', [('success', 'success'),
+                                          ('failure', 'success'), ('success', 'failure'),
+                                          ('success', 'cancelled'), ('skipped', 'success')])
+def test_workflow_combined_gate_requires_both_job_results(tmp_path, ordinary, timing):
+    import os
+    import re
+    import subprocess
+
+    source = (Path(__file__).resolve().parents[1] / '.github/workflows/ci.yml').read_text()
+    section = re.split(r'\n  \S', source.split('\n  python-tests:\n', 1)[1], maxsplit=1)[0]
+    assert 'needs: [coverage-shards, coverage-timing]' in section
+    first = section.split('      - uses:', 1)[0]
+    environment = dict(os.environ)
+    results = {'coverage-shards': ordinary, 'coverage-timing': timing}
+    for key, job in re.findall(r'(\w+): \$\{\{ needs\.([\w-]+)\.result \}\}', first):
+        environment[key] = results[job]
+    command = first.split('        run: ', 1)[1].strip()
+    result = subprocess.run(['bash', '-c', 'set -eu\n' + command], cwd=tmp_path,
+                            env=environment, stdin=subprocess.DEVNULL,
+                            capture_output=True, timeout=10)
+    assert (result.returncode == 0) == (ordinary == timing == 'success')
+    assert 'name: coverage-timing\n' in section
+    assert '--timing-artifact "$RUNNER_TEMP/timing-artifact"' in section
+
+
+def _check_combined_workflow_command(tmp_path, command):
+    import os
+    import subprocess
+    import sys
+
+    binaries = tmp_path / 'bin'
+    binaries.mkdir()
+    driver = binaries / 'python'
+    driver.write_text('#!' + sys.executable + '\n' + '''
+import json, pathlib, sys
+pathlib.Path('combined-argv.json').write_text(json.dumps(sys.argv[1:]))
+''')
+    driver.chmod(0o700)
+    environment = dict(os.environ, PATH=str(binaries) + os.pathsep + os.environ['PATH'],
+                       RUNNER_TEMP=str(tmp_path))
+    result = subprocess.run(['bash', '-c', command], cwd=tmp_path, env=environment,
+                            stdin=subprocess.DEVNULL, capture_output=True, timeout=10)
+    assert result.returncode == 0
+    args = json.loads((tmp_path / 'combined-argv.json').read_text())
+    assert args == ['scripts/ci-checks/test_shards.py', 'coverage', '--count', '6',
+                    '--prefix', 'coverage-shard', '--artifacts',
+                    str(tmp_path / 'coverage-artifacts'), '--timing-artifact',
+                    str(tmp_path / 'timing-artifact')]
+
+
+@pytest.mark.parametrize('omit_timing', [False, True])
+def test_combined_workflow_command_must_include_timing_coverage(tmp_path, omit_timing):
+    source = (Path(__file__).resolve().parents[1] / '.github/workflows/ci.yml').read_text()
+    command = source.split('      - name: Require complete partition and combined 90% coverage\n',
+                           1)[1].split('        run: ', 1)[1].splitlines()[0]
+    if omit_timing:
+        command = command.replace(' --timing-artifact "$RUNNER_TEMP/timing-artifact"', '')
+        with pytest.raises(AssertionError):
+            _check_combined_workflow_command(tmp_path, command)
+    else:
+        _check_combined_workflow_command(tmp_path, command)
 
 
 @pytest.fixture
@@ -133,6 +249,133 @@ def corpus(tmp_path):
         folder.mkdir()
         shards.write_manifest(root, 2, index, folder / 'manifest.json')
     return root, artifacts
+
+
+@pytest.fixture
+def timing_artifact(tmp_path):
+    import xml.etree.ElementTree as ET
+
+    folder = tmp_path / 'timing-artifact'
+    folder.mkdir()
+    (folder / '.coverage').write_bytes(b'controlled coverage')
+    suite = ET.Element('testsuite', tests='256', failures='0', errors='0', skipped='0')
+    for name in ('TestDecisionTimeIsBounded', 'TestPatternDecisionTimeIsBounded'):
+        for index in range(128):
+            ET.SubElement(suite, 'testcase', classname='tests.test_security.' + name,
+                          name='case_' + str(index), file='tests/test_security.py')
+    ET.ElementTree(suite).write(folder / 'serial-timing.xml')
+    return folder
+
+
+def test_complete_timing_receipt_is_required(timing_artifact):
+    assert shards.validate_timing_artifact(timing_artifact) == timing_artifact / '.coverage'
+
+
+@pytest.mark.parametrize('damage', ['missing-data', 'empty-data', 'symlink-data',
+                                   'missing-report', 'invalid-xml', 'extra-file',
+                                   'missing-case', 'extra-case', 'duplicate-case',
+                                   'wrong-class', 'wrong-file', 'failure', 'error',
+                                   'skipped', 'header-failure', 'header-count'])
+def test_timing_artifact_fails_closed(timing_artifact, damage):
+    import xml.etree.ElementTree as ET
+
+    folder = timing_artifact
+    data, report = folder / '.coverage', folder / 'serial-timing.xml'
+    if damage == 'missing-data':
+        data.unlink()
+    elif damage == 'empty-data':
+        data.write_bytes(b'')
+    elif damage == 'symlink-data':
+        data.rename(folder.parent / 'outside-coverage')
+        data.symlink_to(folder.parent / 'outside-coverage')
+    elif damage == 'missing-report':
+        report.unlink()
+    elif damage == 'invalid-xml':
+        report.write_text('<broken')
+    elif damage == 'extra-file':
+        (folder / 'unexpected').touch()
+    else:
+        tree = ET.parse(report)
+        suite = tree.getroot()
+        case = suite[0]
+        if damage == 'missing-case':
+            suite.remove(case)
+        elif damage == 'extra-case':
+            ET.SubElement(suite, 'testcase', **dict(case.attrib, name='extra'))
+        elif damage == 'duplicate-case':
+            suite[1].attrib = dict(case.attrib)
+        elif damage == 'wrong-class':
+            case.set('classname', 'tests.test_security.OtherTests')
+        elif damage == 'wrong-file':
+            case.set('file', 'tests/test_other.py')
+        elif damage == 'header-failure':
+            suite.set('failures', '1')
+        elif damage == 'header-count':
+            suite.set('tests', '257')
+        else:
+            ET.SubElement(case, damage)
+        tree.write(report)
+    with pytest.raises(ValueError):
+        shards.validate_timing_artifact(folder)
+
+
+@pytest.mark.parametrize('unsafe', ['missing', 'symlink'])
+def test_missing_or_unsafe_timing_directory_fails(tmp_path, timing_artifact, unsafe):
+    folder = tmp_path / 'absent'
+    if unsafe == 'symlink':
+        folder.symlink_to(timing_artifact, target_is_directory=True)
+    with pytest.raises(ValueError):
+        shards.validate_timing_artifact(folder)
+
+
+def test_timing_coverage_is_combined_without_weakening_the_gate(corpus, timing_artifact,
+                                                             monkeypatch):
+    root, artifacts = corpus
+    hooks = root / 'hooks'
+    hooks.mkdir()
+    source = hooks / 'timing_only.py'
+    source.write_text('ordinary = 1\ntiming = 2\n')
+    (root / 'setup.cfg').write_text('[coverage:run]\nsource = hooks\n')
+    monkeypatch.chdir(root)
+    for folder in (artifacts / 'shard-0', artifacts / 'shard-1', timing_artifact):
+        data = coverage.CoverageData(basename=str(folder / '.coverage'))
+        data.add_lines({str(source): [2] if folder == timing_artifact else [1]})
+        data.write()
+    with pytest.raises(ValueError, match='below 90%'):
+        shards.combine_coverage(root, artifacts, 2)
+    assert shards.combine_coverage(root, artifacts, 2,
+                                   timing_artifact=timing_artifact) == 100
+    (artifacts / 'shard-1/manifest.json').unlink()
+    with pytest.raises(ValueError, match='Missing or unsafe shard manifest'):
+        shards.combine_coverage(root, artifacts, 2, timing_artifact=timing_artifact)
+
+
+@pytest.mark.parametrize('report_damage', ['missing', 'incomplete'])
+def test_combining_valid_coverage_still_requires_valid_timing_report(
+        corpus, timing_artifact, monkeypatch, report_damage):
+    import xml.etree.ElementTree as ET
+
+    root, artifacts = corpus
+    hooks = root / 'hooks'
+    hooks.mkdir()
+    source = hooks / 'sample.py'
+    source.write_text('covered = 1\n')
+    (root / 'setup.cfg').write_text('[coverage:run]\nsource = hooks\n')
+    monkeypatch.chdir(root)
+    for folder in (artifacts / 'shard-0', artifacts / 'shard-1', timing_artifact):
+        data = coverage.CoverageData(basename=str(folder / '.coverage'))
+        data.add_lines({str(source): [1]})
+        data.write()
+    report = timing_artifact / 'serial-timing.xml'
+    if report_damage == 'missing':
+        report.unlink()
+    else:
+        tree = ET.parse(report)
+        tree.getroot().remove(tree.getroot()[0])
+        tree.write(report)
+    # All three databases give 100%; only report validation may block the gate.
+    with pytest.raises(ValueError):
+        shards.combine_coverage(root, artifacts, 2, timing_artifact=timing_artifact)
 
 
 def test_complete_partition_contains_each_pytest_file_once(corpus):

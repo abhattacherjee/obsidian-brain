@@ -2023,23 +2023,44 @@
     {
       "source": "tests/test_ci_test_shards.py",
       "expression": "subprocess.run(['bash', '-c', prefix + block + tail], cwd=tmp_path, env=environment, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=20)",
-      "source_sha256": "48511326708dbde5968032d5a218bf4296af735cbc65cc7a472f76cd83a508a8",
+      "source_sha256": "e111d92f8c4a5c6cda9705cb4b83e35338fb9e3d9e4e5b143dcd44298e84135d",
       "scope": "structural",
       "reason": "Private preflight shell control: executes the production parallel, serial, coverage and token blocks with a disposable phase driver, controlled exits, fake coverage bytes and a private token. It runs no native client or live service and proves no client capability."
     },
     {
       "source": "tests/test_ci_test_shards.py",
       "expression": "subprocess.run(['bash', '-c', command], cwd=tmp_path, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=20)",
-      "source_sha256": "48511326708dbde5968032d5a218bf4296af735cbc65cc7a472f76cd83a508a8",
+      "source_sha256": "e111d92f8c4a5c6cda9705cb4b83e35338fb9e3d9e4e5b143dcd44298e84135d",
       "scope": "structural",
       "reason": "Private preflight token control: runs the production startup invalidation stanza against a disposable seeded token, then returns controlled failure or interruption exit codes. It kills no process, touches no live approval token and proves no client capability."
     },
     {
       "source": "tests/test_ci_test_shards.py",
       "expression": "subprocess.run(['bash', '-c', compatibility + block.replace('${{ matrix.shard }}', str(index))], cwd=work, env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=20)",
-      "source_sha256": "48511326708dbde5968032d5a218bf4296af735cbc65cc7a472f76cd83a508a8",
+      "source_sha256": "e111d92f8c4a5c6cda9705cb4b83e35338fb9e3d9e4e5b143dcd44298e84135d",
       "scope": "structural",
       "reason": "Private workflow shard control: executes the production Bash block at every matrix index with disposable fake pytest drivers and private artifact bytes. The Python driver runs only the local partition helper. Wrong-owner and missing-serial mutations must fail. No native client, model, live service or client capability is exercised."
+    },
+    {
+      "source": "tests/test_ci_test_shards.py",
+      "expression": "subprocess.run(['bash', '-c', block], cwd=tmp_path, env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=20)",
+      "source_sha256": "e111d92f8c4a5c6cda9705cb4b83e35338fb9e3d9e4e5b143dcd44298e84135d",
+      "scope": "structural",
+      "reason": "Private dedicated timing workflow control: executes the production Bash block with a disposable fake pytest driver, argv receipt and coverage bytes. Checks exact serial selectors, collection plugin and artifact copy; broken command mutations must fail. No native client, live service or client capability is exercised."
+    },
+    {
+      "source": "tests/test_ci_test_shards.py",
+      "expression": "subprocess.run(['bash', '-c', 'set -eu\\n' + command], cwd=tmp_path, env=environment, stdin=subprocess.DEVNULL, capture_output=True, timeout=10)",
+      "source_sha256": "e111d92f8c4a5c6cda9705cb4b83e35338fb9e3d9e4e5b143dcd44298e84135d",
+      "scope": "structural",
+      "reason": "Private aggregate workflow result control: executes only the production shell success checks with synthetic ordinary and timing job results. It launches no tests, native client, model or live service and proves no client capability."
+    },
+    {
+      "source": "tests/test_ci_test_shards.py",
+      "expression": "subprocess.run(['bash', '-c', command], cwd=tmp_path, env=environment, stdin=subprocess.DEVNULL, capture_output=True, timeout=10)",
+      "source_sha256": "e111d92f8c4a5c6cda9705cb4b83e35338fb9e3d9e4e5b143dcd44298e84135d",
+      "scope": "structural",
+      "reason": "Private aggregate workflow command control: executes the production Bash command with a disposable fake Python driver and argv receipt. Requires both ordinary and timing artifact arguments; omission must fail. It launches no coverage runner, native client, model or live service and proves no client capability."
     }
   ]
 }

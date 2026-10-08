@@ -2,6 +2,7 @@
 import argparse
 import json
 import re
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 
@@ -62,9 +63,44 @@ def validate_artifacts(root, artifacts, count, coverage=False, prefix='shard'):
     return data_files
 
 
-def combine_coverage(root, artifacts, count, prefix='shard'):
+def validate_timing_artifact(folder):
+    """Require the complete successful serial timing run before combining it."""
+    if folder.is_symlink() or not folder.is_dir():
+        raise ValueError('Missing or unsafe timing artifact')
+    if {path.name for path in folder.iterdir()} != {'.coverage', 'serial-timing.xml'}:
+        raise ValueError('Missing or unexpected timing artifact files')
+    data, report = folder / '.coverage', folder / 'serial-timing.xml'
+    for path in (data, report):
+        if path.is_symlink() or not path.is_file() or path.stat().st_size == 0:
+            raise ValueError('Missing or unsafe timing artifact file')
+    if report.stat().st_size > 3_000_000:
+        raise ValueError('Oversized timing report')
+    try:
+        xml = ET.fromstring(report.read_bytes())
+    except ET.ParseError as exc:
+        raise ValueError('Invalid timing report') from exc
+    classes = {'tests.test_security.TestDecisionTimeIsBounded',
+               'tests.test_security.TestPatternDecisionTimeIsBounded'}
+    cases = list(xml.iter('testcase'))
+    identities = {(case.get('classname'), case.get('name')) for case in cases}
+    suites = list(xml.iter('testsuite'))
+    # This reviewed count fails closed when timing tests are added or removed.
+    if (len(suites) != 1 or suites[0].get('tests') != '256'
+            or any(suites[0].get(field) != '0' for field in ('failures', 'errors', 'skipped'))
+            or len(cases) != 256 or len(identities) != 256
+            or {case.get('classname') for case in cases} != classes
+            or any(not case.get('name') or case.get('file') != 'tests/test_security.py'
+                   or len(case) for case in cases)
+            or any(list(xml.iter(tag)) for tag in ('failure', 'error', 'skipped'))):
+        raise ValueError('Timing report must contain 256 unique successful timing cases')
+    return data
+
+
+def combine_coverage(root, artifacts, count, prefix='shard', timing_artifact=None):
     import coverage
     data_files = validate_artifacts(root, artifacts, count, coverage=True, prefix=prefix)
+    if timing_artifact is not None:
+        data_files.append(validate_timing_artifact(timing_artifact))
     combined = coverage.Coverage(config_file=str(root / 'setup.cfg'),
                                  data_file=str(root / '.coverage-combined'))
     combined.combine(data_paths=[str(path) for path in data_files], strict=True, keep=True)
@@ -101,6 +137,7 @@ def main():
     parser.add_argument('--manifest', type=Path)
     parser.add_argument('--artifacts', type=Path)
     parser.add_argument('--prefix', default='shard')
+    parser.add_argument('--timing-artifact', type=Path)
     args = parser.parse_args()
     try:
         if args.command == 'list':
@@ -112,7 +149,8 @@ def main():
             if args.artifacts is None:
                 parser.error('validate and coverage require --artifacts')
             if args.command == 'coverage':
-                combine_coverage(args.root, args.artifacts, args.count, prefix=args.prefix)
+                combine_coverage(args.root, args.artifacts, args.count, prefix=args.prefix,
+                                 timing_artifact=args.timing_artifact)
             else:
                 validate_artifacts(args.root, args.artifacts, args.count, prefix=args.prefix)
     except (ValueError, OSError) as exc:

@@ -79,9 +79,6 @@ jobs:
           python scripts/ci-checks/test_shards.py list --count 6 --index "${{ matrix.shard }}" --manifest "$RUNNER_TEMP/shard-data/manifest.json" > "$RUNNER_TEMP/shard-files"
           mapfile -t TEST_FILES < "$RUNNER_TEMP/shard-files"
           PYTHONUNBUFFERED=1 PYTHONPATH=hooks:tests pytest -p parity_collection_plugin --parity-matrix docs/parity/capabilities.json "${TEST_FILES[@]}" -n 4 --deselect=tests/test_security.py::TestDecisionTimeIsBounded:: --deselect=tests/test_security.py::TestPatternDecisionTimeIsBounded:: -o addopts=--tb=short -q --basetemp="$RUNNER_TEMP/pytest-coverage" --cov=hooks --cov-report= --cov-fail-under=0 -o junit_family=xunit1 --junitxml="$RUNNER_TEMP/shard-data/parallel.xml" --durations=30
-          if [[ "${{ matrix.shard }}" == 4 ]]; then
-            PYTHONUNBUFFERED=1 PYTHONPATH=hooks:tests pytest -p parity_collection_plugin --parity-matrix docs/parity/capabilities.json tests/test_security.py::TestDecisionTimeIsBounded tests/test_security.py::TestPatternDecisionTimeIsBounded -p no:xdist -o addopts=--tb=short -q --basetemp="$RUNNER_TEMP/pytest-coverage-timing" --cov=hooks --cov-append --cov-report= --cov-fail-under=0 -o junit_family=xunit1 --junitxml="$RUNNER_TEMP/shard-data/serial-timing.xml" --durations=30
-          fi
           cp .coverage "$RUNNER_TEMP/shard-data/.coverage"
       - uses: actions/upload-artifact@v7
         if: always()
@@ -93,9 +90,37 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  # Run timing checks alone while the ordinary coverage shards run in parallel.
+  coverage-timing:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r requirements-dev.txt
+      - name: Run serial coverage timing tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/timing-data"
+          PYTHONUNBUFFERED=1 PYTHONPATH=hooks:tests pytest -p parity_collection_plugin --parity-matrix docs/parity/capabilities.json tests/test_security.py::TestDecisionTimeIsBounded tests/test_security.py::TestPatternDecisionTimeIsBounded -p no:xdist -o addopts=--tb=short -q --basetemp="$RUNNER_TEMP/pytest-coverage-timing" --cov=hooks --cov-report= --cov-fail-under=0 -o junit_family=xunit1 --junitxml="$RUNNER_TEMP/timing-data/serial-timing.xml" --durations=30
+          cp .coverage "$RUNNER_TEMP/timing-data/.coverage"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: coverage-timing
+          overwrite: true
+          path: ${{ runner.temp }}/timing-data/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+
   # Preserve the required check name and enforce the full combined threshold.
   python-tests:
-    needs: coverage-shards
+    needs: [coverage-shards, coverage-timing]
     if: always() && github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -103,7 +128,8 @@ jobs:
       - name: Require every coverage shard
         env:
           SHARD_RESULT: ${{ needs.coverage-shards.result }}
-        run: test "$SHARD_RESULT" = success
+          TIMING_RESULT: ${{ needs.coverage-timing.result }}
+        run: test "$SHARD_RESULT" = success && test "$TIMING_RESULT" = success
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
         with:
@@ -114,8 +140,12 @@ jobs:
           pattern: coverage-shard-*
           path: ${{ runner.temp }}/coverage-artifacts
           merge-multiple: false
+      - uses: actions/download-artifact@v8
+        with:
+          name: coverage-timing
+          path: ${{ runner.temp }}/timing-artifact
       - name: Require complete partition and combined 90% coverage
-        run: python scripts/ci-checks/test_shards.py coverage --count 6 --prefix coverage-shard --artifacts "$RUNNER_TEMP/coverage-artifacts"
+        run: python scripts/ci-checks/test_shards.py coverage --count 6 --prefix coverage-shard --artifacts "$RUNNER_TEMP/coverage-artifacts" --timing-artifact "$RUNNER_TEMP/timing-artifact"
 
   # Python 3.9 remains a full test gate without a second coverage measurement.
   py39-shards:
