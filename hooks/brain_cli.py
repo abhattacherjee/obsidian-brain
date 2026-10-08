@@ -73,7 +73,8 @@ def main(argv=None, stdin=None, stdout=None, stderr=None, started_at=None):
                     or not loaded.is_file() or Path(__file__).resolve().parent.parent != root):
                 raise RuntimeContextError("resources_invalid", "The operation does not belong to the loaded installation.")
             skill_name = loaded.parent.name
-        context = resolve_runtime_context(args.host, args.client, {} if args.command == "run" else payload, overrides)
+        context = resolve_runtime_context(args.host, args.client, {} if args.command == "run" else payload, overrides,
+                                          require_payload_session=args.command == "hook")
         if args.command == "run":
             from skill_procedures import run_operation
             with using_runtime_context(context):

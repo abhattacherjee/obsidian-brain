@@ -129,6 +129,8 @@ def test_world_readable_lock_cannot_publish(context):
     operation_id, directory = state.operation_directory(context)
     lock = directory / '.operation.lock'
     lock.touch(mode=0o644)
+    lock.chmod(0o644)
+    assert lock.stat().st_mode & 0o7777 == 0o644
     with pytest.raises(ValueError, match='lock is not owner-only'):
         state.store_artifact(context, operation_id, 'answer.json', '{}')
     assert not (directory / 'answer.json').exists()

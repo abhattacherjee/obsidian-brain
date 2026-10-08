@@ -132,7 +132,8 @@ def _project(cwd):
 
 
 def resolve_runtime_context(host: str, client: str, payload: Mapping[str, object],
-                            overrides: Mapping[str, object]) -> RuntimeContext:
+                            overrides: Mapping[str, object], *,
+                            require_payload_session: bool = False) -> RuntimeContext:
     clients = {"claude": {"claude-code", "cli"}, "codex": {"codex-cli", "codex-desktop", "cli"}}
     if host not in clients:
         raise RuntimeContextError("host_unknown", "Select a supported host explicitly.")
@@ -141,7 +142,13 @@ def resolve_runtime_context(host: str, client: str, payload: Mapping[str, object
     home = Path.home()
     native_home = _path(os.environ.get("CODEX_HOME", home / ".codex") if host == "codex"
                         else os.environ.get("CLAUDE_CONFIG_DIR", home / ".claude"))
-    sid = overrides.get("session_id", payload.get("session_id", payload.get("sessionId")))
+    payload_sid = payload.get("session_id", payload.get("sessionId"))
+    if require_payload_session:
+        if not isinstance(payload_sid, str) or not payload_sid.strip():
+            raise RuntimeContextError("session_missing", "The native hook payload did not supply a session ID.")
+        sid = payload_sid
+    else:
+        sid = overrides.get("session_id", payload_sid)
     if sid is None:
         sid = os.environ.get("CODEX_THREAD_ID" if host == "codex" else "CLAUDE_CODE_SESSION_ID", "")
     if not isinstance(sid, str) or (not sid.strip() and client != "cli"):

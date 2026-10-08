@@ -609,3 +609,41 @@ def test_retired_review_notice_is_project_scoped_and_has_no_scheduled_count(sele
     finished = entry('session_end')
     assert 'retains unverified input for review' in finished.err
     assert 'at least 1 source(s)' not in finished.err
+
+
+@pytest.mark.parametrize('body, expected', [
+    ('## Summary\n\n## Key Decisions\nPrivate decision must not become a summary.\n',
+     'Summary pending; session activity is retained.'),
+    ('## Key Decisions\nPrivate decision must not become a summary.\n',
+     'Summary pending; session activity is retained.'),
+    ('## Summary\n\n<!-- obsidian-brain:summary:start -->\n## Summary\nActual managed context.\n## Key Decisions\nOther text.\n<!-- obsidian-brain:summary:end -->\n',
+     'Actual managed context.'),
+    ('## Summary\nLegacy context.\n## Key Decisions\nOther text.\n', 'Legacy context.'),
+], ids=['empty', 'missing', 'owned', 'legacy'])
+@pytest.mark.parametrize('registered', [False, True], ids=['index', 'registry'])
+def test_native_start_summary_has_content_or_explicit_pending(context, capture_calls, body, expected, registered):
+    from native_lifecycle import dispatch
+    from contextlib import closing
+    from note_transactions import connect_coordination
+    note = context.vault_path / 'claude-sessions' / 'prior.md'
+    with closing(connect_coordination(context)) as conn:
+        if registered:
+            note.parent.mkdir(parents=True, exist_ok=True)
+            note.write_text('---\ntype: claude-session\nagent_provider: ' + context.host
+                            + '\nagent_session_id: ' + context.native_session_id + '\n---\n' + body)
+            conn.execute('CREATE TABLE source_sessions(note TEXT, first_date TEXT, descriptor TEXT)')
+            conn.execute('INSERT INTO source_sessions VALUES (?, ?, ?)',
+                         (str(note), '2026-10-05', json.dumps({
+                             'canonical_project_root': str(context.canonical_project_root),
+                             'host': context.host, 'native_session_id': context.native_session_id})))
+            conn.commit()
+    if not registered:
+        with sqlite3.connect(context.index_path) as conn:
+            conn.execute('CREATE TABLE notes(path TEXT, project TEXT, type TEXT, date TEXT, title TEXT, body TEXT)')
+            conn.execute('INSERT INTO notes VALUES (?, ?, ?, ?, ?, ?)',
+                         (str(note), 'project', 'claude-session', '2026-10-05', 'Prior session', body))
+    output = dispatch(context, 'session_start', {}, time.monotonic())
+    text = output['hookSpecificOutput']['additionalContext']
+    assert text.endswith(expected)
+    assert 'Private decision' not in text
+    assert '<!--' not in text

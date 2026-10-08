@@ -1432,6 +1432,24 @@ def _import_artifact_name(source_host, source_id):
     return 'import-source-' + hashlib.sha256((source_host + '\0' + source_id).encode()).hexdigest() + '.json'
 
 
+def _import_note_read(context, path):
+    """Bind the selected destination bytes before generating an import update."""
+    import stat
+    from note_transactions import record_read
+    path = _note_path(context, {'path': str(path)})
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0))
+    with os.fdopen(descriptor, 'rb') as stream:
+        before = os.fstat(stream.fileno())
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError('Imported destination must be a regular note.')
+        raw = stream.read(1000001)
+        after = path.lstat()
+    if len(raw) > 1000000 or (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
+        raise ValueError('Imported destination changed while reading or exceeds the note limit.')
+    content = raw.decode('utf-8')
+    return content, record_read(context, path, content)
+
+
 def _import_read(context, payload):
     import hashlib
     import time
@@ -1481,12 +1499,21 @@ def _import_read(context, payload):
     from note_transactions import ownership_lock
     with ownership_lock(context, deadline=time.monotonic() + 3):
         ensure_index(str(context.vault_path), indexed_folders(dict(context.config)), str(context.index_path))
-    existing = find_existing_session(origin, deadline)
-    if existing:
-        _emit({'status': 'skipped', 'existing_path': str(existing), 'source_host': source_host, 'source_session_id': source_id})
-        return 0
     raw = _historical_source_bytes(context,source_host,source_path,payload.get('source_root'))
     revision = hashlib.sha256(raw).hexdigest()
+    existing = find_existing_session(origin, deadline)
+    destination = {}
+    if existing:
+        from obsidian_utils import parse_frontmatter_field
+        content, expected = _import_note_read(context, existing)
+        if parse_frontmatter_field(content, 'source_revision') == revision:
+            after = _historical_source_bytes(context, source_host, source_path, payload.get('source_root'))
+            if hashlib.sha256(after).hexdigest() != revision:
+                raise ValueError('Historical source changed during revision lookup; operation remains pending.')
+            _emit({'status': 'skipped', 'existing_path': str(existing), 'source_host': source_host,
+                   'source_session_id': source_id, 'source_revision': revision})
+            return 0
+        destination = {'existing_path': str(existing), 'expected_note_revision': expected}
     cursor = SourceCursor(historical=True)
     records = []
     metadata = {}
@@ -1508,7 +1535,7 @@ def _import_read(context, payload):
         raise ValueError('Historical source changed during normalization; operation remains pending.')
     if not source_path.resolve().is_relative_to(matched.resolve()):
         raise ValueError('Historical source containment changed during normalization.')
-    normalized = {'source_host': source_host, 'source_session_id': source_id, 'source_path': str(source_path), 'source_root': str(matched.resolve()), 'source_revision': revision, 'metadata': metadata, 'records': records}
+    normalized = {'source_host': source_host, 'source_session_id': source_id, 'source_path': str(source_path), 'source_root': str(matched.resolve()), 'source_revision': revision, 'metadata': metadata, 'records': records, **destination}
     from operation_state import store_artifact
     path = store_artifact(context, payload['operation_id'], _import_artifact_name(source_host, source_id), json.dumps(normalized))
     _emit(dict(normalized, path=str(path), status='ready'))
@@ -1538,9 +1565,6 @@ def _import_create_locked(context, payload):
     ensure_index(str(context.vault_path), indexed_folders(dict(context.config)), str(context.index_path))
     from vault_index import index_note
     existing = find_existing_session(origin, time.monotonic() + 3)
-    if existing:
-        _emit({'status': 'skipped', 'existing_path': str(existing)})
-        return 0
     source_path = Path(source['source_path'])
     roots = _approved_import_roots(context, source['source_host'], source.get('source_root'))
     if not any(source_path.resolve().is_relative_to(root.resolve()) for root in roots):
@@ -1550,14 +1574,48 @@ def _import_create_locked(context, payload):
     current = _historical_source_bytes(context,source['source_host'],source_path,source.get('source_root'))
     if len(current) > 16 * 1024 * 1024 or hashlib.sha256(current).hexdigest() != source['source_revision']:
         raise ValueError('Historical source changed during summary generation; import remains pending.')
+    if existing:
+        from obsidian_utils import parse_frontmatter_field
+        existing_content, _ = _import_note_read(context, existing)
+        if parse_frontmatter_field(existing_content, 'source_revision') == source['source_revision']:
+            _emit({'status': 'skipped', 'existing_path': str(existing)})
+            return 0
+        if source.get('existing_path') != str(existing) or not source.get('expected_note_revision'):
+            raise ValueError('Imported destination changed; begin a new operation before updating it.')
+    elif source.get('existing_path'):
+        raise ValueError('Imported destination disappeared; operation remains pending.')
     content = payload['content']
     opened, fields, closed, body, error = split_frontmatter(split_lines_lf_crlf(content))
     if error:
         raise ValueError(error)
     eol = '\r\n' if '\r\n' in content else '\n'
-    fields = [line for line in fields if not line.startswith(('agent_provider:', 'agent_session_id:', 'session_id:'))]
-    fields.extend(['agent_provider: ' + source['source_host'] + eol, 'agent_session_id: ' + source['source_session_id'] + eol, 'session_id: ' + source['source_session_id'] + eol])
-    approved = dict(payload, folder=context.config.get('sessions_folder', 'claude-sessions'), content=opened + ''.join(fields) + closed + ''.join(body))
+    fields = [line for line in fields if not line.startswith(('agent_provider:', 'agent_session_id:', 'session_id:', 'source_revision:'))]
+    fields.extend(['agent_provider: ' + source['source_host'] + eol, 'agent_session_id: ' + source['source_session_id'] + eol, 'session_id: ' + source['source_session_id'] + eol, 'source_revision: ' + source['source_revision'] + eol])
+    summary = ''.join(body).strip()
+    if '<!-- obsidian-brain:' in summary or not summary:
+        raise ValueError('Imported summary must contain text without ownership markers.')
+    if existing:
+        from note_writer import _validate_note_content
+        from note_transactions import NoteMutation, apply_mutations
+        error = _validate_note_content(content)
+        if error:
+            raise ValueError(error)
+        metadata = {'source_revision': source['source_revision'], 'agent_provider': source_host,
+                    'agent_session_id': source_id, 'session_id': source_id,
+                    'author_host': context.host, 'operation_id': payload['operation_id']}
+        mutation = NoteMutation(existing, source['expected_note_revision'],
+            {'summary': summary, 'metadata': json.dumps(metadata)},
+            'import-' + payload['operation_id'] + '-' + hashlib.sha256((source_host + '\0' + source_id).encode()).hexdigest(), file_mode=0o600)
+        result = apply_mutations(context, [mutation])
+        if result.status not in {'applied', 'unchanged'}:
+            _emit({'status': result.status, 'path': str(existing), 'warnings': list(result.warnings)})
+            return 1
+        if not index_note(str(context.index_path), str(existing)):
+            raise ValueError('Imported update was saved but index publication is pending; retry before importing another source.')
+        _emit({'status': result.status, 'path': str(existing), 'source_revision': source['source_revision']})
+        return 0
+    managed_body = '\n<!-- obsidian-brain:summary:start -->\n' + summary + '\n<!-- obsidian-brain:summary:end -->\n'
+    approved = dict(payload, folder=context.config.get('sessions_folder', 'claude-sessions'), content=opened + ''.join(fields) + closed + managed_body)
     result = _note_create(context, approved)
     if result == 0:
         path = context.vault_path / approved['folder'] / approved['filename']

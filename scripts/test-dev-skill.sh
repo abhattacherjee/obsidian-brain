@@ -387,7 +387,7 @@ case "$cmd" in
               echo "Recover by reinstalling: /plugin marketplace update" >&2' ERR
 
         echo "Restoring: $BACKUP_DIR -> $CACHE_DIR"
-        rm -rf "$CACHE_DIR"
+        python3 "$SCRIPT_ROOT/scripts/dev-test/package_tree.py" --remove-owned-tree "$CACHE_DIR"
         mv "$BACKUP_DIR" "$CACHE_DIR"
 
         trap - ERR

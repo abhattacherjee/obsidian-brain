@@ -18,7 +18,7 @@ import time
 import uuid
 from pathlib import Path
 
-from obsidian_utils import get_workspace_roots, match_items_against_evidence
+from obsidian_utils import get_workspace_roots, match_items_against_evidence, owned_summary_source
 
 # --- Module-level compiled regexes (computed once at import) ---
 
@@ -442,7 +442,10 @@ def collect_open_item_records(vault_path, sessions_folder, project, max_sessions
 
 
 _NOTE_EVIDENCE_WINDOW = 10  # mirrors obsidian_utils._OPEN_ITEM_EVIDENCE_WINDOW
-_SUMMARY_RE = re.compile(r"## Summary\n(.+?)(?=\n## |\Z)", re.DOTALL)
+_SUMMARY_RE = re.compile(
+    r"^## Summary[ \t]*\r?\n(.*?)(?=^#{1,2}[ \t]|\Z)",
+    re.DOTALL | re.MULTILINE,
+)
 
 
 def gather_note_completion_evidence(
@@ -530,7 +533,7 @@ def gather_note_completion_evidence(
             # without any extra gate. A guard that can never turn False is
             # not a guard; the real bound is the loop's own break condition.
             content = ''.join(lines)
-            m = _SUMMARY_RE.search(content)
+            m = _SUMMARY_RE.search(owned_summary_source(content))
             if m:
                 summary_text = m.group(1).strip()
                 if summary_text:

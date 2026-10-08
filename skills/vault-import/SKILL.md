@@ -196,9 +196,14 @@ Stop here if no sessions found.
 
 Run `import-read` for each discovered source before generating a summary.
 The trusted helper queries the selected index for the full provider/native ID,
-verifies the complete bounded frontmatter, and returns `skipped` only for a
-proven identity match. It never scans the entire vault or adopts a hash alone.
-Treat a capped, ambiguous, or timed-out lookup as pending.
+verifies the complete bounded frontmatter, and returns `skipped` only when
+both the full identity and saved `source_revision` match the current transcript.
+A grown transcript or legacy note without a saved revision returns `ready`
+with the destination revision bound before analysis. The matching `note-create`
+updates that note's owned summary and source revision, preserving manual text.
+A changed source or conflicting owned edit leaves the update pending.
+It never scans the entire vault or adopts a hash alone. Treat a capped,
+ambiguous, or timed-out lookup as pending.
 
 Store the remaining sessions as `PENDING_SESSIONS` and the count of skipped sessions as `SKIPPED_COUNT`.
 

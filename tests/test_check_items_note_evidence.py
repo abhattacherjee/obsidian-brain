@@ -825,3 +825,30 @@ def test_cached_record_for_git_project_still_reaches_high():
         record["note_evidence_only"],
     )
     assert tier == "HIGH", tier
+
+
+@pytest.mark.parametrize('body, expected', [
+    ('<!-- obsidian-brain:summary:start -->\n## Summary\nShipped the foo exporter service.\n<!-- obsidian-brain:summary:end -->\n\n## Summary\nUnowned manual prose.\n', 'Shipped the foo exporter service.'),
+    ('<!-- obsidian-brain:summary:start -->\n## Summary\n\n## Key Decisions\nShipped the foo exporter service.\n<!-- obsidian-brain:summary:end -->\n', None),
+    ('<!-- obsidian-brain:summary:start -->\n## Key Decisions\nShipped the foo exporter service.\n<!-- obsidian-brain:summary:end -->\n\n## Summary\nShipped the foo exporter service.\n', None),
+    ('## Summary\n\n## Key Decisions\nShipped the foo exporter service.\n', None),
+    ('## Summary\nShipped the foo exporter service.\n\n## Key Decisions\nManual extra text.\n', 'Shipped the foo exporter service.'),
+], ids=['managed-summary', 'empty-managed', 'no-managed-summary', 'empty-legacy', 'legacy-summary'])
+def test_completion_evidence_uses_only_nonempty_owned_summary(selected_host_context, tmp_path, monkeypatch, body, expected):
+    vault, sessions = _vault(tmp_path)
+    _session(sessions / '2026-01-01-source.md', '2026-01-01', 'notes-only',
+             summary='', open_items=['wire up the foo exporter service'])
+    _session(sessions / '2026-02-01-newer.md', '2026-02-01', 'notes-only')
+    newer = sessions / '2026-02-01-newer.md'
+    original = newer.read_text()
+    newer.write_text(original[:original.index('## Summary')] + body)
+    observed = []
+    def match(summary, items):
+        observed.append(summary)
+        return [{'confidence': 5, 'has_completion_phrase': True}]
+    monkeypatch.setattr(oid, 'match_items_against_evidence', match)
+    result = oid.gather_note_completion_evidence(str(vault), 'claude-sessions', 'notes-only')
+    assert observed == ([] if expected is None else [expected])
+    assert len(result) == (0 if expected is None else 1)
+    if result:
+        assert result[0]['contradicted_by_title'] == expected

@@ -238,8 +238,9 @@ each input. Keep canonical expected facts in `fixture-manifest.json`.
   a repeatable thematic pattern for emerge; a small import corpus with one
   duplicate and one same-name/different-content collision.
 - A manual-note marker, a summary marker and a raw-capture marker used to
-  assert preservation across replay. A fake secret-looking marker used only
-  to check scrubbing; no actual token or credential.
+  assert preservation across replay. Use a clearly fake recognized credential
+  shape, such as `api_key=OBPFAKESECRETNOTREALf73bdce3`, to check scrubbing.
+  A bare arbitrary marker is not a credential detection oracle; use no actual token.
 
 Seed files are fixture inputs, not plugin-output evidence. Hash them before
 tests. Follow the loaded skills' schema and taxonomy; do not seed impossible
@@ -373,7 +374,7 @@ save a handoff and continue independent cases rather than waiting silently.
 | `standup` | Summarize synthetic completed and open work. | Completed/open distinction is accurate; manual unchecked sentinel remains open. |
 | `retro` | Analyze pre/post-compaction synthetic work. | Evidence includes parent and snapshot, claims reflect observed work, and classification-before-save runs. |
 | `check-items` | Triage duplicate and completed synthetic checkboxes. | Approved fixture updates occur once; manual sentinel is never checked off; concurrent edit survives/refuses safely. |
-| `consolidate` | Merge the overlapping fixture insights. | Distinct facts and source tracking survive; approved originals handled as documented; no unrelated note removed. |
+| `consolidate` | Cluster overlapping fixture notes into named database themes; exercise theme split and merge by ID. | Theme membership and source tracking survive; original note files remain intact; no unrelated note is removed. |
 | `emerge` | Find the retry pattern in seeded themes. | Analysis grounded in selected sources; selected native backend performs synthesis; saved artifact has correct provenance. |
 | `link` | Link the two related notes; repeat once. | Bidirectional links appear once; repeated execution is idempotent; concurrent revision conflicts preserve edits. |
 | `vault-ask` | Ask why SQLite was selected; approve eligible wiki filing; ask again. | Cited answer matches fixture; only qualifying sources filed; fresh wiki reused; reviewed stale page not overwritten without approval. |

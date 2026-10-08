@@ -350,3 +350,59 @@ def test_skill_client_guard_uses_claude_constant_and_declared_codex_client(
     assert not list(selected_host_context.vault_path.iterdir())
     assert 'infer the frontend from transcript creation' in source
     assert 'OB_CLIENT=codex-cli' not in block
+
+
+@pytest.mark.host_only('claude', reason='claude-record-format', capability='claude_native_format')
+@pytest.mark.parametrize('custom_home', [False, True, 'empty'])
+def test_claude_setup_reference_commands_use_selected_home_and_project(tmp_path, custom_home):
+    import os
+    import re
+    import subprocess
+    text = (ROOT / 'skills/obsidian-setup/references/host-claude.md').read_text()
+    commands = re.findall(r'```bash\n(.*?)```', text, re.S)
+    home = tmp_path / 'private user home'
+    global_home = home / '.claude'
+    global_home.mkdir(parents=True)
+    sentinel = global_home / '.obsidian-brain-canary'
+    sentinel.write_text('preserve original canary')
+    global_rule = global_home / 'hookify.claudeception-compress-nudge.local.md'
+    global_rule.write_text('preserve global rule')
+    project = tmp_path / 'native project with spaces'
+    project.mkdir()
+    unrelated = tmp_path / 'unrelated shell directory'
+    unrelated.mkdir()
+    selected = tmp_path / 'custom Claude home with spaces' if custom_home else global_home
+    environment = dict(os.environ, HOME=str(home))
+    environment.pop("OB_CWD", None)
+    import shlex
+    commands[1] = "OB_CWD=" + shlex.quote(str(project)) + "\n" + commands[1]
+    environment.pop('CLAUDE_CONFIG_DIR', None)
+    if custom_home:
+        environment['CLAUDE_CONFIG_DIR'] = '' if custom_home == 'empty' else str(selected)
+    canary = subprocess.run(['bash', '-c', commands[0]], env=environment, cwd=unrelated,
+                            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10)
+    if custom_home == 'empty':
+        assert canary.stdout.strip() == 'FAIL'
+        assert sentinel.read_text() == 'preserve original canary'
+        assert not selected.exists()
+        return
+    assert canary.returncode == 0 and canary.stdout.strip() == 'OK'
+    assert selected.is_dir()
+    assert not list(selected.glob('.obsidian-brain-canary-*'))
+    assert sentinel.read_text() == 'preserve original canary'
+    nudge = subprocess.run(['bash', '-c', commands[1]], env=environment, cwd=unrelated,
+                           stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10)
+    assert nudge.returncode == 0 and nudge.stdout.strip() == 'CREATED'
+    rules = list(project.glob('.claude/hookify.*.local.md'))
+    assert len(rules) == 1
+    content = rules[0].read_text()
+    assert 'enabled: true\nevent: stop\n' in content and 'action: warn' in content
+    assert 'Run `/compress`' in content
+    assert not (unrelated / '.claude').exists()
+    assert global_rule.read_text() == 'preserve global rule'
+    rules[0].write_text('preserve existing project rule')
+    repeated = subprocess.run(['bash', '-c', commands[1]], env=environment, cwd=unrelated,
+                              stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10)
+    assert repeated.returncode == 0 and repeated.stdout.strip() == 'EXISTS'
+    assert rules[0].read_text() == 'preserve existing project rule'
+    assert global_rule.read_text() == 'preserve global rule'

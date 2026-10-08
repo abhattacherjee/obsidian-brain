@@ -62,13 +62,15 @@ def test_invalid_native_binding_never_enters_runtime(monkeypatch, capsys, host, 
     assert "identity is invalid" in output.err
 
 
-@pytest.mark.parametrize("declared", ["", "codex-desktop", "claude-code", "unknown"])
-def test_conflicting_launcher_declaration_skips_without_runtime(monkeypatch, capsys, declared):
+@pytest.mark.parametrize("host,client,declared", [
+    ("codex", "codex-cli", value) for value in ("", "codex-desktop", "claude-code", "unknown")
+] + [("claude", "claude-code", value) for value in ("", "codex-cli", "codex-desktop", "unknown")])
+def test_conflicting_launcher_declaration_skips_without_runtime(monkeypatch, capsys, host, client, declared):
     module = entry()
     monkeypatch.setenv("OB_CLIENT", declared)
     monkeypatch.setitem(sys.modules, "brain_cli", SimpleNamespace(
         main=lambda *args, **kwargs: pytest.fail("Conflicting declaration reached runtime")))
-    assert module.run(["--host", "codex", "--client", "codex-cli"]) == 0
+    assert module.run(["--host", host, "--client", client]) == 0
     output = capsys.readouterr()
     assert output.out == ""
     assert "declaration conflicts" in output.err
@@ -280,3 +282,15 @@ def test_codex_sessionend_descriptor_grants_supported_three_second_budget():
     handlers = [handler for group in definition['hooks']['SessionEnd'] for handler in group['hooks']]
     assert handlers and all(handler['timeout'] == 3 for handler in handlers)
     assert all('--client codex-cli' not in handler['command'] for handler in handlers)
+
+
+@pytest.mark.parametrize("declared", [None, "claude-code"])
+def test_claude_matching_or_unset_declaration_enters_runtime(monkeypatch, declared):
+    module = entry()
+    if declared is not None:
+        monkeypatch.setenv("OB_CLIENT", declared)
+    observed = []
+    monkeypatch.setitem(sys.modules, "brain_cli", SimpleNamespace(
+        main=lambda *args, **kwargs: observed.append(args)))
+    assert module.run(["--host", "claude", "--client", "claude-code", "--event", "stop"]) == 0
+    assert len(observed) == 1

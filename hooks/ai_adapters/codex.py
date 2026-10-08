@@ -50,6 +50,8 @@ class NativeRpc:
                                             cwd=context.worktree, env=env, start_new_session=True, umask=0o077)
         except (FileNotFoundError, OSError) as exc:
             raise _BackendFailure("unavailable", "native_inventory_start_failed") from exc
+        from ai_backend import record_child
+        self.child_receipt = record_child(self.process, binary, 'discovery')
         self.selector = selectors.DefaultSelector()
         os.set_blocking(self.process.stdin.fileno(), False)
         for pipe in (self.process.stdout, self.process.stderr):
@@ -64,6 +66,8 @@ class NativeRpc:
         try:
             _stop_process(self.process)
         finally:
+            from ai_backend import finish_child
+            finish_child(self.child_receipt, self.process)
             self.selector.close()
             for pipe in (self.process.stdin, self.process.stdout, self.process.stderr):
                 if not pipe.closed:

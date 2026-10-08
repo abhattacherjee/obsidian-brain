@@ -5116,10 +5116,18 @@ def find_unsummarized_notes(
             continue
 
         # Defense-in-depth: check if already has a real summary
-        has_summary = bool(re.search(r'^## Summary', content, re.MULTILINE))
-        has_unavailable = 'AI summary unavailable' in content
+        summary_source = owned_summary_source(content)
+        summary_sections = re.finditer(
+            r'^## Summary[ \t]*\r?\n(.*?)(?=^#{1,6}[ \t]|\Z)',
+            summary_source, re.MULTILINE | re.DOTALL,
+        )
+        has_summary = any(
+            re.sub(r'<!--.*?-->', '', match.group(1), flags=re.DOTALL).strip()
+            and 'AI summary unavailable' not in match.group(1)
+            for match in summary_sections
+        )
 
-        if has_summary and not has_unavailable and not stale_summary:
+        if has_summary and not stale_summary:
             # Already summarized by legacy code path — fix status on disk
             try:
                 from note_transactions import NoteMutation, apply_mutations, record_read
@@ -5198,6 +5206,34 @@ def find_unsummarized_notes(
 # items are already capped to that recent window, so evidence built from the
 # same window cannot miss a session that could contradict one of them.
 _OPEN_ITEM_EVIDENCE_WINDOW = 10
+
+
+def _recall_project_decisions(db_path: str, vault_path: Path, insights_dir: Path, project: str,
+                              ranked_notes: list) -> list:
+    """Add up to three recent active decisions after the contextual hits."""
+    remaining = min(3, max(0, 20 - len(ranked_notes)))
+    if not remaining or _vault_index is None:
+        return []
+    root = insights_dir.resolve()
+    if vault_path.resolve() not in root.parents:
+        return []
+    prefix = str(root) + os.sep
+    excluded = [note["path"] for note in ranked_notes]
+    exclusion = " AND path NOT IN (" + ",".join("?" for _ in excluded) + ")" if excluded else ""
+    conn = _vault_index._connect(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT path, title FROM notes WHERE project=? AND type='claude-decision' "
+            "AND status='active' AND path>=? AND path<?" + exclusion +
+            " ORDER BY date DESC, path ASC LIMIT ?",
+            [project, prefix, prefix + "\U0010ffff", *excluded, remaining],
+        ).fetchall()
+    finally:
+        conn.close()
+    # The index is a lookup aid, not permission to follow a path outside the vault.
+    return [dict(row) for row in rows
+            if Path(row["path"]).is_file() and not Path(row["path"]).is_symlink()
+            and root in Path(row["path"]).resolve().parents]
 
 
 def build_context_brief(
@@ -5448,6 +5484,7 @@ def build_context_brief(
                 note_types=["claude-insight", "claude-decision", "claude-error-fix", "claude-retro"],
                 limit=20,
             )
+            ranked_notes.extend(_recall_project_decisions(db_path, Path(vault_path), insights_dir, project, ranked_notes))
             insight_count = len(ranked_notes)
             for note in ranked_notes:
                 title = note["title"]

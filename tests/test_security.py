@@ -45,6 +45,8 @@ class TestSecureDirectory:
     def test_ensure_secure_dir_fixes_wrong_permissions(self, tmp_path, monkeypatch):
         test_dir = str(tmp_path / "secure-test")
         os.makedirs(test_dir, mode=0o755)
+        os.chmod(test_dir, 0o755)
+        assert stat.S_IMODE(os.stat(test_dir).st_mode) == 0o755
         monkeypatch.setattr("obsidian_utils._SECURE_DIR", test_dir)
         from obsidian_utils import _ensure_secure_dir
         _ensure_secure_dir()

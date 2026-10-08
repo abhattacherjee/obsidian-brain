@@ -160,7 +160,7 @@ def run(argv=None, *, started_at=None):
     # OB_CLIENT is a launcher declaration, never a frontend guess. Registered
     # Codex commands pass it explicitly; an absent declaration stays unbound.
     declared = os.environ.get("OB_CLIENT")
-    if selected.host == "codex" and declared is not None and declared != selected.client:
+    if declared is not None and declared != selected.client:
         print("[obsidian-brain] native client declaration conflicts with the selected client; "
               "capture was skipped; no source was retained.", file=sys.stderr)
         return 0

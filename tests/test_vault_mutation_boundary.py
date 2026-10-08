@@ -119,6 +119,13 @@ def _allowed(file, function, node):
         return (name == 'os.write' and len(node.args) == 2
                 and ast.unparse(node.args[0]) == 'pipe.fileno()'
                 and ast.unparse(node.args[1]) == 'payload[:65536]')
+    if file == 'hooks/ai_backend.py' and function == '_write_ai_receipt':
+        if name == 'os.open':
+            return (not node.keywords and len(node.args) == 3
+                    and [ast.unparse(arg) for arg in node.args[:2]] == ['path', 'flags']
+                    and isinstance(node.args[2], ast.Constant) and node.args[2].value == 0o600)
+        return (name == 'os.write' and not node.keywords
+                and [ast.unparse(arg) for arg in node.args] == ['descriptor', 'payload'])
     if file == 'hooks/ai_adapters/codex.py' and function == '_send':
         return (name == 'os.write' and [ast.unparse(arg) for arg in node.args]
                 == ['self.process.stdin.fileno()', 'payload'])
@@ -472,3 +479,43 @@ def test_cross_run_cache_exception_cannot_publish_a_note():
     assert not _violations(source, 'hooks/session_auxiliary_state.py')
     assert _violations(source.replace('_write_private(path,', '_write_private(note_path,'),
                        'hooks/session_auxiliary_state.py')
+
+
+def test_ai_receipt_exception_is_scoped_and_cannot_publish_vault_content():
+    root = Path(__file__).resolve().parents[1]
+    tree = ast.parse((root / 'hooks/ai_backend.py').read_text())
+    function = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                    and node.name == '_write_ai_receipt')
+    source = ast.unparse(function)
+    assert "if context is None:\n        return" in source
+    assert "from session_auxiliary_state import directory" in source
+    assert "path = directory(context, 'logs') / 'ai-operations.jsonl'" in source
+    assert "flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, 'O_NOFOLLOW', 0)" in source
+    assert 'details = os.fstat(descriptor)' in source
+    assert 'not stat.S_ISREG(details.st_mode)' in source
+    assert 'details.st_uid != os.getuid()' in source
+    assert 'details.st_nlink != 1' in source
+    assert 'os.fchmod(descriptor, 384)' in source
+    assert 'fcntl.flock(descriptor, fcntl.LOCK_EX)' in source
+    assert not _violations(source, 'hooks/ai_backend.py')
+
+    # The path helper independently refuses vault storage and symbolic links.
+    auxiliary = ast.parse((root / 'hooks/session_auxiliary_state.py').read_text())
+    helper = next(node for node in auxiliary.body if isinstance(node, ast.FunctionDef)
+                  and node.name == 'directory')
+    helper_source = ast.unparse(helper)
+    assert '_no_symlinks(root)' in helper_source
+    assert '_no_symlinks(scoped)' in helper_source
+    assert 'root.resolve() == context.vault_path.resolve()' in helper_source
+    assert 'context.vault_path.resolve() in root.resolve().parents' in helper_source
+
+    forbidden = [
+        source + '\n    Path(note_path).write_text("bypass")\n',
+        source + '\n    os.write(note_fd, payload)\n',
+        source.replace('os.open(path, flags, 384)', 'os.open(note_path, flags, 384)'),
+        source.replace('os.open(path, flags, 384)', 'os.open(path, flags, 420)'),
+        source.replace('os.write(descriptor, payload)', 'os.write(note_fd, payload)'),
+        source.replace('def _write_ai_receipt(', 'def unrelated_vault_writer('),
+    ]
+    assert all(_violations(mutant, 'hooks/ai_backend.py') for mutant in forbidden)
+    assert _violations(source, 'hooks/unreviewed_writer.py')

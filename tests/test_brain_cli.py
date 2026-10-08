@@ -3,6 +3,7 @@
 import importlib
 import io
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -75,3 +76,62 @@ def test_parser_recursion_error_is_structured_before_runtime_resolution(runtime_
     assert code == 2 and not output
     assert decode(errors)["code"] == "input_invalid"
     assert "Traceback" not in errors
+
+
+@pytest.mark.parametrize("sid", [None, "", "   ", 7])
+@pytest.mark.parametrize("event", ["session_start", "stop", "pre_compact", "session_end"])
+def test_native_hook_missing_payload_id_never_dispatches_or_writes(runtime_case, monkeypatch, sid, event):
+    case = runtime_case
+    monkeypatch.setenv("CODEX_THREAD_ID", "valid-parent-codex")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "valid-parent-claude")
+    monkeypatch.setitem(sys.modules, "native_lifecycle", type("ForbiddenDispatch", (), {
+        "dispatch": staticmethod(lambda *args: pytest.fail("Missing hook identity reached dispatch"))}))
+    before = {str(path): path.read_bytes() for path in case["home"].rglob("*") if path.is_file()}
+    vault_before = list(case["vault"].rglob("*"))
+    home_before = list(case["home"].rglob("*"))
+    coordination = Path(os.environ["XDG_STATE_HOME"])
+    coordination_before = list(coordination.rglob("*"))
+    payload = {"cwd": str(case["worktree"])}
+    if sid is not None:
+        payload["session_id"] = sid
+    output, errors = io.StringIO(), io.StringIO()
+    code = importlib.import_module("brain_cli").main([
+        "--host", case["host"], "--client", "codex-cli" if case["host"] == "codex" else "claude-code",
+        "--config", str(case["config_path"]), "--resource-root", str(case["resource_root"]),
+        "--session-id", "explicit-cli-override", "--event", event, "hook",
+    ], stdin=io.StringIO(json.dumps(payload)), stdout=output, stderr=errors)
+    assert code == 0 and output.getvalue() == ""
+    assert json.loads(errors.getvalue())["code"] == "session_missing"
+    assert {str(path): path.read_bytes() for path in case["home"].rglob("*") if path.is_file()} == before
+    assert list(case["vault"].rglob("*")) == vault_before
+    assert list(case["home"].rglob("*")) == home_before
+    assert list(coordination.rglob("*")) == coordination_before
+
+
+def test_native_hook_uses_valid_payload_id_over_inherited_and_cli_ids(runtime_case, monkeypatch):
+    case = runtime_case
+    monkeypatch.setenv("CODEX_THREAD_ID", "valid-parent-codex")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "valid-parent-claude")
+    observed = []
+    monkeypatch.setitem(sys.modules, "native_lifecycle", type("ObservedDispatch", (), {
+        "dispatch": staticmethod(lambda context, *args: observed.append(context.native_session_id))}))
+    output, errors = io.StringIO(), io.StringIO()
+    code = importlib.import_module("brain_cli").main([
+        "--host", case["host"], "--client", "codex-cli" if case["host"] == "codex" else "claude-code",
+        "--config", str(case["config_path"]), "--resource-root", str(case["resource_root"]),
+        "--session-id", "explicit-cli-override", "--event", "stop", "hook",
+    ], stdin=io.StringIO(json.dumps({"session_id": "payload-current", "cwd": str(case["worktree"])})),
+        stdout=output, stderr=errors)
+    assert code == 0 and errors.getvalue() == "" and output.getvalue() == ""
+    assert observed == ["payload-current"]
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_authored_cli_context_keeps_explicit_and_selected_host_session_fallback(runtime_case, monkeypatch, explicit):
+    monkeypatch.setenv("CODEX_THREAD_ID", "selected-codex")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "selected-claude")
+    options = ("--session-id", "explicit-context") if explicit else ()
+    code, output, errors = invoke(runtime_case, json.dumps({"cwd": str(runtime_case["worktree"])}), *options)
+    assert code == 0 and not errors
+    expected = "explicit-context" if explicit else ("selected-codex" if runtime_case["host"] == "codex" else "selected-claude")
+    assert json.loads(output)["native_session_id"] == expected

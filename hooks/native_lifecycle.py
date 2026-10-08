@@ -17,6 +17,16 @@ def _warn(stage, error):
     print(f"[obsidian-brain] {stage} failed: {error}", file=sys.stderr)
 
 
+def _context_summary(content):
+    """Inject summary prose, or state that capture still needs a summary."""
+    from obsidian_utils import owned_summary_source
+    body = owned_summary_source(content)
+    match = re.search(r"^## Summary[ \t]*\r?\n(.*?)(?=^#{1,2}[ \t]|\Z)",
+                      body, re.MULTILINE | re.DOTALL)
+    text = match.group(1).strip() if match else ""
+    return text[:1000] if text else "Summary pending; session activity is retained."
+
+
 def _context_hint(context, deadline):
     """Read at most one indexed session after checking existing vault identity."""
     if time.monotonic() >= deadline:
@@ -59,9 +69,7 @@ def _context_hint(context, deadline):
                 with path.open() as stream:
                     candidate = (str(path),registered[1],stream.read(64*1024))
         if candidate:
-            from obsidian_utils import owned_summary_source
-            body = owned_summary_source(candidate[2])
-            summary = body.split("## Summary",1)[-1].split("\n## ",1)[0].strip()[:1000]
+            summary = _context_summary(candidate[2])
             return {"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":
                 f"Obsidian context: Last session for {project} ({candidate[1]}): {summary}"}}
         if not context.index_path.is_file():
@@ -77,9 +85,7 @@ def _context_hint(context, deadline):
         if not row or time.monotonic() >= deadline:
             return None
         Path(row[0]).resolve().relative_to(root)
-        from obsidian_utils import owned_summary_source
-        body = owned_summary_source(row[2] or "")
-        summary = body.split("## Summary", 1)[-1].split("\n## ", 1)[0].strip()[:1000]
+        summary = _context_summary(row[2] or "")
         return {"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext":
                 f"Obsidian context: Last session for {project} ({row[1]}): {summary}"}}
     except (OSError, ValueError, sqlite3.Error):

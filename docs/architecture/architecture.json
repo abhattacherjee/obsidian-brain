@@ -2737,7 +2737,7 @@
   "testing": {
     "unitSuite": {
       "tool": "pytest",
-      "fileCount": 194,
+      "fileCount": 198,
       "duration": "fast (stdlib, no network)",
       "environments": {
         "python": "3.12",

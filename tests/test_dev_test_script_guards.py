@@ -1372,27 +1372,23 @@ def test_unreadable_cache_base_reports_instead_of_exiting_silently(
 
 @requires_bash
 def test_a_partway_install_exits_3_not_1(tmp_path: Path, host, selected_host_context, monkeypatch) -> None:
-    """The failure that leaves the cache MODIFIED needs its own exit code.
+    """A failure after backup publication keeps exit 3 and recoverable originals.
 
-    Every other non-zero path refuses before anything is written; this one
-    happens after the ``.bak`` is published and while the cache is being
-    overwritten, so the cache ends up holding a mix of original and dev files.
-    Sharing exit 1 with the refuse-first guards is what let ``/dev-test``'s
-    catch-all arm report it as *"nothing was installed"* — the exact opposite
-    of what this arm's ERR trap prints. A user told nothing happened does not
-    run ``restore``, and is left with a half-dev cache plus a stale ``.bak``
-    that blocks the next install.
-
-    Driven for real: the recursive runtime copier publishes hooks, then
-    rejects a symlink in skills. The backup is already published and the
-    cache contains the dev hook beside the released skill.
+    A forbidden source symlink fails staging after hooks were copied. The active
+    cache and published backup must both retain the exact released bytes.
     """
     if host == 'codex':
         _codex_guard_case('test_a_partway_install_exits_3_not_1', tmp_path, monkeypatch)
         return
     home, repo, script, cache_dir = _stage_production_geometry(tmp_path)
-    # Hooks publish first. A forbidden symlink in the next runtime directory
-    # makes the real package copier fail after that first publication.
+    original_cache = _tree_bytes(cache_dir)
+
+    def tree_modes(root):
+        return {str(path.relative_to(root)): path.stat().st_mode & 0o7777
+                for path in (root, *root.rglob('*'))}
+
+    original_modes = tree_modes(cache_dir)
+    # Hooks stage first; a later source symlink must not publish that partial tree.
     (repo / "skills" / "blocked-link").symlink_to(tmp_path / "outside-source")
 
     proc = _run(script, "install", home)
@@ -1412,8 +1408,12 @@ def test_a_partway_install_exits_3_not_1(tmp_path: Path, host, selected_host_con
         f"{proc.stderr!r}"
     )
     assert "/dev-test restore" in proc.stderr
-    assert "# dev hook" in (cache_dir / "hooks/obsidian_utils.py").read_text()
-    assert "# released hook" in (cache_dir.with_name(cache_dir.name + ".bak") / "hooks/obsidian_utils.py").read_text()
+    assert _tree_bytes(cache_dir) == original_cache
+    assert _tree_bytes(cache_dir.with_name(cache_dir.name + ".bak")) == original_cache
+    assert tree_modes(cache_dir) == original_modes
+    assert tree_modes(cache_dir.with_name(cache_dir.name + ".bak")) == original_modes
+    assert not list(cache_dir.parent.glob('.runtime-stage-*'))
+    assert not list(cache_dir.parent.glob('.runtime-previous-*'))
     # The precondition the exit code is claiming: a backup really was published.
     assert list(cache_dir.parent.glob("*.bak")), (
         "exit 3 asserts a backup exists to restore from — if none was "

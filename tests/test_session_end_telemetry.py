@@ -449,7 +449,7 @@ def test_native_sessionend_success_records_selected_origin_and_retained_facts(se
 def test_native_sessionend_bad_config_fails_open_without_mutation(selected_host_context):
     context=selected_host_context
     context.config_path.write_text('{bad')
-    result,_=_native_session_child(context,{},driver=False)
+    result,_=_native_session_child(context,driver=False)
     assert json.loads(result.stderr)['code']=='config_invalid'
     assert list(context.vault_path.rglob('*.md'))==[]
 

@@ -488,6 +488,7 @@ def test_public_installer_without_site_packages_preserves_config_and_backup(pack
     installer_path = source / 'scripts/dev-test/codex_install.py'
     installer_path.parent.mkdir(parents=True)
     installer_path.write_bytes((ROOT / 'scripts/dev-test/codex_install.py').read_bytes())
+    installer_path.with_name('package_tree.py').write_bytes((ROOT / 'scripts/dev-test/package_tree.py').read_bytes())
     driver = '''
 import importlib.util, json, pathlib, sys
 spec = importlib.util.spec_from_file_location('installer', sys.argv[1])

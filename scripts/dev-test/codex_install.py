@@ -4,6 +4,7 @@ import contextlib
 import copy
 import fcntl
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -14,6 +15,11 @@ import tempfile
 import time
 from pathlib import Path
 from types import SimpleNamespace
+
+_package_spec = importlib.util.spec_from_file_location(
+    'dev_runtime_package_tree', Path(__file__).with_name('package_tree.py'))
+_package_tree = importlib.util.module_from_spec(_package_spec)
+_package_spec.loader.exec_module(_package_tree)
 
 try:
     import tomllib
@@ -276,28 +282,7 @@ def _selected_hooks(package, require_codex=False):
 
 
 def _snapshot(source, destination):
-    source = source.resolve()
-    exclusions = {'__pycache__', '.git', '.pytest_cache', '.coverage', 'coverage',
-                  'tests', 'state', '.superpowers'}
-    def ignored(directory, names):
-        return [name for name in names if name in exclusions or name.startswith('.coverage.')
-                or name.endswith(('.pyc', '.bak'))]
-    def copy_tree(relative):
-        origin = source / relative
-        if origin.exists():
-            for path in (origin, *origin.rglob('*')):
-                if path.is_symlink():
-                    raise ValueError('Runtime package cannot contain symlinks')
-            shutil.copytree(origin, destination / relative, ignore=ignored)
-    for directory in ('hooks', 'skills', '.claude-plugin', '.codex-plugin', '.codex', 'scripts/vault_doctor_checks', 'scripts/dev-test'):
-        copy_tree(directory)
-    (destination / 'scripts').mkdir(exist_ok=True)
-    for name in ('vault_doctor.py', 'doctor_repair_state.py', 'test-dev-skill.sh'):
-        origin = source / 'scripts' / name
-        if origin.is_file():
-            if origin.is_symlink():
-                raise ValueError('Runtime script cannot be a symlink')
-            shutil.copy2(origin, destination / 'scripts' / name)
+    _package_tree.copy_runtime(source, destination)
     _, manifest = _selected_hooks(destination, require_codex=True)
     claude = json.loads((destination / '.claude-plugin/plugin.json').read_text())
     if (not isinstance(claude, dict) or claude.get('name') != manifest.get('name')
@@ -471,7 +456,7 @@ def run(mode, source, home, fault=lambda point: None, cache_path=None):
                     os.rename(parked, cache)
                 raise
             if had_cache:
-                shutil.rmtree(parked)
+                _package_tree.remove_owned_tree(parked)
             config_record.unlink()
             print('Original Codex cache and plugin configuration restored.')
             return 0
@@ -516,7 +501,7 @@ def run(mode, source, home, fault=lambda point: None, cache_path=None):
                 failed = cache.with_name(cache.name + '.failed.partial')
                 os.rename(cache, failed)
                 os.rename(backup, cache)
-                shutil.rmtree(failed)
+                _package_tree.remove_owned_tree(failed)
             elif backup.exists() and not cache.exists():
                 os.rename(backup, cache)
             # Restore our selected entry while preserving unrelated concurrent edits.
@@ -534,7 +519,7 @@ def run(mode, source, home, fault=lambda point: None, cache_path=None):
             raise
         finally:
             if stage.exists():
-                shutil.rmtree(stage)
+                _package_tree.remove_owned_tree(stage)
         print('Codex dev runtime installed; original cache and plugin entry are backed up.')
         return 0
 

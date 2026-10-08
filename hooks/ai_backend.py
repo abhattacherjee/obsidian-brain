@@ -1,6 +1,13 @@
 """Run bounded analysis through the explicitly selected native host."""
 
 import copy
+import datetime
+import fcntl
+import hashlib
+import re
+import sys
+import uuid
+from contextvars import ContextVar
 import json
 import math
 import os
@@ -21,6 +28,80 @@ OPERATIONS = frozenset({"snapshot_summary", "theme_names", "session_summary",
                         "session_summaries", "semantic_merge", "classify_items"})
 ANALYSIS_INSTRUCTION = "\n\nReturn only JSON matching this schema. Analyze the supplied input without tools.\n"
 VALIDATION_POLICY_REVISION = "strict-json-semantic-v1"
+_CALL_CHILDREN = ContextVar('native_ai_receipt_children', default=None)
+
+
+def record_child(process, argv0, kind='analysis'):
+    """Track actual transport children without storing arguments or input."""
+    records = _CALL_CHILDREN.get()
+    if records is None:
+        return None
+    entry = {'kind': kind, 'pid': process.pid, 'exit': None,
+             'argv0': Path(argv0).name, 'argv0_sha256': hashlib.sha256(os.fsencode(argv0)).hexdigest()}
+    records.append(entry)
+    return entry
+
+
+def finish_child(entry, process):
+    if entry is not None:
+        entry['exit'] = process.poll()
+
+
+def _write_ai_receipt(context, operation, request, outcome, started, children):
+    if context is None:
+        return
+    from session_auxiliary_state import directory
+    module = sys.modules.get('skill_procedures')
+    caller = module.context_skill_name() if module is not None else None
+    revision = request.input_revision
+    revision = revision if isinstance(revision, str) and re.fullmatch(r'[0-9a-f]{64}', revision) else None
+    receipt = {
+        'schema': 1, 'invocation_id': uuid.uuid4().hex,
+        'ts_start': started, 'ts_end': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        'operation': operation if operation in OPERATIONS else None,
+        'caller_skill': caller or 'unknown', 'host': context.host, 'client': context.client,
+        'native_session_id': context.native_session_id, 'backend': outcome.backend,
+        'model': outcome.model, 'status': outcome.status, 'code': outcome.error_code or outcome.diagnostic,
+        'input_revision': revision,
+        'output_sha256': hashlib.sha256(json.dumps(outcome.data, sort_keys=True,
+            separators=(',', ':'), ensure_ascii=False).encode()).hexdigest()
+            if outcome.status == 'ok' else None,
+        'validation_policy_revision': VALIDATION_POLICY_REVISION,
+        'children': children,
+    }
+    path = directory(context, 'logs') / 'ai-operations.jsonl'
+    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, 'O_NOFOLLOW', 0)
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        details = os.fstat(descriptor)
+        if not stat.S_ISREG(details.st_mode) or details.st_uid != os.getuid() or details.st_nlink != 1:
+            raise ValueError('AI receipt must be a private owned file')
+        os.fchmod(descriptor, 0o600)
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        payload = memoryview((json.dumps(receipt, sort_keys=True) + '\n').encode())
+        while payload:
+            written = os.write(descriptor, payload)
+            if written <= 0:
+                raise OSError('AI receipt write failed')
+            payload = payload[written:]
+    finally:
+        os.close(descriptor)
+
+
+def execute_ai(context, operation, request):
+    children = []
+    token = _CALL_CHILDREN.set(children)
+    started = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    try:
+        outcome = _execute_ai(context, operation, request)
+        try:
+            _write_ai_receipt(context, operation, request, outcome, started, children)
+        except Exception:
+            print('[obsidian-brain] AI operation receipt unavailable; result unchanged.', file=sys.stderr)
+        return outcome
+    finally:
+        _CALL_CHILDREN.reset(token)
+
 
 
 def _freeze(value):
@@ -111,6 +192,7 @@ def _run_bounded(command, prompt, *, cwd, env, deadline):
         raise _BackendFailure("unavailable", "executable_missing") from exc
     except OSError as exc:
         raise _BackendFailure("unavailable", "process_start_failed") from exc
+    child_receipt = record_child(process, command[0])
     payload = memoryview(prompt.encode("utf-8"))
     output, errors = bytearray(), bytearray()
     total = 0
@@ -160,10 +242,13 @@ def _run_bounded(command, prompt, *, cwd, env, deadline):
                 raise _BackendFailure("timeout", "deadline_exceeded") from exc
         return code, bytes(output), bytes(errors)
     finally:
-        _stop_process(process)
-        for pipe in (process.stdin, process.stdout, process.stderr):
-            if pipe and not pipe.closed:
-                pipe.close()
+        try:
+            _stop_process(process)
+        finally:
+            finish_child(child_receipt, process)
+            for pipe in (process.stdin, process.stdout, process.stderr):
+                if pipe and not pipe.closed:
+                    pipe.close()
 
 
 def _object(properties, required=None):
@@ -296,7 +381,7 @@ def ai_contract_identity(operation, options=None):
             "validation_policy_revision": VALIDATION_POLICY_REVISION}
 
 
-def execute_ai(context, operation, request):
+def _execute_ai(context, operation, request):
     backend, selected_model = resolve_ai_selection(context, operation, request.model)
     model = None
     def result(status, data=None, code=""):
