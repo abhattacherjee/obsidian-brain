@@ -695,12 +695,36 @@ def dedup_note_open_items(
     if not existing:
         return []
 
+    # Summary upgrades may deduplicate only their owned region. Legacy notes
+    # without ownership markers retain the original whole-note behavior.
+    from note_transactions import _REGION, _render
+    try:
+        _render(content, {})  # Validate complete, unique, non-nested ownership.
+    except ValueError:
+        print('[obsidian-brain] dedup: malformed managed regions; note preserved.', file=sys.stderr)
+        return []
+    summary_regions = [match.span(2) for match in _REGION.finditer(content)
+                       if match.group(1) == "summary"]
+    managed = '<!-- obsidian-brain:' in content
+    eligible_lines = None
+    if managed:
+        eligible_lines = set()
+        offset = 0
+        for index, line in enumerate(lines):
+            if any(start <= offset and offset + len(line) <= end
+                   for start, end in summary_regions):
+                eligible_lines.add(index)
+            offset += len(line)
+
     # Find open items section and mark duplicates for removal
     in_section = False
     lines_to_remove: set[int] = set()
     removed_texts: list[str] = []
 
     for i, line in enumerate(lines):
+        if eligible_lines is not None and i not in eligible_lines:
+            in_section = False
+            continue
         stripped = line.strip()
         if stripped == '## Open Questions / Next Steps':
             in_section = True

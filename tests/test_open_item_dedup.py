@@ -2284,3 +2284,64 @@ def test_fold_tags_and_paths_noop_when_no_tags_or_paths():
     zone = {"releases_text": "v1.0.0", "changelog_excerpt": "notes"}
     out = fold_tags_and_paths_into_completion_zone(zone, {})
     assert out == zone
+
+
+def test_summary_dedup_preserves_manual_open_items(selected_host_context, tmp_vault):
+    sessions = tmp_vault / 'claude-sessions'
+    duplicate = 'Fix hooks/obsidian_utils.py import error'
+    _create_session_note(sessions, '2026-04-09-proj-old.md', 'myproject', [duplicate])
+    note = _create_session_note(sessions, '2026-04-10-proj-new.md', 'myproject', [duplicate])
+    manual = note.read_text()
+    summary = ('<!-- obsidian-brain:summary:start -->\n## Summary\nCompleted the schema.\n'
+               '## Open Questions / Next Steps\n- [ ] ' + duplicate + '\n'
+               '- [ ] Keep the distinct follow-up\n<!-- obsidian-brain:summary:end -->\n')
+    suffix = '\n## Manual follow-up\n- [ ] ' + duplicate + '\n'
+    note.write_text(manual + summary + suffix)
+
+    removed = dedup_note_open_items(str(tmp_vault), 'claude-sessions', 'myproject', str(note))
+
+    assert note.read_text().startswith(manual)
+    assert note.read_text().endswith(suffix)
+    assert removed == [duplicate]
+    managed = note.read_text()[len(manual):-len(suffix)]
+    assert '- [ ] ' + duplicate not in managed
+    assert '- [ ] Keep the distinct follow-up' in managed
+
+
+@pytest.mark.parametrize('owned_tail', [
+    '<!-- obsidian-brain:capture:start -->\nRetained activity.\n<!-- obsidian-brain:capture:end -->\n',
+    '<!-- obsidian-brain:summary:start -->\nIncomplete region.\n',
+], ids=['capture-only', 'incomplete-summary'])
+def test_dedup_without_owned_summary_preserves_manual_bytes(selected_host_context, tmp_vault, owned_tail):
+    sessions = tmp_vault / 'claude-sessions'
+    duplicate = 'Fix hooks/obsidian_utils.py import error'
+    _create_session_note(sessions, '2026-04-09-proj-old.md', 'myproject', [duplicate])
+    note = _create_session_note(sessions, '2026-04-10-proj-new.md', 'myproject', [duplicate])
+    note.write_text(note.read_text() + owned_tail)
+    before = note.read_bytes()
+
+    assert dedup_note_open_items(str(tmp_vault), 'claude-sessions', 'myproject', str(note)) == []
+    assert note.read_bytes() == before
+
+
+@pytest.mark.parametrize('structure', ['nested', 'duplicate'], ids=['nested', 'duplicate'])
+def test_dedup_malformed_owned_regions_never_publish(selected_host_context, tmp_vault, monkeypatch, structure):
+    sessions = tmp_vault / 'claude-sessions'
+    duplicate = 'Fix hooks/obsidian_utils.py import error'
+    _create_session_note(sessions, '2026-04-09-proj-old.md', 'myproject', [duplicate])
+    note = _create_session_note(sessions, '2026-04-10-proj-new.md', 'myproject', [])
+    section = '## Open Questions / Next Steps\n- [ ] ' + duplicate + '\n'
+    if structure == 'nested':
+        owned = ('<!-- obsidian-brain:summary:start -->\n' + section +
+                 '<!-- obsidian-brain:capture:start -->\nManual capture text.\n'
+                 '<!-- obsidian-brain:capture:end -->\n<!-- obsidian-brain:summary:end -->\n')
+    else:
+        block = '<!-- obsidian-brain:summary:start -->\n' + section + '<!-- obsidian-brain:summary:end -->\n'
+        owned = block + '\nManual text between duplicate regions.\n' + block
+    note.write_text(note.read_text() + owned)
+    before = note.read_bytes()
+    monkeypatch.setattr('note_transactions.apply_mutations',
+                        lambda *args, **kwargs: pytest.fail('Malformed ownership must not publish'))
+
+    assert dedup_note_open_items(str(tmp_vault), 'claude-sessions', 'myproject', str(note)) == []
+    assert note.read_bytes() == before

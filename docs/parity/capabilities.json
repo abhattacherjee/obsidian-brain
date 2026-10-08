@@ -1143,55 +1143,55 @@
     {
       "source": "hooks/open_item_dedup.py",
       "expression": "subprocess.run(['git', 'log', '--oneline', '-40'], cwd=repo_path, capture_output=True, text=True, timeout=10)",
-      "source_sha256": "d9657d2270628903b146e39d6b107e0cfbe7a27237cd0b01632167a389e49543",
+      "source_sha256": "6257774cb89b95cd39d5dc5a5535f71741ef0bf676b75d3be869a4ebf1341055",
       "scope": "support",
       "reason": "Bounded or disposable-repository Git metadata/setup. The enclosing native operation keeps its separate host contract."
     },
     {
       "source": "hooks/open_item_dedup.py",
       "expression": "subprocess.run(['git', 'tag', '--list', '--sort=-creatordate'], cwd=repo_path, capture_output=True, text=True, timeout=10)",
-      "source_sha256": "d9657d2270628903b146e39d6b107e0cfbe7a27237cd0b01632167a389e49543",
+      "source_sha256": "6257774cb89b95cd39d5dc5a5535f71741ef0bf676b75d3be869a4ebf1341055",
       "scope": "support",
       "reason": "Bounded or disposable-repository Git metadata/setup. The enclosing native operation keeps its separate host contract."
     },
     {
       "source": "hooks/open_item_dedup.py",
       "expression": "subprocess.run(['git', 'log', '--name-only', '--pretty=format:', '-40'], cwd=repo_path, capture_output=True, text=True, timeout=10)",
-      "source_sha256": "d9657d2270628903b146e39d6b107e0cfbe7a27237cd0b01632167a389e49543",
+      "source_sha256": "6257774cb89b95cd39d5dc5a5535f71741ef0bf676b75d3be869a4ebf1341055",
       "scope": "support",
       "reason": "Bounded or disposable-repository Git metadata/setup. The enclosing native operation keeps its separate host contract."
     },
     {
       "source": "hooks/open_item_dedup.py",
       "expression": "subprocess.run(['gh', 'release', 'list', '--limit', '5'], cwd=repo_path, capture_output=True, text=True, timeout=10)",
-      "source_sha256": "d9657d2270628903b146e39d6b107e0cfbe7a27237cd0b01632167a389e49543",
+      "source_sha256": "6257774cb89b95cd39d5dc5a5535f71741ef0bf676b75d3be869a4ebf1341055",
       "scope": "support",
       "reason": "Read-only release, PR, or issue metadata for the explicit repository. No native session or model is selected here."
     },
     {
       "source": "hooks/open_item_dedup.py",
       "expression": "subprocess.run(['gh', 'pr', 'list', '--state', 'merged', '--limit', '20', '--json', 'number,title,mergedAt,url'], cwd=repo_path, capture_output=True, text=True, timeout=10)",
-      "source_sha256": "d9657d2270628903b146e39d6b107e0cfbe7a27237cd0b01632167a389e49543",
+      "source_sha256": "6257774cb89b95cd39d5dc5a5535f71741ef0bf676b75d3be869a4ebf1341055",
       "scope": "support",
       "reason": "Read-only release, PR, or issue metadata for the explicit repository. No native session or model is selected here."
     },
     {
       "source": "hooks/open_item_dedup.py",
       "expression": "subprocess.run(['gh', 'issue', 'list', '--state', 'closed', '--limit', '20', '--json', 'number,title,closedAt,body,url'], cwd=repo_path, capture_output=True, text=True, timeout=10)",
-      "source_sha256": "d9657d2270628903b146e39d6b107e0cfbe7a27237cd0b01632167a389e49543",
+      "source_sha256": "6257774cb89b95cd39d5dc5a5535f71741ef0bf676b75d3be869a4ebf1341055",
       "scope": "support",
       "reason": "Read-only release, PR, or issue metadata for the explicit repository. No native session or model is selected here."
     },
     {
       "source": "hooks/open_item_dedup.py",
       "expression": "subprocess.run(['python3', cli_path, 'semantic_merge', str(out_path)], input=in_path.read_text(), capture_output=True, text=True, timeout=_outer_subagent_timeout())",
-      "source_sha256": "d9657d2270628903b146e39d6b107e0cfbe7a27237cd0b01632167a389e49543",
+      "source_sha256": "6257774cb89b95cd39d5dc5a5535f71741ef0bf676b75d3be869a4ebf1341055",
       "capability": "ai.native_selection"
     },
     {
       "source": "hooks/open_item_dedup.py",
       "expression": "subprocess.run(['python3', cli_path, 'classifier', str(out_path)], input=in_path.read_text(), capture_output=True, text=True, timeout=_outer_subagent_timeout())",
-      "source_sha256": "d9657d2270628903b146e39d6b107e0cfbe7a27237cd0b01632167a389e49543",
+      "source_sha256": "6257774cb89b95cd39d5dc5a5535f71741ef0bf676b75d3be869a4ebf1341055",
       "capability": "ai.native_selection"
     },
     {
