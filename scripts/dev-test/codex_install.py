@@ -19,7 +19,13 @@ from types import SimpleNamespace
 _package_spec = importlib.util.spec_from_file_location(
     'dev_runtime_package_tree', Path(__file__).with_name('package_tree.py'))
 _package_tree = importlib.util.module_from_spec(_package_spec)
-_package_spec.loader.exec_module(_package_tree)
+# Importing the installed helper must not change the cache before its backup.
+_previous_bytecode_flag = sys.dont_write_bytecode
+try:
+    sys.dont_write_bytecode = True
+    _package_spec.loader.exec_module(_package_tree)
+finally:
+    sys.dont_write_bytecode = _previous_bytecode_flag
 
 try:
     import tomllib

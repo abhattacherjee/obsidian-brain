@@ -682,7 +682,9 @@ def test_loaded_restore_does_not_require_external_dev_source(context, tmp_path, 
     assert (cache / 'scripts/dev-test/package_tree.py').stat().st_mode & 0o7777 == 0o444
     assert (cache / 'hooks/obsidian_utils.py').stat().st_mode & 0o7777 == 0o644
     assert (cache / 'scripts/test-dev-skill.sh').stat().st_mode & 0o7777 == 0o755
-    monkeypatch.setenv('PYTHONDONTWRITEBYTECODE', '1')
+    # Exercise the installed launcher with normal bytecode writing enabled.
+    monkeypatch.delenv('PYTHONDONTWRITEBYTECODE', raising=False)
+    monkeypatch.delenv('PYTHONPYCACHEPREFIX', raising=False)
     selected = replace(context, resource_root=cache, native_home=home / native_folder(), user_home=home)
     environment = metadata_environment(home)
     for name, value in environment.items():

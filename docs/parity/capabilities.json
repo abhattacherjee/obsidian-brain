@@ -2016,7 +2016,7 @@
     {
       "source": "tests/test_host_package_install.py",
       "expression": "subprocess.run([sys.executable, '-S', '-c', driver, str(public_script), mode, str(source), str(cache)], env=environment, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)",
-      "source_sha256": "96a0c86dd4247004bbac5d3af689c2e380feba993ccfae57980c154cbc6e4326",
+      "source_sha256": "60fe212364d18a0f28dd19f0401515e332057ea8f973ab0d3a01810ea08bd1bb",
       "scope": "support",
       "reason": "Runs only the copied installer in disposable home/cache/config with metadata-only native inventory. No installed client, AI, source capture or live vault runs; validates Python 3.9 stdlib packaging and exact backup restoration."
     },
@@ -2086,7 +2086,7 @@
     {
       "source": "tests/test_review_skill_requests.py",
       "expression": "subprocess.run(command, env=metadata_environment(home), stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)",
-      "source_sha256": "65d5667f2ab1e8afc6e898f9706d2aa8d9afa15e8364e70289d70f51e3a39644",
+      "source_sha256": "dc448eb9f80610de28faaa46bba6fec4d9bc1b232dd54534d77b022bce8a3291",
       "capability": "installation.rollback"
     }
   ]

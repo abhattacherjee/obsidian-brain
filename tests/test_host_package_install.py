@@ -21,6 +21,27 @@ native_inventory = installer.native_hooks_inventory
 version = load('version_sync')
 
 
+@pytest.mark.parametrize('initial_flag', [False, True], ids=['write', 'no-write'])
+@pytest.mark.parametrize('failed_import', [False, True], ids=['success', 'failure'])
+def test_installer_helper_import_preserves_bytecode_policy(tmp_path, monkeypatch, initial_flag, failed_import):
+    import sys
+    directory = tmp_path / 'installed helper'
+    directory.mkdir()
+    script = directory / 'codex_install.py'
+    script.write_bytes((ROOT / 'scripts/dev-test/codex_install.py').read_bytes())
+    helper = directory / 'package_tree.py'
+    helper.write_text('raise RuntimeError("synthetic helper import failure")\n' if failed_import else '# synthetic helper\n')
+    monkeypatch.setattr(sys, 'dont_write_bytecode', initial_flag)
+    namespace = {'__file__': str(script), '__name__': 'private_installer_import'}
+    if failed_import:
+        with pytest.raises(RuntimeError, match='synthetic helper import failure'):
+            exec(compile(script.read_bytes(), str(script), 'exec'), namespace)
+    else:
+        exec(compile(script.read_bytes(), str(script), 'exec'), namespace)
+    assert sys.dont_write_bytecode is initial_flag
+    assert not (directory / '__pycache__').exists()
+
+
 @pytest.fixture(autouse=True)
 def metadata_only_transport(monkeypatch):
     def inventory(source, home):
