@@ -79,7 +79,7 @@ jobs:
           python scripts/ci-checks/test_shards.py list --count 6 --index "${{ matrix.shard }}" --manifest "$RUNNER_TEMP/shard-data/manifest.json" > "$RUNNER_TEMP/shard-files"
           mapfile -t TEST_FILES < "$RUNNER_TEMP/shard-files"
           PYTHONUNBUFFERED=1 PYTHONPATH=hooks:tests pytest -p parity_collection_plugin --parity-matrix docs/parity/capabilities.json "${TEST_FILES[@]}" -n 4 --deselect=tests/test_security.py::TestDecisionTimeIsBounded:: --deselect=tests/test_security.py::TestPatternDecisionTimeIsBounded:: -o addopts=--tb=short -q --basetemp="$RUNNER_TEMP/pytest-coverage" --cov=hooks --cov-report= --cov-fail-under=0 -o junit_family=xunit1 --junitxml="$RUNNER_TEMP/shard-data/parallel.xml" --durations=30
-          if [[ "${{ matrix.shard }}" == 0 ]]; then
+          if [[ "${{ matrix.shard }}" == 4 ]]; then
             PYTHONUNBUFFERED=1 PYTHONPATH=hooks:tests pytest -p parity_collection_plugin --parity-matrix docs/parity/capabilities.json tests/test_security.py::TestDecisionTimeIsBounded tests/test_security.py::TestPatternDecisionTimeIsBounded -p no:xdist -o addopts=--tb=short -q --basetemp="$RUNNER_TEMP/pytest-coverage-timing" --cov=hooks --cov-append --cov-report= --cov-fail-under=0 -o junit_family=xunit1 --junitxml="$RUNNER_TEMP/shard-data/serial-timing.xml" --durations=30
           fi
           cp .coverage "$RUNNER_TEMP/shard-data/.coverage"

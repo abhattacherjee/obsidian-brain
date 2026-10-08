@@ -13,6 +13,110 @@ shards = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(shards)
 
 
+def _workflow_shard_block(job):
+    """Read the executable literal from the production workflow."""
+    import re
+    import textwrap
+
+    source = (Path(__file__).resolve().parents[1] / '.github/workflows/ci.yml').read_text()
+    section = re.split(r'\n  \S', source.split('\n  ' + job + ':\n', 1)[1], maxsplit=1)[0]
+    return textwrap.dedent(section.split('        run: |\n', 1)[1].split(
+        '      - ', 1)[0])
+
+
+def _check_workflow_timing_owner(tmp_path, job, block):
+    """Execute every matrix index and check actual test commands and artifacts."""
+    import os
+    import subprocess
+    import sys
+
+    root = Path(__file__).resolve().parents[1]
+    count, owner = (6, 4) if job == 'coverage-shards' else (4, 0)
+    binaries = tmp_path / 'bin'
+    binaries.mkdir()
+    driver = binaries / 'driver'
+    driver.write_text('#!' + sys.executable + '\n' + '''
+import json, os, pathlib, sys
+args = sys.argv[1:]
+if pathlib.Path(sys.argv[0]).name == 'python':
+    os.execv(sys.executable, [sys.executable, os.environ['SHARD_HELPER'],
+                            '--root', os.environ['SHARD_ROOT'], *args[1:]])
+with open(os.environ['ARGV_LOG'], 'a') as handle:
+    handle.write(json.dumps(args) + '\\n')
+data = pathlib.Path('.coverage')
+with data.open('ab' if '--cov-append' in args else 'wb') as handle:
+    handle.write(b'serial\\n' if 'no:xdist' in args else b'parallel\\n')
+''')
+    driver.chmod(0o700)
+    for name in ('python', 'pytest'):
+        (binaries / name).symlink_to(driver)
+    timing = ['tests/test_security.py::TestDecisionTimeIsBounded',
+              'tests/test_security.py::TestPatternDecisionTimeIsBounded']
+    serial_indices = []
+    for index in range(count):
+        work = tmp_path / str(index)
+        work.mkdir()
+        log = work / 'argv.jsonl'
+        env = dict(os.environ, PATH=str(binaries) + os.pathsep + os.environ['PATH'],
+                   RUNNER_TEMP=str(work), ARGV_LOG=str(log), SHARD_ROOT=str(root),
+                   SHARD_HELPER=str(root / 'scripts/ci-checks/test_shards.py'))
+        # macOS ships Bash3; Ubuntu uses its built-in mapfile for this same block.
+        compatibility = '''
+if ! type mapfile >/dev/null 2>&1; then
+  mapfile() {
+    [[ "$1" == -t && "$2" == TEST_FILES ]] || return 1
+    TEST_FILES=()
+    while IFS= read -r shard_line; do TEST_FILES+=("$shard_line"); done
+  }
+fi
+'''
+        result = subprocess.run(['bash', '-c', compatibility + block.replace(
+            '${{ matrix.shard }}', str(index))], cwd=work, env=env,
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=20)
+        assert result.returncode == 0, result.stdout + result.stderr
+        calls = [json.loads(line) for line in log.read_text().splitlines()]
+        ordinary = calls[0]
+        assert ordinary[ordinary.index('-n') + 1] == '4'
+        assert all('--deselect=' + name + '::' in ordinary for name in timing)
+        files = [arg for arg in ordinary if arg.startswith('tests/')]
+        assert files == shards.partitions(root, count)[index]
+        serial = [args for args in calls if 'no:xdist' in args]
+        assert len(calls) == 1 + len(serial)
+        assert len(serial) == (1 if index == owner else 0), 'Wrong timing owner'
+        if serial:
+            serial_indices.append(index)
+            args = serial[0]
+            assert [arg for arg in args if arg.startswith('tests/')] == timing
+            assert '-n' not in args
+            assert '--junitxml=' + str(work / 'shard-data/serial-timing.xml') in args
+            if job == 'coverage-shards':
+                assert '--cov-append' in args and '--cov=hooks' in args
+        for args in calls:
+            assert 'parity_collection_plugin' in args
+            assert 'docs/parity/capabilities.json' in args
+        if job == 'coverage-shards':
+            expected = b'parallel\nserial\n' if index == owner else b'parallel\n'
+            assert (work / 'shard-data/.coverage').read_bytes() == expected
+    assert serial_indices == [owner]
+
+
+@pytest.mark.parametrize('job', ['coverage-shards', 'py39-shards'])
+def test_workflow_runs_timing_classes_once_on_the_measured_owner(tmp_path, job):
+    _check_workflow_timing_owner(tmp_path, job, _workflow_shard_block(job))
+
+
+@pytest.mark.parametrize('mutation', ['wrong-owner', 'missing-serial'])
+def test_workflow_timing_controls_reject_lost_or_moved_tests(tmp_path, mutation):
+    block = _workflow_shard_block('coverage-shards')
+    if mutation == 'wrong-owner':
+        block = block.replace('== 4', '== 0', 1)
+    else:
+        block = '\n'.join('  :' if 'pytest ' in line and 'no:xdist' in line else line
+                          for line in block.splitlines())
+    with pytest.raises(AssertionError, match='Wrong timing owner'):
+        _check_workflow_timing_owner(tmp_path, 'coverage-shards', block)
+
+
 @pytest.fixture
 def corpus(tmp_path):
     root = tmp_path / 'checkout'

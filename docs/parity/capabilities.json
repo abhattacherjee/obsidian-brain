@@ -2023,16 +2023,23 @@
     {
       "source": "tests/test_ci_test_shards.py",
       "expression": "subprocess.run(['bash', '-c', prefix + block + tail], cwd=tmp_path, env=environment, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=20)",
-      "source_sha256": "fb99c6a899af1f1bbeff5962c009e25ee326e43e3ef48e2e8f5b5cc2d271a3d2",
+      "source_sha256": "48511326708dbde5968032d5a218bf4296af735cbc65cc7a472f76cd83a508a8",
       "scope": "structural",
       "reason": "Private preflight shell control: executes the production parallel, serial, coverage and token blocks with a disposable phase driver, controlled exits, fake coverage bytes and a private token. It runs no native client or live service and proves no client capability."
     },
     {
       "source": "tests/test_ci_test_shards.py",
       "expression": "subprocess.run(['bash', '-c', command], cwd=tmp_path, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=20)",
-      "source_sha256": "fb99c6a899af1f1bbeff5962c009e25ee326e43e3ef48e2e8f5b5cc2d271a3d2",
+      "source_sha256": "48511326708dbde5968032d5a218bf4296af735cbc65cc7a472f76cd83a508a8",
       "scope": "structural",
       "reason": "Private preflight token control: runs the production startup invalidation stanza against a disposable seeded token, then returns controlled failure or interruption exit codes. It kills no process, touches no live approval token and proves no client capability."
+    },
+    {
+      "source": "tests/test_ci_test_shards.py",
+      "expression": "subprocess.run(['bash', '-c', compatibility + block.replace('${{ matrix.shard }}', str(index))], cwd=work, env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=20)",
+      "source_sha256": "48511326708dbde5968032d5a218bf4296af735cbc65cc7a472f76cd83a508a8",
+      "scope": "structural",
+      "reason": "Private workflow shard control: executes the production Bash block at every matrix index with disposable fake pytest drivers and private artifact bytes. The Python driver runs only the local partition helper. Wrong-owner and missing-serial mutations must fail. No native client, model, live service or client capability is exercised."
     }
   ]
 }
