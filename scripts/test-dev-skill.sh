@@ -35,9 +35,12 @@ case "$COMMAND" in
     *) echo "ERROR: Command must be install, restore or status" >&2; exit 1 ;;
 esac
 SCRIPT_ROOT="$REPO_ROOT"
-REPO_ROOT="$(cd "$SOURCE_ROOT" && pwd -P)"
+if [[ "$COMMAND" == "install" ]]; then
+    REPO_ROOT="$(cd "$SOURCE_ROOT" && pwd -P)"
+fi
 if [[ "$HOST" == "codex" ]]; then
-    CODEX_ARGS=("$COMMAND" --source "$REPO_ROOT")
+    CODEX_ARGS=("$COMMAND")
+    if [[ "$COMMAND" == "install" ]]; then CODEX_ARGS+=(--source "$REPO_ROOT"); fi
     if [[ -n "$CACHE_PATH" ]]; then CODEX_ARGS+=(--cache-path "$CACHE_PATH"); fi
     exec python3 "$SCRIPT_ROOT/scripts/dev-test/codex_install.py" "${CODEX_ARGS[@]}"
 fi
@@ -66,8 +69,8 @@ set -- "$COMMAND"
 # during the #287 adversarial review. `restore`'s completeness check below
 # already used the non-empty predicate for this same property; the two must
 # not disagree about what "has skills" means.
-if [[ ! -f "$REPO_ROOT/hooks/obsidian_utils.py" ]] \
-    || ! compgen -G "$REPO_ROOT/skills/*" > /dev/null 2>&1; then
+if [[ "$COMMAND" == "install" ]] && { [[ ! -f "$REPO_ROOT/hooks/obsidian_utils.py" ]] \
+    || ! compgen -G "$REPO_ROOT/skills/*" > /dev/null 2>&1; }; then
     echo "ERROR: $REPO_ROOT does not look like an obsidian-brain checkout (missing hooks/obsidian_utils.py, or skills/ is missing or empty)." >&2
     echo "This script must live inside a real obsidian-brain repo checkout; refusing to run." >&2
     exit 1
@@ -90,19 +93,19 @@ fi
 # loudly instead of "succeeding" -- hence the prefix covers all of
 # ~/.claude/plugins/, not just the cache subtree.
 #
-# Scoped to the mutating subcommands (install/restore): `status` is a
+# Scoped to install: restore uses the loaded launcher and its owned backup.
+# `status` is a
 # read-only report and there is no reason to withhold it from someone who
 # invoked this script directly out of an installed tree to see what is there.
-# (Via /dev-test that never happens -- the skill's resolver only ever hands
-# over a real checkout -- so this exemption exists for the by-hand
-# invocation, not for a "machine with no local checkout" scenario.)
+# Installed /dev-test restore and status use this loaded launcher. They do
+# not require the external development checkout used for install.
 case "${1:-status}" in
-    install|restore)
+    install)
         # REPO_ROOT above is resolved through symlinks (`pwd -P`), so the
         # prefix it is compared against must be resolved to the SAME degree or
         # the `==` never matches and the guard silently fails to fire. If
-        # $HOME can't be resolved at all, fail closed for these mutating
-        # subcommands rather than skipping the guard -- a guard that can't be
+        # $HOME can't be resolved at all, fail closed for install
+        # rather than skipping the guard -- a guard that can't be
         # evaluated is not a guard.
         if [[ -z "${HOME:-}" ]] || [[ ! -d "$HOME" ]]; then
             echo "ERROR: \$HOME is unset, empty, or not a directory; cannot verify this script isn't" >&2
@@ -130,7 +133,7 @@ case "${1:-status}" in
         # directory can live under a path that does not exist. Skipping it is
         # also what keeps the `cd` below evaluable at all -- `cd` into a missing
         # directory fails, and under `set -euo pipefail` that would abort every
-        # `install`/`restore` on a machine that has no plugins tree yet, which
+        # `install` on a machine that has no plugins tree yet, which
         # is a refusal with no defect behind it. If the directory exists but
         # cannot be entered, the
         # `cd` fails, `set -e` aborts on the assignment, and the run stops before
@@ -262,7 +265,7 @@ case "$cmd" in
         # any future command appended after it.
         trap 'echo "ERROR: Backup of $CACHE_DIR failed. The cache was NOT modified and no backup was kept." >&2; rm -rf "$BACKUP_TMP" || true' ERR
         echo "Backing up: $CACHE_DIR -> $BACKUP_DIR"
-        cp -R "$CACHE_DIR" "$BACKUP_TMP"
+        cp -pR "$CACHE_DIR" "$BACKUP_TMP"
         mv "$BACKUP_TMP" "$BACKUP_DIR"
         trap - ERR
 

@@ -154,7 +154,7 @@ def test_dev_install_passes_loaded_root_even_when_cwd_and_cache_disagree(install
     assert commands, 'dev-test must invoke its trusted install procedure'
     request = cwd / 'request.json'
     payload = {'mode': 'status'}
-    expected = ['status', '--host', selected_host_context.host, '--source', str(root)]
+    expected = ['status', '--host', selected_host_context.host]
     if selected_host_context.host == 'codex':
         cache = selected_host_context.native_home / 'plugins/cache/fixture/obsidian-brain/3.8.1'
         cache.mkdir(parents=True)
@@ -167,6 +167,7 @@ def test_dev_install_passes_loaded_root_even_when_cwd_and_cache_disagree(install
                             capture_output=True, text=True, timeout=10)
     assert result.returncode == 0, result.stderr
     assert result.stdout.splitlines() == expected
+    assert '--source' not in result.stdout.splitlines()
 
 
 def test_changed_loaded_hook_source_cannot_enter_combined_coverage(installed):

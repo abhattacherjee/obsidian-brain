@@ -564,7 +564,7 @@ def test_native_install_environment_uses_only_frozen_invoking_home(context):
         selected_native_environment(replace(context, native_home=None), base)
 
 
-@pytest.mark.parametrize('mode', ['install', 'restore'])
+@pytest.mark.parametrize('mode', ['install'])
 def test_installed_dev_test_forwards_verified_external_source(context, tmp_path, monkeypatch, mode):
     from dataclasses import replace
     from types import SimpleNamespace
@@ -642,4 +642,77 @@ def test_external_loaded_dev_test_keeps_source_default(context, monkeypatch, mod
         cache.mkdir(parents=True)
         payload['cache_path'] = str(cache)
     assert procedures.run_operation(context, 'dev-test', 'dev-install', payload, io.StringIO(), io.StringIO()) == 0
-    assert calls[0][calls[0].index('--source') + 1] == str(context.resource_root)
+    if mode == 'install':
+        assert calls[0][calls[0].index('--source') + 1] == str(context.resource_root)
+    else:
+        assert '--source' not in calls[0]
+
+
+@pytest.fixture
+def recovery_umask(request):
+    import os
+    previous = os.umask(request.param)
+    try:
+        yield
+    finally:
+        os.umask(previous)
+
+
+@pytest.mark.parametrize('recovery_umask', [0o022, 0o077], indirect=True, ids=['022', '077'])
+@pytest.mark.parametrize('unavailable', ['deleted', 'unreadable'])
+@pytest.mark.parametrize('dispatch', ['authored', 'direct'])
+def test_loaded_restore_does_not_require_external_dev_source(context, tmp_path, monkeypatch, unavailable, dispatch, recovery_umask):
+    from dataclasses import replace
+    import shutil
+    from tests.test_dev_skill_install import _stage_repo, _stage_cache
+    from tests.native_install_test_helpers import metadata_environment, native_folder
+    source = _stage_repo(tmp_path)
+    home = _stage_cache(tmp_path)
+    cache = home / native_folder() / 'plugins/cache/claude-code-skills/obsidian-brain/2.3.0'
+    # The released loaded launcher must survive independently of the checkout.
+    shutil.copytree(source / 'scripts/dev-test', cache / 'scripts/dev-test',
+                    ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
+    shutil.copy2(source / 'scripts/test-dev-skill.sh', cache / 'scripts/test-dev-skill.sh')
+    # Pin original modes independently of the ambient mask, including read-only code.
+    (cache / 'scripts/dev-test').chmod(0o750)
+    (cache / 'scripts/dev-test/package_tree.py').chmod(0o444)
+    (cache / 'hooks/obsidian_utils.py').chmod(0o644)
+    (cache / 'scripts/test-dev-skill.sh').chmod(0o755)
+    assert (cache / 'scripts/dev-test').stat().st_mode & 0o7777 == 0o750
+    assert (cache / 'scripts/dev-test/package_tree.py').stat().st_mode & 0o7777 == 0o444
+    assert (cache / 'hooks/obsidian_utils.py').stat().st_mode & 0o7777 == 0o644
+    assert (cache / 'scripts/test-dev-skill.sh').stat().st_mode & 0o7777 == 0o755
+    monkeypatch.setenv('PYTHONDONTWRITEBYTECODE', '1')
+    selected = replace(context, resource_root=cache, native_home=home / native_folder(), user_home=home)
+    environment = metadata_environment(home)
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+    def inventory(root):
+        return {str(path.relative_to(root)): (path.stat().st_mode & 0o7777, path.read_bytes() if path.is_file() else None)
+                for path in [root, *root.rglob('*')]}
+    before = inventory(cache)
+    config = selected.native_home / 'config.toml'
+    if config.exists(): config.chmod(0o600)
+    config_before = (config.read_bytes(), config.stat().st_mode & 0o7777) if config.exists() else None
+    request = {'mode': 'install', 'source_path': str(source)}
+    if selected.host == 'codex': request['cache_path'] = str(cache)
+    assert procedures._dev_install(selected, request) == 0
+    if unavailable == 'deleted': shutil.rmtree(source)
+    else: source.chmod(0o000)
+    try:
+        request['mode'] = 'restore'
+        # A stale source_path must not be touched during recovery.
+        if dispatch == 'authored':
+            assert procedures._dev_install(selected, request) == 0
+        else:
+            import subprocess
+            command = ['bash', str(cache / 'scripts/test-dev-skill.sh'), 'restore', '--host', selected.host,
+                       '--source', str(source), '--cache-path', str(cache)]
+            result = subprocess.run(command, env=metadata_environment(home), stdin=subprocess.DEVNULL,
+                                    capture_output=True, text=True, timeout=30)
+            assert result.returncode == 0, result.stderr
+        assert inventory(cache) == before
+        after = (config.read_bytes(), config.stat().st_mode & 0o7777) if config.exists() else None
+        assert after == config_before
+    finally:
+        if source.exists(): source.chmod(0o700)

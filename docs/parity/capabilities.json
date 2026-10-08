@@ -1197,14 +1197,14 @@
     {
       "source": "hooks/skill_procedures.py",
       "expression": "subprocess.run(['git', '-C', repo_path, 'rev-parse', 'HEAD'], capture_output=True, text=True, timeout=10)",
-      "source_sha256": "1e6b13f214b73addd098857b1ee4ed8232835233568a02a4bcf0f171b7efae82",
+      "source_sha256": "de2f76288117825ee456492e5a6e7a833f4b8ccf03e6d1f4eb2c25a26e0d05e9",
       "scope": "support",
       "reason": "Bounded or disposable-repository Git metadata/setup. The enclosing native operation keeps its separate host contract."
     },
     {
       "source": "hooks/skill_procedures.py",
       "expression": "subprocess.run(command, env=environment, stdin=subprocess.DEVNULL, timeout=120)",
-      "source_sha256": "1e6b13f214b73addd098857b1ee4ed8232835233568a02a4bcf0f171b7efae82",
+      "source_sha256": "de2f76288117825ee456492e5a6e7a833f4b8ccf03e6d1f4eb2c25a26e0d05e9",
       "capability": "installation.fresh_upgrade"
     },
     {
@@ -1262,25 +1262,25 @@
       "source": "tests/test_dev_skill_install.py",
       "expression": "subprocess.run(['bash', str(repo / 'scripts' / 'test-dev-skill.sh'), 'install', '--host', context.host, '--source', str(repo), '--cache-path', str(home / native_folder() / 'plugins/cache/claude-code-skills/obsidian-brain/2.3.0')], env=env, capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL)",
       "capability": "installation.fresh_upgrade",
-      "source_sha256": "0c9ef3731db582c4d68d8eb1c5492a22439e1c6deba5d3faad00d4702b7c8ee5"
+      "source_sha256": "9629b017758d2fdad0adba1848d8c542c2b74d6191923cdee6f86c2dda345030"
     },
     {
       "source": "tests/test_dev_skill_install.py",
       "expression": "subprocess.run(['bash', str(repo / 'scripts' / 'test-dev-skill.sh'), 'install', '--host', context.host, '--source', str(repo), '--cache-path', str(home / native_folder() / 'plugins/cache/claude-code-skills/obsidian-brain/2.3.0')], env=env, capture_output=True, text=True, timeout=10, stdin=subprocess.DEVNULL)",
       "capability": "installation.fresh_upgrade",
-      "source_sha256": "0c9ef3731db582c4d68d8eb1c5492a22439e1c6deba5d3faad00d4702b7c8ee5"
+      "source_sha256": "9629b017758d2fdad0adba1848d8c542c2b74d6191923cdee6f86c2dda345030"
     },
     {
       "source": "tests/test_dev_test_script_guards.py",
       "expression": "subprocess.run([_BASH, str(script), cmd, '--host', context.host, '--source', str(script.parent.parent)], env=env, capture_output=True, text=True, timeout=10, stdin=subprocess.DEVNULL)",
       "capability": "installation.rollback",
-      "source_sha256": "afaa6dc46b882d0ef868375114c3b72776457bb71a692fa11e3061ba751cb703"
+      "source_sha256": "5240c8765f8bbe0cc94859b1774f972477ad1b4e141b839545190776ea7e85e8"
     },
     {
       "source": "tests/test_dev_test_script_guards.py",
       "expression": "subprocess.run([_BASH, str(SCRIPT_PATH), mode, '--host', context.host, '--source', str(source), '--cache-path', str(cache)], env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)",
       "capability": "installation.rollback",
-      "source_sha256": "afaa6dc46b882d0ef868375114c3b72776457bb71a692fa11e3061ba751cb703"
+      "source_sha256": "5240c8765f8bbe0cc94859b1774f972477ad1b4e141b839545190776ea7e85e8"
     },
     {
       "source": "tests/test_hook_dedup_guard.py",
@@ -1297,26 +1297,26 @@
     {
       "source": "tests/test_hooks_resolver_drift.py",
       "expression": "subprocess.run([sys.executable, '-c', _root_code(skill), str(loaded)], cwd=cwd, env=env, capture_output=True, text=True, timeout=10)",
-      "source_sha256": "5e996ef66dd7974c823456f9d7067e888d3e1ae812bcf3f64e22c77bd4002b2d",
+      "source_sha256": "64bb682ffa943ba2db3d8b3938fc81d0336790db1f63c5db48cac182e0ed8ec7",
       "scope": "structural",
       "reason": "Resource-root resolution expression in a fresh interpreter; this call does not execute the skill operation."
     },
     {
       "source": "tests/test_hooks_resolver_drift.py",
       "expression": "subprocess.run(['bash', '-c', _context_command(skill)], cwd=cwd, env=env, capture_output=True, text=True, timeout=10)",
-      "source_sha256": "5e996ef66dd7974c823456f9d7067e888d3e1ae812bcf3f64e22c77bd4002b2d",
+      "source_sha256": "64bb682ffa943ba2db3d8b3938fc81d0336790db1f63c5db48cac182e0ed8ec7",
       "capability": "skill.dispatch"
     },
     {
       "source": "tests/test_hooks_resolver_drift.py",
       "expression": "subprocess.run([sys.executable, str(root / 'hooks/brain_cli.py'), '--host', selected_host_context.host, '--client', selected_host_context.client, '--resource-root', str(root), '--session-id', 'synthetic-loaded-skill', '--cwd', str(cwd), 'run', '--skill-path', str(REPO / 'skills/recall/SKILL.md'), '--operation', 'config'], input='{}', cwd=cwd, env=env, capture_output=True, text=True, timeout=10)",
       "capability": "skill.dispatch",
-      "source_sha256": "5e996ef66dd7974c823456f9d7067e888d3e1ae812bcf3f64e22c77bd4002b2d"
+      "source_sha256": "64bb682ffa943ba2db3d8b3938fc81d0336790db1f63c5db48cac182e0ed8ec7"
     },
     {
       "source": "tests/test_hooks_resolver_drift.py",
       "expression": "subprocess.run(['bash', '-c', commands[0]], cwd=cwd, env=env, capture_output=True, text=True, timeout=10)",
-      "source_sha256": "5e996ef66dd7974c823456f9d7067e888d3e1ae812bcf3f64e22c77bd4002b2d",
+      "source_sha256": "64bb682ffa943ba2db3d8b3938fc81d0336790db1f63c5db48cac182e0ed8ec7",
       "capability": "skill.dispatch"
     },
     {
@@ -2082,6 +2082,12 @@
       "source_sha256": "e98f9fc524f7da5227ba418ba879ea283795c47faa6ee34d33e85ccf9e31fcb9",
       "scope": "support",
       "reason": "Runs only the copied restore script against a disposable private home and read-only partial cache, with metadata-only native inventory. Checks exact backup restoration and unchanged source permissions. No installed native client, AI, live configuration or vault runs; the enclosing paired test retains its host context."
+    },
+    {
+      "source": "tests/test_review_skill_requests.py",
+      "expression": "subprocess.run(command, env=metadata_environment(home), stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)",
+      "source_sha256": "65d5667f2ab1e8afc6e898f9706d2aa8d9afa15e8364e70289d70f51e3a39644",
+      "capability": "installation.rollback"
     }
   ]
 }

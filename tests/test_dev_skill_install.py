@@ -42,14 +42,14 @@ def _stage_repo(tmp_path: Path) -> Path:
     repo = tmp_path / "repo"
     if repo.exists():
         return repo
-    shutil.copytree(REPO_ROOT / 'hooks', repo / 'hooks')
+    shutil.copytree(REPO_ROOT / 'hooks', repo / 'hooks', ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
     (repo / "hooks" / "obsidian_utils.py").write_text("# fake hook\n")
     (repo / "hooks" / "hooks.json").write_text('{"hooks": {"SessionEnd": []}}\n')
 
     (repo / "skills" / "test-skill").mkdir(parents=True)
     (repo / "skills" / "test-skill" / "SKILL.md").write_text("# fake skill\n")
 
-    shutil.copytree(REPO_ROOT / "scripts/vault_doctor_checks", repo / "scripts/vault_doctor_checks")
+    shutil.copytree(REPO_ROOT / "scripts/vault_doctor_checks", repo / "scripts/vault_doctor_checks", ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
     (repo / "scripts" / "vault_doctor.py").write_text("# fake dispatcher\n")
     shutil.copy2(REPO_ROOT / "scripts/doctor_repair_state.py", repo / "scripts/doctor_repair_state.py")
     (repo / "scripts" / "vault_doctor_checks" / "__init__.py").write_text("")
@@ -64,7 +64,7 @@ def _stage_repo(tmp_path: Path) -> Path:
     # REPO_ROOT correctly via $(dirname "$0")/..
     (repo / "scripts" / "test-dev-skill.sh").write_bytes(SCRIPT_PATH.read_bytes())
     (repo / "scripts" / "test-dev-skill.sh").chmod(0o755)
-    shutil.copytree(REPO_ROOT / "scripts/dev-test", repo / "scripts/dev-test")
+    shutil.copytree(REPO_ROOT / "scripts/dev-test", repo / "scripts/dev-test", ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
     for directory in ('.codex-plugin', '.claude-plugin'):
         target = repo / directory
         target.mkdir(exist_ok=True)

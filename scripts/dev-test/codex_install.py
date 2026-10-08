@@ -454,7 +454,8 @@ def _validate_restore_backup(backup):
 
 
 def run(mode, source, home, fault=lambda point: None, cache_path=None):
-    source, home = Path(source).resolve(), Path(home).absolute()
+    source = Path(source).resolve() if mode == 'install' else None
+    home = Path(home).absolute()
     _no_links(home)
     config_path = home / 'config.toml'
     original = config_path.read_bytes() if config_path.exists() else b''
@@ -470,10 +471,11 @@ def run(mode, source, home, fault=lambda point: None, cache_path=None):
     if mode == 'status':
         print(json.dumps({'host': 'codex', 'version': cache.name, 'dev_active': backup.exists()}))
         return 0
-    if source == home.resolve() or home.resolve() in source.parents:
-        raise ValueError('Install source must be outside the selected native home')
-    if not (source / 'hooks/obsidian_utils.py').is_file():
-        raise ValueError('Source is not an obsidian-brain checkout')
+    if mode == 'install':
+        if source == home.resolve() or home.resolve() in source.parents:
+            raise ValueError('Install source must be outside the selected native home')
+        if not (source / 'hooks/obsidian_utils.py').is_file():
+            raise ValueError('Source is not an obsidian-brain checkout')
     _no_links(cache)
     recovery = _private_recovery_directory(home, cache)
     with _ownership(recovery / '.dev-install.lock'):
@@ -582,9 +584,11 @@ def run(mode, source, home, fault=lambda point: None, cache_path=None):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('mode', choices=('install', 'restore', 'status'))
-    parser.add_argument('--source', required=True)
+    parser.add_argument('--source')
     parser.add_argument('--cache-path', required=True)
     args = parser.parse_args()
+    if args.mode == 'install' and args.source is None:
+        parser.error('--source is required for install')
     home = os.environ.get('CODEX_HOME') or str(Path.home() / '.codex')
     try:
         return run(args.mode, args.source, home, cache_path=args.cache_path)

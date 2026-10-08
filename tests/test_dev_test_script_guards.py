@@ -158,7 +158,6 @@ def _codex_guard_case(name, tmp_path, monkeypatch, **parameters):
     expect = 'refused'
     if name == 'test_sentinel_guard_rejects_non_checkout':
         shutil.rmtree(source / 'hooks')
-        mode, expect = 'status', 'status'
     elif name in {'test_sentinel_guard_fires_before_any_mutation',
                   'test_sentinel_guard_rejects_checkout_missing_hooks_file'}:
         (source / 'hooks/obsidian_utils.py').unlink()
@@ -171,9 +170,10 @@ def _codex_guard_case(name, tmp_path, monkeypatch, **parameters):
         (source / 'skills').mkdir()
         (source / 'skills/README.md').write_text('not an installable skill')
     elif name in {'test_self_copy_guard_rejects_install_from_inside_cache',
-                  'test_self_copy_guard_rejects_restore_from_inside_cache'}:
+                  'test_loaded_restore_without_backup_returns_four'}:
         source = cache
         mode = 'restore' if 'restore' in name else 'install'
+        if mode == 'restore': expect = 'nothing'
     elif name == 'test_self_copy_guard_fires_with_symlinked_home':
         linked = tmp_path / 'linked-native-home'
         linked.symlink_to(home, target_is_directory=True)
@@ -390,8 +390,8 @@ def test_sentinel_guard_rejects_non_checkout(tmp_path: Path, host, selected_host
     the script must refuse rather than trust its own location blindly.
 
     Deliberately placed OUTSIDE any ~/.claude/plugins/cache/ path, and run
-    with "status" (not install/restore), so this failure can only be
-    attributed to guard 1 -- guard 2 does not even apply to "status".
+    with "install". Source validation runs only when copying a development
+    source; guard 2 cannot match this external directory.
     """
     if host == 'codex':
         _codex_guard_case('test_sentinel_guard_rejects_non_checkout', tmp_path, monkeypatch)
@@ -400,7 +400,7 @@ def test_sentinel_guard_rejects_non_checkout(tmp_path: Path, host, selected_host
     script = _write_script(repo / "scripts")
     home = tmp_path / "home"  # empty; never touched by this test
 
-    proc = _run(script, "status", home)
+    proc = _run(script, "install", home)
 
     assert proc.returncode != 0, f"expected non-zero exit, got 0: {proc.stdout}"
     assert GUARD1_MSG in proc.stderr
@@ -470,7 +470,7 @@ def test_sentinel_guard_rejects_checkout_without_a_non_empty_skills_dir(
     # else: deliberately no skills/ dir at all
     home = tmp_path / "home"
 
-    proc = _run(script, "status", home)
+    proc = _run(script, "install", home)
 
     assert proc.returncode != 0, f"expected non-zero exit, got 0: {proc.stdout}"
     assert GUARD1_MSG in proc.stderr
@@ -531,7 +531,7 @@ def test_sentinel_guard_rejects_checkout_missing_hooks_file(tmp_path: Path, host
     # deliberately no hooks/obsidian_utils.py
     home = tmp_path / "home"
 
-    proc = _run(script, "status", home)
+    proc = _run(script, "install", home)
 
     assert proc.returncode != 0, f"expected non-zero exit, got 0: {proc.stdout}"
     assert GUARD1_MSG in proc.stderr
@@ -569,13 +569,10 @@ def test_self_copy_guard_rejects_install_from_inside_cache(tmp_path: Path, host,
 
 
 @requires_bash
-def test_self_copy_guard_rejects_restore_from_inside_cache(tmp_path: Path, host, selected_host_context, monkeypatch) -> None:
-    """Guard 2 also applies to "restore" -- restoring a .bak while REPO_ROOT
-    is the cache itself is equally nonsensical (there is no local checkout
-    to have diverged from).
-    """
+def test_loaded_restore_without_backup_returns_four(tmp_path: Path, host, selected_host_context, monkeypatch) -> None:
+    """An installed launcher can restore without an external development source."""
     if host == 'codex':
-        _codex_guard_case('test_self_copy_guard_rejects_restore_from_inside_cache', tmp_path, monkeypatch)
+        _codex_guard_case('test_loaded_restore_without_backup_returns_four', tmp_path, monkeypatch)
         return
     home = tmp_path / "home"
     cache_version_dir = (
@@ -588,8 +585,9 @@ def test_self_copy_guard_rejects_restore_from_inside_cache(tmp_path: Path, host,
 
     proc = _run(script, "restore", home)
 
-    assert proc.returncode != 0
-    assert GUARD2_MSG in proc.stderr
+    assert proc.returncode == 4
+    assert "nothing to restore" in proc.stdout
+    assert GUARD2_MSG not in proc.stderr
 
 
 @requires_bash

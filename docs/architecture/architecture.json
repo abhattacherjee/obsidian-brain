@@ -1063,7 +1063,7 @@
           "files": [
             "skills/dev-test/SKILL.md"
           ],
-          "purpose": "MAINTENANCE. Install/restore/status the explicitly selected loaded package. Scripts validate descriptors, dependency closure and selected cache metadata; failures restore prior cache/config bytes. No inferred newest-cache or current-directory source selection. Installation does not certify current frontend binding."
+          "purpose": "MAINTENANCE. Install/restore/status the explicitly selected loaded package. Scripts validate descriptors, dependency closure and selected cache metadata; failures restore prior cache/config bytes. No inferred newest-cache or current-directory source selection. Installation does not certify current frontend binding. Only install requires a verified external source. Restore uses the loaded launcher, selected native home/cache and saved backup even when the dev source is missing or unreadable."
         },
         {
           "id": "sk-check-items",
@@ -2785,7 +2785,7 @@
     },
     {
       "name": "test-dev-skill.sh",
-      "command": "/dev-test install \u2014 receives an absolute repo root from the skill (sentinel-gated git toplevel first, then the _ob_repo() registry resolver, no cache fallback); independently re-derives REPO_ROOT from its own location and refuses to run outside a real checkout (hooks/obsidian_utils.py plus a NON-EMPTY skills/) or to install/restore from anywhere under ~/.claude/plugins/ (cache or marketplace clone, prefix resolved by cd-ing into the plugin dir itself so a symlinked ~/.claude cannot evade it); publishes its .bak by atomic rename (built at .bak.partial.$$, moved into place only after cp -R succeeds) so an incomplete backup can never carry the .bak name, with a retained shape check as a secondary guard on restore; status additionally discloses orphaned .bak.partial.<pid> trees left by a hard-killed install (inert, but each is a full cache copy); exit codes are distinct per state \u2014 0 installed/restored, 2 copied but security tests failed, 3 aborted partway with a backup published and the cache possibly mixed (needs restore), 4 restore had no backup to restore (nothing changed), 1 refused before anything was written \u2014 and the skill branches its reporting on that status; copies the working tree into the plugin cache for local testing (#287)"
+      "command": "/dev-test install requires a verified source outside the selected native home. The loaded launcher validates source sentinels and refuses self-copy from installed plugin directories. Restore and status use the loaded launcher and selected cache without reading the external source. Install and recovery preserve selected cache/config bytes, permissions and backup ownership; interrupted installs retain recovery records. Claude restores its complete .bak by rename. Codex uses private recovery storage outside plugins on the cache filesystem. Missing complete backups return 4 without changing the cache. Installation alone does not prove native hook dispatch."
     },
     {
       "name": "test-security.sh",
