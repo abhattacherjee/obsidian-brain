@@ -116,8 +116,10 @@ The user provides a query after `/vault-search`. Determine the search mode:
 
 **Structured mode** — query contains `key:value` pairs (e.g. `project:api-service type:decision`):
 - Parse each `key:value` pair
-- Each pair maps to a frontmatter field grep: pattern `^key:.*value` (case-insensitive)
-- All pairs must match in the same file (intersection)
+- For `type`, normalize recognized short aliases by adding `claude-`: `session`, `snapshot`, `insight`, `decision`, `error-fix`, `retro`, `standup`, `stats`, `dashboard`, `wiki`, and `wiki-index`. Canonical values stay unchanged. Treat every other value as an exact literal; do not add a prefix or use substring matching. Thus the documented `type:decision` query matches `claude-decision` notes.
+- Separate the `key:value` constraints from any remaining keyword text. For `SQLite type:claude-insight project:parity-lab`, the keywords are `SQLite`; the constraints are `type:claude-insight` and `project:parity-lab`.
+- Match each field value literally in frontmatter, not in the body. Escape regex characters in keys and values, anchor the entire scalar field, and allow YAML quotes around the value.
+- All pairs must match in the same file (intersection). Keywords never replace or relax a field constraint.
 
 **Keyword mode** — everything else (e.g. `jwt refresh`):
 - Treat the entire query as a content search
@@ -125,7 +127,9 @@ The user provides a query after `/vault-search`. Determine the search mode:
 
 ### Step 3 — Try FTS search (fast path)
 
-Before falling back to pattern search, try the vault index:
+Use this fast path only for **keyword mode**. Tag and structured queries go directly to Step 4; a non-empty keyword index result does not prove their frontmatter constraints. Never send `key:value` pairs or a tag as literal FTS query text.
+
+For keyword mode, try the vault index before falling back to pattern search. Keep its existing AND-first, OR-fallback keyword matching:
 
 Request for `search` (substitute the values as data):
 
@@ -141,7 +145,7 @@ Request for `search` (substitute the values as data):
 python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'search' < "$REQUEST_PATH"
 ```
 
-If the output is a non-empty JSON array: parse and present results (path, title, type, date, excerpt) using the format in Step 6. Skip Steps 4 and 5 below.
+For keyword mode only, if the output is a non-empty JSON array: parse and present results (path, title, type, date, excerpt) using the format in Step 6. Skip Steps 4 and 5 below.
 
 If the output is `[]` or the command fails: print a note that the vault index returned no results, then fall through to Step 4. If the command failed because the DB does not exist, also suggest running `/vault-reindex` to build the index.
 
@@ -159,7 +163,13 @@ Use the fixed `grep` operation. It searches validated indexed folders and emits 
 python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'grep' < "$REQUEST_PATH"
 ```
 
-**Structured mode:** Run one request per `key:value` pair with `pattern: "^<key>:.*<value>"`, `ignore_case: true`, and `frontmatter_only: true`. Intersect the returned file lists: every pair must match the same file.
+**Structured mode:** Run one frontmatter-only request per field constraint and intersect the returned file lists. Use escaped literal keys and values, with complete-field anchors. For `type:claude-insight`, use this request; quoted and unquoted scalar values both match, while `claude-session` and `claude-insight-other` do not:
+
+```json
+{"pattern": "^type:[ \t]*(?:claude-insight|\"claude-insight\"|'claude-insight')[ \t]*$", "ignore_case": true, "frontmatter_only": true}
+```
+
+Apply the same rule to `project:parity-lab` and every other scalar constraint. If there is no keyword text, the field intersection is the complete result. Otherwise, search for the remaining keyword phrase in content and intersect those matches with the field intersection. If that leaves no matches, intersect the individual keyword match lists (AND) and the field intersection. If there are still no matches, union the individual keyword lists (OR) and intersect that union with the field intersection. Every branch must retain every field constraint. For `SQLite type:claude-insight project:parity-lab`, a session that mentions those strings in its body is never a result. Apply the 20-result limit only after these intersections.
 
 **Keyword mode:** Run one request for the complete query with `ignore_case: true`. If it finds no matches and the query contains several words, run one request per word and intersect the file lists.
 
