@@ -7,7 +7,7 @@ import time
 
 import pytest
 
-from parity_test_helpers import host, context, selected_host_context
+from parity_test_helpers import host, context, selected_host_context, host_identity_scenario
 
 import capture
 from note_transactions import NoteMutation, apply_mutations, read_revision
@@ -162,3 +162,101 @@ def test_native_memory_discovery_obeys_declared_host_capability(host, context, m
         assert errors == []
         assert found == [note.resolve()]
     assert note.read_text() == 'Synthetic memory.\n'
+
+
+@pytest.mark.parametrize('project_name,expected', [
+    pytest.param('Parity Lab', 'parity-lab', id='spaces'),
+    pytest.param('Parity_Lab', 'parity-lab', id='underscore'),
+    pytest.param('Café_Lab', 'café-lab', id='unicode'),
+    pytest.param('Long_' + 'Project_' * 7 + 'Name',
+                 'long-' + 'project-' * 7 + 'name', id='long'),
+])
+def test_native_project_metadata_and_skill_filters_agree(
+        context, host_identity_scenario, project_name, expected):
+    import io
+    import skill_procedures
+    from obsidian_utils import get_session_context
+
+    root = context.canonical_project_root.parent / project_name
+    root.mkdir()
+    bound = source(replace(context, canonical_project_root=root, worktree=root))
+    host_identity_scenario.register(bound)
+    original_key = context.session_key
+    with using_runtime_context(bound):
+        result = capture.capture_checkpoint(
+            bound, capture.CaptureEvent('pre_compact', min_messages=1),
+            time.monotonic() + 3)
+        assert result.status == 'complete'
+        output, errors = io.StringIO(), io.StringIO()
+        assert skill_procedures.run_operation(
+            bound, 'vault-stats', 'config', {}, output, errors) == 0
+        config = json.loads(output.getvalue())
+        assert config['project'] == expected
+        assert get_session_context()['project'] == expected
+        output = io.StringIO()
+        assert skill_procedures.run_operation(
+            bound, 'vault-stats', 'stats', {'project': config['project']},
+            output, errors) == 0
+        stats = json.loads(output.getvalue())
+        assert stats['project']['name'] == expected
+        assert stats['project']['total_notes'] == 2
+        assert stats['vault_wide']['total_notes'] == 2
+        output = io.StringIO()
+        assert skill_procedures.run_operation(
+            bound, 'vault-stats', 'stats', {}, output, errors) == 0
+        assert json.loads(output.getvalue())['project']['total_notes'] == 2
+        output = io.StringIO()
+        assert skill_procedures.run_operation(
+            bound, 'vault-stats', 'stats', {'project': 'foreign-project'},
+            output, errors) == 0
+        assert json.loads(output.getvalue())['project']['total_notes'] == 0
+    assert bound.canonical_project_root == root
+    assert bound.session_key == original_key
+    notes = list((bound.vault_path / 'claude-sessions').glob('*.md'))
+    assert len(notes) == 2
+    for path in notes:
+        assert capture._note_identity(path)['project'] == expected
+
+
+@pytest.mark.parametrize('project_name,expected', [
+    pytest.param('Café_Lab', 'café-lab', id='unicode'),
+    pytest.param('Long_' + 'Project_' * 7 + 'Name',
+                 'long-' + 'project-' * 7 + 'name', id='long'),
+])
+def test_native_start_index_fallback_uses_full_project_label(
+        context, host_identity_scenario, project_name, expected):
+    from contextlib import closing
+    import sqlite3
+    import native_lifecycle
+    from note_transactions import connect_coordination
+
+    root = context.canonical_project_root.parent / project_name
+    root.mkdir()
+    bound = replace(context, canonical_project_root=root, worktree=root)
+    host_identity_scenario.register(bound)
+    note = bound.vault_path / 'claude-sessions' / 'prior.md'
+    note.parent.mkdir(parents=True)
+    note.write_text('---\ntype: claude-session\nproject: ' + expected
+                    + '\n---\n## Summary\nCorrect project context.\n')
+    with closing(connect_coordination(bound)):
+        pass
+    bound.index_path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(bound.index_path) as connection:
+        connection.execute('CREATE TABLE notes(path TEXT, project TEXT, type TEXT, date TEXT, body TEXT)')
+        connection.execute('INSERT INTO notes VALUES (?, ?, ?, ?, ?)',
+                           (str(note), expected, 'claude-session', '2026-10-05',
+                            '## Summary\nCorrect project context.\n'))
+    result = native_lifecycle._context_hint(bound, time.monotonic() + 2)
+    assert result is not None
+    assert result['hookSpecificOutput']['additionalContext'].endswith('Correct project context.')
+
+
+def test_native_project_repo_map_uses_logical_label(context, monkeypatch):
+    import open_item_dedup
+    root = context.canonical_project_root.parent / 'Parity_Lab'
+    root.mkdir()
+    (root / '.git').mkdir()
+    bound = replace(context, canonical_project_root=root, worktree=root)
+    monkeypatch.setattr(open_item_dedup, 'get_workspace_roots', lambda: [])
+    with using_runtime_context(bound):
+        assert open_item_dedup._resolve_project_paths() == {'parity-lab': str(root)}

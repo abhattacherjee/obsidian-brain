@@ -31,7 +31,7 @@ def _config(context, payload):
     value['folders'] = indexed_folders(value)
     wiki = value.get('wiki_folder', 'claude-wiki')
     value['wiki_folder'] = wiki if wiki in value['folders'] else ''
-    value['project'] = context.canonical_project_root.name
+    value['project'] = context.project_name
     _emit(value)
 
 def _session(context, payload):
@@ -298,7 +298,7 @@ def _check_items_stage_01(context, payload):
     known, needs = ([], [])
     heads = {}
     for proj, groups in coarse_by_proj.items():
-        repo_path = str(context.canonical_project_root) if proj == context.canonical_project_root.name and (context.canonical_project_root / '.git').exists() else None
+        repo_path = str(context.canonical_project_root) if proj == context.project_name and (context.canonical_project_root / '.git').exists() else None
         for _root in get_workspace_roots():
             _candidate = os.path.join(_root, proj)
             if os.path.exists(os.path.join(_candidate, '.git')):
@@ -679,7 +679,7 @@ def _check_items_stage_07(context, payload):
     elif scope['mode'] == 'project' and scope['project']:
         scope_name = scope['project']
     else:
-        scope_name = context.canonical_project_root.name or 'unknown'
+        scope_name = context.project_name or 'unknown'
     date_str = datetime.date.today().isoformat()
     window_days = scope.get('window_days', 14)
     dry_run = bool(scope.get('dry_run', False))
@@ -1088,7 +1088,7 @@ def _check_collect(context, payload):
         if not (context.worktree / '.git').exists() and context.canonical_project_root == context.worktree:
             print('ERROR: /check-items current-project mode requires running inside a git repo.\nUse /check-items all (vault-wide) or /check-items <project>.', file=sys.stderr)
             return 1
-        projects = {context.canonical_project_root.name}
+        projects = {context.project_name}
     records = []
     for project in sorted(projects):
         records.extend(collect_open_item_records(str(context.vault_path), folder, project, max_sessions=50))
@@ -1193,12 +1193,12 @@ def _unsummarized(context, payload):
         raise ValueError('include_aged must be a boolean.')
     if threshold is not None and (isinstance(threshold, bool) or not isinstance(threshold, int) or threshold < 1):
         raise ValueError('aged_threshold_days must be a positive integer.')
-    _emit(json.loads(find_unsummarized_notes(str(context.vault_path), context.config.get('sessions_folder', 'claude-sessions'), payload.get('project', context.canonical_project_root.name), include_aged=include_aged, aged_threshold_days=threshold)))
+    _emit(json.loads(find_unsummarized_notes(str(context.vault_path), context.config.get('sessions_folder', 'claude-sessions'), payload.get('project', context.project_name), include_aged=include_aged, aged_threshold_days=threshold)))
 
 
 def _brief(context, payload):
     from obsidian_utils import build_context_brief
-    print(build_context_brief(str(context.vault_path), context.config.get('sessions_folder', 'claude-sessions'), context.config.get('insights_folder', 'claude-insights'), payload.get('project', context.canonical_project_root.name)))
+    print(build_context_brief(str(context.vault_path), context.config.get('sessions_folder', 'claude-sessions'), context.config.get('insights_folder', 'claude-insights'), payload.get('project', context.project_name)))
 
 
 def _themes(context, payload):
@@ -1219,7 +1219,7 @@ def _evidence(context, payload):
             or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,199}', value)
             or '..' in value for value in ids)):
         raise ValueError('also_session_ids must contain explicit full native session IDs.')
-    _emit(gather_session_evidence(str(context.vault_path), context.config.get('sessions_folder', 'claude-sessions'), context.config.get('insights_folder', 'claude-insights'), context.native_session_id, context.canonical_project_root.name, also_session_ids=ids))
+    _emit(gather_session_evidence(str(context.vault_path), context.config.get('sessions_folder', 'claude-sessions'), context.config.get('insights_folder', 'claude-insights'), context.native_session_id, context.project_name, also_session_ids=ids))
 
 
 def _retro_gate(context, payload):
@@ -1239,7 +1239,7 @@ def _summary_apply(context, payload):
     expected = payload['expected_revision']
     if _source_manifest(context, payload)['sources'].get(str(path)) != expected:
         raise ValueError('Read the source before preparing its summary.')
-    result = upgrade_note_with_summary(str(path), payload['summary'], str(context.vault_path), context.config.get('sessions_folder', 'claude-sessions'), payload.get('project', context.canonical_project_root.name), source=context.host + ' native skill', expected_revision=expected)
+    result = upgrade_note_with_summary(str(path), payload['summary'], str(context.vault_path), context.config.get('sessions_folder', 'claude-sessions'), payload.get('project', context.project_name), source=context.host + ' native skill', expected_revision=expected)
     print(result)
     return 0 if result.startswith('Upgraded ') else 1
 
@@ -1254,7 +1254,7 @@ def _stats(context, payload):
     from vault_index import ensure_index
     from vault_stats import compute_stats
     database = ensure_index(str(context.vault_path), indexed_folders(dict(context.config)))
-    result = compute_stats(database, payload.get('project', context.canonical_project_root.name))
+    result = compute_stats(database, payload.get('project', context.project_name))
     print(result)
 
 

@@ -1122,89 +1122,89 @@
     {
       "source": "hooks/obsidian_utils.py",
       "expression": "subprocess.run(['git', 'rev-parse', '--git-common-dir'], capture_output=True, text=True, timeout=5, cwd=cwd or None)",
-      "source_sha256": "4093d51fe5bce628ba541da64645c5bfbb46e4a2a15765f0ba9d47778738dc89",
+      "source_sha256": "964f739ca30478a9086e01da4d9924283d3bbf06951b309cd64c4c71d39a195d",
       "scope": "support",
       "reason": "Bounded or disposable-repository Git metadata/setup. The enclosing native operation keeps its separate host contract."
     },
     {
       "source": "hooks/obsidian_utils.py",
       "expression": "subprocess.run(['find', str(projects_dir), '-name', target, '-type', 'f', '-print', '-quit'], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=5)",
-      "source_sha256": "4093d51fe5bce628ba541da64645c5bfbb46e4a2a15765f0ba9d47778738dc89",
+      "source_sha256": "964f739ca30478a9086e01da4d9924283d3bbf06951b309cd64c4c71d39a195d",
       "scope": "support",
       "reason": "Legacy Claude transcript location compatibility. Bound native contexts return only their selected transcript before this call."
     },
     {
       "source": "hooks/obsidian_utils.py",
       "expression": "subprocess.run(['git', 'rev-parse', '--abbrev-ref', 'HEAD'], capture_output=True, text=True, timeout=5, cwd=cwd or None)",
-      "source_sha256": "4093d51fe5bce628ba541da64645c5bfbb46e4a2a15765f0ba9d47778738dc89",
+      "source_sha256": "964f739ca30478a9086e01da4d9924283d3bbf06951b309cd64c4c71d39a195d",
       "scope": "support",
       "reason": "Bounded or disposable-repository Git metadata/setup. The enclosing native operation keeps its separate host contract."
     },
     {
       "source": "hooks/open_item_dedup.py",
       "expression": "subprocess.run(['git', 'log', '--oneline', '-40'], cwd=repo_path, capture_output=True, text=True, timeout=10)",
-      "source_sha256": "6257774cb89b95cd39d5dc5a5535f71741ef0bf676b75d3be869a4ebf1341055",
+      "source_sha256": "64ea25c05a14da16ee108917f0b5487c407d52cd6f0ddaf5aab61e6e1bf73de3",
       "scope": "support",
       "reason": "Bounded or disposable-repository Git metadata/setup. The enclosing native operation keeps its separate host contract."
     },
     {
       "source": "hooks/open_item_dedup.py",
       "expression": "subprocess.run(['git', 'tag', '--list', '--sort=-creatordate'], cwd=repo_path, capture_output=True, text=True, timeout=10)",
-      "source_sha256": "6257774cb89b95cd39d5dc5a5535f71741ef0bf676b75d3be869a4ebf1341055",
+      "source_sha256": "64ea25c05a14da16ee108917f0b5487c407d52cd6f0ddaf5aab61e6e1bf73de3",
       "scope": "support",
       "reason": "Bounded or disposable-repository Git metadata/setup. The enclosing native operation keeps its separate host contract."
     },
     {
       "source": "hooks/open_item_dedup.py",
       "expression": "subprocess.run(['git', 'log', '--name-only', '--pretty=format:', '-40'], cwd=repo_path, capture_output=True, text=True, timeout=10)",
-      "source_sha256": "6257774cb89b95cd39d5dc5a5535f71741ef0bf676b75d3be869a4ebf1341055",
+      "source_sha256": "64ea25c05a14da16ee108917f0b5487c407d52cd6f0ddaf5aab61e6e1bf73de3",
       "scope": "support",
       "reason": "Bounded or disposable-repository Git metadata/setup. The enclosing native operation keeps its separate host contract."
     },
     {
       "source": "hooks/open_item_dedup.py",
       "expression": "subprocess.run(['gh', 'release', 'list', '--limit', '5'], cwd=repo_path, capture_output=True, text=True, timeout=10)",
-      "source_sha256": "6257774cb89b95cd39d5dc5a5535f71741ef0bf676b75d3be869a4ebf1341055",
+      "source_sha256": "64ea25c05a14da16ee108917f0b5487c407d52cd6f0ddaf5aab61e6e1bf73de3",
       "scope": "support",
       "reason": "Read-only release, PR, or issue metadata for the explicit repository. No native session or model is selected here."
     },
     {
       "source": "hooks/open_item_dedup.py",
       "expression": "subprocess.run(['gh', 'pr', 'list', '--state', 'merged', '--limit', '20', '--json', 'number,title,mergedAt,url'], cwd=repo_path, capture_output=True, text=True, timeout=10)",
-      "source_sha256": "6257774cb89b95cd39d5dc5a5535f71741ef0bf676b75d3be869a4ebf1341055",
+      "source_sha256": "64ea25c05a14da16ee108917f0b5487c407d52cd6f0ddaf5aab61e6e1bf73de3",
       "scope": "support",
       "reason": "Read-only release, PR, or issue metadata for the explicit repository. No native session or model is selected here."
     },
     {
       "source": "hooks/open_item_dedup.py",
       "expression": "subprocess.run(['gh', 'issue', 'list', '--state', 'closed', '--limit', '20', '--json', 'number,title,closedAt,body,url'], cwd=repo_path, capture_output=True, text=True, timeout=10)",
-      "source_sha256": "6257774cb89b95cd39d5dc5a5535f71741ef0bf676b75d3be869a4ebf1341055",
+      "source_sha256": "64ea25c05a14da16ee108917f0b5487c407d52cd6f0ddaf5aab61e6e1bf73de3",
       "scope": "support",
       "reason": "Read-only release, PR, or issue metadata for the explicit repository. No native session or model is selected here."
     },
     {
       "source": "hooks/open_item_dedup.py",
       "expression": "subprocess.run(['python3', cli_path, 'semantic_merge', str(out_path)], input=in_path.read_text(), capture_output=True, text=True, timeout=_outer_subagent_timeout())",
-      "source_sha256": "6257774cb89b95cd39d5dc5a5535f71741ef0bf676b75d3be869a4ebf1341055",
+      "source_sha256": "64ea25c05a14da16ee108917f0b5487c407d52cd6f0ddaf5aab61e6e1bf73de3",
       "capability": "ai.native_selection"
     },
     {
       "source": "hooks/open_item_dedup.py",
       "expression": "subprocess.run(['python3', cli_path, 'classifier', str(out_path)], input=in_path.read_text(), capture_output=True, text=True, timeout=_outer_subagent_timeout())",
-      "source_sha256": "6257774cb89b95cd39d5dc5a5535f71741ef0bf676b75d3be869a4ebf1341055",
+      "source_sha256": "64ea25c05a14da16ee108917f0b5487c407d52cd6f0ddaf5aab61e6e1bf73de3",
       "capability": "ai.native_selection"
     },
     {
       "source": "hooks/skill_procedures.py",
       "expression": "subprocess.run(['git', '-C', repo_path, 'rev-parse', 'HEAD'], capture_output=True, text=True, timeout=10)",
-      "source_sha256": "de2f76288117825ee456492e5a6e7a833f4b8ccf03e6d1f4eb2c25a26e0d05e9",
+      "source_sha256": "2b33246f0b5da66e41e3dd369ea394af4457d032be6bf39f5069132a0cf25377",
       "scope": "support",
       "reason": "Bounded or disposable-repository Git metadata/setup. The enclosing native operation keeps its separate host contract."
     },
     {
       "source": "hooks/skill_procedures.py",
       "expression": "subprocess.run(command, env=environment, stdin=subprocess.DEVNULL, timeout=120)",
-      "source_sha256": "de2f76288117825ee456492e5a6e7a833f4b8ccf03e6d1f4eb2c25a26e0d05e9",
+      "source_sha256": "2b33246f0b5da66e41e3dd369ea394af4457d032be6bf39f5069132a0cf25377",
       "capability": "installation.fresh_upgrade"
     },
     {
@@ -1437,49 +1437,49 @@
     {
       "source": "tests/test_obsidian_utils.py",
       "expression": "subprocess.run(['git', 'init', '-q'], cwd=path, check=True)",
-      "source_sha256": "76f48ae8bee95038dc507af5baf75d0e8638633e3a68738c9ad0f9f1b26fd5e7",
+      "source_sha256": "cf4ff90e0b6793ba11f0b9d7bfdfbd3aed8f07819037682900851aad88fff562",
       "scope": "support",
       "reason": "Disposable Git repository/worktree setup for selected-context lookup or repository policy tests."
     },
     {
       "source": "tests/test_obsidian_utils.py",
       "expression": "subprocess.run(['git', 'config', 'user.email', 'test@example.com'], cwd=path, check=True)",
-      "source_sha256": "76f48ae8bee95038dc507af5baf75d0e8638633e3a68738c9ad0f9f1b26fd5e7",
+      "source_sha256": "cf4ff90e0b6793ba11f0b9d7bfdfbd3aed8f07819037682900851aad88fff562",
       "scope": "support",
       "reason": "Disposable Git repository/worktree setup for selected-context lookup or repository policy tests."
     },
     {
       "source": "tests/test_obsidian_utils.py",
       "expression": "subprocess.run(['git', 'config', 'user.name', 'test'], cwd=path, check=True)",
-      "source_sha256": "76f48ae8bee95038dc507af5baf75d0e8638633e3a68738c9ad0f9f1b26fd5e7",
+      "source_sha256": "cf4ff90e0b6793ba11f0b9d7bfdfbd3aed8f07819037682900851aad88fff562",
       "scope": "support",
       "reason": "Disposable Git repository/worktree setup for selected-context lookup or repository policy tests."
     },
     {
       "source": "tests/test_obsidian_utils.py",
       "expression": "subprocess.run(['git', 'add', '.'], cwd=path, check=True)",
-      "source_sha256": "76f48ae8bee95038dc507af5baf75d0e8638633e3a68738c9ad0f9f1b26fd5e7",
+      "source_sha256": "cf4ff90e0b6793ba11f0b9d7bfdfbd3aed8f07819037682900851aad88fff562",
       "scope": "support",
       "reason": "Disposable Git repository/worktree setup for selected-context lookup or repository policy tests."
     },
     {
       "source": "tests/test_obsidian_utils.py",
       "expression": "subprocess.run(['git', 'commit', '-q', '-m', 'init'], cwd=path, check=True)",
-      "source_sha256": "76f48ae8bee95038dc507af5baf75d0e8638633e3a68738c9ad0f9f1b26fd5e7",
+      "source_sha256": "cf4ff90e0b6793ba11f0b9d7bfdfbd3aed8f07819037682900851aad88fff562",
       "scope": "support",
       "reason": "Disposable Git repository/worktree setup for selected-context lookup or repository policy tests."
     },
     {
       "source": "tests/test_obsidian_utils.py",
       "expression": "subprocess.run(['git', 'worktree', 'add', '-b', 'feature/x', str(worktree)], cwd=repo, check=True, capture_output=True)",
-      "source_sha256": "76f48ae8bee95038dc507af5baf75d0e8638633e3a68738c9ad0f9f1b26fd5e7",
+      "source_sha256": "cf4ff90e0b6793ba11f0b9d7bfdfbd3aed8f07819037682900851aad88fff562",
       "scope": "support",
       "reason": "Disposable Git repository/worktree setup for selected-context lookup or repository policy tests."
     },
     {
       "source": "tests/test_obsidian_utils.py",
       "expression": "subprocess.run(['git', 'worktree', 'add', '-b', 'feature/issue-93', str(worktree)], cwd=repo, check=True, capture_output=True)",
-      "source_sha256": "76f48ae8bee95038dc507af5baf75d0e8638633e3a68738c9ad0f9f1b26fd5e7",
+      "source_sha256": "cf4ff90e0b6793ba11f0b9d7bfdfbd3aed8f07819037682900851aad88fff562",
       "scope": "support",
       "reason": "Disposable Git repository/worktree setup for selected-context lookup or repository policy tests."
     },

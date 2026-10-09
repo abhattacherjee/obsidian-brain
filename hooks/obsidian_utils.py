@@ -2646,7 +2646,7 @@ def get_session_context(vault_path: str | None = None, sessions_folder: str | No
         from capture import planned_note_path
         planned = existing if existing is not None else planned_note_path(context)
         return {"session_id": context.native_session_id, "hash": context.session_key[:16],
-                "project": context.canonical_project_root.name,
+                "project": context.project_name,
                 "session_note_name": planned.stem,
                 "cwd": str(context.worktree)}
     sid = _get_session_id_fast()

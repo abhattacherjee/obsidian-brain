@@ -94,6 +94,11 @@ class RuntimeContext:
 
 
     @property
+    def project_name(self) -> str:
+        """Logical project label, separate from paths and filename slugs."""
+        return self.canonical_project_root.name.lower().replace(" ", "-").replace("_", "-")
+
+    @property
     def session_key(self) -> str:
         return hashlib.sha256((self.host + "\0" + self.native_session_id).encode()).hexdigest()
 

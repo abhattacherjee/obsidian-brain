@@ -1264,7 +1264,7 @@ def _resolve_project_paths() -> dict[str, str]:
     from runtime_context import current_runtime_context
     context = current_runtime_context()
     if context is not None and (context.canonical_project_root / '.git').exists():
-        result[context.canonical_project_root.name] = str(context.canonical_project_root)
+        result[context.project_name] = str(context.canonical_project_root)
     return result
 
 

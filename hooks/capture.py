@@ -534,8 +534,9 @@ def _snapshot(context, note, first_date, body, trigger, deadline):
     identity = hashlib.sha256((context.session_key + "\0" + revision + "\0" + trigger).encode()).hexdigest()
     folder = context.vault_path / str(context.config.get("sessions_folder", "claude-sessions"))
     from obsidian_utils import slugify
-    project = slugify(context.canonical_project_root.name)
-    path = folder / (first_date + "-" + project + "-" + context.host + "-snapshot-" + identity + ".md")
+    project = context.project_name
+    filename_project = slugify(context.canonical_project_root.name)
+    path = folder / (first_date + "-" + filename_project + "-" + context.host + "-snapshot-" + identity + ".md")
     from note_transactions import _contained
     _contained(context, path)
     with ownership_lock(context), contextlib.closing(connect_coordination(context)) as connection:
@@ -752,8 +753,7 @@ def capture_checkpoint(context, event, deadline):
                             "capture_state": state, "capture_completeness": completeness,
                             "duration_minutes": duration / 60, "git_branch": _git_branch(context)}
                 if not selected_note.exists():
-                    from obsidian_utils import slugify
-                    project = slugify(context.canonical_project_root.name)
+                    project = context.project_name
                     metadata.update({"type": "claude-session", "date": first_date,
                                       "status": "auto-logged",
                                      "project": project,

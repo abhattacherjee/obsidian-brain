@@ -2531,7 +2531,7 @@ def test_fast_path_underscore_to_hyphen_fallback(tmp_path, monkeypatch):
 
 
 @pytest.mark.usefixtures("selected_host_context")
-def test_get_session_context_preserves_canonical_project_spelling(tmp_path, monkeypatch, selected_host_context):
+def test_native_get_session_context_normalizes_project_without_changing_cwd(tmp_path, monkeypatch, selected_host_context):
     from runtime_context import resolve_runtime_context, using_runtime_context
     project = tmp_path / "personal_ws"
     project.mkdir()
@@ -2542,7 +2542,7 @@ def test_get_session_context_preserves_canonical_project_spelling(tmp_path, monk
     monkeypatch.chdir(tmp_path)
     with using_runtime_context(actor):
         result = obsidian_utils.get_session_context()
-    assert result["project"] == "personal_ws"
+    assert result["project"] == "personal-ws"
     assert result["cwd"] == str(project)
 
 

@@ -50,8 +50,7 @@ def _context_hint(context, deadline):
             return None
         root = (context.vault_path / sessions).resolve()
         root.relative_to(context.vault_path.resolve())
-        from obsidian_utils import slugify
-        project = slugify(context.canonical_project_root.name)
+        project = context.project_name
         registered = None
         if identity.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='source_sessions'").fetchone():
             registered = identity.execute("SELECT note,first_date,descriptor FROM source_sessions "

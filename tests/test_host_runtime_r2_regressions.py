@@ -55,7 +55,7 @@ def test_planned_note_name_survives_below_threshold(selected_host_context,monkey
         assert get_session_context()['session_note_name'] == name
 
 
-def test_latest_unindexed_registered_session_wins_hint_with_same_slug(selected_host_context,monkeypatch):
+def test_latest_unindexed_registered_session_wins_hint_with_canonical_project(selected_host_context,monkeypatch):
     import native_lifecycle
     from vault_index import ensure_index
     project=selected_host_context.worktree.parent/'My.Repo'
@@ -69,7 +69,7 @@ def test_latest_unindexed_registered_session_wins_hint_with_same_slug(selected_h
         if number == 0:
             ensure_index(actor.vault_path,['claude-sessions'],db_path=actor.index_path)
     hint=native_lifecycle._context_hint(actor,time.monotonic()+1)['hookSpecificOutput']['additionalContext']
-    assert 'my-repo' in hint and '2026-01-02' in hint and '2026-01-01' not in hint
+    assert 'my.repo' in hint and '2026-01-02' in hint and '2026-01-01' not in hint
 
 
 def test_removed_registered_subdirectory_recovers_only_exact_original_cwd(selected_host_context,monkeypatch):
@@ -134,7 +134,7 @@ def test_readonly_doctor_names_retained_partial_type(selected_host_context,monke
     assert any('type=future-thing' in warning for warning in report['warnings'])
 
 
-def test_native_snapshot_keeps_slugged_project_and_legacy_tags(selected_host_context,monkeypatch):
+def test_native_snapshot_keeps_canonical_project_and_slugged_filename(selected_host_context,monkeypatch):
     project=selected_host_context.worktree.parent/'My.Repo'
     project.mkdir()
     actor=replace(selected_host_context,canonical_project_root=project,worktree=project)
@@ -144,8 +144,8 @@ def test_native_snapshot_keeps_slugged_project_and_legacy_tags(selected_host_con
     snapshots=[note for note in actor.vault_path.rglob('*.md') if capture._note_identity(note)['type']=='claude-snapshot']
     assert len(snapshots)==1
     fields=capture._note_identity(snapshots[0])
-    assert fields['project']=='my-repo'
-    assert set(fields['tags']) == {'claude/snapshot','claude/project/my-repo','claude/auto'}
+    assert fields['project']=='my.repo'
+    assert set(fields['tags']) == {'claude/snapshot','claude/project/my.repo','claude/auto'}
     snapshot = snapshots[0]
     assert '-my-repo-' in snapshot.name
     parents = [note for note in actor.vault_path.rglob('*.md')
