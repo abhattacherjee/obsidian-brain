@@ -27,3 +27,16 @@ approval remains explicit; a missing tool is never treated as approval.
 The invoking runtime must explicitly supply the current client. If it does not,
 stop with "Current native client binding is unavailable". Do not default Desktop
 to CLI or infer the frontend from a transcript header or environment markers.
+
+Context, metadata and local operations use the ordinary workspace sandbox.
+Native AI may also need SQLite writes under the selected private `CODEX_HOME`
+and network access to the declared provider API. The user must first authorize
+that provider, the exact payload and the writes.
+
+If the outer tool sandbox blocks an authorized native AI operation, request
+normal one-time tool approval for the exact loaded `brain_cli.py` operation and
+its explicit approved payload (synthetic for acceptance tests). Keep the same
+bound context, source revisions and declared model. Do not invent approval,
+override the model, switch to Claude, change global sandbox or network policy,
+relax backend tool restrictions, or raise deadlines. This permission applies
+to that command; it is not a general extra-directory grant.
