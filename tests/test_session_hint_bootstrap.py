@@ -24,106 +24,12 @@ def _import_hook_module():
     return importlib.import_module("obsidian_session_hint")
 
 
-def test_hook_writes_bootstrap_file(tmp_path):
-    """Hook writes the authoritative session_id to the bootstrap file."""
-    project_dir = tmp_path / "fake-project"
-    project_dir.mkdir()
-    secure_dir = tmp_path / ".claude" / "obsidian-brain"
-
-    env = os.environ.copy()
-    env["HOME"] = str(tmp_path)
-
-    payload = {
-        "cwd": str(project_dir),
-        "session_id": "test-sid-aaaaaaaa",
-    }
-    result = subprocess.run(
-        [sys.executable, _hook_script_path()],
-        input=json.dumps(payload),
-        capture_output=True,
-        text=True,
-        env=env,
-    )
-    assert result.returncode == 0, f"hook exited {result.returncode}: {result.stderr}"
-    bootstrap_path = secure_dir / "sid-fake-project"
-    assert bootstrap_path.exists(), "bootstrap file was not written"
-    assert bootstrap_path.read_text(encoding="utf-8").strip() == "test-sid-aaaaaaaa"
 
 
-def test_hook_handles_missing_session_id(tmp_path):
-    """Hook does not crash when stdin JSON omits session_id and does not write bootstrap."""
-    project_dir = tmp_path / "proj-nosid"
-    project_dir.mkdir()
-
-    env = os.environ.copy()
-    env["HOME"] = str(tmp_path)
-
-    payload = {"cwd": str(project_dir)}  # no session_id
-    result = subprocess.run(
-        [sys.executable, _hook_script_path()],
-        input=json.dumps(payload),
-        capture_output=True,
-        text=True,
-        env=env,
-    )
-    assert result.returncode == 0, f"hook exited {result.returncode}: {result.stderr}"
-    secure_dir = tmp_path / ".claude" / "obsidian-brain"
-    bootstrap_path = secure_dir / "sid-proj-nosid"
-    assert not bootstrap_path.exists(), "bootstrap should not be written without session_id"
 
 
-def test_hook_writes_log_line(tmp_path):
-    """Hook appends an audit line to ~/.claude/obsidian-brain-hook.log."""
-    project_dir = tmp_path / "proj-log"
-    project_dir.mkdir()
-    claude_dir = tmp_path / ".claude"
-    claude_dir.mkdir()
-
-    env = os.environ.copy()
-    env["HOME"] = str(tmp_path)
-
-    payload = {"cwd": str(project_dir), "session_id": "log-sid-bbbb"}
-    result = subprocess.run(
-        [sys.executable, _hook_script_path()],
-        input=json.dumps(payload),
-        capture_output=True,
-        text=True,
-        env=env,
-    )
-    assert result.returncode == 0, f"hook exited {result.returncode}: {result.stderr}"
-
-    log_path = claude_dir / "obsidian-brain-hook.log"
-    assert log_path.exists(), "hook log was not written"
-    content = log_path.read_text(encoding="utf-8")
-    assert "SessionStart" in content
-    assert "proj-log" in content
-    assert "log-sid-" in content
-    assert "bootstrap_updated=true" in content
 
 
-def test_hook_log_rotates_when_large(tmp_path):
-    """Hook rotates the log file when it exceeds ~100 KB."""
-    project_dir = tmp_path / "proj-rotate"
-    project_dir.mkdir()
-    claude_dir = tmp_path / ".claude"
-    claude_dir.mkdir()
-    log_path = claude_dir / "obsidian-brain-hook.log"
-    log_path.write_text("x" * (150 * 1024), encoding="utf-8")
-
-    env = os.environ.copy()
-    env["HOME"] = str(tmp_path)
-
-    payload = {"cwd": str(project_dir), "session_id": "rot-sid-cccc"}
-    subprocess.run(
-        [sys.executable, _hook_script_path()],
-        input=json.dumps(payload),
-        capture_output=True,
-        text=True,
-        env=env,
-    )
-    rotated = claude_dir / "obsidian-brain-hook.log.1"
-    assert rotated.exists(), "log should have been rotated to .log.1"
-    assert "rot-sid-" in log_path.read_text(encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -279,3 +185,65 @@ def test_write_bootstrap_atomic_tmp_cleanup_on_failure(monkeypatch, tmp_path):
     tmp_files = [f for f in Path(secure_dir).iterdir()
                  if f.name.startswith(".ob-sid-")]
     assert len(tmp_files) == 0
+
+from test_snapshot_e2e import selected_host_context
+
+
+def _native_hint(context,payload):
+    root=Path(__file__).resolve().parents[1]
+    command=[sys.executable,str(root/'tests/native_hook_test_driver.py'),
+        '--host',context.host,'--client',context.client,'--session-id',context.native_session_id,
+        '--cwd',str(context.worktree),'--vault',str(context.vault_path),'--config',str(context.config_path),
+        '--resource-root',str(context.resource_root),'--index',str(context.index_path),
+        '--state',str(context.state_path),'--transcript',str(context.transcript_path),
+        'obsidian_session_hint.py']
+    result=subprocess.run(command,input=json.dumps(payload),env=dict(os.environ,
+        CLAUDE_CODE_SESSION_ID='foreign-inherited-session',CODEX_THREAD_ID='foreign-inherited-thread'),
+        capture_output=True,text=True,timeout=5,cwd=context.worktree)
+    assert result.returncode==0,result.stderr
+    proof=json.loads(next(line.split(':',1)[1] for line in result.stderr.splitlines()
+        if line.startswith('NATIVE_CONTEXT_PROOF:')))
+    for field in ('host','client','native_session_id','vault_path','resource_root','index_path','state_path'):
+        assert proof[field]==str(getattr(context,field))
+    return result,proof
+
+
+def test_native_hint_captures_authoritative_session(selected_host_context):
+    context=selected_host_context
+    _,proof=_native_hint(context,{'session_id':context.native_session_id,'cwd':str(context.worktree)})
+    assert proof['mutation_contexts']
+    notes=list(context.vault_path.rglob('*.md'))
+    assert len(notes)==1
+    import obsidian_utils
+    content=notes[0].read_text()
+    assert obsidian_utils.parse_frontmatter_field(content,'agent_provider')==context.host
+    assert obsidian_utils.parse_frontmatter_field(content,'agent_session_id')==context.native_session_id
+    assert 'foreign-inherited' not in content
+
+
+def test_native_hint_keeps_explicit_identity_when_payload_omits_id(selected_host_context):
+    context=selected_host_context
+    _,proof=_native_hint(context,{'cwd':str(context.worktree)})
+    assert proof['mutation_contexts']
+    assert len(list(context.vault_path.rglob('*.md')))==1
+    assert proof['native_session_id']==context.native_session_id
+
+
+def test_native_hint_child_proves_selected_mutation_context(selected_host_context):
+    context=selected_host_context
+    _,proof=_native_hint(context,{'session_id':'foreign-payload-id','cwd':'/foreign/project'})
+    assert proof['mutation_contexts']
+    assert all(actor['host']==context.host and actor['native_session_id']==context.native_session_id
+               and actor['vault_path']==str(context.vault_path) for actor in proof['mutation_contexts'])
+
+
+def test_native_hint_replay_does_not_rewrite_captured_note(selected_host_context):
+    context=selected_host_context
+    _native_hint(context,{})
+    before={path:path.read_bytes() for path in context.vault_path.rglob('*.md')}
+    assert before
+    mtimes={path:path.stat().st_mtime_ns for path in before}
+    _,proof=_native_hint(context,{})
+    assert {path:path.read_bytes() for path in context.vault_path.rglob('*.md')}==before
+    assert {path:path.stat().st_mtime_ns for path in before}==mtimes
+    assert all(actor['native_session_id']==context.native_session_id for actor in proof['mutation_contexts'])

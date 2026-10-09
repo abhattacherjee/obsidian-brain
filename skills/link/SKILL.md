@@ -5,11 +5,73 @@ metadata:
   version: 1.0.0
 ---
 
+## Native runtime and installed resources
+
+Use the absolute path of this loaded `SKILL.md` as `OB_SKILL_PATH`. Read the
+reference for the invoking host when this skill has paired host references.
+Set `OB_HOST`, `OB_SESSION_ID`, and `OB_CWD` from that native invocation.
+Claude has one frontend: use the fixed host client `claude-code`. Reject an
+inherited `OB_CLIENT` that differs, including an empty declaration.
+For Codex, read the operator-declared, inherited `OB_CLIENT`; never choose or
+export it yourself. It must be `codex-cli` or `codex-desktop`; if missing or
+invalid, stop with "Current native client binding is unavailable". Never label a Desktop
+invocation as a CLI invocation or infer the frontend from transcript creation
+metadata or inherited environment markers. Use the selected host's own session ID. Keep curated note taxonomy
+separate from `agent_provider` and `agent_session_id` provenance.
+
+```bash
+case "$OB_HOST" in
+  claude)
+    if [ "${OB_CLIENT+x}" = x ] && [ "$OB_CLIENT" != claude-code ]; then
+      printf '%s\n' 'Current native client binding is unavailable: conflicting Claude declaration.' >&2
+      exit 1
+    fi
+    OB_CLIENT=claude-code
+    ;;
+  codex)
+    case "${OB_CLIENT:-}" in
+      codex-cli|codex-desktop) ;;
+      *) printf '%s\n' 'Current native client binding is unavailable; stop without choosing a frontend.' >&2; exit 1 ;;
+    esac
+    ;;
+  *) printf '%s\n' 'Current native client binding is unavailable: unknown host.' >&2; exit 1 ;;
+esac
+OB_SKILL_PATH='<absolute path of this loaded SKILL.md>'
+OB_RESOURCE_ROOT=$(python3 -c 'import pathlib,sys; p=pathlib.Path(sys.argv[1]); assert p.is_absolute(); p=p.resolve(); assert p.name == "SKILL.md" and p.parent.parent.name == "skills"; print(p.parents[2])' "$OB_SKILL_PATH")
+python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" context < /dev/null
+```
+
+Use the returned `config_path`, `vault_path`, `index_path`, and `state_path`.
+Create the operation with this fixed literal request:
+
+```bash
+printf '{}' | python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'prepare'
+```
+
+Call `prepare` to create a private operation under native state. Retain its
+`operation_id` and `operation_dir`. Register approved helper output names with `artifact-store`;
+inputs are read through the immutable artifact manifest. Do not discover resources from the current directory or another plugin
+cache. Each shell invocation supplies the same explicit values; a previous
+shell's variables are not assumed to persist.
+
+Each data operation uses the installed launcher with a JSON request on stdin:
+
+```bash
+python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation '<fixed operation>' < "$REQUEST_PATH"
+```
+
+Map config JSON `vault_path`, `sessions_folder`, and `insights_folder` to the
+procedure variables `VAULT_PATH`/`VAULT`, `SESSIONS_FOLDER`/`SESS`, and
+`INSIGHTS_FOLDER`/`INS`. Use the canonical project returned in config JSON (and native `session` when available),
+not the basename of an unrelated shell working directory.
+
+Before drafting an edit or summary, call `note-read` and retain its exact `expected_revision`. Use `note-apply` with that revision for the reviewed edit. A conflict preserves the current note; show the pending result and do not count it as saved. Use only the operations documented for this skill. Their writes bind the source revisions before analysis and preserve manual edits on conflict. Content is JSON data, never shell code. Read `references/host-claude.md` or `references/host-codex.md` when present. Codex has no native memory-file API; shared vault retrieval and wiki filing continue without borrowing another host's memory.
+
 # Link — Cross-Reference Vault Notes with Bidirectional Wikilinks
 
 Search the Obsidian vault for notes related to the current session or a specific description, then create bidirectional wikilinks between them in their respective `## Related` sections.
 
-**Tools needed:** Bash, Grep, Read, Write, Edit
+**Tools needed:** native shell, native content search, native file reading, trusted publication, conditional trusted updates
 
 ## Procedure
 
@@ -19,40 +81,17 @@ Follow these steps exactly. Do not skip steps or reorder them.
 
 Run:
 
-```bash
-cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-python3 -c '
-import sys, os
-import glob, json, os, re, sys
-def _ob_hooks():
-    try:
-        for _m in json.load(open(os.path.expanduser("~/.claude/plugins/known_marketplaces.json"))).values():
-            _s = _m.get("source") if isinstance(_m, dict) else None
-            if not (isinstance(_s, dict) and _s.get("source") == "directory"):
-                continue
-            _i = _m.get("installLocation") if isinstance(_m, dict) else None
-            if not (isinstance(_i, str) and os.path.isabs(_i)):
-                continue
-            _h = os.path.join(_i, "hooks")
-            if os.path.isfile(os.path.join(_h, "obsidian_utils.py")):
-                return _h
-    except Exception:
-        pass
-    _c = [_d for _d in glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")) if re.fullmatch("[0-9]+([.][0-9]+)*", _d.split("/")[-2])]
-    return max(_c, key=lambda _p: ([int(_n) for _n in _p.split("/")[-2].split(".")], _p), default="hooks")
-sys.path.insert(0, _ob_hooks())
-from obsidian_utils import load_config
-c = load_config()
-if not c.get("vault_path"):
-    print("ERROR: vault_path not configured", file=sys.stderr)
-    sys.exit(1)
-print("VAULT=" + c["vault_path"])
-print("SESS=" + c.get("sessions_folder", "claude-sessions"))
-print("INS=" + c.get("insights_folder", "claude-insights"))
-'
+Request for `config` (substitute the values as data):
+
+```json
+{}
 ```
 
-Parse each output line as KEY=VALUE, splitting on the first `=`.
+```bash
+python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'config' < "$REQUEST_PATH"
+```
+
+Parse the single JSON object. Read its named fields; do not split output on `=`.
 
 If the command exits non-zero or prints ERROR, tell the user:
 
@@ -97,15 +136,19 @@ Store as `PROJECT`. Normalize: lowercase, hyphens for spaces.
 ls -t "$VAULT_PATH/$SESSIONS_FOLDER"/ | head -20
 ```
 
-From that list, identify the most recent file whose name contains the project name (or whose frontmatter contains `project: $PROJECT`). If you cannot determine from the filename alone, use Grep:
+From that list, identify the most recent file whose name contains the project name (or whose frontmatter contains `project: $PROJECT`). If you cannot determine from the filename alone, run the fixed `grep` operation:
 
-```
-pattern: "project: $PROJECT"
-path: $VAULT_PATH/$SESSIONS_FOLDER/
-output_mode: files_with_matches
+Keep returned paths under `$VAULT_PATH/$SESSIONS_FOLDER/`. Send this JSON to the fixed `grep` operation:
+
+```json
+{"pattern": "project: $PROJECT", "ignore_case": true}
 ```
 
-Sort the matched files by modification time and pick the most recent one. This is the **source note**. Read its full content using the Read tool.
+```bash
+python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'grep' < "$REQUEST_PATH"
+```
+
+Sort the matched files by modification time and pick the most recent one. This is the **source note**. Read its full content using native file reading.
 
 **4A.3 — Extract keywords:**
 
@@ -113,22 +156,28 @@ From the current conversation topics and the source note's content, identify 3-5
 
 **4A.4 — Search vault for related notes (parallel):**
 
-Run these searches in parallel using Grep, case-insensitive (`-i: true`):
+Run these searches in parallel with the fixed `grep` operation, using `ignore_case: true`:
 
 For each keyword (run as parallel searches across both folders):
 
-```
-pattern: "<keyword>"
-path: $VAULT_PATH/$SESSIONS_FOLDER/
-output_mode: files_with_matches
--i: true
+Keep returned paths under `$VAULT_PATH/$SESSIONS_FOLDER/`. Send this JSON to the fixed `grep` operation:
+
+```json
+{"pattern": "<keyword>", "ignore_case": true}
 ```
 
+```bash
+python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'grep' < "$REQUEST_PATH"
 ```
-pattern: "<keyword>"
-path: $VAULT_PATH/$INSIGHTS_FOLDER/
-output_mode: files_with_matches
--i: true
+
+Keep returned paths under `$VAULT_PATH/$INSIGHTS_FOLDER/`. Send this JSON to the fixed `grep` operation:
+
+```json
+{"pattern": "<keyword>", "ignore_case": true}
+```
+
+```bash
+python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'grep' < "$REQUEST_PATH"
 ```
 
 Collect all matched files across all keywords. Exclude the source note itself.
@@ -137,16 +186,24 @@ Collect all matched files across all keywords. Exclude the source note itself.
 
 Read the source note's frontmatter and extract its `tags:` list. For each tag that starts with `claude/topic/`, run:
 
-```
-pattern: "<tag>"
-path: $VAULT_PATH/$SESSIONS_FOLDER/
-output_mode: files_with_matches
+Keep returned paths under `$VAULT_PATH/$SESSIONS_FOLDER/`. Send this JSON to the fixed `grep` operation:
+
+```json
+{"pattern": "<tag>", "ignore_case": true}
 ```
 
+```bash
+python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'grep' < "$REQUEST_PATH"
 ```
-pattern: "<tag>"
-path: $VAULT_PATH/$INSIGHTS_FOLDER/
-output_mode: files_with_matches
+
+Keep returned paths under `$VAULT_PATH/$INSIGHTS_FOLDER/`. Send this JSON to the fixed `grep` operation:
+
+```json
+{"pattern": "<tag>", "ignore_case": true}
+```
+
+```bash
+python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'grep' < "$REQUEST_PATH"
 ```
 
 Add any new matches to your candidate list, excluding the source note.
@@ -180,36 +237,48 @@ If the user's description contains "this session", "current session", or similar
 
 Otherwise, use the user's description to search for a source note:
 
-```
-pattern: "<keywords from description>"
-path: $VAULT_PATH/$SESSIONS_FOLDER/
-output_mode: files_with_matches
--i: true
+Keep returned paths under `$VAULT_PATH/$SESSIONS_FOLDER/`. Send this JSON to the fixed `grep` operation:
+
+```json
+{"pattern": "<keywords from description>", "ignore_case": true}
 ```
 
+```bash
+python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'grep' < "$REQUEST_PATH"
 ```
-pattern: "<keywords from description>"
-path: $VAULT_PATH/$INSIGHTS_FOLDER/
-output_mode: files_with_matches
--i: true
+
+Keep returned paths under `$VAULT_PATH/$INSIGHTS_FOLDER/`. Send this JSON to the fixed `grep` operation:
+
+```json
+{"pattern": "<keywords from description>", "ignore_case": true}
+```
+
+```bash
+python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'grep' < "$REQUEST_PATH"
 ```
 
 **4B.2 — Identify target note:**
 
 Parse the user's description for target note clues. Search both folders:
 
-```
-pattern: "<target keywords>"
-path: $VAULT_PATH/$SESSIONS_FOLDER/
-output_mode: files_with_matches
--i: true
+Keep returned paths under `$VAULT_PATH/$SESSIONS_FOLDER/`. Send this JSON to the fixed `grep` operation:
+
+```json
+{"pattern": "<target keywords>", "ignore_case": true}
 ```
 
+```bash
+python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'grep' < "$REQUEST_PATH"
 ```
-pattern: "<target keywords>"
-path: $VAULT_PATH/$INSIGHTS_FOLDER/
-output_mode: files_with_matches
--i: true
+
+Keep returned paths under `$VAULT_PATH/$INSIGHTS_FOLDER/`. Send this JSON to the fixed `grep` operation:
+
+```json
+{"pattern": "<target keywords>", "ignore_case": true}
+```
+
+```bash
+python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'grep' < "$REQUEST_PATH"
 ```
 
 **4B.3 — Resolve ambiguity:**
@@ -227,7 +296,7 @@ Wait for the user's selection. Once both source and target are unambiguously ide
 
 For each source-target pair:
 
-**5.1 — Read the source note** using the Read tool.
+**5.1 — Read the source note** using native file reading.
 
 **5.2 — Check for duplicate link in source:**
 
@@ -237,9 +306,9 @@ Search the source note's content for `[[target-filename]]` (filename without `.m
 
 **5.3 — Add link to source note:**
 
-- If the source note has a `## Related` section: use the Edit tool to append a new line to that section:
+- If the source note has a `## Related` section: prepare a revision-bound `note-apply` request to append a new line to that section:
   `- [[target-filename]] — <one-line reason for the connection>`
-- If no `## Related` section exists: use the Edit tool to append the following to the end of the file:
+- If no `## Related` section exists: prepare a revision-bound `note-apply` request to append the following to the end of the file:
 
   ```
   
@@ -248,7 +317,7 @@ Search the source note's content for `[[target-filename]]` (filename without `.m
   - [[target-filename]] — <one-line reason for the connection>
   ```
 
-- Use the Write tool only if the note is very short or the Edit tool would be unreliable due to unclear anchor text.
+- Preserve the note bytes captured by `note-read`. Publish the approved document with `note-apply` and that pre-analysis SHA256. A conflict keeps the operation pending.
 
 After writing, set permissions:
 
@@ -256,7 +325,7 @@ After writing, set permissions:
 chmod 600 "<source-note-path>"
 ```
 
-**5.4 — Read the target note** using the Read tool.
+**5.4 — Read the target note** using native file reading.
 
 **5.5 — Check for duplicate link in target:**
 
@@ -302,5 +371,30 @@ If multiple pairs were linked, print a summary after all pairs are done:
 - **Already linked (both directions):** Tell the user both notes already reference each other — no changes needed.
 - **Only one direction already linked:** Add only the missing direction; do not duplicate the existing link.
 - **Wikilink format:** Always use the filename without the `.md` extension: `[[2026-04-04-obsidian-brain-297a]]` not `[[2026-04-04-obsidian-brain-297a.md]]`.
-- **Large vault (50+ files):** Never glob or read the entire folder. Always use Grep to search — never `ls` the whole folder for matching.
+- **Large vault (50+ files):** Never glob or read the entire folder. Always use the fixed `grep` operation to search — never `ls` the whole folder for matching.
 - **Config exists but vault path is invalid:** Warn the user and suggest running `/obsidian-setup` again.
+
+## Fixed request shapes
+
+Pass these objects through the installed launcher for the named operation. Keep
+one operation ID across source reads, analysis and reviewed publication.
+
+Request for `note-read`:
+
+```json
+{
+  "operation_id": "<prepared id>",
+  "path": "<vault-relative note.md>"
+}
+```
+
+Request for `note-apply`:
+
+```json
+{
+  "operation_id": "<same prepared id>",
+  "path": "<same vault-relative note.md>",
+  "expected_revision": "<note-read SHA256>",
+  "content": "<complete reviewed note>"
+}
+```

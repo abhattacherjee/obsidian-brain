@@ -14,6 +14,8 @@ import datetime
 import json
 import os
 import sys
+from runtime_adapters import selected_home
+from runtime_context import current_runtime_context
 
 # Must match obsidian_utils._HOOK_LOG_NAME / _HOOK_LOG_MAX_BYTES.
 _HOOK_LOG_NAME = "obsidian-brain-hook.log"
@@ -45,7 +47,7 @@ def failure_detail(exc):
     return text[:_DETAIL_MAX_CHARS]
 
 
-def log_import_failure(event, exc):
+def log_import_failure(event, exc, host="claude"):
     """Append one ``outcome=IMPORT_FAILED`` line to the hook log. Never raises.
 
     Same file, field order, 100 KB rotation and 0o600 mode as
@@ -55,9 +57,12 @@ def log_import_failure(event, exc):
     detail = failure_detail(exc)
     try:
         payload = _payload()
-        project = os.path.basename(str(payload.get("cwd") or os.getcwd()).rstrip("/"))
-        sid = str(payload.get("session_id") or "unknown")[:8]
-        log_dir = os.path.join(os.path.expanduser("~"), ".claude")
+        context = current_runtime_context()
+        cwd = context.worktree if context is not None else payload.get("cwd") or os.getcwd()
+        native_id = context.native_session_id if context is not None else payload.get("session_id") or "unknown"
+        project = os.path.basename(str(cwd).rstrip("/"))
+        sid = str(native_id)[:8]
+        log_dir = selected_home(context.host if context is not None else host, context)
         os.makedirs(log_dir, mode=0o700, exist_ok=True)
         log_path = os.path.join(log_dir, _HOOK_LOG_NAME)
         try:
@@ -83,13 +88,15 @@ def log_import_failure(event, exc):
     return detail
 
 
-def session_start_notice(detail):
+def session_start_notice(detail, host="claude"):
     """SessionStart stdout JSON telling the model the plugin did not load."""
+    context = current_runtime_context()
+    location = str(selected_home(context.host if context is not None else host, context) / _HOOK_LOG_NAME)
     return json.dumps({"hookSpecificOutput": {
         "hookEventName": "SessionStart",
         "additionalContext": (
             f"obsidian-brain failed to load ({detail}), so its hooks are off "
-            "this session. Details: ~/.claude/obsidian-brain-hook.log "
+            f"this session. Details: {location} "
             "(outcome=IMPORT_FAILED)."
         ),
     }})

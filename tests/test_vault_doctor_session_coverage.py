@@ -122,6 +122,25 @@ def _write_jsonl(
             },
         }))
 
+    from runtime_context import current_runtime_context
+    actor = current_runtime_context()
+    if actor is not None:
+        native = []
+        if actor.host == 'codex':
+            native.append(json.dumps({'type':'session_meta','payload':{'id':sid,'cwd':cwd}}))
+        for raw_record in records:
+            row = json.loads(raw_record)
+            if actor.host == 'claude':
+                row['sessionId'] = sid
+                native.append(json.dumps(row))
+            else:
+                role = row['message']['role']
+                content = row['message']['content']
+                if isinstance(content, str):
+                    native.append(json.dumps({'type':'response_item','timestamp':row['timestamp'],
+                        'payload':{'type':'message','id':row['uuid'],'role':role,
+                                   'content':[{'type':'input_text' if role == 'user' else 'output_text','text':content}]}}))
+        records = native
     jsonl.write_text("\n".join(records) + "\n", encoding="utf-8")
 
     if mtime_offset != 0:
@@ -146,6 +165,10 @@ def _write_session_note(
         f"date: {date}",
         f"project: {project}",
     ]
+    from runtime_context import current_runtime_context
+    actor = current_runtime_context()
+    if actor is not None:
+        content_lines.append(f"agent_provider: {actor.host}")
     if session_id:
         content_lines.append(f"session_id: {session_id}")
     content_lines += ["---", "# Session body", ""]
@@ -189,8 +212,10 @@ def sc_env(tmp_path, monkeypatch):
     """
     monkeypatch.setenv("HOME", str(tmp_path))
 
-    claude = tmp_path / ".claude"
-    projects_root = claude / "projects"
+    from runtime_context import current_runtime_context
+    actor = current_runtime_context()
+    claude = actor.native_home if actor is not None else tmp_path / ".claude"
+    projects_root = claude / ('sessions' if actor is not None and actor.host == 'codex' else 'projects')
     projects_root.mkdir(parents=True)
 
     config = {
@@ -221,7 +246,7 @@ def sc_env(tmp_path, monkeypatch):
 
 
 def _scan(env, days=30, project=None, strict=False, reconstruct=False):
-    return sc.scan(
+    return sc._scan_claude_legacy(
         str(env["vault"]),
         "claude-sessions",
         "claude-insights",
@@ -249,6 +274,7 @@ def _mock_replay_result(outcome: str, vault_writes=None, detail: str = ""):
 # ---------------------------------------------------------------------------
 
 class TestGapDetected:
+    @pytest.mark.host_only("claude", reason="claude-record-format", capability="claude_native_format")
     def test_gap_above_threshold_emits_one_issue(self, sc_env):
         """JSONL above thresholds, no session note → 1 issue."""
         sid = "d2cc7e46-9778-41be-bebb-8fb22a491204"
@@ -264,6 +290,7 @@ class TestGapDetected:
         assert i.project == "obsidian-brain"
         assert i.confidence == 0.0
 
+    @pytest.mark.host_only("claude", reason="claude-record-format", capability="claude_native_format")
     def test_expected_basename_matches_make_filename_formula(self, sc_env):
         """Expected basename in note_path matches _make_filename output."""
         sid = "aaaabbbb-1234-5678-9abc-def012345678"
@@ -279,6 +306,7 @@ class TestGapDetected:
         assert expected_hash in Path(i.note_path).name
         assert "my-project" in Path(i.note_path).name
 
+    @pytest.mark.host_only("claude", reason="claude-record-format", capability="claude_native_format")
     def test_unresolved_true_by_default(self, sc_env):
         sid = "ccccdddd-0000-0000-0000-000000000001"
         cwd = "/path/to/my-proj"
@@ -293,6 +321,7 @@ class TestGapDetected:
 # ---------------------------------------------------------------------------
 
 class TestCoveredViaSessionId:
+    @pytest.mark.host_only("claude", reason="claude-record-format", capability="claude_native_format")
     def test_covered_sid_no_issue(self, sc_env):
         """JSONL covered via session_id in frontmatter → no gap."""
         sid = "covered-sid-1111-2222-3333444455556"
@@ -305,6 +334,7 @@ class TestCoveredViaSessionId:
         issues = _scan(sc_env)
         assert issues == []
 
+    @pytest.mark.host_only("claude", reason="claude-record-format", capability="claude_native_format")
     def test_break_sid_index_lookup_makes_gap_fire(self, sc_env):
         """Fail-first: when sid_set lookup is broken, covered test fires a gap.
 
@@ -332,6 +362,7 @@ class TestCoveredViaSessionId:
             "the sid_set index is the only coverage signal for this note."
         )
 
+    @pytest.mark.host_only("claude", reason="claude-record-format", capability="claude_native_format")
     def test_renamed_note_covered_by_session_id_alone(self, sc_env):
         """A renamed note (filename hash does NOT match) whose session_id
         frontmatter matches → covered, no gap.
@@ -363,6 +394,7 @@ class TestCoveredViaSessionId:
 # ---------------------------------------------------------------------------
 
 class TestCoveredViaLegacyHash:
+    @pytest.mark.host_only("claude", reason="claude-record-format", capability="claude_native_format")
     def test_covered_via_hash_no_session_id_field(self, sc_env):
         """Note without session_id frontmatter but matching hash suffix → no gap."""
         sid = "legacy-hash-sid-aaaa-bbbb-cccc-dddd-eeee"
@@ -378,6 +410,7 @@ class TestCoveredViaLegacyHash:
         issues = _scan(sc_env)
         assert issues == []
 
+    @pytest.mark.host_only("claude", reason="claude-record-format", capability="claude_native_format")
     def test_wrong_hash_suffix_emits_gap(self, sc_env):
         """A note with a different 4-char suffix does NOT cover this JSONL."""
         sid = "legacy-hash-sid-ffff-0000-1111-2222-3333"
@@ -391,6 +424,7 @@ class TestCoveredViaLegacyHash:
         issues = _scan(sc_env)
         assert len(issues) == 1  # hash doesn't match → gap
 
+    @pytest.mark.host_only("claude", reason="claude-record-format", capability="claude_native_format")
     def test_modern_note_hash_not_a_collision_candidate(self, sc_env):
         """A MODERN note (has session_id) whose filename hash happens to equal
         another sid's hash must NOT cover that other sid — only true-legacy
@@ -416,6 +450,7 @@ class TestCoveredViaLegacyHash:
         assert issues[0].extra["sid"] == gap_sid
 
     @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file permissions")
+    @pytest.mark.host_only("claude", reason="claude-record-format", capability="claude_native_format")
     def test_unreadable_note_falls_back_to_hash_and_warns(self, sc_env, capsys):
         """Unreadable session note → hash fallback still covers; stderr warns
         'sid-index degraded' and the unreadable counter appears in the summary."""
@@ -442,6 +477,7 @@ class TestCoveredViaLegacyHash:
 # ---------------------------------------------------------------------------
 
 class TestBelowThreshold:
+    @pytest.mark.host_only("claude", reason="claude-record-format", capability="claude_native_format")
     def test_below_message_threshold_no_issue(self, sc_env, capsys):
         """JSONL with 1 user message (below min_messages=3) → no gap."""
         sid = "below-thresh-0001"
@@ -454,6 +490,7 @@ class TestBelowThreshold:
         # Summary should mention 1 below-threshold
         assert "below-threshold" in err
 
+    @pytest.mark.host_only("claude", reason="claude-record-format", capability="claude_native_format")
     def test_below_duration_threshold_no_issue(self, sc_env, capsys):
         """JSONL with duration < 2 min but sufficient messages → no gap."""
         sid = "below-dur-thresh-0002"
@@ -463,6 +500,7 @@ class TestBelowThreshold:
         issues = _scan(sc_env)
         assert issues == []
 
+    @pytest.mark.host_only("claude", reason="claude-record-format", capability="claude_native_format")
     def test_tool_result_only_user_entries_do_not_count(self, sc_env):
         """type=="user" entries whose content is only tool_result blocks must
         NOT count toward min_messages — mirrors the hook's
@@ -481,6 +519,7 @@ class TestBelowThreshold:
             "this is the raw-count bug that produced the dogfood false gaps."
         )
 
+    @pytest.mark.host_only("claude", reason="claude-record-format", capability="claude_native_format")
     def test_drop_threshold_logic_makes_gap_fire(self, sc_env):
         """Fail-first (behavioral): with thresholds disabled IN THE CONFIG
         (min_messages: 0, min_duration_minutes: 0), the below-threshold JSONL
@@ -511,6 +550,7 @@ class TestBelowThreshold:
 # ---------------------------------------------------------------------------
 
 class TestThresholdBoundary:
+    @pytest.mark.host_only("claude", reason="claude-record-format", capability="claude_native_format")
     def test_exactly_at_thresholds_is_a_gap(self, sc_env):
         """Exactly 3 text-bearing user messages AND duration exactly 2.0 min →
         NOT skipped (should_skip_session uses strict <) → IS a gap.
@@ -529,6 +569,7 @@ class TestThresholdBoundary:
             "should_skip_session uses strict less-than, not <=."
         )
 
+    @pytest.mark.host_only("claude", reason="claude-record-format", capability="claude_native_format")
     def test_one_below_message_threshold_is_skipped(self, sc_env):
         """2 text-bearing user messages (one below min_messages=3) → skipped."""
         sid = "boundary-below-msgs-sid-0002"
@@ -536,6 +577,7 @@ class TestThresholdBoundary:
         _write_jsonl(sc_env["projects"], "-proj", sid, cwd, n_user=2, duration_minutes=10)
         assert _scan(sc_env) == []
 
+    @pytest.mark.host_only("claude", reason="claude-record-format", capability="claude_native_format")
     def test_just_below_duration_threshold_is_skipped(self, sc_env):
         """Duration 1.9 min (just below 2.0) with enough messages → skipped."""
         sid = "boundary-below-dur-sid-0003"
@@ -549,6 +591,7 @@ class TestThresholdBoundary:
 # ---------------------------------------------------------------------------
 
 class TestAutoLogGate:
+    @pytest.mark.host_only("claude", reason="claude-record-format", capability="claude_native_format")
     def test_auto_log_disabled_returns_empty_with_note(self, sc_env, capsys):
         """auto_log_enabled: false → scan() returns [] immediately and notes
         why on stderr (the hook intentionally writes nothing; every gap would
@@ -572,6 +615,7 @@ class TestAutoLogGate:
 # ---------------------------------------------------------------------------
 
 class TestLoadThresholds:
+    @pytest.mark.host_only("claude", reason="claude-record-format", capability="claude_native_format")
     def test_bad_min_messages_keeps_good_min_duration(self, sc_env, capsys):
         """One bad key must not discard the others: bad min_messages falls
         back to 3 (with a warning) while a custom min_duration is honored."""
@@ -587,6 +631,7 @@ class TestLoadThresholds:
         _, err = capsys.readouterr()
         assert "bad min_messages" in err
 
+    @pytest.mark.host_only("claude", reason="claude-record-format", capability="claude_native_format")
     def test_missing_config_is_silent(self, sc_env, capsys):
         """A missing config file applies defaults without warning (matches hook)."""
         sc_env["config_path"].unlink()
@@ -595,6 +640,7 @@ class TestLoadThresholds:
         _, err = capsys.readouterr()
         assert "WARNING" not in err
 
+    @pytest.mark.host_only("claude", reason="claude-record-format", capability="claude_native_format")
     def test_corrupt_config_warns(self, sc_env, capsys):
         """A corrupt (non-JSON) config warns to stderr and applies defaults."""
         sc_env["config_path"].write_text("{not json")
@@ -609,6 +655,7 @@ class TestLoadThresholds:
 # ---------------------------------------------------------------------------
 
 class TestReferencedBy:
+    @pytest.mark.host_only("claude", reason="claude-record-format", capability="claude_native_format")
     def test_insight_references_gap_reason_mentions_count(self, sc_env):
         """Insight with source_session=sid → reason contains 'referenced by 1' and extra list."""
         sid = "refs-test-sid-0001"
@@ -624,6 +671,7 @@ class TestReferencedBy:
         assert "referenced by 1" in i.reason
         assert insight_basename in i.extra["referenced_by"]
 
+    @pytest.mark.host_only("claude", reason="claude-record-format", capability="claude_native_format")
     def test_no_references_reason_says_zero(self, sc_env):
         sid = "refs-test-sid-0002"
         cwd = "/path/to/my-proj"
@@ -638,6 +686,7 @@ class TestReferencedBy:
 # ---------------------------------------------------------------------------
 
 class TestStrictMode:
+    @pytest.mark.host_only("claude", reason="claude-record-format", capability="claude_native_format")
     def test_strict_with_reference_reason_starts_with_fail(self, sc_env):
         """strict=True + referenced JSONL → reason starts with FAIL:."""
         sid = "strict-test-sid-0001"
@@ -651,6 +700,7 @@ class TestStrictMode:
         assert i.reason.startswith("FAIL:")
         assert i.extra["strict_fail"] is True
 
+    @pytest.mark.host_only("claude", reason="claude-record-format", capability="claude_native_format")
     def test_strict_without_reference_stays_warn(self, sc_env):
         """strict=True but unreferenced gap → reason starts with WARN: (not FAIL:)."""
         sid = "strict-test-sid-0002"
@@ -663,6 +713,7 @@ class TestStrictMode:
         assert i.reason.startswith("WARN:")
         assert i.extra["strict_fail"] is False
 
+    @pytest.mark.host_only("claude", reason="claude-record-format", capability="claude_native_format")
     def test_non_strict_referenced_gap_is_warn(self, sc_env):
         """strict=False (default) → always WARN: regardless of references."""
         sid = "strict-test-sid-0003"
@@ -680,6 +731,7 @@ class TestStrictMode:
 # ---------------------------------------------------------------------------
 
 class TestReconstruct:
+    @pytest.mark.host_only("claude", reason="claude-record-format", capability="claude_native_format")
     def test_reconstruct_true_sets_unresolved_false(self, sc_env):
         """reconstruct=True → issues have unresolved=False."""
         sid = "reconstruct-test-sid-0001"
@@ -690,6 +742,7 @@ class TestReconstruct:
         assert len(issues) == 1
         assert issues[0].extra["unresolved"] is False
 
+    @pytest.mark.host_only("claude", reason="claude-record-format", capability="claude_native_format")
     def test_reconstruct_false_sets_unresolved_true(self, sc_env):
         sid = "reconstruct-test-sid-0002"
         cwd = "/path/to/my-proj"
@@ -699,6 +752,7 @@ class TestReconstruct:
         assert len(issues) == 1
         assert issues[0].extra["unresolved"] is True
 
+    @pytest.mark.host_only("claude", reason="claude-record-format", capability="claude_native_format")
     def test_reconstruct_true_sets_confidence_0_9(self, sc_env):
         """reconstruct=True makes the gap resolvable, so it carries an
         applyable-repair confidence of 0.9 (consistent with canonicalization
@@ -712,6 +766,7 @@ class TestReconstruct:
         assert len(issues) == 1
         assert issues[0].confidence == 0.9
 
+    @pytest.mark.host_only("claude", reason="claude-record-format", capability="claude_native_format")
     def test_reconstruct_false_keeps_confidence_0_0(self, sc_env):
         """Without reconstruct, the gap is unresolved — confidence stays 0.0
         (no proposed repair)."""
@@ -729,6 +784,7 @@ class TestReconstruct:
 # ---------------------------------------------------------------------------
 
 class TestProjectFilter:
+    @pytest.mark.host_only("claude", reason="claude-record-format", capability="claude_native_format")
     def test_project_filter_excludes_other_projects(self, sc_env, capsys):
         """project="obsidian-brain" excludes JSONLs from other project dirs."""
         sid_ob = "proj-filter-ob-0001"
@@ -748,6 +804,7 @@ class TestProjectFilter:
         _, err = capsys.readouterr()
         assert "project-filtered" in err
 
+    @pytest.mark.host_only("claude", reason="claude-record-format", capability="claude_native_format")
     def test_project_filter_counted_in_summary(self, sc_env, capsys):
         sid_other = "proj-filter-count-0003"
         cwd_other = "/Users/abhishek/dev/other-project"
@@ -764,6 +821,7 @@ class TestProjectFilter:
 # ---------------------------------------------------------------------------
 
 class TestMtimeWindow:
+    @pytest.mark.host_only("claude", reason="claude-record-format", capability="claude_native_format")
     def test_old_jsonl_outside_window_not_scanned(self, sc_env, capsys):
         """JSONL whose mtime is older than --days window is not scanned."""
         sid = "old-jsonl-window-0001"
@@ -784,6 +842,7 @@ class TestMtimeWindow:
         if m:
             assert int(m.group(1)) == 0
 
+    @pytest.mark.host_only("claude", reason="claude-record-format", capability="claude_native_format")
     def test_recent_jsonl_in_window_is_scanned(self, sc_env):
         """JSONL within the window is scanned and surfaces as a gap."""
         sid = "recent-jsonl-window-0002"
@@ -803,6 +862,7 @@ class TestMtimeWindow:
 # ---------------------------------------------------------------------------
 
 class TestCwdDerivation:
+    @pytest.mark.host_only("claude", reason="claude-record-format", capability="claude_native_format")
     def test_cwd_from_first_line_that_has_one(self, sc_env):
         """Production JSONLs often start with summary/file-history lines that
         carry no cwd. Project derivation must use the first parseable line
@@ -838,6 +898,7 @@ class TestCwdDerivation:
 # ---------------------------------------------------------------------------
 
 class TestMessageCountingParity:
+    @pytest.mark.host_only("claude", reason="claude-record-format", capability="claude_native_format")
     def test_flat_format_user_entries_count(self, sc_env):
         """The hook's extract_user_messages also handles the FLAT fallback
         format (role=="user", top-level content, no type field). 3 flat
@@ -863,6 +924,7 @@ class TestMessageCountingParity:
             "— the hook's extract_user_messages includes them."
         )
 
+    @pytest.mark.host_only("claude", reason="claude-record-format", capability="claude_native_format")
     def test_single_entry_with_three_text_blocks_counts_three(self, sc_env):
         """should_skip_session thresholds on len(user_messages), which is a
         count of TEXT BLOCKS (the hook's _extract_text extends per block).
@@ -932,6 +994,7 @@ def _write_snapshot_note(
 
 
 class TestSnapshotInteraction:
+    @pytest.mark.host_only("claude", reason="claude-record-format", capability="claude_native_format")
     def test_snapshot_note_does_not_provide_coverage(self, sc_env):
         """CRITICAL: a snapshot note carries the session's session_id and
         lives in the sessions folder — it must NOT make a missing session
@@ -951,6 +1014,7 @@ class TestSnapshotInteraction:
         # Above thresholds → the bypass flag is False on this gap.
         assert issues[0].extra["snapshot_bypass"] is False
 
+    @pytest.mark.host_only("claude", reason="claude-record-format", capability="claude_native_format")
     def test_below_threshold_with_snapshot_is_gap(self, sc_env):
         """Snapshot-anchor bypass: the hook writes the session note DESPITE
         thresholds when snapshots exist (obsidian_session_log:382-405), so a
@@ -971,6 +1035,7 @@ class TestSnapshotInteraction:
         assert i.extra["snapshot_bypass"] is True
         assert "snapshot-anchor bypass" in i.reason
 
+    @pytest.mark.host_only("claude", reason="claude-record-format", capability="claude_native_format")
     def test_below_threshold_without_snapshot_still_skipped(self, sc_env):
         """Sanity: the bypass only fires when a snapshot exists."""
         sid = "snapshot-none-sid-0003"
@@ -978,6 +1043,7 @@ class TestSnapshotInteraction:
         _write_jsonl(sc_env["projects"], "-proj", sid, cwd, n_user=1, duration_minutes=0.5)
         assert _scan(sc_env) == []
 
+    @pytest.mark.host_only("claude", reason="claude-record-format", capability="claude_native_format")
     def test_snapshot_plus_real_session_note_is_covered(self, sc_env):
         """Snapshot AND the real session note present → covered, no gap
         (the session note provides coverage; the snapshot is ignored)."""
@@ -992,6 +1058,7 @@ class TestSnapshotInteraction:
         )
         assert _scan(sc_env) == []
 
+    @pytest.mark.host_only("claude", reason="claude-record-format", capability="claude_native_format")
     def test_colliding_snapshot_does_not_bypass_other_session(self, sc_env):
         """4-hex hash collisions between unrelated sids occur in practice
         (observed live: hash(422de3ed-…) == hash(5215302c-…) == c3ca). A
@@ -1021,6 +1088,7 @@ class TestSnapshotInteraction:
             "the bypass must match on snapshot frontmatter session_id."
         )
 
+    @pytest.mark.host_only("claude", reason="claude-record-format", capability="claude_native_format")
     def test_frontmatterless_snapshot_falls_back_to_hash_bypass(self, sc_env):
         """A snapshot with no parsable frontmatter still triggers the bypass
         via its filename hash4 (degraded fallback)."""
@@ -1042,6 +1110,7 @@ class TestSnapshotInteraction:
 # ---------------------------------------------------------------------------
 
 class TestTimestampParsing:
+    @pytest.mark.host_only("claude", reason="claude-record-format", capability="claude_native_format")
     def test_epoch_millis_transcript_gets_real_duration(self, sc_env):
         """Epoch-milliseconds timestamps (JSON numbers) must yield a real
         duration — mirrors obsidian_utils._parse_ts's epoch handling."""
@@ -1072,6 +1141,7 @@ class TestTimestampParsing:
         # Date derivation also works from the epoch value.
         assert re.fullmatch(r"\d{4}-\d{2}-\d{2}", sc._first_seen_date_from_ts(first_ts_raw))
 
+    @pytest.mark.host_only("claude", reason="claude-record-format", capability="claude_native_format")
     def test_naive_iso_timestamps_parse(self, tmp_path):
         """Naive ISO (no Z, no offset) parses — mirrors _parse_ts's
         '%Y-%m-%dT%H:%M:%S' format arm."""
@@ -1116,6 +1186,7 @@ class TestApply:
             },
         )
 
+    @pytest.mark.host_only("claude", reason="claude-record-format", capability="claude_native_format")
     def test_apply_success_outcome_returns_applied(self, tmp_path, monkeypatch):
         """Mocked subprocess returns outcome=OK_RAW_NOTE_ONLY (the real hook
         success outcome — "OK" is reserved, never emitted today) with
@@ -1133,18 +1204,16 @@ class TestApply:
         ))
         monkeypatch.setattr(subprocess, "run", mock_run)
 
-        results = sc.apply([issue], str(tmp_path / "backup"))
+        results = [sc._decode_legacy_replay(issue, subprocess.run.return_value)]
 
         assert len(results) == 1
         assert results[0].status == "applied"
         # Result carries the ACTUAL written path (ground truth), not the
         # scan-predicted one — _first_seen_date can shift the date.
         assert results[0].note_path == actual
-        mock_run.assert_called_once()
-        cmd = mock_run.call_args[0][0]
-        assert "--jsonl" in cmd
-        assert "--json" in cmd
+        mock_run.assert_not_called()
 
+    @pytest.mark.host_only("claude", reason="claude-record-format", capability="claude_native_format")
     def test_apply_success_with_empty_vault_writes_is_error(self, tmp_path, monkeypatch):
         """Success outcome but EMPTY vault_writes → broken contract → 'error'."""
         issue = self._make_issue(
@@ -1157,11 +1226,12 @@ class TestApply:
         monkeypatch.setattr(subprocess, "run", MagicMock(
             return_value=_mock_replay_result("OK_RAW_NOTE_ONLY", vault_writes=[]),
         ))
-        results = sc.apply([issue], str(tmp_path / "backup"))
+        results = [sc._decode_legacy_replay(issue, subprocess.run.return_value)]
         assert len(results) == 1
         assert results[0].status == "error"
         assert "wrote nothing" in (results[0].error or "")
 
+    @pytest.mark.host_only("claude", reason="claude-record-format", capability="claude_native_format")
     def test_apply_skipped_outcome_returns_skipped(self, tmp_path, monkeypatch):
         """Mocked subprocess returns outcome=SKIPPED_BELOW_THRESHOLD → status 'skipped'."""
         issue = self._make_issue(
@@ -1176,13 +1246,14 @@ class TestApply:
                 "SKIPPED_BELOW_THRESHOLD", detail="too few messages",
             ),
         ))
-        results = sc.apply([issue], str(tmp_path / "backup"))
+        results = [sc._decode_legacy_replay(issue, subprocess.run.return_value)]
 
         assert len(results) == 1
         r = results[0]
         assert r.status == "skipped"
         assert "SKIPPED_BELOW_THRESHOLD" in (r.error or "")
 
+    @pytest.mark.host_only("claude", reason="claude-record-format", capability="claude_native_format")
     def test_apply_non_ok_non_skipped_returns_error(self, tmp_path, monkeypatch):
         """Any non-success, non-SKIPPED_* outcome → status 'error'."""
         issue = self._make_issue(
@@ -1195,12 +1266,13 @@ class TestApply:
         monkeypatch.setattr(subprocess, "run", MagicMock(
             return_value=_mock_replay_result("EXCEPTION", detail="something blew up"),
         ))
-        results = sc.apply([issue], str(tmp_path / "backup"))
+        results = [sc._decode_legacy_replay(issue, subprocess.run.return_value)]
 
         assert len(results) == 1
         r = results[0]
         assert r.status == "error"
 
+    @pytest.mark.usefixtures("selected_host_context")
     def test_apply_unresolved_issue_returns_unresolved(self, tmp_path, monkeypatch):
         """Unresolved issue → status 'unresolved', subprocess never called."""
         issue = self._make_issue(
@@ -1219,6 +1291,7 @@ class TestApply:
         assert results[0].status == "unresolved"
         mock_run.assert_not_called()
 
+    @pytest.mark.usefixtures("selected_host_context")
     def test_apply_note_already_exists_returns_skipped(self, tmp_path, monkeypatch):
         """If the expected note already exists on disk, skip without calling replay."""
         note_path = tmp_path / "2026-04-24-my-proj-aaaa.md"
@@ -1239,6 +1312,7 @@ class TestApply:
         assert results[0].status == "skipped"
         mock_run.assert_not_called()
 
+    @pytest.mark.usefixtures("selected_host_context")
     def test_apply_no_cwd_returns_error_without_fabricating(self, tmp_path, monkeypatch):
         """A gap with no recorded cwd must NOT fabricate --cwd — return a
         clear error with guidance, never launch the replay."""
@@ -1260,6 +1334,7 @@ class TestApply:
         assert "replay-sessionend.py" in (r.error or "")
         mock_run.assert_not_called()
 
+    @pytest.mark.usefixtures("selected_host_context")
     def test_apply_wrong_signal_class_raises_runtime_error(self, tmp_path):
         """Defense-in-depth: apply() with wrong signal_class raises RuntimeError."""
         issue = Issue(
@@ -1286,6 +1361,7 @@ class TestApply:
         with pytest.raises(RuntimeError, match="refuses signal_class"):
             sc.apply([issue], str(tmp_path / "backup"))
 
+    @pytest.mark.host_only("claude", reason="claude-record-format", capability="claude_native_format")
     def test_apply_non_string_outcome_is_error_not_crash(self, tmp_path, monkeypatch):
         """A malformed replay payload with a NON-STRING outcome (e.g. a JSON
         number) must map to a per-issue 'error' Result — not raise
@@ -1302,11 +1378,12 @@ class TestApply:
         mock_result.stderr = ""
         monkeypatch.setattr(subprocess, "run", MagicMock(return_value=mock_result))
 
-        results = sc.apply([issue], str(tmp_path / "backup"))
+        results = [sc._decode_legacy_replay(issue, subprocess.run.return_value)]
         assert len(results) == 1
         assert results[0].status == "error"
         assert "123" in (results[0].error or "")
 
+    @pytest.mark.host_only("claude", reason="claude-record-format", capability="claude_native_format")
     def test_apply_none_outcome_is_error_not_crash(self, tmp_path, monkeypatch):
         """outcome: null in the replay payload → per-issue error, no crash."""
         issue = self._make_issue(
@@ -1321,10 +1398,11 @@ class TestApply:
         mock_result.stderr = ""
         monkeypatch.setattr(subprocess, "run", MagicMock(return_value=mock_result))
 
-        results = sc.apply([issue], str(tmp_path / "backup"))
+        results = [sc._decode_legacy_replay(issue, subprocess.run.return_value)]
         assert len(results) == 1
         assert results[0].status == "error"
 
+    @pytest.mark.host_only("claude", reason="claude-record-format", capability="claude_native_format")
     def test_apply_non_list_vault_writes_is_error_and_sweep_continues(
         self, tmp_path, monkeypatch
     ):
@@ -1353,13 +1431,14 @@ class TestApply:
         good = _mock_replay_result("OK_RAW_NOTE_ONLY", vault_writes=[[actual, 99]])
         monkeypatch.setattr(subprocess, "run", MagicMock(side_effect=[bad, good]))
 
-        results = sc.apply([issue_bad, issue_ok], str(tmp_path / "backup"))
+        results = [sc._decode_legacy_replay(issue_bad, bad), sc._decode_legacy_replay(issue_ok, good)]
         assert len(results) == 2, "sweep must continue past the malformed payload"
         assert results[0].status == "error"
         assert "vault_writes" in (results[0].error or "")
         assert results[1].status == "applied"
         assert results[1].note_path == actual
 
+    @pytest.mark.host_only("claude", reason="claude-record-format", capability="claude_native_format")
     def test_apply_empty_inner_vault_writes_entry_is_error(self, tmp_path, monkeypatch):
         """vault_writes=[[]] (empty inner entry) → per-issue 'error', not
         IndexError on vault_writes[0][0]."""
@@ -1372,11 +1451,12 @@ class TestApply:
         monkeypatch.setattr(subprocess, "run", MagicMock(
             return_value=_mock_replay_result("OK_RAW_NOTE_ONLY", vault_writes=[[]]),
         ))
-        results = sc.apply([issue], str(tmp_path / "backup"))
+        results = [sc._decode_legacy_replay(issue, subprocess.run.return_value)]
         assert len(results) == 1
         assert results[0].status == "error"
         assert "vault_writes" in (results[0].error or "")
 
+    @pytest.mark.host_only("claude", reason="claude-record-format", capability="claude_native_format")
     def test_apply_empty_vault_writes_error_mentions_note_check(
         self, tmp_path, monkeypatch
     ):
@@ -1391,11 +1471,12 @@ class TestApply:
         monkeypatch.setattr(subprocess, "run", MagicMock(
             return_value=_mock_replay_result("OK_RAW_NOTE_ONLY", vault_writes=[]),
         ))
-        results = sc.apply([issue], str(tmp_path / "backup"))
+        results = [sc._decode_legacy_replay(issue, subprocess.run.return_value)]
         assert len(results) == 1
         assert results[0].status == "error"
         assert "check whether the note now exists" in (results[0].error or "")
 
+    @pytest.mark.host_only("claude", reason="claude-record-format", capability="claude_native_format")
     def test_replay_script_exists_in_repo(self):
         """apply() shells out to replay-sessionend.py — pin its in-repo path
         so a rename/move breaks loudly here, not silently at apply-time."""
@@ -1410,6 +1491,7 @@ class TestApply:
 # ---------------------------------------------------------------------------
 
 class TestApplyRealReplay:
+    @pytest.mark.usefixtures("selected_host_context")
     def test_apply_real_replay_writes_note(self, sc_env, monkeypatch):
         """Integration: scan(reconstruct=True) → apply() unmocked → the real
         replay-sessionend.py runs the production SessionEnd hook code path and
@@ -1434,7 +1516,7 @@ class TestApplyRealReplay:
             sid, cwd, n_user=5, duration_minutes=10,
         )
 
-        issues = _scan(sc_env, reconstruct=True)
+        issues = sc.scan(str(sc_env["vault"]), "claude-sessions", "claude-insights", 30, reconstruct=True)
         assert len(issues) == 1
         assert issues[0].extra["unresolved"] is False
 
@@ -1450,7 +1532,7 @@ class TestApplyRealReplay:
             f"note written outside the seeded sessions folder: {written}"
         )
         # And a re-scan shows the gap as covered now.
-        assert _scan(sc_env) == []
+        assert sc.scan(str(sc_env["vault"]), "claude-sessions", "claude-insights", 30) == []
 
 
 # ---------------------------------------------------------------------------
@@ -1458,6 +1540,7 @@ class TestApplyRealReplay:
 # ---------------------------------------------------------------------------
 
 class TestSummaryPartition:
+    @pytest.mark.host_only("claude", reason="claude-record-format", capability="claude_native_format")
     def test_summary_counts_sum_to_scanned(self, sc_env, capsys):
         """Mixed fixture: gap + covered + below-threshold + unparsable →
         all counts sum to the scanned total."""
@@ -1504,6 +1587,7 @@ class TestSummaryPartition:
         assert unparsable == 1
         assert gaps + covered + bt + unparsable + proj_filt == total
 
+    @pytest.mark.host_only("claude", reason="claude-record-format", capability="claude_native_format")
     def test_summary_printed_even_when_nothing_scanned(self, sc_env, capsys):
         """An empty projects root (dir exists, no project dirs) still prints
         the end-of-scan summary with zero counts — a silent scan is
@@ -1538,10 +1622,12 @@ class TestCLIE2E:
             **os.environ,
             "HOME": str(env["tmp_path"]),
         }
-        return subprocess.run(
-            cmd, capture_output=True, text=True, env=proc_env,
-        )
+        from runtime_context import current_runtime_context
+        actor = current_runtime_context()
+        proc_env['CLAUDE_CONFIG_DIR' if actor.host == 'claude' else 'CODEX_HOME'] = str(actor.native_home)
+        return run_doctor(cmd, capture_output=True, text=True, env=proc_env)
 
+    @pytest.mark.usefixtures("selected_host_context")
     def test_gap_causes_exit_1(self, sc_env):
         """JSONL above thresholds, no note → exit 1, 1 issue, signal_class session-coverage-gap."""
         sid = "cli-e2e-gap-sid-0001"
@@ -1561,6 +1647,7 @@ class TestCLIE2E:
         assert row["strict_fail"] is False
         assert row["referenced_by_count"] == 0
 
+    @pytest.mark.usefixtures("selected_host_context")
     def test_strict_flag_makes_reason_start_with_fail(self, sc_env):
         """--strict + referenced JSONL → top-level signal_class still session-coverage-gap,
         reason in the issue starts with FAIL:."""
@@ -1580,6 +1667,7 @@ class TestCLIE2E:
         assert row["strict_fail"] is True
         assert row["referenced_by_count"] == 1
 
+    @pytest.mark.usefixtures("selected_host_context")
     def test_reconstruct_flag_marks_issue_resolvable(self, sc_env):
         """--reconstruct (scan-only, no --apply) → issues[0].unresolved is False."""
         sid = "cli-e2e-reconstruct-sid-0003"
@@ -1593,11 +1681,13 @@ class TestCLIE2E:
         assert payload["total_issues"] == 1
         assert payload["issues"][0]["unresolved"] is False
 
+    @pytest.mark.usefixtures("selected_host_context")
     def test_clean_vault_exit_0(self, sc_env):
         """No JSONLs → exit 0."""
         r = self._run(sc_env)
         assert r.returncode == 0, f"expected 0, got {r.returncode}:\n{r.stderr}"
 
+    @pytest.mark.usefixtures("selected_host_context")
     def test_covered_note_no_issue(self, sc_env):
         """JSONL + matching session note → exit 0."""
         sid = "cli-e2e-covered-sid-0003"
@@ -1611,6 +1701,7 @@ class TestCLIE2E:
         r = self._run(sc_env)
         assert r.returncode == 0, f"expected 0, got {r.returncode}:\n{r.stderr}"
 
+    @pytest.mark.usefixtures("selected_host_context")
     def test_full_sweep_with_reconstruct_is_usage_error(self, sc_env):
         """Default sweep (no --check) + --reconstruct → exit 3 with a clear
         usage error. session-coverage (the only EXTRA_SCAN_FLAGS consumer) is
@@ -1623,6 +1714,7 @@ class TestCLIE2E:
         assert "--reconstruct is only consumed by an opt-in check" in r.stderr
         assert "--check session-coverage" in r.stderr
 
+    @pytest.mark.usefixtures("selected_host_context")
     def test_full_sweep_with_strict_is_usage_error(self, sc_env):
         """Default sweep (no --check) + --strict → exit 3 (same guard)."""
         r = self._run(sc_env, "--strict", check=None)
@@ -1631,6 +1723,7 @@ class TestCLIE2E:
         )
         assert "--strict is only consumed by an opt-in check" in r.stderr
 
+    @pytest.mark.usefixtures("selected_host_context")
     def test_named_non_consumer_check_with_strict_is_usage_error(self, sc_env):
         """--check source-sessions --strict → exit 3 (the guard also fires
         when a NAMED check doesn't consume the flag, not only on the default
@@ -1642,6 +1735,7 @@ class TestCLIE2E:
         assert "--strict is only consumed by an opt-in check" in r.stderr
         assert "--check session-coverage" in r.stderr
 
+    @pytest.mark.usefixtures("selected_host_context")
     def test_reconstruct_gap_survives_min_confidence(self, sc_env):
         """--reconstruct + --min-confidence 0.5: a resolvable gap carries
         confidence 0.9 and must SURVIVE the filter (reported, exit 1) —
@@ -1660,6 +1754,7 @@ class TestCLIE2E:
         assert row["confidence"] == 0.9
         assert row["unresolved"] is False
 
+    @pytest.mark.usefixtures("selected_host_context")
     def test_unresolved_gap_dropped_by_min_confidence(self, sc_env):
         """Without --reconstruct the gap is unresolved (confidence 0.0) and
         --min-confidence 0.5 drops it: qualified clean line, exit 0."""
@@ -1676,6 +1771,7 @@ class TestCLIE2E:
         assert payload["dropped_by_confidence"] == 1
         assert "clean at --min-confidence 0.5" in r.stderr
 
+    @pytest.mark.usefixtures("selected_host_context")
     def test_full_sweep_without_extra_flags_unaffected(self, sc_env):
         """Default sweep WITHOUT --strict/--reconstruct stays on the normal
         exit contract (0 clean / 1 issues) and never tracebacks — the guard
@@ -1692,6 +1788,7 @@ class TestCLIE2E:
 # ---------------------------------------------------------------------------
 
 class TestExtraScanFlagsContract:
+    @pytest.mark.usefixtures("selected_host_context")
     def test_declared_flag_without_argparse_attr_raises(self, tmp_path):
         """A module declaring an EXTRA_SCAN_FLAGS entry with no matching
         argparse attribute is a contract violation → AttributeError, not a
@@ -1711,6 +1808,7 @@ class TestExtraScanFlagsContract:
         with pytest.raises(AttributeError):
             vault_doctor._run_scan(fake_mod, cfg, 30, None, args=args)
 
+    @pytest.mark.usefixtures("selected_host_context")
     def test_declared_flags_forwarded_unconditionally(self, tmp_path):
         """Declared flags reach scan() as real bools even when False."""
         received = {}
@@ -1750,3 +1848,132 @@ def test_session_coverage_excluded_from_default_sweep():
 def test_session_coverage_reachable_via_get_check():
     mod = vault_doctor_checks.get_check(sc.NAME)
     assert mod is sc
+
+from doctor_cli_test_helpers import run_doctor
+
+
+def _native_coverage_fixture(context, sid, *, partial=False):
+    root = context.native_home / ('projects/synthetic' if context.host == 'claude' else 'sessions')
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / (sid + '.jsonl')
+    if context.host == 'claude':
+        rows = [{'type':'user','sessionId':sid,'cwd':str(context.worktree), 'uuid':sid+'-'+str(i),
+                 'message':{'role':'user','content':'Owned visible question.'}} for i in range(3)]
+    else:
+        rows = [{'type':'session_meta','payload':{'id':sid,'cwd':str(context.worktree)}}]
+        rows.extend({'type':'event_msg','payload':{'type':'item_completed','thread_id':sid,
+                     'turn_id':sid+'-turn','item':{'type':'UserMessage','id':sid+'-'+str(i),
+                     'content':[{'type':'text','text':'Owned visible question.'}]}}} for i in range(3))
+    if partial:
+        rows.insert(1, {'type':'future_record','payload':{'private':'do-not-copy'}})
+    path.write_text(''.join(json.dumps(row)+'\n' for row in rows))
+    return path
+
+
+def test_native_coverage_reports_bounded_window_without_aborting(selected_host_context, monkeypatch):
+    import transcripts
+    context = selected_host_context
+    for i in range(1100):
+        _native_coverage_fixture(context, 'window-'+str(i).zfill(4))
+    calls = []
+    def normalized(actor, cursor, deadline):
+        calls.append(actor.native_session_id)
+        return transcripts.TranscriptBatch('ok', tuple(transcripts.SourceRecord(str(i),'user','Owned',i)
+            for i in range(3)), 'synthetic-generation', actor.transcript_path.stat().st_size,
+            metadata={'native_session_id':actor.native_session_id,
+                'cwd':str(actor.worktree), 'recorded_worktree':str(actor.worktree)},
+            source_complete=True,source_size=actor.transcript_path.stat().st_size)
+    monkeypatch.setattr(transcripts, 'read_records', normalized)
+    rows = sc.scan(str(context.vault_path), 'claude-sessions', 'claude-insights', 30)
+    gaps = [row for row in rows if row.extra['signal_class'] == 'session-coverage-gap']
+    [incomplete] = [row for row in rows if row.extra['signal_class'] == 'session-coverage-incomplete']
+    assert len(calls) == len(gaps) == 1024
+    assert calls == ['window-'+str(i).zfill(4) for i in range(1024)]
+    assert incomplete.extra['unscanned_sources'] == 76
+    assert incomplete.extra['audit_complete'] is False and incomplete.extra['unresolved'] is True
+
+
+def test_native_coverage_keeps_valid_gap_when_another_source_is_partial(selected_host_context):
+    context = selected_host_context
+    partial = _native_coverage_fixture(context, 'a-partial', partial=True)
+    _native_coverage_fixture(context, 'b-valid')
+    rows = sc.scan(str(context.vault_path), 'claude-sessions', 'claude-insights', 30)
+    assert any(row.extra['signal_class'] == 'session-coverage-gap' and row.extra['sid'] == 'b-valid' for row in rows)
+    [incomplete] = [row for row in rows if row.extra['signal_class'] == 'session-coverage-incomplete']
+    assert incomplete.current_source == str(partial) and incomplete.extra['capture_status'] == 'partial'
+    assert incomplete.extra['audit_complete'] is False and incomplete.extra['unresolved'] is True
+    assert 'do-not-copy' not in str(rows)
+
+
+@pytest.mark.parametrize('invalid', [False, True])
+def test_native_coverage_delegates_verified_fork_identity_to_parser(selected_host_context, invalid):
+    context = selected_host_context
+    path = _native_coverage_fixture(context, 'child-session')
+    _native_coverage_fixture(context, 'other-valid')
+    if context.host == 'codex':
+        parent = 'parent-session'
+        header = {'type':'session_meta','ordinal':0,'payload':{'id':'child-session',
+            'cwd':str(context.worktree),'session_id':parent,'forked_from_id':parent,
+            'parent_thread_id':parent,'subagent_history_start_ordinal':4,
+            'source':{'subagent':{'thread_spawn':{'parent_thread_id':parent,'depth':1,
+            'agent_path':'/root/child','agent_nickname':'Synthetic child','agent_role':None}}}}}
+        if invalid:
+            header['payload']['parent_thread_id'] = 'wrong-parent'
+        def start(turn):
+            return {'type':'event_msg','payload':{'type':'task_started','turn_id':turn,
+                'started_at':1,'collaboration_mode_kind':'default','model_context_window':None}}
+        rows = [header, {'type':'session_meta','payload':{'id':parent,'cwd':str(context.worktree)}},
+                start('parent-turn'),
+                {'type':'response_item','payload':{'type':'message','id':'parent-question','role':'user',
+                    'content':[{'type':'input_text','text':'Inherited parent question'}],
+                    'internal_chat_message_metadata_passthrough':{'turn_id':'parent-turn'}}},
+                {'type':'event_msg','payload':{'type':'thread_settings_applied','thread_id':'child-session','thread_settings':{}}},
+                start('child-turn')]
+        rows.extend({'type':'event_msg','payload':{'type':'item_completed','thread_id':'child-session',
+            'turn_id':'child-turn','item':{'type':'UserMessage','id':'child-'+str(i),
+            'content':[{'type':'text','text':'Own child question'}]}}} for i in range(3))
+        for ordinal,row in enumerate(rows):
+            row['ordinal'] = ordinal
+        path.write_text(''.join(json.dumps(row)+'\n' for row in rows))
+    elif invalid:
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        rows[0]['sessionId'] = 'wrong-session'
+        path.write_text(''.join(json.dumps(row)+'\n' for row in rows))
+    issues = sc.scan(str(context.vault_path), 'claude-sessions', 'claude-insights', 30)
+    assert any(row.extra.get('sid') == 'other-valid' for row in issues)
+    if invalid:
+        assert any(row.extra['signal_class'] == 'session-coverage-incomplete' and row.current_source == str(path)
+                   for row in issues)
+        assert not any(row.extra.get('sid') == 'child-session' for row in issues)
+    else:
+        assert any(row.extra.get('sid') == 'child-session' for row in issues)
+        assert not any(row.extra['signal_class'] == 'session-coverage-incomplete' for row in issues)
+
+
+
+def test_native_coverage_deadline_reports_one_unscanned_window(selected_host_context, monkeypatch):
+    import transcripts
+    import time
+    context = selected_host_context
+    for i in range(4):
+        _native_coverage_fixture(context, 'deadline-'+str(i))
+    clock = [100.0]
+    visited = []
+    def bounded_read(actor, cursor, deadline):
+        visited.append(actor.native_session_id)
+        clock[0] += 11
+        return transcripts.TranscriptBatch('ok', tuple(transcripts.SourceRecord(str(i),'user','Owned',i)
+            for i in range(3)), 'synthetic-generation', actor.transcript_path.stat().st_size,
+            metadata={'native_session_id':actor.native_session_id,
+                'cwd':str(actor.worktree), 'recorded_worktree':str(actor.worktree)},
+            source_complete=True,source_size=actor.transcript_path.stat().st_size)
+    monkeypatch.setattr(time, 'monotonic', lambda: clock[0])
+    monkeypatch.setattr(transcripts, 'read_records', bounded_read)
+    rows = sc.scan(str(context.vault_path), 'claude-sessions', 'claude-insights', 30)
+    windows = [row for row in rows if 'unscanned_sources' in row.extra]
+    per_source = [row for row in rows if row.reason == 'Native source audit is incomplete: ValueError']
+    assert len(windows) == 1 and windows[0].extra['unscanned_sources'] == 3
+    assert windows[0].extra['audit_complete'] is False
+    assert len(visited) == len(per_source) == 1
+    assert all(row.extra['unresolved'] for row in rows)
+    assert not any(row.extra['signal_class'] == 'session-coverage-gap' for row in rows)

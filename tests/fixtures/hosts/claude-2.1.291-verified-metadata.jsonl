@@ -1,0 +1,12 @@
+{"atis": "", "sessionId": "opaque-native-id", "type": "atis-latch"}
+{"aiTitle": "<text>", "sessionId": "opaque-native-id", "type": "ai-title"}
+{"mode": "normal", "sessionId": "opaque-native-id", "type": "mode"}
+{"bridgeSessionId": "<text>", "lastSequenceNum": 1, "ownerAccountUuid": "00000000-0000-4000-8000-000000000001", "ownerOrganizationUuid": "00000000-0000-4000-8000-000000000001", "sessionId": "opaque-native-id", "type": "bridge-session"}
+{"relocatedCwd": "/synthetic/path", "sessionId": "opaque-native-id", "type": "relocated"}
+{"hasUnknownModelCost": true, "modelUsage": {"<key:data>": {"cacheCreationInputTokens": 1, "cacheReadInputTokens": 1, "costUSD": 0.5, "inputTokens": 1, "outputTokens": 1, "thinkingTokens": 1, "webSearchRequests": 1}}, "sessionId": "opaque-native-id", "startTime": 1, "totalAPIDuration": 1, "totalAPIDurationWithoutRetries": 1, "totalCostUSD": 0.5, "totalDuration": 1, "totalLinesAdded": 1, "totalLinesRemoved": 1, "totalToolDuration": 1, "type": "cost-state"}
+{"sessionId": "opaque-native-id", "type": "worktree-state", "worktreeSession": null}
+{"artifactCount": 1, "sessionId": "opaque-native-id", "timestamp": "2026-10-06T10:00:00.000Z", "type": "frame-link"}
+{"backup": {"backupFileName": null, "backupTime": "2026-10-06T10:00:00.000Z", "realParentDir": "/synthetic/path", "version": 1}, "messageId": "00000000-0000-4000-8000-000000000001", "snapshotMessageId": "00000000-0000-4000-8000-000000000001", "timestamp": "2026-10-06T10:00:00.000Z", "trackingPath": "/synthetic/path", "type": "file-history-delta"}
+{"accountUuid": "00000000-0000-4000-8000-000000000001", "artifacts": {"<key:uuid>": {"everBaselined": true, "everHadThreads": true, "savedAt": 1, "stampHighWater": "2026-10-06T10:00:00.000Z", "threads": [], "turnTimestamps": []}}, "sessionId": "opaque-native-id", "type": "artifact-autoreact-ledger", "v": 1}
+{"artifacts": {"<key:uuid>": {"state": "armed", "title": "<text>", "writtenAtMs": 1}}, "sessionId": "opaque-native-id", "type": "artifact-comment-monitor", "v": 1}
+{"continuedInSessionId": "00000000-0000-4000-8000-000000000001", "sessionId": "opaque-native-id", "timestamp": "2026-10-06T10:00:00.000Z", "type": "continued-in"}

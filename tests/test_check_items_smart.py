@@ -13,6 +13,7 @@ Adaptations from plan's verbatim version:
 
 from __future__ import annotations
 
+from tests.native_pipeline_test_adapter import private_pipeline_output, run_native_pipeline
 import importlib
 import json
 import os
@@ -33,6 +34,98 @@ SUBAGENT_TIMEOUT_SEC = _check_items_cli_mod.SUBAGENT_TIMEOUT_SEC
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+# Native CLI tests keep real schema validation and fake only the transport.
+from ai_backend import execute_ai as _REAL_NATIVE_AI
+from dataclasses import replace
+from runtime_context import using_runtime_context
+
+@pytest.fixture(autouse=True)
+def selected_host_context(host, selected_host_context, tmp_path, tmp_path_factory):
+    private = tmp_path_factory.mktemp("smart-private")
+    selected = replace(selected_host_context, vault_path=tmp_path,
+        state_path=private / "state", index_path=private / "index.sqlite3",
+        user_home=tmp_path_factory.mktemp("smart-account-home"),
+        config=dict(selected_host_context.config, vault_path=str(tmp_path),
+                    codex_ai_model="gpt-native-configured"))
+    with using_runtime_context(selected):
+        yield selected
+
+
+@pytest.fixture
+def native_cli_context(selected_host_context, tmp_path, monkeypatch):
+    from check_items_test_helpers import native_ai_context
+    generator = native_ai_context.__wrapped__(selected_host_context, tmp_path, monkeypatch)
+    context = next(generator)
+    context.config.pop("classifier_model", None)
+    try:
+        yield context
+    finally:
+        generator.close()
+
+
+def _mock_native_transport(monkeypatch, *, status=None, invalid_json=False, data=None):
+    import ai_backend
+    import check_items_cli as cli
+    calls = []
+    def transport(command, prompt, **kwargs):
+        calls.append((command, prompt, kwargs))
+        if status:
+            raise ai_backend._BackendFailure(status, 'synthetic_failure')
+        if invalid_json:
+            return 0, b'not-json', b''
+        payload_text = prompt.rsplit('\n\nInput JSON:\n', 1)[1].split(ai_backend.ANALYSIS_INSTRUCTION, 1)[0]
+        payload = json.loads(payload_text)
+        groups = payload['groups']
+        if data is not None:
+            value = data
+        elif cli.SEMANTIC_MERGE_PROMPT in prompt:
+            value = {'merges':[], 'total_groups_before':len(groups), 'total_groups_after':len(groups)}
+        else:
+            value = {'items':[{'group_id':g['group_id'], 'classification':'ACTIVE', 'confidence':'LOW',
+                               'canonical_text':g.get('representative', 'work'), 'evidence_citation':None,
+                               'action_required':None} for g in groups]}
+        envelope = {'structured_output':value, 'modelUsage':{'claude-haiku-4-5-20251001':{}}}
+        return 0, json.dumps(envelope).encode(), b''
+    monkeypatch.setattr(ai_backend, '_run_bounded', transport)
+    from ai_adapters import codex
+    monkeypatch.setattr(codex, 'discover_restrictions',
+                        lambda *args: (codex.restrictions(), 'gpt-native-configured'))
+    def codex_transport(command, prompt, **kwargs):
+        code, raw, errors = transport(command, prompt, **kwargs)
+        if invalid_json:
+            value = 'not-json'
+        else:
+            value = json.dumps(json.loads(raw)['structured_output'])
+        output = __import__('pathlib').Path(command[command.index('--output-last-message') + 1])
+        output.write_text(value); output.chmod(0o600)
+        events = [{'type':'thread.started', 'thread_id':'synthetic-analysis'},
+                  {'type':'turn.started'},
+                  {'type':'item.completed', 'item':{'type':'agent_message', 'text':'Output'}},
+                  {'type':'turn.completed'}]
+        return code, b'\n'.join(json.dumps(row).encode() for row in events), errors
+    monkeypatch.setattr(codex, '_run_bounded', codex_transport)
+    monkeypatch.setattr(ai_backend, 'execute_ai', _REAL_NATIVE_AI)
+    return calls
+
+
+def _mock_bound_cli(monkeypatch, fake, operation="classifier"):
+    """Mock the trusted wrapper call; native transport is tested separately."""
+    import check_items_cli
+    def invoke(payload, output):
+        result = fake(["trusted-cli", "wrapper", operation, output], input=payload)
+        if result.stderr:
+            print(result.stderr, file=sys.stderr)
+        return result.returncode
+    monkeypatch.setattr(check_items_cli,
+                        "run_classifier" if operation == "classifier" else "run_semantic_merge", invoke)
+
+
+def _native_groups(count=1):
+    return [{'group_id':f'g{i}', 'project':'p', 'representative':f'work {i}', 'instances':[]}
+            for i in range(count)]
+
+
 
 def _fake_completed(stdout="", returncode=0):
     cp = MagicMock()
@@ -65,7 +158,7 @@ def test_deep_analysis_pipeline_includes_merged_prs_and_closed_issues(tmp_path):
     """
     repo_dir = tmp_path / "fake-repo"
     repo_dir.mkdir()
-    output_path = str(tmp_path / "pipeline-out.json")
+    output_path = str(private_pipeline_output(tmp_path, "pipeline-out.json"))
 
     # Minimal vault structure (no actual notes needed — projects list drives evidence loop)
     vault_path = str(tmp_path)
@@ -109,7 +202,7 @@ def test_deep_analysis_pipeline_includes_merged_prs_and_closed_issues(tmp_path):
          patch.dict("sys.modules", {"vault_index": fake_vi}), \
          patch.object(oid, "_resolve_project_paths", return_value={"myproject": str(repo_dir)}):
 
-        result = oid.deep_analysis_pipeline(
+        result = run_native_pipeline(
             basenames=[],
             projects_json=json.dumps(["myproject"]),
             output_path=output_path,
@@ -152,7 +245,7 @@ def test_deep_analysis_pipeline_subprocess_timeout_bounded(tmp_path):
     """All evidence subprocess calls must share the 10s timeout pattern."""
     repo_dir = tmp_path / "fake-repo"
     repo_dir.mkdir()
-    output_path = str(tmp_path / "pipeline-out.json")
+    output_path = str(private_pipeline_output(tmp_path, "pipeline-out.json"))
 
     vault_path = str(tmp_path)
     sessions_folder = "sessions"
@@ -183,7 +276,7 @@ def test_deep_analysis_pipeline_subprocess_timeout_bounded(tmp_path):
          patch.dict("sys.modules", {"vault_index": fake_vi}), \
          patch.object(oid, "_resolve_project_paths", return_value={"myproject": str(repo_dir)}):
 
-        result = oid.deep_analysis_pipeline(
+        result = run_native_pipeline(
             basenames=[],
             projects_json=json.dumps(["myproject"]),
             output_path=output_path,
@@ -208,7 +301,7 @@ def test_deep_analysis_pipeline_evidence_error_swallow(tmp_path):
 
     repo_dir = tmp_path / "fake-repo"
     repo_dir.mkdir()
-    output_path = str(tmp_path / "pipeline-out.json")
+    output_path = str(private_pipeline_output(tmp_path, "pipeline-out.json"))
 
     vault_path = str(tmp_path)
     sessions_folder = "sessions"
@@ -235,7 +328,7 @@ def test_deep_analysis_pipeline_evidence_error_swallow(tmp_path):
          patch.dict("sys.modules", {"vault_index": fake_vi}), \
          patch.object(oid, "_resolve_project_paths", return_value={"myproject": str(repo_dir)}):
 
-        result = oid.deep_analysis_pipeline(
+        result = run_native_pipeline(
             basenames=[],
             projects_json=json.dumps(["myproject"]),
             output_path=output_path,
@@ -386,60 +479,32 @@ def test_cross_project_dedup_single_project_passthrough():
 # Task 11: run_semantic_merge() CLI wrapper
 # ---------------------------------------------------------------------------
 
-def test_run_semantic_merge_picks_haiku_for_small_groups(tmp_path, monkeypatch):
-    """<=60 groups -> claude -p --model haiku."""
+def test_run_semantic_merge_picks_haiku_for_small_groups(native_cli_context, monkeypatch):
     import check_items_cli as cli
-
-    captured = {}
-
-    def fake_run(cmd, *args, **kwargs):
-        captured["cmd"] = cmd
-        captured["stdin"] = kwargs.get("input", "")
-        out_path = tmp_path / "out.json"
-        out_path.write_text(json.dumps({
-            "merges": [],
-            "total_groups_before": 5,
-            "total_groups_after": 5,
-        }))
-        return _fake_completed(stdout=out_path.read_text(), returncode=0)
-
-    monkeypatch.setattr(cli.subprocess, "run", fake_run)
-
-    stdin_json = json.dumps({"groups": [{"group_id": f"g{i}", "project": "p",
-                                          "representative": f"item {i}", "member_texts": []}
-                                         for i in range(5)]})
-    out_path = tmp_path / "merge.json"
-    rc = cli.run_semantic_merge(stdin_json=stdin_json, output_path=str(out_path))
+    from check_items_test_helpers import private_output
+    monkeypatch.setenv('CHECK_ITEMS_PREFILTER', 'off')
+    calls = _mock_native_transport(monkeypatch)
+    output = private_output()
+    payload = {'groups':_native_groups(5), 'evidence':{}}
+    rc = cli.run_semantic_merge(json.dumps(payload), str(output))
     assert rc == 0
-    assert out_path.exists()
-    assert "haiku" in " ".join(captured["cmd"])
+    assert calls and all(command[command.index('--model') + 1] == ('haiku' if native_cli_context.host == 'claude' else 'gpt-native-configured') for command, _, _ in calls)
+    assert json.loads(output.read_text()) is not None
 
 
-def test_run_semantic_merge_picks_sonnet_above_60(tmp_path, monkeypatch):
-    """>60 groups escalates to sonnet."""
+
+def test_run_semantic_merge_picks_sonnet_above_60(native_cli_context, monkeypatch):
     import check_items_cli as cli
-
-    captured = {}
-
-    def fake_run(cmd, *args, **kwargs):
-        captured["cmd"] = cmd
-        out_path = tmp_path / "out.json"
-        out_path.write_text(json.dumps({
-            "merges": [],
-            "total_groups_before": 75,
-            "total_groups_after": 75,
-        }))
-        return _fake_completed(stdout=out_path.read_text(), returncode=0)
-
-    monkeypatch.setattr(cli.subprocess, "run", fake_run)
-
-    big_groups = [{"group_id": f"g{i}", "project": "p", "representative": f"x{i}",
-                   "member_texts": []} for i in range(75)]
-    stdin_json = json.dumps({"groups": big_groups})
-    out_path = tmp_path / "merge2.json"
-    rc = cli.run_semantic_merge(stdin_json=stdin_json, output_path=str(out_path))
+    from check_items_test_helpers import private_output
+    monkeypatch.setenv('CHECK_ITEMS_PREFILTER', 'off')
+    calls = _mock_native_transport(monkeypatch)
+    output = private_output()
+    payload = {'groups':_native_groups(75), 'evidence':{}}
+    rc = cli.run_semantic_merge(json.dumps(payload), str(output))
     assert rc == 0
-    assert "sonnet" in " ".join(captured["cmd"])
+    assert calls and all(command[command.index('--model') + 1] == ('sonnet' if native_cli_context.host == 'claude' else 'gpt-native-configured') for command, _, _ in calls)
+    assert json.loads(output.read_text()) is not None
+
 
 
 def test_run_semantic_merge_caps_stdin_at_1mb():
@@ -467,7 +532,7 @@ def test_run_semantic_merge_prompt_includes_five_examples():
 # Task 12: merge_groups_semantically() orchestrator
 # ---------------------------------------------------------------------------
 
-def test_semantic_merge_pairs_with_zero_token_overlap(tmp_path, monkeypatch):
+def test_semantic_merge_pairs_with_zero_token_overlap(selected_host_context, tmp_path, monkeypatch):
     """Test 1b - sub-agent merges two zero-token-overlap items into one group."""
     import open_item_dedup as oid
 
@@ -507,7 +572,7 @@ def test_semantic_merge_pairs_with_zero_token_overlap(tmp_path, monkeypatch):
         },
     ]
 
-    monkeypatch.setattr(oid.subprocess, "run", fake_cli_run)
+    _mock_bound_cli(monkeypatch, fake_cli_run, "semantic_merge")
     merged = oid.merge_groups_semantically({"obsidian-brain": coarse})
 
     flat = merged if isinstance(merged, list) else [
@@ -518,7 +583,7 @@ def test_semantic_merge_pairs_with_zero_token_overlap(tmp_path, monkeypatch):
     assert len(flat[0]["members"]) == 2
 
 
-def test_semantic_merge_rejects_cross_project(tmp_path, monkeypatch):
+def test_semantic_merge_rejects_cross_project(selected_host_context, tmp_path, monkeypatch):
     """Test 1c - sub-agent returns a cross-project merge; Python filter drops it."""
     import open_item_dedup as oid
 
@@ -550,7 +615,7 @@ def test_semantic_merge_rejects_cross_project(tmp_path, monkeypatch):
                                   "representative": "Y", "members": []}],
     }
 
-    monkeypatch.setattr(oid.subprocess, "run", fake_cli_run)
+    _mock_bound_cli(monkeypatch, fake_cli_run, "semantic_merge")
     merged = oid.merge_groups_semantically(coarse_by_proj)
 
     flat = merged if isinstance(merged, list) else [
@@ -563,7 +628,7 @@ def test_semantic_merge_rejects_cross_project(tmp_path, monkeypatch):
 # Task 13: token-only fallback after 2 sub-agent failures
 # ---------------------------------------------------------------------------
 
-def test_semantic_merge_fallback_on_failure(monkeypatch, tmp_path):
+def test_semantic_merge_fallback_on_failure(selected_host_context, monkeypatch, tmp_path):
     """Test 1d - sub-agent returns malformed JSON twice; coarse groups pass through
     with pipeline_mode flag set."""
     import open_item_dedup as oid
@@ -579,7 +644,7 @@ def test_semantic_merge_fallback_on_failure(monkeypatch, tmp_path):
         {"group_id": "g2", "project": "p", "representative": "B", "members": []},
     ]
 
-    monkeypatch.setattr(oid.subprocess, "run", fake_cli_run)
+    _mock_bound_cli(monkeypatch, fake_cli_run, "semantic_merge")
     merged = oid.merge_groups_semantically(coarse)
 
     assert call_count["n"] == 2, f"expected 2 attempts before fallback, got {call_count['n']}"
@@ -589,7 +654,7 @@ def test_semantic_merge_fallback_on_failure(monkeypatch, tmp_path):
     assert mode == "token-only (semantic pass failed)"
 
 
-def test_semantic_merge_mode_reset_on_success(monkeypatch, tmp_path):
+def test_semantic_merge_mode_reset_on_success(selected_host_context, monkeypatch, tmp_path):
     """Successful merge clears the failure flag."""
     import open_item_dedup as oid
 
@@ -603,7 +668,7 @@ def test_semantic_merge_mode_reset_on_success(monkeypatch, tmp_path):
                 json.dump({"merges": [], "total_groups_before": 1, "total_groups_after": 1}, f)
         return _fake_completed(returncode=0)
 
-    monkeypatch.setattr(oid.subprocess, "run", fake_cli_run)
+    _mock_bound_cli(monkeypatch, fake_cli_run, "semantic_merge")
     oid.merge_groups_semantically([
         {"group_id": "g1", "project": "p", "representative": "A", "members": []}
     ])
@@ -614,7 +679,7 @@ def test_semantic_merge_mode_reset_on_success(monkeypatch, tmp_path):
 # Task 14: over-merge guards (test-only)
 # ---------------------------------------------------------------------------
 
-def test_semantic_merge_keeps_dry_run_vs_apply_separate(monkeypatch):
+def test_semantic_merge_keeps_dry_run_vs_apply_separate(selected_host_context, monkeypatch):
     """Test 1e - dry-run and apply variants of the same command MUST NOT merge."""
     import open_item_dedup as oid
 
@@ -635,14 +700,14 @@ def test_semantic_merge_keeps_dry_run_vs_apply_separate(monkeypatch):
          "representative": "Run /vault-doctor fix --check snapshot-integrity (apply mode)",
          "members": [{"file": "b.md", "line": 1, "text": "..."}]},
     ]
-    monkeypatch.setattr(oid.subprocess, "run", fake_cli_run)
+    _mock_bound_cli(monkeypatch, fake_cli_run, "semantic_merge")
     merged = oid.merge_groups_semantically(coarse)
     flat = merged if isinstance(merged, list) else [g for v in merged.values() for g in v]
     ids = {g["group_id"] for g in flat}
     assert ids == {"g1", "g2"}, f"dry-run and apply must remain separate; got {ids}"
 
 
-def test_semantic_merge_keeps_investigate_vs_fix_separate(monkeypatch):
+def test_semantic_merge_keeps_investigate_vs_fix_separate(selected_host_context, monkeypatch):
     """Test 1f - 'Investigate X' and 'Fix X' MUST NOT merge."""
     import open_item_dedup as oid
 
@@ -663,7 +728,7 @@ def test_semantic_merge_keeps_investigate_vs_fix_separate(monkeypatch):
          "representative": "Fix dispatcher-discovery fallback to probe check availability",
          "members": [{"file": "b.md", "line": 1, "text": "..."}]},
     ]
-    monkeypatch.setattr(oid.subprocess, "run", fake_cli_run)
+    _mock_bound_cli(monkeypatch, fake_cli_run, "semantic_merge")
     merged = oid.merge_groups_semantically(coarse)
     flat = merged if isinstance(merged, list) else [g for v in merged.values() for g in v]
     ids = {g["group_id"] for g in flat}
@@ -686,87 +751,35 @@ def test_semantic_merge_prompt_contains_negative_examples():
 # ---------------------------------------------------------------------------
 
 
-def _make_model_pick_fake_run(captured: dict):
-    """Chunk-aware subprocess.run stub for model-selection assertions.
-
-    Parses the embedded output path out of the prompt and writes a one-record
-    classifier payload there, so the stub works for both single and chunked
-    dispatch paths. Records the most recent cmd in captured["cmd"].
-    """
-    import re as _re
-    from pathlib import Path as _Path
-
-    def fake_run(cmd, *args, **kwargs):
-        captured["cmd"] = cmd
-        prompt = kwargs.get("input", "")
-        in_match = _re.search(r"(/\S+\.classin\.json)", prompt)
-        out_match = _re.search(r"JSON to (/\S+?)\.?(?:\s|$)", prompt)
-        assert in_match and out_match, f"paths missing from prompt: {prompt[:200]!r}"
-        chunk_in = json.loads(_Path(in_match.group(1)).read_text())
-        chunk_out = [
-            {
-                "group_id": g["group_id"],
-                "classification": "ACTIVE",
-                "confidence": "LOW",
-                "canonical_text": g["representative"],
-                "evidence_citation": None,
-                "action_required": None,
-            }
-            for g in chunk_in["groups"]
-        ]
-        _Path(out_match.group(1)).write_text(json.dumps(chunk_out))
-        return _fake_completed(stdout=json.dumps(chunk_out), returncode=0)
-
-    return fake_run
 
 
-def test_run_classifier_picks_haiku_at_30_or_fewer(tmp_path, monkeypatch):
-    """<=30 merged groups -> claude -p --model haiku per spec line 106."""
+def test_run_classifier_picks_haiku_at_30_or_fewer(native_cli_context, monkeypatch):
     import check_items_cli as cli
-
-    # Disable L2 prefilter: this test exercises sub-agent model selection, not L2.
-    monkeypatch.setenv("CHECK_ITEMS_PREFILTER", "off")
-
-    captured: dict = {}
-    monkeypatch.setattr(cli.subprocess, "run", _make_model_pick_fake_run(captured))
-    payload = {
-        "groups": [{"group_id": f"g{i}", "project": "p", "representative": f"x{i}",
-                    "instances": []} for i in range(30)],
-        "evidence": {"p": {}},
-    }
-    out_path = tmp_path / "classify.json"
-    rc = cli.run_classifier(stdin_json=json.dumps(payload), output_path=str(out_path))
+    from check_items_test_helpers import private_output
+    monkeypatch.setenv('CHECK_ITEMS_PREFILTER', 'off')
+    calls = _mock_native_transport(monkeypatch)
+    output = private_output()
+    payload = {'groups':_native_groups(30), 'evidence':{}}
+    rc = cli.run_classifier(json.dumps(payload), str(output))
     assert rc == 0
-    assert "haiku" in " ".join(captured["cmd"])
+    assert calls and all(command[command.index('--model') + 1] == ('haiku' if native_cli_context.host == 'claude' else 'gpt-native-configured') for command, _, _ in calls)
+    assert json.loads(output.read_text()) is not None
 
 
-def test_run_classifier_picks_sonnet_above_30(tmp_path, monkeypatch):
-    """>30 merged groups in a single dispatch escalates to sonnet.
 
-    Chunking is disabled (CLASSIFIER_CHUNK_SIZE > group_count) so model
-    selection runs on the full payload, exercising the documented
-    haiku/sonnet 30-group threshold per spec line 106.
-    """
+def test_run_classifier_picks_sonnet_above_30(native_cli_context, monkeypatch):
     import check_items_cli as cli
-
-    # Disable L2 prefilter: this test exercises sub-agent model selection, not L2.
-    monkeypatch.setenv("CHECK_ITEMS_PREFILTER", "off")
-    # Disable chunking: 45 groups in one dispatch lets the 30-group sonnet
-    # threshold fire. Under chunked dispatch the model is picked per chunk,
-    # so chunks <=30 always pick haiku — a separate code path.
-    monkeypatch.setattr(cli, "CLASSIFIER_CHUNK_SIZE", 100)
-
-    captured: dict = {}
-    monkeypatch.setattr(cli.subprocess, "run", _make_model_pick_fake_run(captured))
-    payload = {
-        "groups": [{"group_id": f"g{i}", "project": "p", "representative": f"x{i}",
-                    "instances": []} for i in range(45)],
-        "evidence": {"p": {}},
-    }
-    out_path = tmp_path / "classify2.json"
-    rc = cli.run_classifier(stdin_json=json.dumps(payload), output_path=str(out_path))
+    from check_items_test_helpers import private_output
+    monkeypatch.setenv('CHECK_ITEMS_PREFILTER', 'off')
+    monkeypatch.setattr(cli, 'CLASSIFIER_CHUNK_SIZE', 100)
+    calls = _mock_native_transport(monkeypatch)
+    output = private_output()
+    payload = {'groups':_native_groups(45), 'evidence':{}}
+    rc = cli.run_classifier(json.dumps(payload), str(output))
     assert rc == 0
-    assert "sonnet" in " ".join(captured["cmd"])
+    assert calls and all(command[command.index('--model') + 1] == ('sonnet' if native_cli_context.host == 'claude' else 'gpt-native-configured') for command, _, _ in calls)
+    assert json.loads(output.read_text()) is not None
+
 
 
 def test_classifier_prompt_includes_self_referential_rule():
@@ -790,119 +803,109 @@ def test_classifier_prompt_includes_self_referential_rule():
 # ---------------------------------------------------------------------------
 
 
-def test_run_semantic_merge_invalid_json_returns_2():
+def test_run_semantic_merge_invalid_json_returns_2(selected_host_context, ):
     """run_semantic_merge returns 2 on invalid stdin JSON."""
     import check_items_cli as cli
     rc = cli.run_semantic_merge(stdin_json="not-json", output_path="/dev/null")
     assert rc == 2
 
 
-def test_run_semantic_merge_timeout_returns_3(tmp_path, monkeypatch):
-    """run_semantic_merge returns 3 on subprocess timeout."""
+def test_run_semantic_merge_timeout_returns_3(native_cli_context, monkeypatch):
+    """Native failure status is nonzero and leaves prior output unchanged."""
     import check_items_cli as cli
-
-    def fake_run(cmd, *args, **kwargs):
-        raise subprocess.TimeoutExpired(cmd, SUBAGENT_TIMEOUT_SEC)
-
-    monkeypatch.setattr(cli.subprocess, "run", fake_run)
-    payload = {"groups": [{"group_id": "g1", "project": "p",
-                           "representative": "x", "instances": []}]}
-    out_path = tmp_path / "out.json"
-    rc = cli.run_semantic_merge(stdin_json=json.dumps(payload), output_path=str(out_path))
+    from check_items_test_helpers import private_output
+    monkeypatch.setenv('CHECK_ITEMS_PREFILTER', 'off')
+    calls = _mock_native_transport(monkeypatch, status='timeout', invalid_json=False)
+    output = private_output(); output.write_text('previous')
+    rc = cli.run_semantic_merge(
+        json.dumps({'groups':_native_groups(), 'evidence':{}}), str(output))
     assert rc == 3
+    assert calls and output.read_text() == 'previous'
 
 
-def test_run_semantic_merge_nonzero_rc_propagated(tmp_path, monkeypatch):
-    """run_semantic_merge propagates non-zero subprocess return code."""
+
+def test_run_semantic_merge_nonzero_rc_propagated(native_cli_context, monkeypatch):
+    """Native failure status is nonzero and leaves prior output unchanged."""
     import check_items_cli as cli
+    from check_items_test_helpers import private_output
+    monkeypatch.setenv('CHECK_ITEMS_PREFILTER', 'off')
+    calls = _mock_native_transport(monkeypatch, status='unavailable', invalid_json=False)
+    output = private_output(); output.write_text('previous')
+    rc = cli.run_semantic_merge(
+        json.dumps({'groups':_native_groups(), 'evidence':{}}), str(output))
+    assert rc == 8
+    assert calls and output.read_text() == 'previous'
 
-    monkeypatch.setattr(cli.subprocess, "run",
-                        lambda *a, **kw: _fake_completed(returncode=5))
-    payload = {"groups": [{"group_id": "g1", "project": "p",
-                           "representative": "x", "instances": []}]}
-    out_path = tmp_path / "out.json"
-    rc = cli.run_semantic_merge(stdin_json=json.dumps(payload), output_path=str(out_path))
-    assert rc == 5
 
 
-def test_run_semantic_merge_invalid_stdout_json_returns_4(tmp_path, monkeypatch):
-    """run_semantic_merge returns 4 when stdout is not valid JSON and output file absent."""
+def test_run_semantic_merge_invalid_stdout_json_returns_4(native_cli_context, monkeypatch):
+    """Native failure status is nonzero and leaves prior output unchanged."""
     import check_items_cli as cli
-
-    monkeypatch.setattr(cli.subprocess, "run",
-                        lambda *a, **kw: _fake_completed(stdout="not-json", returncode=0))
-    payload = {"groups": [{"group_id": "g1", "project": "p",
-                           "representative": "x", "instances": []}]}
-    out_path = tmp_path / "no_such.json"  # must not exist
-    rc = cli.run_semantic_merge(stdin_json=json.dumps(payload), output_path=str(out_path))
+    from check_items_test_helpers import private_output
+    monkeypatch.setenv('CHECK_ITEMS_PREFILTER', 'off')
+    calls = _mock_native_transport(monkeypatch, status=None, invalid_json=True)
+    output = private_output(); output.write_text('previous')
+    rc = cli.run_semantic_merge(
+        json.dumps({'groups':_native_groups(), 'evidence':{}}), str(output))
     assert rc == 4
+    assert calls and output.read_text() == 'previous'
 
 
-def test_run_classifier_invalid_json_returns_2():
+
+def test_run_classifier_invalid_json_returns_2(selected_host_context, ):
     """run_classifier returns 2 on invalid stdin JSON."""
     import check_items_cli as cli
     rc = cli.run_classifier(stdin_json="bad-json", output_path="/dev/null")
     assert rc == 2
 
 
-def test_run_classifier_timeout_returns_3(tmp_path, monkeypatch):
-    """run_classifier returns 3 on subprocess timeout."""
+def test_run_classifier_timeout_returns_3(native_cli_context, monkeypatch):
+    """Native failure status is nonzero and leaves prior output unchanged."""
     import check_items_cli as cli
-
-    # Disable L2 prefilter so group reaches sub-agent and can trigger timeout.
-    monkeypatch.setenv("CHECK_ITEMS_PREFILTER", "off")
-
-    def fake_run(cmd, *args, **kwargs):
-        raise subprocess.TimeoutExpired(cmd, SUBAGENT_TIMEOUT_SEC)
-
-    monkeypatch.setattr(cli.subprocess, "run", fake_run)
-    payload = {"groups": [{"group_id": "g1", "project": "p",
-                           "representative": "x", "instances": []}],
-               "evidence": {"p": {}}}
-    out_path = tmp_path / "out.json"
-    rc = cli.run_classifier(stdin_json=json.dumps(payload), output_path=str(out_path))
+    from check_items_test_helpers import private_output
+    monkeypatch.setenv('CHECK_ITEMS_PREFILTER', 'off')
+    calls = _mock_native_transport(monkeypatch, status='timeout', invalid_json=False)
+    output = private_output(); output.write_text('previous')
+    rc = cli.run_classifier(
+        json.dumps({'groups':_native_groups(), 'evidence':{}}), str(output))
     assert rc == 3
+    assert calls and output.read_text() == 'previous'
 
 
-def test_run_classifier_nonzero_rc_propagated(tmp_path, monkeypatch):
-    """run_classifier propagates non-zero subprocess return code."""
+
+def test_run_classifier_nonzero_rc_propagated(native_cli_context, monkeypatch):
+    """Native failure status is nonzero and leaves prior output unchanged."""
     import check_items_cli as cli
-
-    # Disable L2 prefilter so group reaches sub-agent and can return non-zero rc.
-    monkeypatch.setenv("CHECK_ITEMS_PREFILTER", "off")
-
-    monkeypatch.setattr(cli.subprocess, "run",
-                        lambda *a, **kw: _fake_completed(returncode=7))
-    payload = {"groups": [{"group_id": "g1", "project": "p",
-                           "representative": "x", "instances": []}],
-               "evidence": {"p": {}}}
-    out_path = tmp_path / "out.json"
-    rc = cli.run_classifier(stdin_json=json.dumps(payload), output_path=str(out_path))
+    from check_items_test_helpers import private_output
+    monkeypatch.setenv('CHECK_ITEMS_PREFILTER', 'off')
+    calls = _mock_native_transport(monkeypatch, status='cancelled', invalid_json=False)
+    output = private_output(); output.write_text('previous')
+    rc = cli.run_classifier(
+        json.dumps({'groups':_native_groups(), 'evidence':{}}), str(output))
     assert rc == 7
+    assert calls and output.read_text() == 'previous'
 
 
-def test_run_classifier_invalid_stdout_json_returns_4(tmp_path, monkeypatch):
-    """run_classifier returns 4 when stdout is not valid JSON and output file absent."""
+
+def test_run_classifier_invalid_stdout_json_returns_4(native_cli_context, monkeypatch):
+    """Native failure status is nonzero and leaves prior output unchanged."""
     import check_items_cli as cli
-
-    # Disable L2 prefilter so group reaches sub-agent and can trigger the json-error path.
-    monkeypatch.setenv("CHECK_ITEMS_PREFILTER", "off")
-
-    monkeypatch.setattr(cli.subprocess, "run",
-                        lambda *a, **kw: _fake_completed(stdout="not-json", returncode=0))
-    payload = {"groups": [{"group_id": "g1", "project": "p",
-                           "representative": "x", "instances": []}],
-               "evidence": {"p": {}}}
-    out_path = tmp_path / "no_such_classifier.json"
-    rc = cli.run_classifier(stdin_json=json.dumps(payload), output_path=str(out_path))
+    from check_items_test_helpers import private_output
+    monkeypatch.setenv('CHECK_ITEMS_PREFILTER', 'off')
+    calls = _mock_native_transport(monkeypatch, status=None, invalid_json=True)
+    output = private_output(); output.write_text('previous')
+    rc = cli.run_classifier(
+        json.dumps({'groups':_native_groups(), 'evidence':{}}), str(output))
     assert rc == 4
+    assert calls and output.read_text() == 'previous'
+
 
 
 # ---------------------------------------------------------------------------
 # Task 16: classify_groups_with_agent orchestrator
 # ---------------------------------------------------------------------------
 
-def test_classifier_retry_on_malformed_json(monkeypatch):
+def test_classifier_retry_on_malformed_json(selected_host_context, monkeypatch):
     """Test 2 - first sub-agent response missing 'classification'; retry succeeds."""
     import open_item_dedup as oid
 
@@ -929,7 +932,7 @@ def test_classifier_retry_on_malformed_json(monkeypatch):
                 }], f)
         return _fake_completed(returncode=0)
 
-    monkeypatch.setattr(oid.subprocess, "run", fake_cli_run)
+    _mock_bound_cli(monkeypatch, fake_cli_run)
 
     merged_groups = [
         {"group_id": "g1", "project": "p", "representative": "ship",
@@ -943,7 +946,7 @@ def test_classifier_retry_on_malformed_json(monkeypatch):
     assert out[0]["classification"] == "DONE"
 
 
-def test_needs_action_surfaces_command(monkeypatch):
+def test_needs_action_surfaces_command(selected_host_context, monkeypatch):
     """Test 5 - NEEDS-ACTION items carry an `action_required` command string."""
     import open_item_dedup as oid
 
@@ -962,7 +965,7 @@ def test_needs_action_surfaces_command(monkeypatch):
                 }], f)
         return _fake_completed(returncode=0)
 
-    monkeypatch.setattr(oid.subprocess, "run", fake_cli_run)
+    _mock_bound_cli(monkeypatch, fake_cli_run)
 
     merged_groups = [
         {"group_id": "tva-0003", "project": "tiny-vacation-agent",
@@ -982,7 +985,7 @@ def test_needs_action_surfaces_command(monkeypatch):
 # Task 7: outer telemetry line in classify_groups_with_agent
 # ---------------------------------------------------------------------------
 
-def test_outer_telemetry_line_format(monkeypatch, capsys):
+def test_outer_telemetry_line_format(selected_host_context, monkeypatch, capsys):
     """classify_groups_with_agent emits a [check-items] classifier-result line
     with total_classified/prefiltered/subagent fields and no cache_hit key
     (cache_hit lives outside this function's visibility — see Task 7 option b)."""
@@ -1015,7 +1018,7 @@ def test_outer_telemetry_line_format(monkeypatch, capsys):
                 ], f)
         return _fake_completed(returncode=0)
 
-    monkeypatch.setattr(oid.subprocess, "run", fake_cli_run)
+    _mock_bound_cli(monkeypatch, fake_cli_run)
 
     merged_groups = [
         {"group_id": "g1", "project": "p", "representative": "ship",
@@ -1051,7 +1054,7 @@ def test_outer_telemetry_line_format(monkeypatch, capsys):
     )
 
 
-def test_outer_telemetry_invariant_with_partial_parse(monkeypatch, capsys):
+def test_outer_telemetry_invariant_with_partial_parse(selected_host_context, monkeypatch, capsys):
     """total_classified must equal prefiltered + subagent even when the CLI
     returns fewer records than merged_groups (e.g. partial parse, dropped
     entries). All three counts derive from `parsed`, not merged_groups."""
@@ -1087,7 +1090,7 @@ def test_outer_telemetry_invariant_with_partial_parse(monkeypatch, capsys):
                 ], f)
         return _fake_completed(returncode=0)
 
-    monkeypatch.setattr(oid.subprocess, "run", fake_cli_run)
+    _mock_bound_cli(monkeypatch, fake_cli_run)
 
     merged_groups = [
         {"group_id": "g1", "project": "p", "representative": "ship",
@@ -1100,48 +1103,26 @@ def test_outer_telemetry_invariant_with_partial_parse(monkeypatch, capsys):
     evidence = {"p": {"commits": [], "merged_prs": [], "closed_issues": []}}
 
     parsed = oid.classify_groups_with_agent(merged_groups, evidence)
-    assert len(parsed) == 2  # one dropped
-
+    # Covered and prefiltered verdicts survive; g2 remains explicitly unclassified.
+    assert {item["group_id"] for item in parsed} == {"g1", "g3"}
+    assert oid.get_last_classifier_mode() == "partial"
     captured = capsys.readouterr()
-    outer_lines = [
-        l for l in captured.err.splitlines()
-        if l.startswith("[check-items] classifier-result:")
-    ]
-    assert len(outer_lines) == 1
-    line = outer_lines[0]
-
-    total_m = re.search(r'total_classified=(\d+)', line)
-    prefiltered_m = re.search(r'prefiltered=(\d+)', line)
-    subagent_m = re.search(r'subagent=(\d+)', line)
-    assert total_m and prefiltered_m and subagent_m, f"Missing field in: {line}"
-
-    total = int(total_m.group(1))
-    prefiltered = int(prefiltered_m.group(1))
-    subagent = int(subagent_m.group(1))
-
-    # Invariant: counts sum correctly. total_classified must reflect parsed,
-    # NOT merged_groups (which would give 3 and break the invariant).
-    assert total == 2, f"total_classified should equal len(parsed)=2, got {total}: {line}"
-    assert prefiltered == 1, f"prefiltered=1, got {prefiltered}: {line}"
-    assert subagent == 1, f"subagent=1, got {subagent}: {line}"
-    assert total == prefiltered + subagent, (
-        f"Invariant broken: total={total} != prefiltered={prefiltered} + "
-        f"subagent={subagent}; line: {line}"
-    )
+    assert "classifier PARTIAL: 1 of 3" in captured.err
+    assert "total_classified=2 prefiltered=1 subagent=1" in captured.err
 
 
 # ---------------------------------------------------------------------------
 # Task 17: heuristic fallback classifier
 # ---------------------------------------------------------------------------
 
-def test_classifier_heuristic_fallback(monkeypatch):
+def test_classifier_heuristic_fallback(selected_host_context, monkeypatch):
     """Test 3 - both sub-agent attempts fail; heuristic fallback runs."""
     import open_item_dedup as oid
 
     def always_fail(cmd, *args, **kwargs):
         return _fake_completed(stdout="not json", returncode=1)
 
-    monkeypatch.setattr(oid.subprocess, "run", always_fail)
+    _mock_bound_cli(monkeypatch, always_fail)
 
     merged_groups = [
         {"group_id": "g1", "project": "p",
@@ -1442,7 +1423,7 @@ def test_verify_before_edit_handles_line_out_of_range(tmp_path):
 def test_dashboard_report_always_written_on_dry_run(tmp_path):
     """Test 7 - --dry-run still writes the report."""
     from check_items_report import write_check_items_dashboard
-    vault = tmp_path / "vault"
+    vault = tmp_path
     (vault / "claude-dashboards").mkdir(parents=True)
 
     path = write_check_items_dashboard(
@@ -1475,7 +1456,7 @@ def test_dashboard_report_threads_skipped_count(tmp_path):
     can see cascade candidates that were refused or lost, not only the
     ones that succeeded."""
     from check_items_report import write_check_items_dashboard
-    vault = tmp_path / "vault"
+    vault = tmp_path
     (vault / "claude-dashboards").mkdir(parents=True)
 
     path = write_check_items_dashboard(
@@ -1503,7 +1484,7 @@ def test_report_filename_scope_suffix(tmp_path):
     """Test 8 - project scope -> check-items-<project>-<date>.md;
     'vault' -> check-items-vault-<date>.md."""
     from check_items_report import write_check_items_dashboard
-    vault = tmp_path / "vault"
+    vault = tmp_path
     (vault / "claude-dashboards").mkdir(parents=True)
 
     p1 = write_check_items_dashboard(
@@ -1526,7 +1507,7 @@ def test_dashboard_body_includes_merged_groups_audit(tmp_path):
     """Spec § Dashboard audit — body must list each merge with reasoning.
     Also exercises all four classification buckets and action_required."""
     from check_items_report import write_check_items_dashboard
-    vault = tmp_path / "vault"
+    vault = tmp_path
     (vault / "claude-dashboards").mkdir(parents=True)
     merges = [
         {"canonical_group_id": "ob-0004", "absorbed_group_ids": ["ob-0003"],
@@ -1570,7 +1551,7 @@ def test_dashboard_body_includes_review_section(tmp_path):
     REVIEW classification would look correct in the live Step-7 print but
     silently vanish from the file that gets left behind for the user."""
     from check_items_report import write_check_items_dashboard
-    vault = tmp_path / "vault"
+    vault = tmp_path
     (vault / "claude-dashboards").mkdir(parents=True)
     classifications = [
         {"group_id": "g1", "classification": "REVIEW",
@@ -1603,7 +1584,7 @@ def test_applied_review_item_renders_checked(tmp_path):
     stamped by Step 8's primary-flip loop) must render `- [x]`, even though
     REVIEW is never auto-checked by classification alone."""
     from check_items_report import write_check_items_dashboard
-    vault = tmp_path / "vault"
+    vault = tmp_path
     (vault / "claude-dashboards").mkdir(parents=True)
     classifications = [
         {"group_id": "g1", "classification": "REVIEW",
@@ -1626,7 +1607,7 @@ def test_unapplied_done_item_renders_unchecked(tmp_path):
     render `- [ ]`, not `- [x]` -- this is what stops the by-fact fix from
     marking everything checked (DONE no longer means auto-checked)."""
     from check_items_report import write_check_items_dashboard
-    vault = tmp_path / "vault"
+    vault = tmp_path
     (vault / "claude-dashboards").mkdir(parents=True)
     classifications = [
         {"group_id": "g1", "classification": "DONE",
@@ -1648,7 +1629,7 @@ def test_done_heading_counts_only_applied_done_items(tmp_path):
     """The ## Done heading must count applied DONE items, not the run's
     total applied count -- an applied REVIEW flip must not inflate it."""
     from check_items_report import write_check_items_dashboard
-    vault = tmp_path / "vault"
+    vault = tmp_path
     (vault / "claude-dashboards").mkdir(parents=True)
     classifications = [
         {"group_id": "g1", "classification": "DONE",
@@ -1674,7 +1655,7 @@ def test_applied_elsewhere_line_names_non_done_flips(tmp_path):
     the arithmetic once the ## Done heading stops over-counting -- a summary
     line must name it."""
     from check_items_report import write_check_items_dashboard
-    vault = tmp_path / "vault"
+    vault = tmp_path
     (vault / "claude-dashboards").mkdir(parents=True)
     classifications = [
         {"group_id": "g1", "classification": "DONE",
@@ -1705,7 +1686,7 @@ def test_applied_outside_done_derived_from_stamps_not_subtraction(tmp_path):
     outside DONE" (5 - 1) though only ONE record anywhere outside DONE
     renders checked. The correct, fact-derived count is 1."""
     from check_items_report import write_check_items_dashboard
-    vault = tmp_path / "vault"
+    vault = tmp_path
     (vault / "claude-dashboards").mkdir(parents=True)
     classifications = [
         {"group_id": "g1", "classification": "DONE",
@@ -1732,7 +1713,7 @@ def test_applied_outside_done_derived_from_stamps_not_subtraction(tmp_path):
 def test_dashboard_idempotent_overwrite(tmp_path):
     """Same scope + same date overwrites previous file."""
     from check_items_report import write_check_items_dashboard
-    vault = tmp_path / "vault"
+    vault = tmp_path
     (vault / "claude-dashboards").mkdir(parents=True)
     p1 = write_check_items_dashboard(
         vault_path=str(vault), scope_name="x", date_str="2026-05-11",
@@ -1753,7 +1734,7 @@ def test_dashboard_idempotent_overwrite(tmp_path):
 def test_dashboard_active_truncation_and_path_guard(tmp_path):
     """ACTIVE >50 items are truncated in the body; path-containment guard is present."""
     from check_items_report import write_check_items_dashboard
-    vault = tmp_path / "vault"
+    vault = tmp_path
     (vault / "claude-dashboards").mkdir(parents=True)
     active_items = [
         {"group_id": f"g{i}", "classification": "ACTIVE",
@@ -1847,7 +1828,7 @@ def test_dashboard_renders_merge_records(tmp_path):
     """Records shaped by merge_records_from_groups render in the dashboard
     body's Merged Groups section."""
     from check_items_report import write_check_items_dashboard
-    vault = tmp_path / "vault"
+    vault = tmp_path
     (vault / "claude-dashboards").mkdir(parents=True)
     groups = [
         {"group_id": "ob-1",
@@ -1870,7 +1851,7 @@ def test_dashboard_tolerates_int_merges(tmp_path):
     (type + repr), not silently coerce to [] and read as 'no merges this
     run', which would hide the caller bug."""
     from check_items_report import write_check_items_dashboard
-    vault = tmp_path / "vault"
+    vault = tmp_path
     (vault / "claude-dashboards").mkdir(parents=True)
     path = write_check_items_dashboard(
         vault_path=str(vault), scope_name="x", date_str="2026-05-11",
@@ -1891,7 +1872,7 @@ def test_dashboard_tolerates_huge_merges_repr_truncated(tmp_path):
     The warning must cap the repr length and say so, rather than writing
     an unbounded blob into a kept artefact."""
     from check_items_report import write_check_items_dashboard
-    vault = tmp_path / "vault"
+    vault = tmp_path
     (vault / "claude-dashboards").mkdir(parents=True)
     huge_bad_value = "x" * 5000
     path = write_check_items_dashboard(
@@ -1912,7 +1893,7 @@ def test_dashboard_tolerates_none_merges(tmp_path):
     """merges=None is a legitimate 'nothing to report' -- renders the plain
     fallback with NO warning line (unlike the int case above)."""
     from check_items_report import write_check_items_dashboard
-    vault = tmp_path / "vault"
+    vault = tmp_path
     (vault / "claude-dashboards").mkdir(parents=True)
     path = write_check_items_dashboard(
         vault_path=str(vault), scope_name="x", date_str="2026-05-11",
@@ -1932,7 +1913,7 @@ def test_dashboard_tolerates_none_merges(tmp_path):
 
 def test_dashboard_renders_evidence_gap_section(tmp_path):
     from check_items_report import write_check_items_dashboard
-    vault = tmp_path / "vault"
+    vault = tmp_path
     (vault / "claude-dashboards").mkdir(parents=True)
     evidence_gaps = {
         "projects_scanned": 1, "projects_with_evidence": 0,
@@ -1955,7 +1936,7 @@ def test_dashboard_omits_gap_section_when_no_gaps(tmp_path):
     render the section -- a section that always renders would pass the
     test above while saying nothing."""
     from check_items_report import write_check_items_dashboard
-    vault = tmp_path / "vault"
+    vault = tmp_path
     (vault / "claude-dashboards").mkdir(parents=True)
     evidence_gaps = {
         "projects_scanned": 1, "projects_with_evidence": 1,
@@ -1976,7 +1957,7 @@ def test_dashboard_gap_frontmatter_field(tmp_path):
     when N is 0 for a caller who passed a real (gap-free) dict -- distinct
     from the argument being omitted entirely (see the no-op test below)."""
     from check_items_report import write_check_items_dashboard
-    vault = tmp_path / "vault"
+    vault = tmp_path
     (vault / "claude-dashboards").mkdir(parents=True)
 
     gapped = {
@@ -2008,7 +1989,7 @@ def test_dashboard_without_evidence_gaps_argument_is_unchanged(tmp_path):
     """Every existing caller omits evidence_gaps entirely -- the default
     must be a true no-op: no heading, no frontmatter key, no exception."""
     from check_items_report import write_check_items_dashboard
-    vault = tmp_path / "vault"
+    vault = tmp_path
     (vault / "claude-dashboards").mkdir(parents=True)
     path = write_check_items_dashboard(
         vault_path=str(vault), scope_name="x", date_str="2026-05-11",
@@ -2036,13 +2017,17 @@ def test_dashboard_rejects_path_traversal_in_scope_name(tmp_path, monkeypatch):
     import json
     cfg_path = tmp_path / "obsidian-brain-config.json"
     cfg_path.write_text(json.dumps({"vault_path": str(tmp_path / "vault")}))
-    monkeypatch.setattr("obsidian_utils._CONFIG_PATH", cfg_path)
+    from runtime_context import current_runtime_context
+    context = current_runtime_context()
+    configured = json.loads(cfg_path.read_text())
+    configured["vault_path"] = str(context.vault_path)
+    context.config.update(configured)
     _reset_load_config_cache()
 
     try:
         from check_items_report import write_check_items_dashboard
-        vault = tmp_path / "vault"
-        vault.mkdir(parents=True)
+        vault = tmp_path
+        vault.mkdir(parents=True, exist_ok=True)
         # Path-traversal scope name: should be sanitized, not escape
         path = write_check_items_dashboard(
             vault_path=str(vault), scope_name="../../etc/passwd", date_str="2026-05-11",
@@ -2076,7 +2061,7 @@ def test_verify_before_edit_handles_indented_checkbox(tmp_path):
 # R4 regression: Finding D — classify_groups_with_agent oversized payload
 # ---------------------------------------------------------------------------
 
-def test_classify_groups_oversized_payload_skips_subagent(monkeypatch):
+def test_classify_groups_oversized_payload_skips_subagent(selected_host_context, monkeypatch):
     """Payloads exceeding 1MB stdin cap must skip the sub-agent and fall back
     to heuristic mode without invoking subprocess.run.
 
@@ -2133,7 +2118,7 @@ def test_dashboard_yaml_frontmatter_rejects_injection(tmp_path):
     sanitized token — no standalone `malicious_field: pwned` line is injected.
     """
     from check_items_report import write_check_items_dashboard
-    vault = tmp_path / "vault"
+    vault = tmp_path
     (vault / "claude-dashboards").mkdir(parents=True)
     crafted = "obsidian-brain\nmalicious_field: pwned\nscope2"
     path = write_check_items_dashboard(
@@ -2165,7 +2150,7 @@ def test_dashboard_yaml_rejects_date_injection(tmp_path):
     extra standalone YAML key-value lines inside the frontmatter block.
     """
     from check_items_report import write_check_items_dashboard
-    vault = tmp_path / "vault"
+    vault = tmp_path
     (vault / "claude-dashboards").mkdir(parents=True)
     crafted = "2026-05-11\nmalicious_field: pwned\nextra"
     path = write_check_items_dashboard(
@@ -2195,92 +2180,40 @@ def test_dashboard_yaml_rejects_date_injection(tmp_path):
 # R6 regression: prompt piped via stdin, not argv  (Finding A + B)
 # ---------------------------------------------------------------------------
 
-def test_run_semantic_merge_pipes_prompt_via_stdin(tmp_path, monkeypatch):
-    """Prompt must NOT appear in argv (avoids ARG_MAX + ps leakage).
-
-    After the R6 fix, cmd is ["claude", "-p", "--model", model] and the full
-    prompt is passed via the `input=` kwarg to subprocess.run.
-    """
+def test_run_semantic_merge_pipes_prompt_via_stdin(native_cli_context, monkeypatch):
+    """Inline prompt reaches native stdin, never argv or a model input path."""
     import check_items_cli as cli
-
-    captured = {}
-
-    def fake_run(cmd, *args, **kwargs):
-        captured["cmd"] = list(cmd)
-        captured["input"] = kwargs.get("input", "")
-        out_path = tmp_path / "out.json"
-        out_path.write_text(json.dumps({
-            "merges": [],
-            "total_groups_before": 0,
-            "total_groups_after": 0,
-        }))
-        return _fake_completed(stdout=out_path.read_text(), returncode=0)
-
-    monkeypatch.setattr(cli.subprocess, "run", fake_run)
-
-    out_path = tmp_path / "merge.json"
+    from check_items_test_helpers import private_output
+    monkeypatch.setenv('CHECK_ITEMS_PREFILTER', 'off')
+    calls = _mock_native_transport(monkeypatch)
+    output = private_output()
     rc = cli.run_semantic_merge(
-        stdin_json=json.dumps({"groups": []}),
-        output_path=str(out_path),
-    )
-    assert rc == 0
-    # argv must only contain the known-safe tokens; no prompt text
-    allowed = {"claude", "-p", "--model", "haiku", "sonnet"}
-    unexpected = [arg for arg in captured["cmd"] if arg not in allowed]
-    assert not unexpected, (
-        f"argv contains unexpected items (likely prompt leaked into argv): {unexpected}"
-    )
-    # Prompt should be delivered via stdin (the input= kwarg)
-    assert "SHOULD MERGE" in captured["input"], (
-        "SEMANTIC_MERGE_PROMPT must be piped via stdin, not argv"
-    )
+        json.dumps({'groups':_native_groups(), 'evidence':{}}), str(output))
+    assert rc == 0 and len(calls) == 1
+    command, prompt, options = calls[0]
+    assert 'SHOULD MERGE' in prompt
+    assert all('SHOULD MERGE' not in argument for argument in command)
+    assert str(output) not in prompt and '<input-json-path>' not in prompt
+    assert options['env']['OBSIDIAN_BRAIN_NESTED_AI'] == '1'
 
 
-def test_run_classifier_pipes_prompt_via_stdin(tmp_path, monkeypatch):
-    """Same stdin-pipe contract for run_classifier (R6 Finding B).
 
-    cmd must be ["claude", "-p", "--model", model]; classifier prompt piped via input=.
-    """
+def test_run_classifier_pipes_prompt_via_stdin(native_cli_context, monkeypatch):
+    """Inline prompt reaches native stdin, never argv or a model input path."""
     import check_items_cli as cli
-
-    # Disable L2 prefilter: this test exercises prompt delivery via stdin, not L2.
-    # Also requires at least one group with content so sub-agent dispatch happens.
-    monkeypatch.setenv("CHECK_ITEMS_PREFILTER", "off")
-
-    captured = {}
-
-    def fake_run(cmd, *args, **kwargs):
-        captured["cmd"] = list(cmd)
-        captured["input"] = kwargs.get("input", "")
-        out_path = tmp_path / "out.json"
-        out_path.write_text(json.dumps([
-            {"group_id": "g1", "classification": "ACTIVE", "confidence": "LOW",
-             "canonical_text": "Investigate dispatcher", "evidence_citation": None,
-             "action_required": None}
-        ]))
-        return _fake_completed(stdout=out_path.read_text(), returncode=0)
-
-    monkeypatch.setattr(cli.subprocess, "run", fake_run)
-
-    payload = {"groups": [{"group_id": "g1", "project": "p",
-                           "representative": "Investigate dispatcher",
-                           "instances": []}],
-               "evidence": {}}
-    out_path = tmp_path / "classify.json"
+    from check_items_test_helpers import private_output
+    monkeypatch.setenv('CHECK_ITEMS_PREFILTER', 'off')
+    calls = _mock_native_transport(monkeypatch)
+    output = private_output()
     rc = cli.run_classifier(
-        stdin_json=json.dumps(payload),
-        output_path=str(out_path),
-    )
-    assert rc == 0
-    allowed = {"claude", "-p", "--model", "haiku", "sonnet"}
-    unexpected = [arg for arg in captured["cmd"] if arg not in allowed]
-    assert not unexpected, (
-        f"argv contains unexpected items (likely prompt leaked into argv): {unexpected}"
-    )
-    # Classifier prompt must also be delivered via stdin
-    assert "discovery" in captured["input"].lower(), (
-        "CLASSIFIER_PROMPT must be piped via stdin, not argv"
-    )
+        json.dumps({'groups':_native_groups(), 'evidence':{}}), str(output))
+    assert rc == 0 and len(calls) == 1
+    command, prompt, options = calls[0]
+    assert 'discovery' in prompt
+    assert all('discovery' not in argument for argument in command)
+    assert str(output) not in prompt and '<input-json-path>' not in prompt
+    assert options['env']['OBSIDIAN_BRAIN_NESTED_AI'] == '1'
+
 
 
 # ---------------------------------------------------------------------------
@@ -2363,82 +2296,32 @@ def test_strip_json_fences_empty_and_none_safe():
 # R13 C1 — classifier stdout-fallback shape validation
 # ---------------------------------------------------------------------------
 
-def test_classifier_stdout_fallback_rejects_invalid_shape(tmp_path, monkeypatch):
-    """run_classifier stdout-fallback must reject wrong-shape JSON (rc=4).
-
-    When the sub-agent writes a valid JSON object that doesn't match the
-    classifier list-of-dicts contract, the old code wrote it to output_path
-    and returned 0. The downstream orchestrator then consumed the bad data.
-    R13 C1 fix: _validate_classifier_payload rejects it and returns rc=4.
-    """
-    import json
-    import subprocess
+def test_classifier_stdout_fallback_rejects_invalid_shape(native_cli_context, monkeypatch):
+    """Wrong native result shape cannot publish classifier output."""
     import check_items_cli as cli
-    from unittest.mock import patch, MagicMock
-
-    # Disable L2 prefilter so group reaches sub-agent and triggers the fallback path.
-    monkeypatch.setenv("CHECK_ITEMS_PREFILTER", "off")
-
-    output_path = str(tmp_path / "out.json")
-
-    valid_payload = json.dumps({
-        "groups": [{"group_id": "g1", "representative": "Do the thing", "members": []}],
-        "evidence": {},
-    })
-
-    # Sub-agent returns rc=0 but emits wrong-shape JSON (object, not list)
-    cp = MagicMock()
-    cp.returncode = 0
-    cp.stdout = '{"not_classifications": []}'
-    cp.stderr = ""
-
-    with patch.object(cli.subprocess, "run", return_value=cp):
-        rc = cli.run_classifier(valid_payload, output_path)
-
-    assert rc == 4, f"Expected rc=4 for invalid shape, got {rc}"
-    # Output file must NOT have been written
-    assert not (tmp_path / "out.json").exists(), "output_path must not be written for invalid shape"
+    from check_items_test_helpers import private_output
+    monkeypatch.setenv('CHECK_ITEMS_PREFILTER', 'off')
+    _mock_native_transport(monkeypatch, data={'not_classifications':[]})
+    output = private_output(); output.unlink()
+    rc = cli.run_classifier(json.dumps({'groups':_native_groups(), 'evidence':{}}), str(output))
+    assert rc == 4 and not output.exists()
 
 
-def test_classifier_stdout_fallback_accepts_valid_shape(tmp_path, monkeypatch):
-    """run_classifier stdout-fallback writes output for a correctly-shaped response."""
-    import json
+
+def test_classifier_stdout_fallback_accepts_valid_shape(native_cli_context, monkeypatch):
+    """Validated native JSON is published as the unwrapped classifier list."""
     import check_items_cli as cli
-    from unittest.mock import patch, MagicMock
+    from check_items_test_helpers import private_output
+    monkeypatch.setenv('CHECK_ITEMS_PREFILTER', 'off')
+    record = {'group_id':'g0', 'classification':'DONE', 'confidence':'HIGH',
+              'canonical_text':'work 0', 'evidence_citation':'commit abc', 'action_required':None}
+    _mock_native_transport(monkeypatch, data={'items':[record]})
+    output = private_output()
+    assert cli.run_classifier(json.dumps({'groups':_native_groups(), 'evidence':{}}), str(output)) == 0
+    written = json.loads(output.read_text())
+    assert isinstance(written, list) and written[0]['classification'] == 'DONE'
+    assert written[0]['ai_model'] == ('claude-haiku-4-5-20251001' if native_cli_context.host == 'claude' else 'gpt-native-configured')
 
-    # Disable L2 prefilter so group reaches sub-agent and triggers the fallback path.
-    monkeypatch.setenv("CHECK_ITEMS_PREFILTER", "off")
-
-    output_path = str(tmp_path / "out.json")
-
-    valid_payload = json.dumps({
-        "groups": [{"group_id": "g1", "representative": "Do the thing", "members": []}],
-        "evidence": {},
-    })
-
-    valid_response = json.dumps([
-        {
-            "group_id": "g1",
-            "classification": "DONE",
-            "confidence": 0.9,
-            "canonical_text": "Do the thing",
-            "evidence_citation": "commit abc",
-            "action_required": "",
-        }
-    ])
-
-    cp = MagicMock()
-    cp.returncode = 0
-    cp.stdout = valid_response
-    cp.stderr = ""
-
-    with patch.object(cli.subprocess, "run", return_value=cp):
-        rc = cli.run_classifier(valid_payload, output_path)
-
-    assert rc == 0
-    written = json.loads((tmp_path / "out.json").read_text(encoding="utf-8"))
-    assert isinstance(written, list)
-    assert written[0]["classification"] == "DONE"
 
 
 def test_validate_classifier_payload_rejects_missing_field():
@@ -2500,11 +2383,15 @@ def test_check_items_report_default_folder_is_claude_check_items(tmp_path, monke
     # so the default kicks in.
     cfg_path = tmp_path / "obsidian-brain-config.json"
     cfg_path.write_text(json.dumps({"vault_path": str(tmp_path / "vault")}))
-    monkeypatch.setattr("obsidian_utils._CONFIG_PATH", cfg_path)
+    from runtime_context import current_runtime_context
+    context = current_runtime_context()
+    configured = json.loads(cfg_path.read_text())
+    configured["vault_path"] = str(context.vault_path)
+    context.config.update(configured)
     _reset_load_config_cache()
 
-    vault = tmp_path / "vault"
-    vault.mkdir()
+    vault = tmp_path
+    vault.mkdir(exist_ok=True)
     from check_items_report import write_check_items_dashboard
     try:
         path = write_check_items_dashboard(
@@ -2544,11 +2431,15 @@ def test_check_items_report_honors_check_items_folder_config(tmp_path, monkeypat
         "vault_path": str(tmp_path / "vault"),
         "check_items_folder": "claude-dashboards",
     }))
-    monkeypatch.setattr("obsidian_utils._CONFIG_PATH", cfg_path)
+    from runtime_context import current_runtime_context
+    context = current_runtime_context()
+    configured = json.loads(cfg_path.read_text())
+    configured["vault_path"] = str(context.vault_path)
+    context.config.update(configured)
     _reset_load_config_cache()
 
-    vault = tmp_path / "vault"
-    vault.mkdir()
+    vault = tmp_path
+    vault.mkdir(exist_ok=True)
     from check_items_report import write_check_items_dashboard
     try:
         path = write_check_items_dashboard(
@@ -2606,11 +2497,15 @@ def test_check_items_report_rejects_parent_traversal_in_folder_config(tmp_path, 
         "vault_path": str(tmp_path / "vault"),
         "check_items_folder": "../../etc",
     }))
-    monkeypatch.setattr("obsidian_utils._CONFIG_PATH", cfg_path)
+    from runtime_context import current_runtime_context
+    context = current_runtime_context()
+    configured = json.loads(cfg_path.read_text())
+    configured["vault_path"] = str(context.vault_path)
+    context.config.update(configured)
     _reset_load_config_cache()
 
-    vault = tmp_path / "vault"
-    vault.mkdir()
+    vault = tmp_path
+    vault.mkdir(exist_ok=True)
     from check_items_report import write_check_items_dashboard
     try:
         with _pytest.raises(ValueError, match="parent-traversing|outside vault root"):
@@ -2632,11 +2527,15 @@ def test_check_items_report_rejects_absolute_folder_config(tmp_path, monkeypatch
         "vault_path": str(tmp_path / "vault"),
         "check_items_folder": "/tmp/escape",
     }))
-    monkeypatch.setattr("obsidian_utils._CONFIG_PATH", cfg_path)
+    from runtime_context import current_runtime_context
+    context = current_runtime_context()
+    configured = json.loads(cfg_path.read_text())
+    configured["vault_path"] = str(context.vault_path)
+    context.config.update(configured)
     _reset_load_config_cache()
 
-    vault = tmp_path / "vault"
-    vault.mkdir()
+    vault = tmp_path
+    vault.mkdir(exist_ok=True)
     from check_items_report import write_check_items_dashboard
     try:
         with _pytest.raises(ValueError, match="absolute|outside vault root"):
@@ -2657,11 +2556,15 @@ def test_check_items_report_empty_string_folder_uses_default(tmp_path, monkeypat
         "vault_path": str(tmp_path / "vault"),
         "check_items_folder": "",
     }))
-    monkeypatch.setattr("obsidian_utils._CONFIG_PATH", cfg_path)
+    from runtime_context import current_runtime_context
+    context = current_runtime_context()
+    configured = json.loads(cfg_path.read_text())
+    configured["vault_path"] = str(context.vault_path)
+    context.config.update(configured)
     _reset_load_config_cache()
 
-    vault = tmp_path / "vault"
-    vault.mkdir()
+    vault = tmp_path
+    vault.mkdir(exist_ok=True)
     from check_items_report import write_check_items_dashboard
     try:
         path = write_check_items_dashboard(**_make_minimal_dashboard_kwargs(vault))

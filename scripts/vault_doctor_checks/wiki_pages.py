@@ -80,7 +80,14 @@ def _read_config() -> dict:
     because guessing the wiki folder would make a broken setup look clean."""
     from obsidian_utils import _DEFAULTS
 
-    path = Path.home() / ".claude" / "obsidian-brain-config.json"
+    from runtime_context import current_runtime_context
+    context = current_runtime_context()
+    if context:
+        from obsidian_utils import load_config
+        return load_config(context=context)
+
+    from runtime_adapters.claude import legacy_config_path
+    path = legacy_config_path()
     cfg = {"wiki_folder": _DEFAULTS.get("wiki_folder", "claude-wiki")}
     try:
         with open(path, encoding="utf-8") as fh:
@@ -331,7 +338,6 @@ def scan(
 def apply(issues: list, backup_root: str) -> list:
     """Rebuild the index for ``index-drift`` rows; every other row is
     report-only and comes back ``unresolved``."""
-    from note_writer import _acquire_lock, _release_lock
     import wiki
 
     results = []
@@ -342,10 +348,6 @@ def apply(issues: list, backup_root: str) -> list:
             continue
         ctx = i.extra["ctx"]
         wiki_root = Path(ctx["vault"]) / ctx["wiki_folder"]
-        lock, err = _acquire_lock(wiki_root / ".wiki")
-        if err:
-            results.append(Result(check=NAME, note_path=i.note_path, status="skipped", error=err))
-            continue
         backed_up = None
         try:
             stamp = _dt.datetime.now().strftime("%Y%m%dT%H%M%S")
@@ -361,6 +363,4 @@ def apply(issues: list, backup_root: str) -> list:
         except Exception as exc:  # noqa: BLE001
             results.append(Result(check=NAME, note_path=i.note_path, status="error",
                                   backup_path=backed_up, error=str(exc)))
-        finally:
-            _release_lock(lock)
     return results

@@ -10,6 +10,20 @@ from pathlib import Path
 
 import pytest
 
+import pwd
+_ACCOUNT_COORDINATION_ROOT = (Path(pwd.getpwuid(os.getuid()).pw_dir) / '.local' / 'state').resolve()
+_SYSTEM_COORDINATION_ROOT = (Path('/var/tmp') / ('obsidian-brain-state-' + str(os.getuid()))).resolve()
+
+
+def _assert_test_coordination_root(value):
+    """Refuse actual account and UID fallback state before a test can write."""
+    if not isinstance(value, (str, Path)) or not Path(value).is_absolute():
+        raise AssertionError('Test coordination requires an explicit private XDG_STATE_HOME')
+    path = Path(value).resolve()
+    if any(path == live or path.is_relative_to(live)
+           for live in (_ACCOUNT_COORDINATION_ROOT, _SYSTEM_COORDINATION_ROOT)):
+        raise AssertionError('Tests cannot use actual account or UID fallback coordination state')
+
 # Add hooks/ to sys.path so test modules can import obsidian_utils etc.
 _HOOKS_DIR = os.path.join(os.path.dirname(__file__), "..", "hooks")
 if _HOOKS_DIR not in sys.path:
@@ -20,6 +34,25 @@ if _HOOKS_DIR not in sys.path:
 _REPO_ROOT = os.path.join(os.path.dirname(__file__), "..")
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, os.path.abspath(_REPO_ROOT))
+
+
+@pytest.fixture(autouse=True)
+def _private_coordination_state(tmp_path_factory, monkeypatch):
+    """Never let transaction tests use the account's real durable state."""
+    import shutil
+    root = tmp_path_factory.mktemp('private-coordination-state')
+    root.chmod(0o700)
+    monkeypatch.setenv('XDG_STATE_HOME', str(root))
+    import importlib
+    for name in ('note_transactions', 'hooks.note_transactions'):
+        module = importlib.import_module(name)
+        original = module.coordination_path
+        def guarded(context, original=original):
+            _assert_test_coordination_root(context.coordination_root)
+            return original(context)
+        monkeypatch.setattr(module, 'coordination_path', guarded)
+    yield root
+    shutil.rmtree(root)
 
 
 @pytest.fixture(autouse=True)
@@ -216,8 +249,21 @@ def sample_jsonl(tmp_path):
     return jsonl_path
 
 
+@pytest.fixture(scope="session")
+def _private_sink_root(tmp_path_factory):
+    """Keep test sinks outside paths a test may treat as its vault."""
+    return tmp_path_factory.mktemp("ob-test-state")
+
+
+@pytest.fixture
+def _private_sink_state(_private_sink_root):
+    """Allocate a private test directory without scanning numbered siblings."""
+    import tempfile
+    return Path(tempfile.mkdtemp(prefix="case-", dir=_private_sink_root))
+
+
 @pytest.fixture(autouse=True)
-def _isolate_summarizer_sink_globally(tmp_path_factory, monkeypatch):
+def _isolate_summarizer_sink_globally(_private_sink_state, monkeypatch):
     """Belt-and-suspenders: redirect summarizer_metrics.METRICS_PATH to a tmp
     path for every test in the suite. Prevents accidental pollution of
     ~/.claude/obsidian-brain-summarizer-metrics.jsonl when a future test
@@ -227,12 +273,14 @@ def _isolate_summarizer_sink_globally(tmp_path_factory, monkeypatch):
         import summarizer_metrics
     except ImportError:
         return  # sink module not present in some test contexts
-    safe_path = tmp_path_factory.mktemp("metrics") / "summarizer-metrics.jsonl"
+    safe_path = _private_sink_state / "metrics"
+    safe_path.mkdir(mode=0o700)
+    safe_path = safe_path / "summarizer-metrics.jsonl"
     monkeypatch.setattr(summarizer_metrics, "METRICS_PATH", safe_path)
 
 
 @pytest.fixture(autouse=True)
-def _isolate_secure_dir_globally(tmp_path_factory, monkeypatch):
+def _isolate_secure_dir_globally(_private_sink_state, monkeypatch):
     """Point obsidian-brain's secure dir (and its lock subdir) at a throwaway
     per-test location so no test writes to the real ~/.claude/obsidian-brain/
     (notably the cross-plugin dedup lock files written by claim_hook_run).
@@ -250,15 +298,41 @@ def _isolate_secure_dir_globally(tmp_path_factory, monkeypatch):
     _CACHE_PREFIX and _BOOTSTRAP_PREFIX are also patched to consistent tmp-based
     paths so that tests checking `x.startswith(_SECURE_DIR)` still hold."""
     import obsidian_utils
-    secure = tmp_path_factory.mktemp("ob-secure")
-    monkeypatch.setattr(obsidian_utils, "_SECURE_DIR", str(secure))
-    monkeypatch.setattr(obsidian_utils, "_LOCK_DIR", str(secure / "locks"))
-    monkeypatch.setattr(obsidian_utils, "_CACHE_PREFIX", str(secure / "cache-"))
-    monkeypatch.setattr(obsidian_utils, "_BOOTSTRAP_PREFIX", str(secure / "sid-"))
+    import hooks.obsidian_utils as qualified_utils
+    secure = _private_sink_state / "ob-secure"
+    secure.mkdir(mode=0o700)
+    for module in (obsidian_utils, qualified_utils):
+        monkeypatch.setattr(module, "_SECURE_DIR", str(secure))
+        monkeypatch.setattr(module, "_LOCK_DIR", str(secure / "locks"))
+        monkeypatch.setattr(module, "_CACHE_PREFIX", str(secure / "cache-"))
+        monkeypatch.setattr(module, "_BOOTSTRAP_PREFIX", str(secure / "sid-"))
+
+    # Classifier scratch files have an independent state helper. Keep it in
+    # the same sandbox, while preserving tests that explicitly select HOME.
+    import importlib
+    from pathlib import Path
+    original_home = Path.home()
+    for name, helper in (
+        ("check_items_cli", "_safe_workdir"),
+        ("hooks.check_items_cli", "_safe_workdir"),
+        ("open_item_dedup", "_check_items_workdir"),
+        ("hooks.open_item_dedup", "_check_items_workdir"),
+    ):
+        module = importlib.import_module(name)
+        original_workdir = getattr(module, helper)
+
+        def isolated_workdir(original=original_workdir):
+            if Path.home() != original_home:
+                return original()
+            secure.mkdir(mode=0o700, parents=True, exist_ok=True)
+            secure.chmod(0o700)
+            return secure
+
+        monkeypatch.setattr(module, helper, isolated_workdir)
 
 
 @pytest.fixture(autouse=True)
-def _isolate_vault_index_db_globally(tmp_path_factory, monkeypatch):
+def _isolate_vault_index_db_globally(_private_sink_state, monkeypatch):
     """Redirect the default index DB to a per-test tmp path so an un-isolated
     in-process call (e.g. deep_analysis_pipeline / obsidian_utils indexing with
     no db_path) cannot reach the production DB. The _connect() guard is the
@@ -267,12 +341,14 @@ def _isolate_vault_index_db_globally(tmp_path_factory, monkeypatch):
     Tests that pass an explicit db_path are unaffected (they ignore the env).
     Subprocess tests inherit OBSIDIAN_BRAIN_DB when they copy the parent environment (os.environ.copy()), which the existing subprocess tests do.
     """
-    db = tmp_path_factory.mktemp("vidx") / "test-vault.db"
+    db = _private_sink_state / "vidx"
+    db.mkdir(mode=0o700)
+    db = db / "test-vault.db"
     monkeypatch.setenv("OBSIDIAN_BRAIN_DB", str(db))
 
 
 @pytest.fixture(autouse=True)
-def _isolate_acted_items_path_globally(tmp_path_factory, monkeypatch):
+def _isolate_acted_items_path_globally(_private_sink_state, monkeypatch):
     """Redirect deep_cli._ACTED_ITEMS_PATH to a per-test tmp file so tests that
     call run_batch_edit never read/write/remove the REAL
     ~/.claude/obsidian-brain/deep-acted-items.json. That real-state mutation
@@ -285,7 +361,9 @@ def _isolate_acted_items_path_globally(tmp_path_factory, monkeypatch):
         import deep_cli
     except ImportError:
         return  # module not present in some test contexts
-    acted = tmp_path_factory.mktemp("acted") / "deep-acted-items.json"
+    acted = _private_sink_state / "acted"
+    acted.mkdir(mode=0o700)
+    acted = acted / "deep-acted-items.json"
     monkeypatch.setattr(deep_cli, "_ACTED_ITEMS_PATH", str(acted))
 
 
@@ -308,3 +386,54 @@ def _isolate_harness_session_id_globally(monkeypatch):
     import obsidian_utils
     for name in obsidian_utils._CODEX_HOST_MARKERS:
         monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _doctor_tests_do_not_read_live_config(request, monkeypatch):
+    """Legacy synthetic doctor issues use test folders, never user config."""
+    module_name = getattr(request.module, "__name__", "")
+    if "vault_doctor" not in module_name:
+        return
+    import obsidian_utils
+    import hooks.obsidian_utils as qualified_utils
+    isolated_config = lambda context=None: dict(context.config) if context is not None else {}
+    monkeypatch.setattr(obsidian_utils, "load_config", isolated_config)
+    monkeypatch.setattr(qualified_utils, "load_config", isolated_config)
+
+
+@pytest.fixture(autouse=True)
+def _block_unmocked_native_ai_processes(monkeypatch, _private_coordination_state):
+    """Tests must replace native AI transport before dispatching model jobs."""
+    import shlex
+    import subprocess
+    original = subprocess.Popen
+
+    def guarded(args, *positional, **kwargs):
+        environment = kwargs.get('env')
+        environment = os.environ if environment is None else environment
+        _assert_test_coordination_root(environment.get('XDG_STATE_HOME'))
+        values = shlex.split(args) if isinstance(args, str) else list(args)
+        commands = [Path(str(value)).name for value in values]
+        if commands and (commands[0] in {"claude", "codex"} or
+                         commands[0] == "env" and any(value in {"claude", "codex"} for value in commands[1:])):
+            pytest.fail("Native AI subprocess transport must be mocked in tests", pytrace=False)
+        return original(args, *positional, **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", guarded)
+
+
+@pytest.fixture
+def native_ai_frontend(selected_host_context, monkeypatch):
+    """Frontend tests use the selected invoking host and replace AI transport."""
+    import ai_backend
+    import native_ai_test_adapter
+    from runtime_context import using_runtime_context
+    context = selected_host_context
+    monkeypatch.setattr(ai_backend, "execute_ai", native_ai_test_adapter.execute_ai)
+    with using_runtime_context(context):
+        yield context
+
+
+# Invoking-host conformance uses an explicit active context. Individual modules
+# may specialize its vault/config fixture while keeping this host contract.
+from parity_test_helpers import host, selected_host_context, host_identity_scenario  # noqa: E402, F401

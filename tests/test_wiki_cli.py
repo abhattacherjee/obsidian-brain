@@ -7,14 +7,32 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 
 
+@pytest.fixture(autouse=True)
+def _selected_wiki_actor(selected_host_context):
+    return selected_host_context
+
+
 def run(args, stdin="", home=None, db=None):
+    from runtime_context import current_runtime_context
+    selected = current_runtime_context()
+    assert selected is not None
     env = dict(os.environ)
     if home:
         env["HOME"] = str(home)
     if db:
         env["OBSIDIAN_BRAIN_DB"] = str(db)
-    env["CLAUDE_CODE_SESSION_ID"] = "wiki-cli-test"
-    return subprocess.run([sys.executable, str(REPO / "hooks" / "wiki.py"), *args],
+    config = home / '.claude' / 'obsidian-brain-config.json' if home else selected.config_path
+    if not config.exists():
+        config = selected.config_path
+    child = ("import sys; from runtime_context import resolve_runtime_context, using_runtime_context; "
+             "import wiki; ctx=resolve_runtime_context(sys.argv[1],sys.argv[2],{},"
+             "{'config_path':sys.argv[3],'resource_root':sys.argv[4],"
+             "'index_path':sys.argv[5],'session_id':sys.argv[6],'cwd':sys.argv[7]}); "
+             "\nwith using_runtime_context(ctx): raise SystemExit(wiki.main(sys.argv[8:]))")
+    env['PYTHONPATH'] = str(REPO / 'hooks')
+    return subprocess.run([sys.executable, '-c', child, selected.host, selected.client,
+                           str(config), str(REPO), str(db or selected.index_path),
+                           selected.native_session_id, str(selected.canonical_project_root), *args],
                           input=stdin, capture_output=True, text=True, env=env, timeout=60)
 
 
@@ -41,10 +59,10 @@ import io
 import wiki
 
 
-def _setup(tmp_path, wiki_folder="claude-wiki"):
+def _setup(tmp_path, wiki_folder="claude-wiki", vault=None):
     home = tmp_path / "home"
     (home / ".claude").mkdir(parents=True)
-    vault = tmp_path / "v"
+    vault = vault or tmp_path / "v"
     for n, t in (("i1", "claude-insight"), ("i2", "claude-insight"), ("d1", "claude-decision")):
         p = vault / "claude-insights" / f"{n}.md"
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -113,9 +131,9 @@ def test_list_fields_must_be_lists(monkeypatch):
         wiki._list_field({"sources": "i1"}, "sources")
 
 
-def test_commands_in_process(tmp_path, monkeypatch, capsys):
+def test_commands_in_process(tmp_path, monkeypatch, capsys, selected_host_context):
     import vault_index
-    home, vault, db = _setup(tmp_path)
+    home, vault, db = _setup(tmp_path, vault=selected_host_context.vault_path)
     ctx = {"vault": str(vault), "wiki_folder": "claude-wiki",
            "folders": ["claude-sessions", "claude-insights", "claude-wiki"], "db": str(db)}
     monkeypatch.setattr(wiki, "_context", lambda: ctx)

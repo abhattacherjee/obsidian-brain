@@ -10,12 +10,27 @@ directly, never a real git/gh invocation).
 
 from __future__ import annotations
 
+from tests.native_pipeline_test_adapter import private_pipeline_output, run_native_pipeline
 import json as _json
 import os
 import re
 from unittest.mock import MagicMock, patch
 
+import pytest
 import open_item_dedup as oid
+
+
+@pytest.fixture
+def selected_host_context(host, selected_host_context, tmp_path, tmp_path_factory):
+    from dataclasses import replace
+    from runtime_context import using_runtime_context
+    private = tmp_path_factory.mktemp("evidence-private")
+    vault = tmp_path
+    selected = replace(selected_host_context, vault_path=vault,
+        state_path=private / "state", index_path=private / "index.sqlite3",
+        config=dict(selected_host_context.config, vault_path=str(vault)))
+    with using_runtime_context(selected):
+        yield selected
 
 
 def _create_session_note(sessions_dir, filename, project, open_items):
@@ -54,7 +69,7 @@ def _run_pipeline(tmp_path, project_paths, fake_run=None):
         ["Ship the widget"],
     )
 
-    output_path = str(tmp_path / "pipeline-out.json")
+    output_path = str(private_pipeline_output(tmp_path, "pipeline-out.json"))
 
     fake_vi = MagicMock()
     fake_vi.ensure_index.return_value = str(tmp_path / "vault.db")
@@ -67,7 +82,7 @@ def _run_pipeline(tmp_path, project_paths, fake_run=None):
          patch.dict("sys.modules", {"vault_index": fake_vi}), \
          patch.object(oid, "_resolve_project_paths", return_value=project_paths):
 
-        result = oid.deep_analysis_pipeline(
+        result = run_native_pipeline(
             basenames=[],
             projects_json=_json.dumps(["notes-only"]),
             output_path=output_path,
@@ -82,12 +97,12 @@ def _run_pipeline(tmp_path, project_paths, fake_run=None):
     return result, data
 
 
-def test_repo_less_project_is_named_in_output_json(tmp_path):
+def test_repo_less_project_is_named_in_output_json(selected_host_context, tmp_path):
     _result, data = _run_pipeline(tmp_path, project_paths={})
     assert data["evidence_gaps"]["projects_without_repo"] == ["notes-only"]
 
 
-def test_repo_less_project_warns_on_stderr(tmp_path, capsys):
+def test_repo_less_project_warns_on_stderr(selected_host_context, tmp_path, capsys):
     _run_pipeline(tmp_path, project_paths={})
     stderr = capsys.readouterr().err
     assert "notes-only" in stderr
@@ -96,14 +111,14 @@ def test_repo_less_project_warns_on_stderr(tmp_path, capsys):
     assert "reach tier HIGH or classification DONE" in stderr
 
 
-def test_all_projects_without_repo_sets_zero_evidence_flag(tmp_path):
+def test_all_projects_without_repo_sets_zero_evidence_flag(selected_host_context, tmp_path):
     _result, data = _run_pipeline(tmp_path, project_paths={})
     gaps = data["evidence_gaps"]
     assert gaps["projects_with_evidence"] == 0
     assert gaps["all_projects_gapped"] is True
 
 
-def test_project_with_repo_reports_no_gap(tmp_path):
+def test_project_with_repo_reports_no_gap(selected_host_context, tmp_path):
     """Positive control: a repo-backed project must NOT be named as a gap.
     subprocess.run is stubbed (returncode=0, stdout="") rather than a real
     git repo — the guard under test is `if not repo_path`, which never
@@ -124,7 +139,7 @@ def test_project_with_repo_reports_no_gap(tmp_path):
     assert gaps["all_projects_gapped"] is False
 
 
-def test_status_string_keeps_ok_prefix_and_gains_gap_count(tmp_path):
+def test_status_string_keeps_ok_prefix_and_gains_gap_count(selected_host_context, tmp_path):
     result, data = _run_pipeline(tmp_path, project_paths={})
     assert re.match(r"^OK:\d+:\d+:\d+:\d+$", result), f"unexpected status format: {result}"
     gap_count = int(result.split(":")[4])

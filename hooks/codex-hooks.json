@@ -1,0 +1,46 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/native_entry.py\" --host codex --require-cli-launcher --client \"${OB_CLIENT:-}\" --event session_start"
+          }
+        ],
+        "matcher": "startup|resume|clear|compact"
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/native_entry.py\" --host codex --require-cli-launcher --client \"${OB_CLIENT:-}\" --event stop"
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/native_entry.py\" --host codex --require-cli-launcher --client \"${OB_CLIENT:-}\" --event pre_compact"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/native_entry.py\" --host codex --require-cli-launcher --client \"${OB_CLIENT:-}\" --event session_end",
+            "timeout": 3
+          }
+        ]
+      }
+    ]
+  }
+}

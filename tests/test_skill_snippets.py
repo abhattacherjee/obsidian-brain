@@ -61,14 +61,10 @@ _HEREDOC_RE = re.compile(
 
 
 def _extract_heredoc_snippets():
-    snippets = []
-    for skill_path in sorted(glob.glob(os.path.join(_REPO_ROOT, "skills/*/SKILL.md"))):
-        skill_name = skill_path.replace("\\", "/").split("/")[-2]
-        with open(skill_path, encoding="utf-8") as f:
-            content = f.read()
-        for i, match in enumerate(_HEREDOC_RE.finditer(content)):
-            snippets.append((f"{skill_name}-heredoc-{i}", textwrap.dedent(match.group(2))))
-    return snippets
+    import inspect
+    import skill_procedures
+    return [('check-items-stage-' + str(index), inspect.getsource(getattr(skill_procedures, '_check_items_stage_%02d' % index))) for index in range(1, 9)]
+
 
 
 _HEREDOCS = _extract_heredoc_snippets()
@@ -93,11 +89,11 @@ def test_snippet_has_no_runtime_pep604_union(name, code):
 
 
 def test_heredoc_snippets_found():
-    """Guard the extractor: check-items has eight `python3 << 'PYEOF'`
-    blocks and obsidian-setup one `python3 - <<'PY'`."""
-    names = [n for n, _ in _HEREDOCS]
-    assert sum(n.startswith("check-items-") for n in names) >= 8, names
-    assert any(n.startswith("obsidian-setup-") for n in names), names
+    assert len(_HEREDOCS) == 8
+    assert len({name for name, _ in _HEREDOCS}) == 8
+    import skill_procedures
+    assert all('stage-%02d' % index in skill_procedures.OPERATIONS['check-items'] for index in range(1,9))
+
 
 
 def test_at_least_one_snippet_found():
@@ -198,14 +194,30 @@ def test_no_tail_c_in_skills():
                     )
 
 
-def test_hooks_future_annotations():
-    """All .py files using PEP 604/585 type hints must have 'from __future__ import annotations'.
+def _modern_annotation_nodes(content):
+    tree = ast.parse(content)
+    annotations = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.AnnAssign):
+            annotations.append(node.annotation)
+        elif isinstance(node, ast.arg) and node.annotation is not None:
+            annotations.append(node.annotation)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.returns is not None:
+            annotations.append(node.returns)
+    return [node for annotation in annotations for node in ast.walk(annotation)
+            if (isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr))
+            or (isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name)
+                and node.value.id in {'list', 'dict', 'set', 'tuple'})]
 
-    Without this import, `dict | None` and `list[str]` syntax fails on
-    Python < 3.10 (macOS system Python is 3.9.6). Scans hooks/ and scripts/.
-    """
-    pep604_re = re.compile(r':\s*\w+\s*\|\s*\w+|-> \w+\s*\|\s*\w+')
-    pep585_re = re.compile(r':\s*(?:list|dict|set|tuple)\[')
+
+def test_annotation_scan_ignores_regex_literals_but_checks_real_hints():
+    assert not _modern_annotation_nodes('pattern = r"(?:Claude|Codex)"\n')
+    assert _modern_annotation_nodes('def call(value: dict | None) -> list[str]: pass\n')
+    assert _modern_annotation_nodes('value: tuple[int, str] = (1, "x")\n')
+
+
+def test_hooks_future_annotations():
+    """Check actual annotations rather than type-like strings or comments."""
     py_files = sorted(
         glob.glob(os.path.join(_REPO_ROOT, "hooks", "*.py"))
         + glob.glob(os.path.join(_REPO_ROOT, "scripts", "**", "*.py"), recursive=True)
@@ -213,14 +225,13 @@ def test_hooks_future_annotations():
     for py_file in py_files:
         with open(py_file, encoding="utf-8") as f:
             content = f.read()
-        uses_modern = pep604_re.search(content) or pep585_re.search(content)
-        if uses_modern:
+        if _modern_annotation_nodes(content):
+            tree = ast.parse(content)
+            imports_future = any(isinstance(node, ast.ImportFrom) and node.module == '__future__'
+                                 and any(alias.name == 'annotations' for alias in node.names)
+                                 for node in tree.body)
             rel_path = os.path.relpath(py_file, _REPO_ROOT)
-            assert "from __future__ import annotations" in content, (
-                f"{rel_path} uses PEP 604/585 type hints "
-                "but is missing 'from __future__ import annotations'. "
-                "This breaks on Python < 3.10 (macOS system Python 3.9.6)."
-            )
+            assert imports_future, f"{rel_path} uses modern annotations without deferred evaluation"
 
 
 def test_snippets_import_os_before_usage():
@@ -302,21 +313,15 @@ def test_note_writer_heredoc_terminators_are_per_invocation():
 
 
 def test_note_writer_heredoc_openers_have_matching_terminator_lines():
-    """Every `<<'OB_..._<eof4>'` opener needs its terminator on its own line
-    at column 0 — an opener whose terminator was renamed (or indented) would
-    swallow the rest of the block."""
-    for skill_path in sorted(glob.glob(os.path.join(_REPO_ROOT, "skills/*/SKILL.md"))):
-        skill_name = skill_path.replace("\\", "/").split("/")[-2]
-        with open(skill_path, encoding="utf-8") as f:
-            content = f.read()
-        for delim in _HEREDOC_OPEN_RE.findall(content):
-            terminators = re.findall(
-                rf"^{re.escape(delim)}$", content, re.MULTILINE
-            )
-            assert terminators, (
-                f"Skill {skill_name}: heredoc opener {delim!r} has no matching "
-                "terminator at column 0"
-            )
+    sites = []
+    for path in glob.glob(os.path.join(_REPO_ROOT,'skills/*/SKILL.md')):
+        content=open(path).read()
+        if "--operation 'note-create'" in content or "--operation 'summary-apply'" in content:
+            assert '< "$REQUEST_PATH"' in content
+            assert 'Content is JSON data, never shell code.' in content
+            sites.append(path)
+    assert len(sites)>=8
+
 
 
 def test_note_writer_call_sites_guard_missing_cli():
@@ -492,15 +497,14 @@ def test_no_skill_resolves_the_plugin_cache_lexicographically():
 
 
 def test_cache_resolution_scan_sees_every_site():
-    """Guards the guard: if the scan stops matching, the check above passes
-    vacuously. 67 is the measured count of resolution sites today (58 inline +
-    9 two-step); a LITERAL, not derived from the scan it validates. A drop
-    means the scan went blind; a rise is fine and only needs this number
-    raised deliberately."""
-    assert len(_cache_resolution_sites()) >= 67, (
-        f"only {len(_cache_resolution_sites())} cache-resolution sites matched "
-        "the scan — the pattern may have been reformatted past it"
-    )
+    sites = []
+    for path in glob.glob(os.path.join(_REPO_ROOT, 'skills/*/SKILL.md')):
+        content = open(path, encoding='utf-8').read()
+        assert 'known_marketplaces.json' not in content and 'plugins/cache/' not in content
+        assert '--skill-path "$OB_SKILL_PATH"' in content
+        sites.append(path)
+    assert len(sites) == 19
+
 
 
 def test_every_version_key_snippet_imports_re():
@@ -519,91 +523,35 @@ def test_every_version_key_snippet_imports_re():
                 break
 
 
-def test_check_items_skill_captures_head_only_once():
-    """#305: skills/check-items/SKILL.md must call `git rev-parse HEAD`
-    exactly once (Step 3), not twice. Step 10 used to re-derive HEAD with its
-    own `git rev-parse HEAD` call; a commit landing between the two reads
-    would stamp the newer HEAD onto verdicts derived at the older one. Step
-    10 now reuses the head captured at Step 3 via partition.json's "heads"
-    key instead. Anchored on `"HEAD"` specifically so Step 3's unrelated
-    `git rev-parse --show-toplevel` call (line ~129) is not counted."""
-    path = os.path.join(_REPO_ROOT, "skills", "check-items", "SKILL.md")
-    with open(path, encoding="utf-8") as f:
-        content = f.read()
-    # The pattern must tolerate BOTH the argv-list form this file uses today
-    # (`["git", "-C", p, "rev-parse", "HEAD"]`) and the bare shell form
-    # (`git rev-parse HEAD`, `head=$(git -C "$r" rev-parse HEAD)`) — SKILL.md
-    # is mostly bash, so a re-derivation reintroduced there is the likelier
-    # regression, and an argv-only pattern would let it back in silently.
-    # `HEAD(?![\w~^])` keeps revision expressions (HEAD~1, HEAD^) out: those
-    # name a specific past commit and are not a re-derivation of current HEAD.
-    # Step 3's `git rev-parse --show-toplevel` (line ~129) never matches.
-    occurrences = re.findall(r'''rev-parse[\s,"']+HEAD(?![\w~^])''', content)
-    assert len(occurrences) == 1, (
-        f"expected exactly one `rev-parse ... HEAD` call in {path}, "
-        f"found {len(occurrences)} — Step 10 must reuse Step 3's captured "
-        "head, not re-derive it"
-    )
+def test_check_items_head_capture_and_reuse_revalidate_freshness():
+    import inspect, skill_procedures
+    helper = inspect.getsource(skill_procedures._project_head)
+    assert len(re.findall(r"rev-parse[\s,\"']+HEAD(?![\w~^])", helper)) == 1
+    for index in range(1, 9):
+        tree = ast.parse(inspect.getsource(getattr(skill_procedures, '_check_items_stage_%02d' % index)))
+        calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
+                 and isinstance(node.func, ast.Name) and node.func.id == '_project_head']
+        # Stage 1 captures the baseline; stage 3 verifies it before evidence reuse.
+        assert len(calls) == (1 if index in (1, 3) else 0)
 
 
 def test_check_items_heads_handoff_key_matches():
-    """#305: Step 3 captures each project's HEAD into partition.json and Step
-    10 reads it back instead of re-deriving it. Nothing else pins that
-    cross-block contract, and breaking it FAILS SILENTLY IN THE WORST
-    DIRECTION: Step 10's `heads.get(proj)` returns None for every project, so
-    every project hits `continue` and /check-items stops persisting
-    classifications entirely — announced only on stderr, which this repo
-    documents as ignorable. Verified by mutation: deleting `"heads": heads`
-    from Step 3's json.dump leaves the entire 2645-test suite green.
+    import inspect, skill_procedures
+    writer = ast.parse(inspect.getsource(skill_procedures._check_items_stage_01))
+    reader = ast.parse(inspect.getsource(skill_procedures._check_items_stage_08))
+    assert any(isinstance(n,ast.Dict) and any(isinstance(k,ast.Constant) and k.value=='heads' and isinstance(v,ast.Name) and v.id=='heads' for k,v in zip(n.keys,n.values)) for n in ast.walk(writer))
+    assert any(isinstance(n,ast.Call) and isinstance(n.func,ast.Attribute) and isinstance(n.func.value,ast.Name) and n.func.value.id=='part' and n.func.attr=='get' and n.args and isinstance(n.args[0],ast.Constant) and n.args[0].value=='heads' for n in ast.walk(reader))
 
-    Both sides are extracted and compared rather than string-matched, so
-    reformatting the dict or the call does not break the test — only an
-    actual rename or removal on either end does.
-    """
-    path = os.path.join(_REPO_ROOT, "skills", "check-items", "SKILL.md")
-    with open(path, encoding="utf-8") as f:
-        content = f.read()
-
-    write = re.search(r'json\.dump\(\{[^}]*"([A-Za-z_]\w*)":\s*heads\b', content)
-    assert write, (
-        "Step 3 must serialize the captured per-project HEADs into "
-        "partition.json (expected a `\"<key>\": heads` entry in its json.dump)"
-    )
-    read = re.search(r'heads\s*=\s*part\.get\(\s*"([A-Za-z_]\w*)"', content)
-    assert read, (
-        "Step 10 must read the HEADs Step 3 captured out of partition.json "
-        "(expected `heads = part.get(\"<key>\", ...)`)"
-    )
-    assert write.group(1) == read.group(1), (
-        f"partition.json heads-key mismatch: Step 3 writes "
-        f"{write.group(1)!r} but Step 10 reads {read.group(1)!r} — every "
-        "cache update would be silently skipped"
-    )
 
 
 _PYEOF_HEREDOC_RE = re.compile(r"<< 'PYEOF'\n(.*?)\nPYEOF", re.DOTALL)
 
 
 def _read_step6_heredoc():
-    """Extract the Step 6 `python3 << 'PYEOF' ... PYEOF` heredoc body from
-    skills/check-items/SKILL.md — the classifier fallback-chain block
-    (agent -> heuristic gap-fill -> cache-merge), distinguished from the
-    other 6 same-delimiter PYEOF blocks (see _read_step7_heredoc's
-    docstring) by the presence of `classify_groups_with_agent`, which is
-    unique to Step 6.
-    """
-    path = os.path.join(_REPO_ROOT, "skills", "check-items", "SKILL.md")
-    with open(path, encoding="utf-8") as f:
-        content = f.read()
-    blocks = _PYEOF_HEREDOC_RE.findall(content)
-    assert blocks, "no `<< 'PYEOF' ... PYEOF` heredoc blocks found in SKILL.md"
-    step6_blocks = [b for b in blocks if "classify_groups_with_agent" in b]
-    assert len(step6_blocks) == 1, (
-        f"expected exactly one PYEOF heredoc block containing "
-        f"classify_groups_with_agent, found {len(step6_blocks)} (of "
-        f"{len(blocks)} total heredoc blocks)"
-    )
-    return step6_blocks[0]
+    import inspect
+    import skill_procedures
+    return inspect.getsource(skill_procedures._check_items_stage_04)
+
 
 
 def _dict_has_pair(node, key_value, val_value):
@@ -676,26 +624,10 @@ def test_check_items_step6_cache_merge_stamps_note_evidence_only():
 
 
 def _read_step5_heredoc():
-    """Extract the Step 5 `python3 << 'PYEOF' ... PYEOF` heredoc body from
-    skills/check-items/SKILL.md -- the evidence-gathering block, distinguished
-    from the other 6 same-delimiter PYEOF blocks by the presence of
-    `deep_analysis_pipeline(`, which is unique to Step 5 (Step 5's `from
-    open_item_dedup import deep_analysis_pipeline` line contains the bare
-    name without a paren, but the call site `status = deep_analysis_pipeline(`
-    is the actual invocation and appears nowhere else).
-    """
-    path = os.path.join(_REPO_ROOT, "skills", "check-items", "SKILL.md")
-    with open(path, encoding="utf-8") as f:
-        content = f.read()
-    blocks = _PYEOF_HEREDOC_RE.findall(content)
-    assert blocks, "no `<< 'PYEOF' ... PYEOF` heredoc blocks found in SKILL.md"
-    step5_blocks = [b for b in blocks if "deep_analysis_pipeline(" in b]
-    assert len(step5_blocks) == 1, (
-        f"expected exactly one PYEOF heredoc block containing "
-        f"deep_analysis_pipeline(, found {len(step5_blocks)} (of "
-        f"{len(blocks)} total heredoc blocks)"
-    )
-    return step5_blocks[0]
+    import inspect
+    import skill_procedures
+    return inspect.getsource(skill_procedures._check_items_stage_03)
+
 
 
 def _is_dict_get_call(node, dict_name, key_value):
@@ -745,31 +677,10 @@ def test_check_items_step5_extracts_evidence_gaps_from_pipeline_output():
 
 
 def _read_step7_heredoc():
-    """Extract the Step 7 `python3 << 'PYEOF' ... PYEOF` heredoc body from
-    skills/check-items/SKILL.md.
+    import inspect
+    import skill_procedures
+    return inspect.getsource(skill_procedures._check_items_stage_05)
 
-    Steps 3-10 ALL use `python3 << 'PYEOF' ... PYEOF` (7 occurrences, same
-    delimiter every time — unlike note_writer's per-invocation `<eof4>`
-    convention) — a naive first-match regex grabs Step 3's block, not
-    Step 7's. Scanned for the one block that actually contains
-    `assign_tier(`, which is unique to Step 7. `python3 -c '...'` snippets
-    elsewhere are already covered by _extract_python_snippets() above via
-    _SQ_SNIPPET_RE / _DQ_SNIPPET_RE (neither pattern matches a heredoc, so
-    no PYEOF block was ever visible to any existing snippet test). Reads
-    the real file on disk, not a fixture, so this test guards the actual
-    call site rather than a stand-in for it (#318 fix round 3, F11).
-    """
-    path = os.path.join(_REPO_ROOT, "skills", "check-items", "SKILL.md")
-    with open(path, encoding="utf-8") as f:
-        content = f.read()
-    blocks = _PYEOF_HEREDOC_RE.findall(content)
-    assert blocks, "no `<< 'PYEOF' ... PYEOF` heredoc blocks found in SKILL.md"
-    step7_blocks = [b for b in blocks if "assign_tier(" in b]
-    assert len(step7_blocks) == 1, (
-        f"expected exactly one PYEOF heredoc block containing assign_tier(, "
-        f"found {len(step7_blocks)} (of {len(blocks)} total heredoc blocks)"
-    )
-    return step7_blocks[0]
 
 
 def test_check_items_step7_threads_note_evidence_only_into_assign_tier():
@@ -828,25 +739,10 @@ def test_check_items_step7_threads_note_evidence_only_into_assign_tier():
 
 
 def _read_step8_heredoc():
-    """Extract the Step 8 `python3 << 'PYEOF' ... PYEOF` heredoc body from
-    skills/check-items/SKILL.md -- the cascade block, distinguished from the
-    other 6 same-delimiter PYEOF blocks by the presence of
-    `cascade_group_members(`, which is unique to Step 8 (the `from
-    open_item_dedup import cascade_group_members` line contains the bare
-    name without a paren; the actual call site is the discriminator).
-    """
-    path = os.path.join(_REPO_ROOT, "skills", "check-items", "SKILL.md")
-    with open(path, encoding="utf-8") as f:
-        content = f.read()
-    blocks = _PYEOF_HEREDOC_RE.findall(content)
-    assert blocks, "no `<< 'PYEOF' ... PYEOF` heredoc blocks found in SKILL.md"
-    step8_blocks = [b for b in blocks if "cascade_group_members(" in b]
-    assert len(step8_blocks) == 1, (
-        f"expected exactly one PYEOF heredoc block containing "
-        f"cascade_group_members(, found {len(step8_blocks)} (of "
-        f"{len(blocks)} total heredoc blocks)"
-    )
-    return step8_blocks[0]
+    import inspect
+    import skill_procedures
+    return inspect.getsource(skill_procedures._check_items_stage_06)
+
 
 
 def test_check_items_step8_stamps_applied_on_flipped_records():
@@ -920,58 +816,21 @@ def test_check_items_step8_stamps_applied_on_flipped_records():
 
 
 def test_check_items_step8_atomic_write_helper_uses_temp_and_replace():
-    """#318 M3: the buckets_path REWRITE (and the new cascade_summary.json
-    write) must go through temp-file-then-rename, not a plain `open(path,
-    "w")` -- the repo's atomic-write convention (write_vault_note(),
-    check_items_cache.save_cache()). A plain in-place write left the
-    previous test's `_atomic_write_json(buckets_path, buckets)` call site
-    guard satisfied by a helper that still truncates the file directly, so
-    this checks the helper's OWN body for `tempfile.mkstemp` and
-    `os.replace`, not just that something named `_atomic_write_json` gets
-    called."""
-    source = _read_step8_heredoc()
-    tree = ast.parse(source)
+    import inspect, skill_procedures, operation_state
+    source = inspect.getsource(skill_procedures._check_items_stage_06)
+    assert '_store_json(context, payload, path, data)' in source
+    assert 'store_artifact(' in inspect.getsource(skill_procedures._store_json)
+    engine = inspect.getsource(operation_state)
+    assert 'os.replace(' in engine and 'os.fsync(' in engine
+    assert '_no_symlinks' in engine
 
-    funcs = [
-        node for node in ast.walk(tree)
-        if isinstance(node, ast.FunctionDef) and node.name == "_atomic_write_json"
-    ]
-    assert len(funcs) == 1, (
-        f"expected exactly one _atomic_write_json def in Step 8's heredoc, "
-        f"found {len(funcs)}"
-    )
-    body_src = ast.unparse(funcs[0])
-    assert "tempfile.mkstemp" in body_src, (
-        "_atomic_write_json does not use tempfile.mkstemp -- it is not "
-        "writing to a temp file first."
-    )
-    assert "os.replace" in body_src, (
-        "_atomic_write_json does not use os.replace -- a temp file with no "
-        "rename into place is not an atomic write, just a stray temp file."
-    )
 
 
 def _read_step9_heredoc():
-    """Extract the Step 9 `python3 << 'PYEOF' ... PYEOF` heredoc body from
-    skills/check-items/SKILL.md -- the dashboard-write block, distinguished
-    from the other 7 same-delimiter PYEOF blocks by the presence of
-    `write_check_items_dashboard(` (the actual call, with its opening
-    paren -- the bare `write_check_items_dashboard()` mention in this
-    step's own prose, outside any heredoc, is never part of the extracted
-    block strings in the first place, so it can't cause a false match here).
-    """
-    path = os.path.join(_REPO_ROOT, "skills", "check-items", "SKILL.md")
-    with open(path, encoding="utf-8") as f:
-        content = f.read()
-    blocks = _PYEOF_HEREDOC_RE.findall(content)
-    assert blocks, "no `<< 'PYEOF' ... PYEOF` heredoc blocks found in SKILL.md"
-    step9_blocks = [b for b in blocks if "write_check_items_dashboard(" in b]
-    assert len(step9_blocks) == 1, (
-        f"expected exactly one PYEOF heredoc block containing "
-        f"write_check_items_dashboard(, found {len(step9_blocks)} (of "
-        f"{len(blocks)} total heredoc blocks)"
-    )
-    return step9_blocks[0]
+    import inspect
+    import skill_procedures
+    return inspect.getsource(skill_procedures._check_items_stage_07)
+
 
 
 def test_check_items_step9_passes_merges_and_evidence_gaps():
@@ -1024,15 +883,9 @@ def test_check_items_step9_passes_merges_and_evidence_gaps():
     def _is_json_load_open_call(node, arg_name):
         return (
             isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "load"
-            and isinstance(node.func.value, ast.Name) and node.func.value.id == "json"
-            and len(node.args) == 1
-            and isinstance(node.args[0], ast.Call)
-            and isinstance(node.args[0].func, ast.Name) and node.args[0].func.id == "open"
-            and node.args[0].args
-            and isinstance(node.args[0].args[0], ast.Name)
-            and node.args[0].args[0].id == arg_name
+            and isinstance(node.func, ast.Name) and node.func.id == "_load_json"
+            and len(node.args) == 3
+            and isinstance(node.args[2], ast.Name) and node.args[2].id == arg_name
         )
 
     buckets_reads = [n for n in ast.walk(tree) if _is_json_load_open_call(n, "buckets_path")]
@@ -1047,15 +900,16 @@ def test_check_items_step9_passes_merges_and_evidence_gaps():
         node for node in ast.walk(tree)
         if isinstance(node, ast.Assign) and len(node.targets) == 1
         and isinstance(node.targets[0], ast.Name) and node.targets[0].id == "classifications"
-        and isinstance(node.value, ast.Call)
-        and isinstance(node.value.func, ast.Attribute) and node.value.func.attr == "get"
-        and isinstance(node.value.func.value, ast.Name) and node.value.func.value.id == "buckets"
+        and isinstance(node.value, ast.BinOp) and isinstance(node.value.op, ast.Add)
+        and all(isinstance(value, ast.Call)
+                and isinstance(value.func, ast.Attribute) and value.func.attr == "get"
+                and isinstance(value.func.value, ast.Name) and value.func.value.id == "buckets"
+                for value in (node.value.left, node.value.right))
+        and [value.args[0].value for value in (node.value.left, node.value.right)] == ["review", "dashboard_only"]
     ]
     assert classifications_from_buckets, (
-        "Step 9's heredoc does not assign classifications = buckets.get(...) "
-        "-- json.load(open(buckets_path)) being present doesn't prove "
-        "`classifications` itself comes from it, only that SOMETHING reads "
-        "the file."
+        "The dashboard must use fresh reviewed and dashboard-only classifications; "
+        "excluding the latter drops ACTIVE and STALE items from the report."
     )
 
     cascade_summary_reads = [
@@ -1070,101 +924,37 @@ def test_check_items_step9_passes_merges_and_evidence_gaps():
 
 
 def test_check_items_step10_uses_locked_cache_not_bare_save():
-    """#306: Step 10 must persist cache updates through locked_cache(), the
-    context manager that serializes the whole load-mutate-save cycle behind
-    a lock, not the old unlocked `load_cache()` ... `save_cache(cache)`
-    pair. Skills are advisory prose, not enforced code (memory:
-    feedback_skills_advisory_not_enforcement) — a future edit could
-    silently drop back to the bare calls without anyone noticing; this pins
-    the call shape so that regresses as a failing test instead.
+    _, step10 = _read_step10()
+    assert 'with locked_cache() as cache:' in step10
+    assert 'save_cache(' not in step10
+    assert 'provenance=provenance' in step10
 
-    Extracted from the Step 10 block specifically (bounded by the next
-    `## ` header), not the whole file, so Step 3's own unlocked
-    load_cache() call — deliberately read-only per the #306 spec — cannot
-    false-positive this check.
-    """
-    path = os.path.join(_REPO_ROOT, "skills", "check-items", "SKILL.md")
-    with open(path, encoding="utf-8") as f:
-        content = f.read()
-
-    step10_start = content.index("## Step 10")
-    rest = content[step10_start + len("## Step 10"):]
-    next_header = re.search(r"\n## ", rest)
-    step10 = rest[:next_header.start()] if next_header else rest
-
-    assert re.search(r"from check_items_cache import[^\n]*\blocked_cache\b", step10), (
-        "Step 10 must import locked_cache from check_items_cache"
-    )
-    assert re.search(r"\bwith\s+locked_cache\s*\(", step10), (
-        "Step 10 must persist cache updates via `with locked_cache(...)`, "
-        "not a bare load_cache()/save_cache() pair"
-    )
-    assert not re.search(r"(?<!\w)save_cache\s*\(\s*cache\s*\)", step10), (
-        "Step 10 must not call save_cache(cache) directly — locked_cache() "
-        "saves internally as part of its lock-protected cycle"
-    )
 
 
 def _read_step10():
-    path = os.path.join(_REPO_ROOT, "skills", "check-items", "SKILL.md")
-    with open(path, encoding="utf-8") as f:
-        content = f.read()
-    step10_start = content.index("## Step 10")
-    rest = content[step10_start + len("## Step 10"):]
-    next_header = re.search(r"\n## ", rest)
-    return content, rest[:next_header.start()] if next_header else rest
+    import inspect, skill_procedures
+    return open(os.path.join(_REPO_ROOT,'skills/check-items/SKILL.md')).read(), inspect.getsource(skill_procedures._check_items_stage_08)
+
 
 
 def test_check_items_step10_reports_failure_on_stdout_and_exits_nonzero():
-    """#323 F3: two paths previously skipped the save entirely (a body
-    exception; save_cache() itself raising on a full/read-only disk) and
-    left the run looking clean anyway — nothing told the driving agent to
-    notice, and the terminal output still showed Step 7's `Cached: N
-    reused, M fresh` as if it were the final state. Step 10 must now catch
-    both, print `cache NOT updated: <reason>` on STDOUT (mirrors the
-    existing `#320 F2` precedent in Step 8: stderr is documented elsewhere
-    in this repo, skills/standup/SKILL.md, as ignorable, so the failure
-    signal must not live there), and exit non-zero."""
-    _, step10 = _read_step10()
+    _, source = _read_step10()
+    tree = ast.parse(source)
+    handlers = [n for n in ast.walk(tree) if isinstance(n, ast.ExceptHandler) and isinstance(n.type, ast.Name) and n.type.id=='Exception']
+    assert len(handlers)==1
+    body = ast.unparse(handlers[0])
+    assert 'cache NOT updated:' in body and 'sys.exit(1)' in body
+    assert any(isinstance(n,ast.Call) and isinstance(n.func,ast.Name) and n.func.id=='print' and not n.keywords for n in ast.walk(handlers[0]))
 
-    assert re.search(r'except\s+Exception\s+as\s+\w+:', step10), (
-        "Step 10 must wrap the locked_cache block in a try/except so a "
-        "body exception or a save_cache() failure is caught rather than "
-        "left as a bare traceback"
-    )
-    assert re.search(r'print\(f?"cache NOT updated', step10), (
-        "Step 10 must print 'cache NOT updated: <reason>' when the "
-        "locked_cache block fails"
-    )
-    assert re.search(r'print\(f?"cache NOT updated[^\n]*\n\s*sys\.exit\(1\)', step10), (
-        "Step 10 must exit non-zero right after reporting the failure "
-        "(not merely print it and fall through as if nothing happened)"
-    )
-    assert 'print("cache updated")' in step10, (
-        "the pre-existing success message must still be there for the "
-        "happy path"
-    )
 
 
 def test_check_items_step10_does_not_rebind_cache_from_update_cache():
-    """#323 F6: `update_cache()` mutates its `cache` argument IN PLACE and
-    returns that same object — but `locked_cache()` saves its OWN `cache`
-    binding, not whatever a caller inside the `with` block reassigns the
-    name to. `cache = update_cache(...)` is safe today only because the
-    return value happens to be the same object; the day update_cache()
-    returns a copy instead, every run would silently persist the
-    pre-mutation snapshot while still printing 'cache updated'. Step 10
-    must call update_cache(...) unassigned."""
-    _, step10 = _read_step10()
+    _, source = _read_step10()
+    tree = ast.parse(source)
+    calls = [n for n in ast.walk(tree) if isinstance(n,ast.Expr) and isinstance(n.value,ast.Call) and isinstance(n.value.func,ast.Name) and n.value.func.id=='update_cache']
+    assert len(calls)==1
+    assert not any(isinstance(n,ast.Assign) and isinstance(n.value,ast.Call) and isinstance(n.value.func,ast.Name) and n.value.func.id=='update_cache' for n in ast.walk(tree))
 
-    assert not re.search(r"\bcache\s*=\s*update_cache\s*\(", step10), (
-        "Step 10 must not rebind `cache = update_cache(...)` — "
-        "locked_cache() saves its own binding, not the rebind (#323 F6)"
-    )
-    assert re.search(r"\bupdate_cache\(\s*\n", step10), (
-        "Step 10 must still call update_cache(...) (unassigned) so the "
-        "cache is actually mutated"
-    )
 
 
 def test_check_items_output_format_has_a_cache_line():
@@ -1323,7 +1113,16 @@ def test_every_template_starts_with_the_frontmatter_fence():
     )
 
 
-def _run_step8(tmp_path, groups, review, skips, symlinked_vault=False, skip_root=None):
+@pytest.fixture
+def selected_host_context(host, selected_host_context):
+    from dataclasses import replace
+    from runtime_context import using_runtime_context
+    selected = replace(selected_host_context, config=dict(selected_host_context.config))
+    with using_runtime_context(selected):
+        yield selected
+
+
+def _run_step8(selected_host_context, tmp_path, groups, review, skips, symlinked_vault=False, skip_root=None):
     """Run the real Step 8 heredoc against a scratch vault and return
     (completed process, sessions dir, buckets after the run).
 
@@ -1331,7 +1130,7 @@ def _run_step8(tmp_path, groups, review, skips, symlinked_vault=False, skip_root
     or Dropbox vault. skip_root: directory the skip paths are written under
     (default: the sessions dir the config names)."""
     home = tmp_path / "home"
-    (home / ".claude").mkdir(parents=True)
+    (home / ".claude").mkdir(parents=True, exist_ok=True)
     vault = tmp_path / "vault"
     sessions = vault / "claude-sessions"
     sessions.mkdir(parents=True)
@@ -1339,7 +1138,7 @@ def _run_step8(tmp_path, groups, review, skips, symlinked_vault=False, skip_root
     if symlinked_vault:
         config_vault = tmp_path / "vault-link"
         config_vault.symlink_to(vault)
-    (home / ".claude" / "obsidian-brain-config.json").write_text(
+    selected_host_context.config_path.write_text(
         json.dumps({"vault_path": str(config_vault), "sessions_folder": "claude-sessions"})
     )
     files = {}
@@ -1349,33 +1148,34 @@ def _run_step8(tmp_path, groups, review, skips, symlinked_vault=False, skip_root
     for name, lines in files.items():
         body = [lines.get(i, "filler") for i in range(1, max(lines) + 1)]
         (sessions / name).write_text("\n".join(body) + "\n")
-    work = tmp_path / "work"
-    work.mkdir()
-    merged = {"merged_by_proj": {"p": [
-        {"group_id": g["group_id"],
-         "members": [{k: v for k, v in m.items() if k != "_line"} for m in g["members"]]}
-        for g in groups
-    ]}}
-    (work / "merged.json").write_text(json.dumps(merged))
-    (work / "scope.json").write_text("{}")
-    (work / "buckets.json").write_text(json.dumps({"review": review}))
-    skips_file = work / "skips.json"
+    import io
+    import hashlib
+    import skill_procedures
+    from operation_state import operation_directory, store_artifact, read_artifact
+    context = selected_host_context
+    context.config.update(vault_path=str(config_vault), sessions_folder='claude-sessions')
+    identifier, work = operation_directory(context)
+    merged_groups = []
+    for group in groups:
+        members = []
+        for member in group['members']:
+            copied = {key: value for key, value in member.items() if key != '_line'}
+            copied['source_revision'] = hashlib.sha256((sessions / member['file']).read_bytes()).hexdigest()
+            members.append(copied)
+        merged_groups.append({'group_id': group['group_id'], 'members': members})
+    values = {'merged.json': {'merged_by_proj': {'p': merged_groups}}, 'scope.json': {}, 'buckets.json': {'review': review}}
     root = sessions if skip_root is None else skip_root
-    skips_file.write_text(json.dumps([[str(root / f), ln] for f, ln in skips]))
-    env = dict(os.environ, HOME=str(home),
-               SCOPE_PATH=str(work / "scope.json"),
-               BUCKETS_PATH=str(work / "buckets.json"),
-               MERGED_PATH=str(work / "merged.json"),
-               SKIPS_FILE=str(skips_file))
-    proc = subprocess.run(
-        [sys.executable, "-c", _read_step8_heredoc()],
-        cwd=_REPO_ROOT, env=env, capture_output=True, text=True, timeout=60,
-    )
-    buckets = json.loads((work / "buckets.json").read_text())
+    values['skips.json'] = [[str(root / filename), line] for filename, line in skips]
+    for name, value in values.items():
+        store_artifact(context, identifier, name, json.dumps(value))
+    output, errors = io.StringIO(), io.StringIO()
+    status = skill_procedures.run_operation(context, 'check-items', 'stage-06', {'operation_id': identifier, 'inputs': {'SCOPE_PATH': str(work / 'scope.json'), 'BUCKETS_PATH': str(work / 'buckets.json'), 'MERGED_PATH': str(work / 'merged.json'), 'SKIPS_FILE': str(work / 'skips.json')}}, output, errors)
+    proc = subprocess.CompletedProcess(['native-stage-06'], status, output.getvalue(), errors.getvalue())
+    buckets = json.loads(read_artifact(context, identifier, 'buckets.json'))
     return proc, sessions, buckets
 
 
-def test_step8_cascades_only_groups_the_user_flipped(tmp_path):
+def test_step8_cascades_only_groups_the_user_flipped(selected_host_context, tmp_path):
     """#340: a DONE group the user did not flip must not be cascaded. Before
     the fix, Step 8 cascaded every DONE group, so the deselected group's lines
     were checked off in the vault while Step 9's report (which renders from
@@ -1398,7 +1198,7 @@ def test_step8_cascades_only_groups_the_user_flipped(tmp_path):
         {"group_id": "g-deselected", "classification": "DONE", "tier": "HIGH",
          "canonical_text": "Fix the gadget"},
     ]
-    proc, sessions, buckets = _run_step8(tmp_path, groups, review, skips=[("a.md", 1)])
+    proc, sessions, buckets = _run_step8(selected_host_context, tmp_path, groups, review, skips=[("a.md", 1)])
     assert proc.returncode == 0, proc.stderr
     assert "cascaded_total=1" in proc.stdout, proc.stdout
 
@@ -1432,14 +1232,14 @@ def _two_group_fixture():
     return groups, review
 
 
-def test_step8_matches_skips_through_a_symlinked_vault(tmp_path):
+def test_step8_matches_skips_through_a_symlinked_vault(selected_host_context, tmp_path):
     """#340 review: the stamp now gates the cascade, so a path spelling
     difference must not cancel it. Config names a symlink to the vault; the
     primary-flip loop recorded the resolved path. The sibling must still be
     cascaded and the group stamped."""
     groups, review = _two_group_fixture()
     proc, sessions, buckets = _run_step8(
-        tmp_path, groups, review, skips=[("a.md", 1)],
+        selected_host_context, tmp_path, groups, review, skips=[("a.md", 1)],
         symlinked_vault=True, skip_root=(tmp_path / "vault" / "claude-sessions"),
     )
     assert proc.returncode == 0, proc.stderr
@@ -1448,7 +1248,7 @@ def test_step8_matches_skips_through_a_symlinked_vault(tmp_path):
     assert buckets["review"][0].get("applied") is True
 
 
-def test_step8_warns_when_recorded_flips_match_no_group(tmp_path):
+def test_step8_warns_when_recorded_flips_match_no_group(selected_host_context, tmp_path):
     """#340 review: recorded flips that match no group member leave nothing
     stamped and nothing cascaded. That must be said, not printed as an
     ordinary cascaded_total=0."""
@@ -1456,9 +1256,11 @@ def test_step8_warns_when_recorded_flips_match_no_group(tmp_path):
     elsewhere = tmp_path / "elsewhere"
     elsewhere.mkdir()
     proc, sessions, buckets = _run_step8(
-        tmp_path, groups, review, skips=[("a.md", 1)], skip_root=elsewhere,
+        selected_host_context, tmp_path, groups, review, skips=[("a.md", 1)], skip_root=elsewhere,
     )
     assert proc.returncode == 0, proc.stderr
     assert "cascaded_total=0" in proc.stdout
     assert "none matched a grouped item" in proc.stderr, proc.stderr
     assert (sessions / "b.md").read_text().splitlines()[0] == "- [ ] Ship the widget"
+
+pytestmark = pytest.mark.usefixtures("selected_host_context")

@@ -77,6 +77,8 @@ def test_end_to_end_scan_apply_verify(tmp_path):
 
     env = os.environ.copy()
     env["HOME"] = str(home)
+    from runtime_context import current_runtime_context
+    env["OBSIDIAN_BRAIN_STATE_DIR"] = str(current_runtime_context().state_path)
     env["OBSIDIAN_BRAIN_VAULT"] = str(vault)
     env["OBSIDIAN_BRAIN_SESSIONS_FOLDER"] = "claude-sessions"
     env["OBSIDIAN_BRAIN_INSIGHTS_FOLDER"] = "claude-insights"
@@ -84,7 +86,7 @@ def test_end_to_end_scan_apply_verify(tmp_path):
     script = Path(__file__).parent.parent / "scripts" / "vault_doctor.py"
 
     # --- 1. Dry-run → exit 1, file untouched ---
-    r = subprocess.run(
+    r = run_doctor(
         [sys.executable, str(script), "--check", "source-sessions", "--days", "10000",
          "--project", "proj1", "--json"],
         capture_output=True, text=True, env=env,
@@ -97,7 +99,7 @@ def test_end_to_end_scan_apply_verify(tmp_path):
     assert insight.read_text(encoding="utf-8") == original_text, "dry-run must not modify the file"
 
     # --- 2. Apply with --yes (non-interactive) ---
-    r = subprocess.run(
+    r = run_doctor(
         [sys.executable, str(script), "--check", "source-sessions", "--days", "10000",
          "--project", "proj1", "--apply", "--yes"],
         capture_output=True, text=True, env=env,
@@ -114,8 +116,12 @@ def test_end_to_end_scan_apply_verify(tmp_path):
     patched_body = patched.split("---\n", 2)[-1]
     assert patched_body == original_body, "body must be byte-identical after apply"
 
-    # Backup must exist under ~/.claude/obsidian-brain-doctor-backup/<timestamp>/proj1/
-    backup_root = home / ".claude" / "obsidian-brain-doctor-backup"
+    # The real child writes backups under its selected, versioned private state.
+    from dataclasses import replace
+    from runtime_context import current_runtime_context
+    from note_transactions import session_state_path
+    actor = current_runtime_context()
+    backup_root = session_state_path(replace(actor, vault_path=vault.resolve())) / "doctor-backups"
     assert backup_root.exists(), f"backup root not created at {backup_root}"
     backups = list(backup_root.rglob("2026-04-10-stale-e2e.md"))
     assert backups, f"no backup found for the patched note under {backup_root}"
@@ -123,7 +129,7 @@ def test_end_to_end_scan_apply_verify(tmp_path):
     assert backup_content == original_text, "backup must match pre-patch content exactly"
 
     # --- 4. Re-scan → exit 0 (clean) ---
-    r = subprocess.run(
+    r = run_doctor(
         [sys.executable, str(script), "--check", "source-sessions", "--days", "10000",
          "--project", "proj1", "--json"],
         capture_output=True, text=True, env=env,
@@ -207,7 +213,7 @@ def test_json_payload_has_top_level_signal_and_convergence_keys(tmp_path):
     env["OBSIDIAN_BRAIN_INSIGHTS_FOLDER"] = "claude-insights"
 
     script = Path(__file__).parent.parent / "scripts" / "vault_doctor.py"
-    r = subprocess.run(
+    r = run_doctor(
         [sys.executable, str(script), "--check", "source-sessions", "--days", "10000",
          "--project", "convproj", "--json"],
         capture_output=True, text=True, env=env,
@@ -236,3 +242,11 @@ def test_json_payload_has_top_level_signal_and_convergence_keys(tmp_path):
             "unresolved",
             "",  # default for any future Issue lacking the field
         ), f"signal_class={issue['signal_class']!r} not in documented taxonomy"
+
+
+import pytest
+from doctor_cli_test_helpers import run_doctor
+
+@pytest.fixture(autouse=True)
+def _selected_doctor_cli_actor(selected_host_context):
+    return selected_host_context

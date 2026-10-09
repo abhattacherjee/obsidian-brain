@@ -7,6 +7,7 @@ distinctive-token + fuzzy-overlap matching. Python stdlib only.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -14,9 +15,10 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from pathlib import Path
 
-from obsidian_utils import get_workspace_roots, match_items_against_evidence
+from obsidian_utils import get_workspace_roots, match_items_against_evidence, owned_summary_source
 
 # --- Module-level compiled regexes (computed once at import) ---
 
@@ -343,7 +345,8 @@ def collect_open_items(
     project: str,
     max_sessions: int = 10,
     exclude_path: str | None = None,
-) -> list[tuple[str, int, str]]:
+    *, include_revision: bool = False,
+) -> list[tuple]:
     """Collect unchecked open items from recent session notes for a project.
 
     Filters to `type: claude-session` notes; notes without a `type:` field
@@ -376,8 +379,10 @@ def collect_open_items(
         # Single-pass: read file once, check project in frontmatter,
         # then extract open items from ## Open Questions / Next Steps
         try:
-            with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
-                lines = f.readlines()
+            with open(fpath, 'rb') as f:
+                raw = f.read()
+            source_revision = hashlib.sha256(raw).hexdigest()
+            lines = raw.decode('utf-8', errors='replace').splitlines(keepends=True)
         except OSError as exc:
             print(f"[obsidian-brain] skipping unreadable note {fname}: {exc}", file=sys.stderr)
             continue
@@ -418,7 +423,8 @@ def collect_open_items(
                     break  # next section
                 if stripped.startswith('- [ ] '):
                     item_text = stripped[6:]  # after "- [ ] "
-                    results.append((fpath, line_num, item_text))
+                    item = (fpath, line_num, item_text)
+                    results.append((*item, source_revision) if include_revision else item)
 
         if matched >= max_sessions:
             break
@@ -426,8 +432,20 @@ def collect_open_items(
     return results
 
 
+def collect_open_item_records(vault_path, sessions_folder, project, max_sessions=10, exclude_path=None):
+    """Return discovery records bound to the exact source bytes before AI."""
+    return [{"path": path, "line": line, "text": text, "source_revision": revision,
+             "project": project}
+            for path, line, text, revision in collect_open_items(
+                vault_path, sessions_folder, project, max_sessions, exclude_path,
+                include_revision=True)]
+
+
 _NOTE_EVIDENCE_WINDOW = 10  # mirrors obsidian_utils._OPEN_ITEM_EVIDENCE_WINDOW
-_SUMMARY_RE = re.compile(r"## Summary\n(.+?)(?=\n## |\Z)", re.DOTALL)
+_SUMMARY_RE = re.compile(
+    r"^## Summary[ \t]*\r?\n(.*?)(?=^#{1,2}[ \t]|\Z)",
+    re.DOTALL | re.MULTILINE,
+)
 
 
 def gather_note_completion_evidence(
@@ -515,7 +533,7 @@ def gather_note_completion_evidence(
             # without any extra gate. A guard that can never turn False is
             # not a guard; the real bound is the loop's own break condition.
             content = ''.join(lines)
-            m = _SUMMARY_RE.search(content)
+            m = _SUMMARY_RE.search(owned_summary_source(content))
             if m:
                 summary_text = m.group(1).strip()
                 if summary_text:
@@ -658,10 +676,15 @@ def dedup_note_open_items(
 
     Returns list of removed item texts (empty if no duplicates).
     """
+    from obsidian_utils import _note_write_context
+    from note_transactions import NoteMutation, apply_mutations, record_read
     try:
-        with open(note_path, 'r', encoding='utf-8') as f:
-            lines = f.readlines()
-    except OSError as exc:
+        context = _note_write_context(note_path, vault_path)
+        with open(note_path, 'r', encoding='utf-8', newline='') as f:
+            content = f.read()
+        revision = record_read(context, Path(note_path), content)
+        lines = content.splitlines(keepends=True)
+    except (OSError, ValueError) as exc:
         print(f"[obsidian-brain] dedup: cannot read {note_path}: {exc}", file=sys.stderr)
         return []
 
@@ -672,12 +695,36 @@ def dedup_note_open_items(
     if not existing:
         return []
 
+    # Summary upgrades may deduplicate only their owned region. Legacy notes
+    # without ownership markers retain the original whole-note behavior.
+    from note_transactions import _REGION, _render
+    try:
+        _render(content, {})  # Validate complete, unique, non-nested ownership.
+    except ValueError:
+        print('[obsidian-brain] dedup: malformed managed regions; note preserved.', file=sys.stderr)
+        return []
+    summary_regions = [match.span(2) for match in _REGION.finditer(content)
+                       if match.group(1) == "summary"]
+    managed = '<!-- obsidian-brain:' in content
+    eligible_lines = None
+    if managed:
+        eligible_lines = set()
+        offset = 0
+        for index, line in enumerate(lines):
+            if any(start <= offset and offset + len(line) <= end
+                   for start, end in summary_regions):
+                eligible_lines.add(index)
+            offset += len(line)
+
     # Find open items section and mark duplicates for removal
     in_section = False
     lines_to_remove: set[int] = set()
     removed_texts: list[str] = []
 
     for i, line in enumerate(lines):
+        if eligible_lines is not None and i not in eligible_lines:
+            in_section = False
+            continue
         stripped = line.strip()
         if stripped == '## Open Questions / Next Steps':
             in_section = True
@@ -700,27 +747,15 @@ def dedup_note_open_items(
     # Remove duplicate lines
     new_lines = [line for i, line in enumerate(lines) if i not in lines_to_remove]
 
-    # Atomic rewrite: temp file + rename
-    note_dir = os.path.dirname(note_path)
-    fd, tmp_path = tempfile.mkstemp(
-        prefix='.ob-dedup-', suffix='.md.tmp', dir=note_dir,
-    )
     try:
-        # Preserve original file permissions
-        try:
-            orig_mode = os.stat(note_path).st_mode
-        except OSError:
-            orig_mode = 0o644
-        with os.fdopen(fd, 'w', encoding='utf-8') as f:
-            f.writelines(new_lines)
-        os.chmod(tmp_path, orig_mode)
-        os.replace(tmp_path, note_path)
-    except OSError as exc:
+        result = apply_mutations(context, [NoteMutation(
+            Path(note_path), revision, {"document": "".join(new_lines)}, uuid.uuid4().hex,
+        )])
+        if result.status not in {"applied", "unchanged"}:
+            print(f"[obsidian-brain] dedup: atomic write failed for {note_path}: {result.status}", file=sys.stderr)
+            return []
+    except (OSError, ValueError) as exc:
         print(f"[obsidian-brain] dedup: atomic write failed for {note_path}: {exc}", file=sys.stderr)
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
         return []
 
     return removed_texts
@@ -738,6 +773,8 @@ def batch_cascade_checkoff(
     auto-checks high-confidence matches, reports fuzzy-only suggestions.
     Returns a compact summary string.
     """
+    from obsidian_utils import _note_write_context
+    from note_transactions import NoteMutation, apply_mutations, record_read
     existing = collect_open_items(vault_path, sessions_folder, project)
     if not existing:
         return "No open items found for cascading."
@@ -807,9 +844,12 @@ def batch_cascade_checkoff(
 
     for fpath, line_refs in files_to_edit.items():
         try:
-            with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
-                lines = f.readlines()
-        except OSError as exc:
+            context = _note_write_context(fpath, vault_path)
+            with open(fpath, 'r', encoding='utf-8', newline='') as f:
+                content = f.read()
+            revision = record_read(context, Path(fpath), content)
+            lines = content.splitlines(keepends=True)
+        except (OSError, ValueError) as exc:
             print(f"[obsidian-brain] cascade: cannot read {os.path.basename(fpath)}: {exc}", file=sys.stderr)
             continue
 
@@ -850,32 +890,20 @@ def batch_cascade_checkoff(
                 )
 
         if file_edit_count > 0:
-            note_dir = os.path.dirname(fpath)
-            fd, tmp_path = tempfile.mkstemp(
-                prefix='.ob-cascade-', suffix='.md.tmp', dir=note_dir,
-            )
             try:
-                # Preserve original file permissions
-                try:
-                    orig_mode = os.stat(fpath).st_mode
-                except OSError:
-                    orig_mode = 0o644
-                with os.fdopen(fd, 'w', encoding='utf-8') as f:
-                    f.writelines(lines)
-                os.chmod(tmp_path, orig_mode)
-                os.replace(tmp_path, fpath)
+                result = apply_mutations(context, [NoteMutation(
+                    Path(fpath), revision, {"document": "".join(lines)}, uuid.uuid4().hex,
+                )])
+                if result.status not in {"applied", "unchanged"}:
+                    raise OSError(f"publication {result.status}")
                 edited_files.add(os.path.basename(fpath))
                 edited_count += file_edit_count  # count only after successful write
-            except OSError as exc:
+            except (OSError, ValueError) as exc:
                 print(f"[obsidian-brain] cascade: write failed for {os.path.basename(fpath)}: {exc}", file=sys.stderr)
                 # #320 F2: file_edit_count verified flips were computed but
                 # never reached disk. Name the loss instead of letting it
                 # silently collapse into "nothing to cascade".
                 write_failures.append((fpath, file_edit_count))
-                try:
-                    os.unlink(tmp_path)
-                except OSError:
-                    pass
 
     # Build summary. #320 F3: once ANY high-confidence target existed, never
     # collapse "every one of them was refused or lost" down to the same
@@ -928,6 +956,7 @@ def batch_cascade_checkoff(
 def cascade_group_members(
     groups: list,
     source_skips: "set[tuple[str, int]] | None" = None,
+    vault_path: str | None = None,
 ) -> str:
     """Flip checkbox on every member of each group, atomically per file.
 
@@ -957,6 +986,10 @@ def cascade_group_members(
     text-verification skips (drifted or unverifiable) are appended as an
     additional line so a hook caller sees them even without stderr.
     """
+    from obsidian_utils import _note_write_context
+    from note_transactions import NoteMutation, apply_mutations, record_raw_read
+    from runtime_context import current_runtime_context
+    require_source_revision = current_runtime_context() is not None
     if source_skips is None:
         source_skips = set()
 
@@ -964,6 +997,7 @@ def cascade_group_members(
     # deduplicated. When the same key appears twice, keep the FIRST
     # non-blank text rather than letting a later blank overwrite a usable
     # anchor (#250).
+    approved_revisions = {}
     targets: dict[tuple[str, int], str] = {}  # ordered dict as ordered map
     for group in groups or []:
         for m in group.get("members", []) or []:
@@ -994,6 +1028,7 @@ def cascade_group_members(
             key = (fpath, line_num)
             if key in source_skips:
                 continue
+            approved_revisions.setdefault(fpath, []).append(m.get("source_revision"))
             # #320 F7: a member's "text" is a hint carried from merged.json,
             # not guaranteed to be a string (a corrupted cache entry could
             # hand back an int/list/dict). A non-string reaches .strip() at
@@ -1021,13 +1056,29 @@ def cascade_group_members(
     drift_skips: list[tuple[str, int]] = []
     unverifiable_skips: list[tuple[str, int]] = []  # #320 F5: blank/missing text, split from drift
     checkbox_skips: list[tuple[str, int]] = []  # #320 F4: checkbox already gone, was stderr-only
+    revision_conflicts = []
     write_failures: list[tuple[str, int]] = []  # #320 F2: verified flips lost to a failed os.replace
 
     for fpath, line_refs in files_to_lines.items():
         try:
-            with open(fpath, "r", encoding="utf-8", errors="replace") as fh:
-                lines = fh.readlines()
-        except OSError as exc:
+            context = _note_write_context(fpath, vault_path)
+            revisions = approved_revisions[fpath]
+            provided = [value for value in revisions if value is not None]
+            valid_revisions = {value for value in provided if isinstance(value, str)}
+            approved = next(iter(valid_revisions)) if len(valid_revisions) == 1 else None
+            invalid = (any(not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None for value in provided)
+                       or len(valid_revisions) > 1 or (require_source_revision and (approved is None or None in revisions)))
+            with open(fpath, "rb") as fh:
+                raw = fh.read()
+            if invalid or (approved is not None and hashlib.sha256(raw).hexdigest() != approved):
+                revision_conflicts.append(fpath)
+                print(f"[obsidian-brain] cascade_group_members: source revision conflict in {os.path.basename(fpath)}; retained unchanged", file=sys.stderr)
+                continue
+            content = raw.decode("utf-8")
+            current_revision = record_raw_read(context, Path(fpath), raw)
+            revision = approved if approved is not None else current_revision
+            lines = content.splitlines(keepends=True)
+        except (OSError, ValueError) as exc:
             print(
                 f"[obsidian-brain] cascade_group_members: cannot read "
                 f"{os.path.basename(fpath)}: {exc}",
@@ -1076,22 +1127,15 @@ def cascade_group_members(
         if file_flipped == 0:
             continue
 
-        note_dir = os.path.dirname(fpath)
-        fd, tmp_path = tempfile.mkstemp(
-            prefix=".ob-cascade-", suffix=".md.tmp", dir=note_dir,
-        )
         try:
-            try:
-                orig_mode = os.stat(fpath).st_mode
-            except OSError:
-                orig_mode = 0o644
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                fh.writelines(lines)
-            os.chmod(tmp_path, orig_mode)
-            os.replace(tmp_path, fpath)
+            result = apply_mutations(context, [NoteMutation(
+                Path(fpath), revision, {"document": "".join(lines)}, uuid.uuid4().hex,
+            )])
+            if result.status not in {"applied", "unchanged"}:
+                raise OSError(f"publication {result.status}")
             files_edited.add(os.path.basename(fpath))
             total_flipped += file_flipped
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
             print(
                 f"[obsidian-brain] cascade_group_members: write failed for "
                 f"{os.path.basename(fpath)}: {exc}",
@@ -1101,10 +1145,6 @@ def cascade_group_members(
             # reached disk. Name the loss instead of letting it silently
             # collapse into "nothing to cascade".
             write_failures.append((fpath, file_flipped))
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
 
     # #320 F3: once ANY target existed, never collapse "every one of them
     # was refused or lost" down to the same "No member lines to cascade."
@@ -1113,12 +1153,14 @@ def cascade_group_members(
     # byte-identical.
     if total_flipped:
         base = f"Cascaded {total_flipped} member-line(s) across {len(files_edited)} file(s)."
-    elif drift_skips or unverifiable_skips or checkbox_skips or write_failures:
+    elif drift_skips or unverifiable_skips or checkbox_skips or write_failures or revision_conflicts:
         base = "Cascaded 0 member-line(s) — every candidate was refused or failed to save."
     else:
         base = "No member lines to cascade."
 
     parts = [base]
+    if revision_conflicts:
+        parts.append("SOURCE REVISION CONFLICT: " + ", ".join(os.path.basename(path) for path in revision_conflicts))
     if drift_skips:
         # #250 Task 3: surface text-verification skips in the RETURN VALUE,
         # not only stderr -- a hook's caller may never show stderr.
@@ -1219,11 +1261,15 @@ def _resolve_project_paths() -> dict[str, str]:
                     result[entry] = full
         except OSError:
             continue
+    from runtime_context import current_runtime_context
+    context = current_runtime_context()
+    if context is not None and (context.canonical_project_root / '.git').exists():
+        result[context.project_name] = str(context.canonical_project_root)
     return result
 
 
 # Bounds for #264 Task 2's widened git ground truth (tags, changed_paths).
-# Kept small and deterministic — these feed a claude -p prompt payload and an
+# Kept small and deterministic — these feed a native analysis payload and an
 # L2 evidence-text blob, so an unbounded git dump would blow both budgets.
 _MAX_EVIDENCE_TAGS = 20
 _MAX_EVIDENCE_CHANGED_PATHS = 200
@@ -1237,40 +1283,50 @@ def deep_analysis_pipeline(
     sessions_folder: str,
     insights_folder: str,
     db_path: str | None = None,
+    *, operation_id=None, operation_semantic=None,
 ) -> str:
     """Single-pass deep analysis: similarity, open items, evidence gathering.
 
     Returns 'OK:<total_items>:<groups>:<projects_with_evidence>:<projects_without_repo_count>'.
-    Writes structured JSON to output_path (atomic: tempfile + rename).
+    Registers structured JSON in the selected native operation directory.
+    Requires an explicit invoking context and operation_id.
 
-    15-minute module-level cache keyed on (projects_json, vault_path,
-    sessions_folder): when /check-items and /standup deep both invoke
-    this in the same process back-to-back, the second call skips all
-    git/gh subprocess calls and returns the cached result string.
-    Cache helpers _evidence_cache_get/_evidence_cache_put expose the
-    cache for targeted unit tests without mocking the full pipeline.
-    Spec § Open questions / Cache coupling (line 699);
-    Testing test 12 (line 658). Refs #87.
+    Bound calls collect fresh evidence. Reuse belongs to the registered
+    operation artifact with verified source revisions and repository HEAD.
+    Legacy cache helpers remain available to explicit compatibility callers.
     """
+    from runtime_context import current_runtime_context
+    context = current_runtime_context()
+    if context is None:
+        raise ValueError('Pipeline requires the invoking host context')
+    if context is not None:
+        from operation_state import operation_directory, store_artifact
+        if operation_id is None:
+            raise ValueError('Bound pipeline requires an explicit operation ID')
+        _, directory = operation_directory(context, operation_id)
+        if Path(output_path).absolute().parent != directory:
+            raise ValueError('Pipeline output must belong to the selected operation')
+        if Path(vault_path).resolve() != context.vault_path.resolve():
+            raise ValueError('Pipeline cannot switch selected vault')
+
+    def publish(content):
+        store_artifact(context, operation_id, Path(output_path).name, content,
+                       semantic=operation_semantic)
+
     _ck = _cache_key(basenames, projects_json, vault_path, sessions_folder,
                      insights_folder, db_path)
     _now = time.time()
-    _cached = _evidence_cache_get(_ck, _now)
+    _cached = _evidence_cache_get(_ck, _now) if context is None else None
     if _cached is not None:
         # Warm-cache hit: skip all subprocess calls; re-write output_path so the
         # caller always finds a valid file regardless of which path was used on
         # the previous (cold-cache) call (cache key excludes output_path).
         _cached_status, _cached_json = _cached
         try:
-            out_dir = os.path.dirname(output_path) or "."
-            os.makedirs(out_dir, mode=0o700, exist_ok=True)
-            _fd, _tmp = tempfile.mkstemp(prefix=".ob-pipeline-hit-", suffix=".json", dir=out_dir)
-            with os.fdopen(_fd, 'w', encoding='utf-8') as _f:
-                _f.write(_cached_json)
-            os.chmod(_tmp, 0o600)
-            os.replace(_tmp, output_path)
-        except OSError as _exc:
-            print(f"[obsidian-brain] pipeline cache: write failed: {_exc}", file=sys.stderr)
+            publish(_cached_json)
+        except (OSError, ValueError) as exc:
+            print(f"[obsidian-brain] pipeline cache: write failed: {exc}", file=sys.stderr)
+            return f"ERROR:{exc}"
         return _cached_status
 
     import vault_index
@@ -1628,21 +1684,10 @@ def deep_analysis_pipeline(
         },
     }
 
-    # Atomic write: tempfile + rename (ensure dir exists first)
-    out_dir = os.path.dirname(output_path) or "."
-    os.makedirs(out_dir, mode=0o700, exist_ok=True)
-    fd, tmp_path = tempfile.mkstemp(prefix=".ob-pipeline-", suffix=".json", dir=out_dir)
     try:
-        with os.fdopen(fd, 'w', encoding='utf-8') as f:
-            json.dump(output_data, f, indent=2)
-        os.chmod(tmp_path, 0o600)
-        os.replace(tmp_path, output_path)
-    except OSError as exc:
+        publish(json.dumps(output_data, indent=2))
+    except (OSError, ValueError) as exc:
         print(f"[obsidian-brain] pipeline: write failed: {exc}", file=sys.stderr)
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
         return f"ERROR:{exc}"
 
     total = len(all_raw_items)
@@ -1657,7 +1702,8 @@ def deep_analysis_pipeline(
         print(f"[obsidian-brain] cache skip: couldn't serialise output_data ({exc})",
               file=sys.stderr)
         return _result
-    _evidence_cache_put(_ck, (_result, _output_json_str), _now)
+    if context is None:
+        _evidence_cache_put(_ck, (_result, _output_json_str), _now)
     return _result
 
 
@@ -1948,7 +1994,13 @@ def merge_groups_semantically(coarse_groups):
     if not flat_groups:
         return coarse_groups
 
-    workdir = _check_items_workdir()
+    from runtime_context import current_runtime_context
+    context = current_runtime_context()
+    if context is not None:
+        from operation_state import operation_directory
+        _, workdir = operation_directory(context)
+    else:
+        workdir = _check_items_workdir()
     _unique = f"{os.getpid()}-{time.time_ns()}"
     in_path = workdir / f"semantic-merge-{_unique}.in.json"
     out_path = workdir / f"semantic-merge-{_unique}.out.json"
@@ -1984,8 +2036,9 @@ def merge_groups_semantically(coarse_groups):
             return coarse_groups
         return flat_groups
 
-    in_path.write_text(payload_str, encoding="utf-8")
-    os.chmod(str(in_path), 0o600)
+    if context is None:
+        in_path.write_text(payload_str, encoding="utf-8")
+        os.chmod(str(in_path), 0o600)
 
     cli_path = os.path.join(os.path.dirname(__file__), "check_items_cli.py")
     attempt = 0
@@ -1993,13 +2046,20 @@ def merge_groups_semantically(coarse_groups):
     while attempt < 2:
         attempt += 1
         try:
-            cp = subprocess.run(
-                ["python3", cli_path, "semantic_merge", str(out_path)],
-                input=in_path.read_text(),
-                capture_output=True,
-                text=True,
-                timeout=_outer_subagent_timeout(),
-            )
+            if context is not None:
+                from check_items_cli import run_semantic_merge
+                from types import SimpleNamespace
+                cp = SimpleNamespace(returncode=run_semantic_merge(payload_str, str(out_path)), stderr="")
+            else:
+                cp = subprocess.run(
+                    ["python3", cli_path, "semantic_merge", str(out_path)],
+                    input=in_path.read_text(),
+                    capture_output=True,
+                    text=True,
+                    timeout=_outer_subagent_timeout(),
+                )
+            if context is not None and cp.returncode in {7, 8}:
+                break
             if cp.returncode != 0 or not out_path.exists():
                 continue
             merge_map = json.loads(out_path.read_text())
@@ -2094,8 +2154,9 @@ def merge_records_from_groups(groups) -> list:
 
 
 def _check_items_workdir():
-    """Return the 0o700 workdir under ~/.claude/obsidian-brain."""
-    p = Path.home() / ".claude" / "obsidian-brain"
+    """Return selected private state or the named legacy compatibility workdir."""
+    from runtime_adapters import private_workdir
+    p = private_workdir()
     p.mkdir(mode=0o700, parents=True, exist_ok=True)
     return p
 
@@ -2165,7 +2226,7 @@ def classify_groups_with_agent(merged_groups, evidence):
 
     Sets `_LAST_CLASSIFIER_MODE` to one of three values:
       - 'ok': every input group_id came back classified.
-      - 'partial': validation succeeded but some group_ids in
+      - 'partial': the unbound compatibility path validated but some group_ids in
         `merged_groups` are missing from the returned records (a chunked
         run can now succeed partially, #297 defect 2). Returns the
         records that did come back; the caller fills the missing
@@ -2185,7 +2246,13 @@ def classify_groups_with_agent(merged_groups, evidence):
     if not merged_groups:
         return []
 
-    workdir = _check_items_workdir()
+    from runtime_context import current_runtime_context
+    context = current_runtime_context()
+    if context is not None:
+        from operation_state import operation_directory
+        _, workdir = operation_directory(context)
+    else:
+        workdir = _check_items_workdir()
     _unique = f"{os.getpid()}-{time.time_ns()}"
     in_path = workdir / f"classify-{_unique}.in.json"
     out_path = workdir / f"classify-{_unique}.out.json"
@@ -2232,8 +2299,9 @@ def classify_groups_with_agent(merged_groups, evidence):
                 pass
         return []
 
-    in_path.write_text(payload_str, encoding="utf-8")
-    os.chmod(str(in_path), 0o600)
+    if context is None:
+        in_path.write_text(payload_str, encoding="utf-8")
+        os.chmod(str(in_path), 0o600)
 
     cli_path = os.path.join(os.path.dirname(__file__), "check_items_cli.py")
     parsed = None
@@ -2241,13 +2309,18 @@ def classify_groups_with_agent(merged_groups, evidence):
     while attempt < 2:
         attempt += 1
         try:
-            cp = subprocess.run(
-                ["python3", cli_path, "classifier", str(out_path)],
-                input=in_path.read_text(),
-                capture_output=True,
-                text=True,
-                timeout=_outer_subagent_timeout(),
-            )
+            if context is not None:
+                from check_items_cli import run_classifier
+                from types import SimpleNamespace
+                cp = SimpleNamespace(returncode=run_classifier(payload_str, str(out_path)), stderr="")
+            else:
+                cp = subprocess.run(
+                    ["python3", cli_path, "classifier", str(out_path)],
+                    input=in_path.read_text(),
+                    capture_output=True,
+                    text=True,
+                    timeout=_outer_subagent_timeout(),
+                )
             if cp.returncode != 0 or not out_path.exists():
                 _tail = (cp.stderr or "").strip()[-800:]
                 print(
@@ -2256,6 +2329,10 @@ def classify_groups_with_agent(merged_groups, evidence):
                     + (f"; child stderr: {_tail}" if _tail else ""),
                     file=sys.stderr,
                 )
+                # The bound CLI has already used its per-chunk retry budget.
+                # Retry only a successful output rejected locally below.
+                if context is not None and cp.returncode != 0:
+                    break
                 continue
             candidate = json.loads(out_path.read_text())
             # I4: warn early (pre-validation) so the diagnostic is always
@@ -2291,29 +2368,35 @@ def classify_groups_with_agent(merged_groups, evidence):
             pass
 
     if parsed is None:
-        print(
-            f"[check-items] classifier FAILED after {attempt} attempt(s); "
-            f"falling back to the token-overlap heuristic for all "
-            f"{len(merged_groups)} group(s). Heuristic citations are token "
-            f"co-occurrence, not evidence — verify before accepting any DONE.",
-            file=sys.stderr,
-        )
+        if context is not None:
+            print(
+                f"[check-items] classifier FAILED after {attempt} attempt(s); "
+                "operation remains pending; no classification was published "
+                f"for {len(merged_groups)} group(s).",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"[check-items] classifier FAILED after {attempt} attempt(s); "
+                f"falling back to the token-overlap heuristic for all "
+                f"{len(merged_groups)} group(s). Heuristic citations are token "
+                f"co-occurrence, not evidence — verify before accepting any DONE.",
+                file=sys.stderr,
+            )
         _LAST_CLASSIFIER_MODE = "heuristic-fallback"
         return []
 
-    _returned_ids = {r.get("group_id") for r in parsed}
-    _missing = [g.get("group_id") for g in merged_groups
-                if g.get("group_id") not in _returned_ids]
-    if _missing:
-        # A chunked run can now succeed partially (#297 defect 2). The caller
-        # fills exactly these group_ids from the heuristic.
+    _returned_ids = [record.get("group_id") for record in parsed]
+    _expected_ids = {group.get("group_id") for group in merged_groups}
+    if len(_returned_ids) != len(set(_returned_ids)) or not set(_returned_ids).issubset(_expected_ids):
+        _LAST_CLASSIFIER_MODE = "heuristic-fallback"
+        return []
+    missing_ids = _expected_ids - set(_returned_ids)
+    if missing_ids:
         _LAST_CLASSIFIER_MODE = "partial"
-        print(
-            f"[check-items] classifier PARTIAL: {len(_missing)} of "
-            f"{len(merged_groups)} group(s) were not classified by the agent "
-            f"and will fall back to the heuristic.",
-            file=sys.stderr,
-        )
+        print(f"[check-items] classifier PARTIAL: {len(missing_ids)} of "
+              f"{len(merged_groups)} group(s) remain unclassified and will not be applied.",
+              file=sys.stderr)
 
     # #297: stamp provenance on every record the agent path actually
     # returned, so a downstream heuristic-only cap (assign_tier) and cache
@@ -3123,7 +3206,7 @@ def partition_for_review(classifications, show_all=False):
 def verify_before_edit(file_path: str, line_number: int, expected_text: str) -> bool:
     """
     Re-read target line and compare against expected text BEFORE flipping
-    a checkbox via Edit tool.
+    a checkbox through revision-bound publication.
 
     Strips the checkbox prefix (`- [ ]`, `- [x]`, `- [X]`) and surrounding
     whitespace from the file side before comparing to `expected_text`. The
@@ -3132,7 +3215,7 @@ def verify_before_edit(file_path: str, line_number: int, expected_text: str) -> 
     out-of-range line, or read error.
 
     Memory feedback_open_item_checkoff_verify_before_edit: verification
-    is mandatory before Edit-tool dispatch.
+    is mandatory before publishing a checkoff.
     """
     try:
         with open(file_path, "r", encoding="utf-8") as f:

@@ -1,0 +1,2093 @@
+{
+  "schema": 1,
+  "implementation_status": "Task6 draft; required acceptance pending",
+  "clients": {
+    "claude-code": {
+      "status": "unsupported:acceptance-pending"
+    },
+    "codex-cli": {
+      "status": "unsupported:acceptance-pending"
+    },
+    "codex-desktop": {
+      "status": "unsupported:desktop-dispatch-not-observed"
+    }
+  },
+  "capabilities": [
+    {
+      "id": "capture.normalization",
+      "required": true,
+      "calls": [
+        "capture_checkpoint",
+        "transcripts.read_records"
+      ],
+      "hosts": {
+        "claude": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        },
+        "codex": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        }
+      }
+    },
+    {
+      "id": "capture.recovery",
+      "required": true,
+      "calls": [
+        "recover_pending",
+        "recover_registered"
+      ],
+      "hosts": {
+        "claude": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        },
+        "codex": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        }
+      }
+    },
+    {
+      "id": "writer.atomic_revision",
+      "required": true,
+      "calls": [
+        "apply_mutations",
+        "write_vault_note",
+        "flip_note_status",
+        "upgrade_note_with_summary",
+        "note_transactions.read_revision",
+        "note_transactions.record_read",
+        "note_transactions.record_raw_read",
+        "note_transactions.context_for_vault",
+        "note_writer._atomic_rewrite"
+      ],
+      "hosts": {
+        "claude": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        },
+        "codex": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        }
+      }
+    },
+    {
+      "id": "writer.delete_move",
+      "required": true,
+      "calls": [
+        "delete_note",
+        "move_note"
+      ],
+      "hosts": {
+        "claude": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        },
+        "codex": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        }
+      }
+    },
+    {
+      "id": "writer.checkbox",
+      "required": true,
+      "calls": [
+        "cascade_group_members",
+        "batch_cascade_checkoff",
+        "dedup_note_open_items",
+        "run_batch_edit"
+      ],
+      "hosts": {
+        "claude": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        },
+        "codex": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        }
+      }
+    },
+    {
+      "id": "cli.brain",
+      "required": true,
+      "calls": [
+        "brain_cli.main"
+      ],
+      "hosts": {
+        "claude": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        },
+        "codex": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        }
+      }
+    },
+    {
+      "id": "cli.wiki",
+      "required": true,
+      "calls": [
+        "wiki.main",
+        "wiki.rebuild_wiki_index",
+        "wiki.append_log",
+        "wiki.file_page",
+        "wiki.lookup",
+        "wiki.stale",
+        "wiki.count_sources",
+        "wiki.memgrep"
+      ],
+      "hosts": {
+        "claude": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        },
+        "codex": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        }
+      }
+    },
+    {
+      "id": "ai.native_selection",
+      "required": true,
+      "calls": [
+        "execute_ai",
+        "run_classifier",
+        "run_semantic_merge"
+      ],
+      "hosts": {
+        "claude": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        },
+        "codex": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        }
+      }
+    },
+    {
+      "id": "lookup.full_origin",
+      "required": true,
+      "calls": [
+        "find_existing_session",
+        "obsidian_utils.read_note_metadata"
+      ],
+      "hosts": {
+        "claude": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        },
+        "codex": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        }
+      }
+    },
+    {
+      "id": "config.isolation",
+      "required": true,
+      "calls": [
+        "resolve_runtime_context"
+      ],
+      "hosts": {
+        "claude": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        },
+        "codex": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        }
+      }
+    },
+    {
+      "id": "environment.invokinghost",
+      "required": true,
+      "calls": [],
+      "hosts": {
+        "claude": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        },
+        "codex": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        }
+      }
+    },
+    {
+      "id": "capture.fork",
+      "required": true,
+      "calls": [],
+      "hosts": {
+        "claude": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        },
+        "codex": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        }
+      }
+    },
+    {
+      "id": "writer.migration",
+      "required": true,
+      "calls": [],
+      "hosts": {
+        "claude": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        },
+        "codex": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        }
+      }
+    },
+    {
+      "id": "golden.shared_contracts",
+      "required": true,
+      "calls": [],
+      "hosts": {
+        "claude": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        },
+        "codex": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        }
+      }
+    },
+    {
+      "id": "memory.native_discovery",
+      "required": false,
+      "calls": [
+        "memory_sources",
+        "collect_memory_sources",
+        "vault_doctor_checks.memory_index._scan_claude_memory"
+      ],
+      "hosts": {
+        "claude": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        },
+        "codex": {
+          "status": "unsupported:no-verified-native-memory-adapter",
+          "version_range": null,
+          "fixture_provenance": []
+        }
+      },
+      "boundary": "Never borrow Claude native memory for an invoking Codex context."
+    },
+    {
+      "id": "installation.fresh_upgrade",
+      "required": true,
+      "calls": [],
+      "hosts": {
+        "claude": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        },
+        "codex": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        }
+      }
+    },
+    {
+      "id": "installation.rollback",
+      "required": true,
+      "calls": [],
+      "hosts": {
+        "claude": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        },
+        "codex": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        }
+      }
+    },
+    {
+      "id": "installation.writer_compatibility",
+      "required": true,
+      "calls": [],
+      "hosts": {
+        "claude": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        },
+        "codex": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        }
+      }
+    },
+    {
+      "id": "skill.check-items",
+      "required": true,
+      "calls": [],
+      "hosts": {
+        "claude": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        },
+        "codex": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        }
+      }
+    },
+    {
+      "id": "skill.compress",
+      "required": true,
+      "calls": [],
+      "hosts": {
+        "claude": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        },
+        "codex": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        }
+      }
+    },
+    {
+      "id": "skill.consolidate",
+      "required": true,
+      "calls": [],
+      "hosts": {
+        "claude": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        },
+        "codex": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        }
+      }
+    },
+    {
+      "id": "skill.decide",
+      "required": true,
+      "calls": [],
+      "hosts": {
+        "claude": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        },
+        "codex": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        }
+      }
+    },
+    {
+      "id": "skill.dev-test",
+      "required": true,
+      "calls": [],
+      "hosts": {
+        "claude": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        },
+        "codex": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        }
+      }
+    },
+    {
+      "id": "skill.emerge",
+      "required": true,
+      "calls": [],
+      "hosts": {
+        "claude": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        },
+        "codex": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        }
+      }
+    },
+    {
+      "id": "skill.error-log",
+      "required": true,
+      "calls": [],
+      "hosts": {
+        "claude": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        },
+        "codex": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        }
+      }
+    },
+    {
+      "id": "skill.link",
+      "required": true,
+      "calls": [],
+      "hosts": {
+        "claude": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        },
+        "codex": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        }
+      }
+    },
+    {
+      "id": "skill.obsidian-setup",
+      "required": true,
+      "calls": [],
+      "hosts": {
+        "claude": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        },
+        "codex": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        }
+      }
+    },
+    {
+      "id": "skill.recall",
+      "required": true,
+      "calls": [],
+      "hosts": {
+        "claude": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        },
+        "codex": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        }
+      }
+    },
+    {
+      "id": "skill.retro",
+      "required": true,
+      "calls": [],
+      "hosts": {
+        "claude": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        },
+        "codex": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        }
+      }
+    },
+    {
+      "id": "skill.standup",
+      "required": true,
+      "calls": [],
+      "hosts": {
+        "claude": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        },
+        "codex": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        }
+      }
+    },
+    {
+      "id": "skill.vault-ask",
+      "required": true,
+      "calls": [],
+      "hosts": {
+        "claude": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        },
+        "codex": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        }
+      }
+    },
+    {
+      "id": "skill.vault-config",
+      "required": true,
+      "calls": [],
+      "hosts": {
+        "claude": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        },
+        "codex": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        }
+      }
+    },
+    {
+      "id": "skill.vault-doctor",
+      "required": true,
+      "calls": [],
+      "hosts": {
+        "claude": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        },
+        "codex": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        }
+      }
+    },
+    {
+      "id": "skill.vault-import",
+      "required": true,
+      "calls": [],
+      "hosts": {
+        "claude": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        },
+        "codex": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        }
+      }
+    },
+    {
+      "id": "skill.vault-reindex",
+      "required": true,
+      "calls": [],
+      "hosts": {
+        "claude": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        },
+        "codex": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        }
+      }
+    },
+    {
+      "id": "skill.vault-search",
+      "required": true,
+      "calls": [
+        "vault_scan.main"
+      ],
+      "hosts": {
+        "claude": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        },
+        "codex": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        }
+      }
+    },
+    {
+      "id": "skill.vault-stats",
+      "required": true,
+      "calls": [],
+      "hosts": {
+        "claude": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        },
+        "codex": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        }
+      }
+    },
+    {
+      "id": "doctor.audit_historic_repairs",
+      "required": true,
+      "calls": [
+        "vault_doctor_checks.audit_historic_repairs.scan",
+        "vault_doctor_checks.audit_historic_repairs.apply"
+      ],
+      "hosts": {
+        "claude": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        },
+        "codex": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        }
+      }
+    },
+    {
+      "id": "doctor.crossed_source_session",
+      "required": true,
+      "calls": [
+        "vault_doctor_checks.crossed_source_session.scan",
+        "vault_doctor_checks.crossed_source_session.apply"
+      ],
+      "hosts": {
+        "claude": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        },
+        "codex": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        }
+      }
+    },
+    {
+      "id": "doctor.encoding_corruption",
+      "required": true,
+      "calls": [
+        "vault_doctor_checks.encoding_corruption.scan",
+        "vault_doctor_checks.encoding_corruption.apply"
+      ],
+      "hosts": {
+        "claude": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        },
+        "codex": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        }
+      }
+    },
+    {
+      "id": "doctor.memory_index",
+      "required": true,
+      "calls": [
+        "vault_doctor_checks.memory_index.scan",
+        "vault_doctor_checks.memory_index.apply"
+      ],
+      "hosts": {
+        "claude": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        },
+        "codex": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        }
+      }
+    },
+    {
+      "id": "doctor.missing_frontmatter_fence",
+      "required": true,
+      "calls": [
+        "vault_doctor_checks.missing_frontmatter_fence.scan",
+        "vault_doctor_checks.missing_frontmatter_fence.apply"
+      ],
+      "hosts": {
+        "claude": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        },
+        "codex": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        }
+      }
+    },
+    {
+      "id": "doctor.project_name_canonicalization",
+      "required": true,
+      "calls": [
+        "vault_doctor_checks.project_name_canonicalization.scan",
+        "vault_doctor_checks.project_name_canonicalization.apply"
+      ],
+      "hosts": {
+        "claude": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        },
+        "codex": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        }
+      }
+    },
+    {
+      "id": "doctor.project_name_normalization",
+      "required": true,
+      "calls": [
+        "vault_doctor_checks.project_name_normalization.scan",
+        "vault_doctor_checks.project_name_normalization.apply"
+      ],
+      "hosts": {
+        "claude": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        },
+        "codex": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        }
+      }
+    },
+    {
+      "id": "doctor.session_coverage",
+      "required": true,
+      "calls": [
+        "vault_doctor_checks.session_coverage.scan",
+        "vault_doctor_checks.session_coverage.apply"
+      ],
+      "hosts": {
+        "claude": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        },
+        "codex": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        }
+      }
+    },
+    {
+      "id": "doctor.snapshot_integrity",
+      "required": true,
+      "calls": [
+        "vault_doctor_checks.snapshot_integrity.scan",
+        "vault_doctor_checks.snapshot_integrity.apply"
+      ],
+      "hosts": {
+        "claude": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        },
+        "codex": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        }
+      }
+    },
+    {
+      "id": "doctor.snapshot_migration",
+      "required": true,
+      "calls": [
+        "vault_doctor_checks.snapshot_migration.scan",
+        "vault_doctor_checks.snapshot_migration.apply"
+      ],
+      "hosts": {
+        "claude": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        },
+        "codex": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        }
+      }
+    },
+    {
+      "id": "doctor.source_sessions",
+      "required": true,
+      "calls": [
+        "vault_doctor_checks.source_sessions.scan",
+        "vault_doctor_checks.source_sessions.apply"
+      ],
+      "hosts": {
+        "claude": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        },
+        "codex": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        }
+      }
+    },
+    {
+      "id": "doctor.spurious_wikilinks",
+      "required": true,
+      "calls": [
+        "vault_doctor_checks.spurious_wikilinks.scan",
+        "vault_doctor_checks.spurious_wikilinks.apply"
+      ],
+      "hosts": {
+        "claude": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        },
+        "codex": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        }
+      }
+    },
+    {
+      "id": "doctor.wiki_pages",
+      "required": true,
+      "calls": [
+        "vault_doctor_checks.wiki_pages.scan",
+        "vault_doctor_checks.wiki_pages.apply"
+      ],
+      "hosts": {
+        "claude": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        },
+        "codex": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        }
+      }
+    },
+    {
+      "id": "claude_native_format",
+      "required": false,
+      "normalization_contract": "capture.normalization",
+      "calls": [
+        "transcripts.claude.parse_rows",
+        "transcripts.claude.read_records",
+        "ai_adapters.claude.execute",
+        "vault_doctor_checks.wiki_pages._read_config",
+        "vault_doctor_checks.session_coverage._scan_claude_legacy",
+        "vault_doctor_checks.session_coverage._decode_legacy_replay"
+      ],
+      "hosts": {
+        "claude": {
+          "status": "supported",
+          "version_range": "fixture-defined",
+          "fixture_provenance": [
+            "tests/fixtures/hosts/claude"
+          ]
+        },
+        "codex": {
+          "status": "unsupported:claude-record-format",
+          "version_range": null,
+          "fixture_provenance": []
+        }
+      },
+      "description": "Claude native JSONL and CLI envelope/modelUsage schemas; shared backend dispatch is separate."
+    },
+    {
+      "id": "codex_native_format",
+      "required": false,
+      "normalization_contract": "capture.normalization",
+      "calls": [
+        "transcripts.codex.parse_rows",
+        "transcripts.codex.read_records",
+        "ai_adapters.codex.execute",
+        "ai_adapters.codex.discover_restrictions"
+      ],
+      "hosts": {
+        "codex": {
+          "status": "supported",
+          "version_range": "fixture-defined",
+          "fixture_provenance": [
+            "tests/fixtures/hosts/codex"
+          ]
+        },
+        "claude": {
+          "status": "unsupported:codex-record-format",
+          "version_range": null,
+          "fixture_provenance": []
+        }
+      },
+      "description": "Codex native JSONL, RPC/config and exec-envelope schemas; shared backend dispatch is separate."
+    },
+    {
+      "id": "memory.shared_retrieval",
+      "required": true,
+      "calls": [
+        "wiki.count_sources",
+        "wiki.memgrep",
+        "wiki.file_page"
+      ],
+      "hosts": {
+        "claude": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        },
+        "codex": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        }
+      }
+    },
+    {
+      "id": "cli.doctor",
+      "required": true,
+      "calls": [
+        "vault_doctor.main"
+      ],
+      "hosts": {
+        "claude": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        },
+        "codex": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        }
+      }
+    },
+    {
+      "id": "skill.dispatch",
+      "required": true,
+      "calls": [
+        "skill_procedures.run_operation"
+      ],
+      "hosts": {
+        "claude": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        },
+        "codex": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        }
+      }
+    },
+    {
+      "id": "state.auxiliary_identity",
+      "required": true,
+      "calls": [
+        "session_auxiliary_state.directory",
+        "session_auxiliary_state.cache_get",
+        "session_auxiliary_state.cache_update",
+        "session_auxiliary_state.first_seen_date"
+      ],
+      "hosts": {
+        "claude": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        },
+        "codex": {
+          "status": "unsupported:acceptance-pending",
+          "version_range": null,
+          "fixture_provenance": []
+        }
+      },
+      "boundary": "Private state is scoped to vault, host, native session, and canonical project."
+    }
+  ],
+  "launchers": [
+    {
+      "source": "tests/test_native_entry_binding.py",
+      "expression": "subprocess.run(['/usr/bin/codesign', '--force', '--sign', '-', str(executable)], stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10)",
+      "source_sha256": "275a7b4b43f6fad7cf087182df388b0175dea3d467aa7facbecbf89774d262e4",
+      "scope": "structural",
+      "reason": "Private copied-Python argv controls only: macOS ad-hoc signs the disposable fixture executable, then Python launches that fixture to inspect actual kernel argv boundaries. No native client, model, credentials, installed binaries or live stores are used. This is synthetic launcher validation, not native acceptance."
+    },
+    {
+      "source": "tests/test_native_entry_binding.py",
+      "expression": "subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10)",
+      "source_sha256": "275a7b4b43f6fad7cf087182df388b0175dea3d467aa7facbecbf89774d262e4",
+      "scope": "structural",
+      "reason": "Private copied-Python argv controls only: macOS ad-hoc signs the disposable fixture executable, then Python launches that fixture to inspect actual kernel argv boundaries. No native client, model, credentials, installed binaries or live stores are used. This is synthetic launcher validation, not native acceptance."
+    },
+    {
+      "source": "tests/test_native_entry_binding.py",
+      "expression": "subprocess.run(command, shell=True, env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=5)",
+      "source_sha256": "275a7b4b43f6fad7cf087182df388b0175dea3d467aa7facbecbf89774d262e4",
+      "scope": "structural",
+      "reason": "Disposable installed-entry recorder checks the four Codex descriptor shell expansions, including missing and invalid pre-launch declarations and paths with spaces. It launches no native client, model, hook runtime or live store; this check does not certify native dispatch."
+    },
+    {
+      "source": "hooks/ai_backend.py",
+      "expression": "subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=cwd, env=env, start_new_session=True, umask=63)",
+      "source_sha256": "0ae6c929a067d438495479e09f9bae8eff30733e3e61332fe6b6239c6d586123",
+      "scope": "support",
+      "reason": "Bounded transport for the already-selected native adapter. Shared execute_ai selection is required separately; native protocol adapter tests may test one host."
+    },
+    {
+      "source": "hooks/obsidian_utils.py",
+      "expression": "subprocess.run(['git', 'rev-parse', '--git-common-dir'], capture_output=True, text=True, timeout=5, cwd=cwd or None)",
+      "source_sha256": "964f739ca30478a9086e01da4d9924283d3bbf06951b309cd64c4c71d39a195d",
+      "scope": "support",
+      "reason": "Bounded or disposable-repository Git metadata/setup. The enclosing native operation keeps its separate host contract."
+    },
+    {
+      "source": "hooks/obsidian_utils.py",
+      "expression": "subprocess.run(['find', str(projects_dir), '-name', target, '-type', 'f', '-print', '-quit'], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=5)",
+      "source_sha256": "964f739ca30478a9086e01da4d9924283d3bbf06951b309cd64c4c71d39a195d",
+      "scope": "support",
+      "reason": "Legacy Claude transcript location compatibility. Bound native contexts return only their selected transcript before this call."
+    },
+    {
+      "source": "hooks/obsidian_utils.py",
+      "expression": "subprocess.run(['git', 'rev-parse', '--abbrev-ref', 'HEAD'], capture_output=True, text=True, timeout=5, cwd=cwd or None)",
+      "source_sha256": "964f739ca30478a9086e01da4d9924283d3bbf06951b309cd64c4c71d39a195d",
+      "scope": "support",
+      "reason": "Bounded or disposable-repository Git metadata/setup. The enclosing native operation keeps its separate host contract."
+    },
+    {
+      "source": "hooks/open_item_dedup.py",
+      "expression": "subprocess.run(['git', 'log', '--oneline', '-40'], cwd=repo_path, capture_output=True, text=True, timeout=10)",
+      "source_sha256": "64ea25c05a14da16ee108917f0b5487c407d52cd6f0ddaf5aab61e6e1bf73de3",
+      "scope": "support",
+      "reason": "Bounded or disposable-repository Git metadata/setup. The enclosing native operation keeps its separate host contract."
+    },
+    {
+      "source": "hooks/open_item_dedup.py",
+      "expression": "subprocess.run(['git', 'tag', '--list', '--sort=-creatordate'], cwd=repo_path, capture_output=True, text=True, timeout=10)",
+      "source_sha256": "64ea25c05a14da16ee108917f0b5487c407d52cd6f0ddaf5aab61e6e1bf73de3",
+      "scope": "support",
+      "reason": "Bounded or disposable-repository Git metadata/setup. The enclosing native operation keeps its separate host contract."
+    },
+    {
+      "source": "hooks/open_item_dedup.py",
+      "expression": "subprocess.run(['git', 'log', '--name-only', '--pretty=format:', '-40'], cwd=repo_path, capture_output=True, text=True, timeout=10)",
+      "source_sha256": "64ea25c05a14da16ee108917f0b5487c407d52cd6f0ddaf5aab61e6e1bf73de3",
+      "scope": "support",
+      "reason": "Bounded or disposable-repository Git metadata/setup. The enclosing native operation keeps its separate host contract."
+    },
+    {
+      "source": "hooks/open_item_dedup.py",
+      "expression": "subprocess.run(['gh', 'release', 'list', '--limit', '5'], cwd=repo_path, capture_output=True, text=True, timeout=10)",
+      "source_sha256": "64ea25c05a14da16ee108917f0b5487c407d52cd6f0ddaf5aab61e6e1bf73de3",
+      "scope": "support",
+      "reason": "Read-only release, PR, or issue metadata for the explicit repository. No native session or model is selected here."
+    },
+    {
+      "source": "hooks/open_item_dedup.py",
+      "expression": "subprocess.run(['gh', 'pr', 'list', '--state', 'merged', '--limit', '20', '--json', 'number,title,mergedAt,url'], cwd=repo_path, capture_output=True, text=True, timeout=10)",
+      "source_sha256": "64ea25c05a14da16ee108917f0b5487c407d52cd6f0ddaf5aab61e6e1bf73de3",
+      "scope": "support",
+      "reason": "Read-only release, PR, or issue metadata for the explicit repository. No native session or model is selected here."
+    },
+    {
+      "source": "hooks/open_item_dedup.py",
+      "expression": "subprocess.run(['gh', 'issue', 'list', '--state', 'closed', '--limit', '20', '--json', 'number,title,closedAt,body,url'], cwd=repo_path, capture_output=True, text=True, timeout=10)",
+      "source_sha256": "64ea25c05a14da16ee108917f0b5487c407d52cd6f0ddaf5aab61e6e1bf73de3",
+      "scope": "support",
+      "reason": "Read-only release, PR, or issue metadata for the explicit repository. No native session or model is selected here."
+    },
+    {
+      "source": "hooks/open_item_dedup.py",
+      "expression": "subprocess.run(['python3', cli_path, 'semantic_merge', str(out_path)], input=in_path.read_text(), capture_output=True, text=True, timeout=_outer_subagent_timeout())",
+      "source_sha256": "64ea25c05a14da16ee108917f0b5487c407d52cd6f0ddaf5aab61e6e1bf73de3",
+      "capability": "ai.native_selection"
+    },
+    {
+      "source": "hooks/open_item_dedup.py",
+      "expression": "subprocess.run(['python3', cli_path, 'classifier', str(out_path)], input=in_path.read_text(), capture_output=True, text=True, timeout=_outer_subagent_timeout())",
+      "source_sha256": "64ea25c05a14da16ee108917f0b5487c407d52cd6f0ddaf5aab61e6e1bf73de3",
+      "capability": "ai.native_selection"
+    },
+    {
+      "source": "hooks/skill_procedures.py",
+      "expression": "subprocess.run(['git', '-C', repo_path, 'rev-parse', 'HEAD'], capture_output=True, text=True, timeout=10)",
+      "source_sha256": "2b33246f0b5da66e41e3dd369ea394af4457d032be6bf39f5069132a0cf25377",
+      "scope": "support",
+      "reason": "Bounded or disposable-repository Git metadata/setup. The enclosing native operation keeps its separate host contract."
+    },
+    {
+      "source": "hooks/skill_procedures.py",
+      "expression": "subprocess.run(command, env=environment, stdin=subprocess.DEVNULL, timeout=120)",
+      "source_sha256": "2b33246f0b5da66e41e3dd369ea394af4457d032be6bf39f5069132a0cf25377",
+      "capability": "installation.fresh_upgrade"
+    },
+    {
+      "source": "hooks/vault_index.py",
+      "expression": "subprocess.run(['git', 'rev-parse', '--abbrev-ref', 'HEAD'], capture_output=True, text=True, timeout=5)",
+      "source_sha256": "d74f0b2942c5448525c3b712b4930e67922db98c409fee6ca17ccc6c32d0f51f",
+      "scope": "support",
+      "reason": "Bounded or disposable-repository Git metadata/setup. The enclosing native operation keeps its separate host contract."
+    },
+    {
+      "source": "scripts/vault_doctor_checks/project_name_canonicalization.py",
+      "expression": "subprocess.run(['git', '-C', project_path, 'rev-parse', '--git-common-dir'], capture_output=True, text=True, timeout=_GIT_TIMEOUT, env=env)",
+      "source_sha256": "f1356f66e418965b1b7c5520d957536da2e3b7a729cfac15ba1e07aa27f397ec",
+      "capability": "doctor.project_name_canonicalization"
+    },
+    {
+      "source": "scripts/vault_doctor_checks/session_coverage.py",
+      "expression": "subprocess.run(cmd, capture_output=True, text=True, timeout=120)",
+      "source_sha256": "500cf6bbd61cf3dbb53f186b29bd969deec357b0c89fb4a36d23d9231983639e",
+      "capability": "doctor.session_coverage"
+    },
+    {
+      "source": "tests/doctor_cli_test_helpers.py",
+      "expression": "subprocess.run([sys.executable, '-c', child, actor.host, actor.client, str(actor.config_path), str(root), actor.native_session_id, str(actor.canonical_project_root), vault, *command[2:]], env=environment, stdin=subprocess.DEVNULL, timeout=timeout, **kwargs)",
+      "capability": "cli.doctor",
+      "source_sha256": "1ce3b096f8cf9bca55352fdd6c1cd6400477652e9f2959accde36de91405644f"
+    },
+    {
+      "source": "tests/test_brain_cli.py",
+      "expression": "subprocess.run([sys.executable, str(script), '--host', runtime_case['host'], '--client', 'codex-cli' if runtime_case['host'] == 'codex' else 'claude-code', 'context'], input='[' * 2000 + ']' * 2000, text=True, capture_output=True, cwd=runtime_case['worktree'], timeout=5)",
+      "capability": "cli.brain",
+      "source_sha256": "4ef980de6dc45e69aecd9ab6d7805d6dfbcf80046c64d56984a70478611c968d"
+    },
+    {
+      "source": "tests/test_check_items_cache.py",
+      "expression": "subprocess.Popen([sys.executable, '-c', code, os.path.abspath(HOOKS_DIR), str(lock)], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)",
+      "source_sha256": "288b0a33bf2765a2a411dadbd47250872d7d40860ad36b9ddef0310f0567df9c",
+      "scope": "support",
+      "reason": "Disposable child tests OS lock release/bounded lock acquisition. Native cache identity is covered by separate required calls."
+    },
+    {
+      "source": "tests/test_check_items_cache.py",
+      "expression": "subprocess.run([sys.executable, '-c', prog, hooks, str(tmp_path / 'cache.lock')], capture_output=True, text=True, timeout=20)",
+      "source_sha256": "288b0a33bf2765a2a411dadbd47250872d7d40860ad36b9ddef0310f0567df9c",
+      "scope": "support",
+      "reason": "Disposable child tests OS lock release/bounded lock acquisition. Native cache identity is covered by separate required calls."
+    },
+    {
+      "source": "tests/test_codex_lifecycle_skip.py",
+      "expression": "subprocess.run(command, input=json.dumps({'session_id': context.native_session_id, 'cwd': str(context.worktree), 'transcript_path': str(source), 'trigger': 'manual'}), text=True, capture_output=True, env=env, cwd=context.worktree, timeout=5)",
+      "capability": "capture.normalization",
+      "source_sha256": "2baf007f3d5e69329e50e7ebdd46deb9d4e8e2f55a75fe3c4353f15212f9b323"
+    },
+    {
+      "source": "tests/test_dev_skill_install.py",
+      "expression": "subprocess.run(['bash', str(repo / 'scripts' / 'test-dev-skill.sh'), 'install', '--host', context.host, '--source', str(repo), '--cache-path', str(home / native_folder() / 'plugins/cache/claude-code-skills/obsidian-brain/2.3.0')], env=env, capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL)",
+      "capability": "installation.fresh_upgrade",
+      "source_sha256": "9629b017758d2fdad0adba1848d8c542c2b74d6191923cdee6f86c2dda345030"
+    },
+    {
+      "source": "tests/test_dev_skill_install.py",
+      "expression": "subprocess.run(['bash', str(repo / 'scripts' / 'test-dev-skill.sh'), 'install', '--host', context.host, '--source', str(repo), '--cache-path', str(home / native_folder() / 'plugins/cache/claude-code-skills/obsidian-brain/2.3.0')], env=env, capture_output=True, text=True, timeout=10, stdin=subprocess.DEVNULL)",
+      "capability": "installation.fresh_upgrade",
+      "source_sha256": "9629b017758d2fdad0adba1848d8c542c2b74d6191923cdee6f86c2dda345030"
+    },
+    {
+      "source": "tests/test_dev_test_script_guards.py",
+      "expression": "subprocess.run([_BASH, str(script), cmd, '--host', context.host, '--source', str(script.parent.parent)], env=env, capture_output=True, text=True, timeout=10, stdin=subprocess.DEVNULL)",
+      "capability": "installation.rollback",
+      "source_sha256": "5240c8765f8bbe0cc94859b1774f972477ad1b4e141b839545190776ea7e85e8"
+    },
+    {
+      "source": "tests/test_dev_test_script_guards.py",
+      "expression": "subprocess.run([_BASH, str(SCRIPT_PATH), mode, '--host', context.host, '--source', str(source), '--cache-path', str(cache)], env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)",
+      "capability": "installation.rollback",
+      "source_sha256": "5240c8765f8bbe0cc94859b1774f972477ad1b4e141b839545190776ea7e85e8"
+    },
+    {
+      "source": "tests/test_hook_dedup_guard.py",
+      "expression": "subprocess.run(command, input=payload, capture_output=True, text=True, cwd=context.worktree, env=dict(os.environ, CLAUDE_CODE_SESSION_ID='foreign-inherited-id', CODEX_THREAD_ID='foreign-inherited-thread'), timeout=10)",
+      "source_sha256": "864590a5736829b58e39fb0a657783d3730cc5f9eda075282e79044461009811",
+      "capability": "capture.normalization"
+    },
+    {
+      "source": "tests/test_hook_import_guard.py",
+      "expression": "subprocess.run(command, input=stdin, text=True, capture_output=True, env=dict(os.environ), cwd=context.worktree, timeout=5, check=False)",
+      "capability": "capture.normalization",
+      "source_sha256": "d82f607d7f05ab26af028dc0e83cf0accaeca96f830ddbefe6e5bbdfdfe75c90"
+    },
+    {
+      "source": "tests/test_hooks_resolver_drift.py",
+      "expression": "subprocess.run([sys.executable, '-c', _root_code(skill), str(loaded)], cwd=cwd, env=env, capture_output=True, text=True, timeout=10)",
+      "source_sha256": "64bb682ffa943ba2db3d8b3938fc81d0336790db1f63c5db48cac182e0ed8ec7",
+      "scope": "structural",
+      "reason": "Resource-root resolution expression in a fresh interpreter; this call does not execute the skill operation."
+    },
+    {
+      "source": "tests/test_hooks_resolver_drift.py",
+      "expression": "subprocess.run(['bash', '-c', _context_command(skill)], cwd=cwd, env=env, capture_output=True, text=True, timeout=10)",
+      "source_sha256": "64bb682ffa943ba2db3d8b3938fc81d0336790db1f63c5db48cac182e0ed8ec7",
+      "capability": "skill.dispatch"
+    },
+    {
+      "source": "tests/test_hooks_resolver_drift.py",
+      "expression": "subprocess.run([sys.executable, str(root / 'hooks/brain_cli.py'), '--host', selected_host_context.host, '--client', selected_host_context.client, '--resource-root', str(root), '--session-id', 'synthetic-loaded-skill', '--cwd', str(cwd), 'run', '--skill-path', str(REPO / 'skills/recall/SKILL.md'), '--operation', 'config'], input='{}', cwd=cwd, env=env, capture_output=True, text=True, timeout=10)",
+      "capability": "skill.dispatch",
+      "source_sha256": "64bb682ffa943ba2db3d8b3938fc81d0336790db1f63c5db48cac182e0ed8ec7"
+    },
+    {
+      "source": "tests/test_hooks_resolver_drift.py",
+      "expression": "subprocess.run(['bash', '-c', commands[0]], cwd=cwd, env=env, capture_output=True, text=True, timeout=10)",
+      "source_sha256": "64bb682ffa943ba2db3d8b3938fc81d0336790db1f63c5db48cac182e0ed8ec7",
+      "capability": "skill.dispatch"
+    },
+    {
+      "source": "tests/test_host_collection_contract.py",
+      "expression": "subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60, cwd=tmp_path, env=env)",
+      "source_sha256": "b2ed4b95dff91a98e742aa872eae822fbf9ed5a32d6c997068544d556245987d",
+      "scope": "structural",
+      "reason": "Isolated pytest collection negative controls; validates the contract gate itself without a native plugin invocation."
+    },
+    {
+      "source": "tests/test_host_hook_single_source.py",
+      "expression": "subprocess.run(push, shell=True, cwd=work, input=payload, text=True, capture_output=True, timeout=10, env=env)",
+      "source_sha256": "6143feb57b6bd1a251158e8e73f7921ce99202f2100998085207beacc71c352c",
+      "scope": "structural",
+      "reason": "Codex repository PreToolUse Git-policy descriptor and shared policy script contract; distinct from plugin lifecycle hooks and vault capture."
+    },
+    {
+      "source": "tests/test_host_hook_single_source.py",
+      "expression": "subprocess.run(command, shell=True, cwd=ROOT, input=payload, text=True, capture_output=True, timeout=10, env=_hook_env())",
+      "source_sha256": "6143feb57b6bd1a251158e8e73f7921ce99202f2100998085207beacc71c352c",
+      "scope": "structural",
+      "reason": "Codex repository PreToolUse Git-policy descriptor and shared policy script contract; distinct from plugin lifecycle hooks and vault capture."
+    },
+    {
+      "source": "tests/test_host_hook_single_source.py",
+      "expression": "subprocess.run(['git', '-C', str(work), *args], env=env, check=True, capture_output=True)",
+      "source_sha256": "6143feb57b6bd1a251158e8e73f7921ce99202f2100998085207beacc71c352c",
+      "scope": "support",
+      "reason": "Bounded or disposable-repository Git metadata/setup. The enclosing native operation keeps its separate host contract."
+    },
+    {
+      "source": "tests/test_host_hook_single_source.py",
+      "expression": "subprocess.run(command, shell=True, cwd=tmp_path, input=payload, text=True, capture_output=True, timeout=10, env=_hook_env())",
+      "source_sha256": "6143feb57b6bd1a251158e8e73f7921ce99202f2100998085207beacc71c352c",
+      "scope": "structural",
+      "reason": "Codex repository PreToolUse Git-policy descriptor and shared policy script contract; distinct from plugin lifecycle hooks and vault capture."
+    },
+    {
+      "source": "tests/test_host_neutral_lint_controls.py",
+      "expression": "subprocess.run(['git', 'init', '-q', str(root)], env=environment, check=True, timeout=5)",
+      "source_sha256": "a36c2500ae30d52050f9aba8548c515cdf38a4604bb4ed8bae4e51ba8a0a72cc",
+      "scope": "support",
+      "reason": "Bounded or disposable-repository Git metadata/setup. The enclosing native operation keeps its separate host contract."
+    },
+    {
+      "source": "tests/test_host_neutral_lint_controls.py",
+      "expression": "subprocess.run(['git', '-C', str(root), 'add', '.'], env=environment, check=True, timeout=5)",
+      "source_sha256": "a36c2500ae30d52050f9aba8548c515cdf38a4604bb4ed8bae4e51ba8a0a72cc",
+      "scope": "support",
+      "reason": "Bounded or disposable-repository Git metadata/setup. The enclosing native operation keeps its separate host contract."
+    },
+    {
+      "source": "tests/test_host_neutral_lint_controls.py",
+      "expression": "subprocess.run(['bash', 'scripts/commit-preflight.sh', '--docs-only'], cwd=root, env=environment, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10)",
+      "source_sha256": "a36c2500ae30d52050f9aba8548c515cdf38a4604bb4ed8bae4e51ba8a0a72cc",
+      "scope": "structural",
+      "reason": "Disposable docs-only preflight negative control verifies that the host-neutral source lint cannot be skipped."
+    },
+    {
+      "source": "tests/test_host_note_transactions.py",
+      "expression": "subprocess.Popen([sys.executable, '-c', script, str(Path(__file__).resolve().parents[1] / 'hooks'), json.dumps(descriptor)], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)",
+      "source_sha256": "c5e4efa7668848a891b1325be15385ea0b0f1e623d4424637fa0a632606b933f",
+      "scope": "support",
+      "reason": "Disposable physical-vault lock holder uses the full selected RuntimeContext. The paired transaction API call remains required."
+    },
+    {
+      "source": "tests/test_host_runtime_contracts.py",
+      "expression": "subprocess.run([sys.executable, str(VALIDATOR), str(evidence)], capture_output=True, text=True, timeout=10)",
+      "source_sha256": "1e450b4795f55f87dfe52245cc1111fb8bcd7e581f700c478ca85fa722b5c183",
+      "scope": "structural",
+      "reason": "Synthetic fixture metadata/schema validator subprocess. This is not native lifecycle or Desktop acceptance."
+    },
+    {
+      "source": "tests/test_host_skill_contracts.py",
+      "expression": "subprocess.run(['bash', '-c', block], env=environment, cwd=selected_host_context.worktree, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=5)",
+      "source_sha256": "66acb7b6c62948e94d195b40b67973c3283bfbaae2ff106de66517ad7bd0376a",
+      "capability": "skill.dispatch"
+    },
+    {
+      "source": "tests/test_index_skill_snippets_run.py",
+      "expression": "subprocess.run(['bash', '-c', _rebuild_command(skill)], cwd=cwd, env=environment, capture_output=True, text=True, timeout=60)",
+      "source_sha256": "4bde28074c07a2f73af6cf1626d59532b4211b3e397e7796593a404208d529aa",
+      "capability": "skill.vault-reindex"
+    },
+    {
+      "source": "tests/test_module_split_parity.py",
+      "expression": "subprocess.run([sys.executable, '-c', code], capture_output=True, text=True, env=env)",
+      "source_sha256": "801072c81497b83b60746030645abb15d66891a57c7d663590690c5f0e5e219c",
+      "scope": "structural",
+      "reason": "Fresh-interpreter import dependency check for the tfidf leaf module; no runtime host or vault operation."
+    },
+    {
+      "source": "tests/test_native_lifecycle_integration.py",
+      "expression": "subprocess.run(command, input=json.dumps({'session_id': native_id, 'cwd': str(context.worktree), 'transcript_path': str(source)}), text=True, capture_output=True, timeout=5)",
+      "source_sha256": "7e331a8a165a6f05d6df1faf8dea8cf86aca75112bf34c241cd9858413dffa42",
+      "capability": "capture.normalization"
+    },
+    {
+      "source": "tests/test_native_lifecycle_integration.py",
+      "expression": "subprocess.run([sys.executable, str(wrapper), '--host', 'codex'], stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=5)",
+      "source_sha256": "7e331a8a165a6f05d6df1faf8dea8cf86aca75112bf34c241cd9858413dffa42",
+      "scope": "structural",
+      "reason": "Codex wrapper without verified current-client binding skips before runtime/capture and retains no source. This is a negative control, not successful lifecycle evidence."
+    },
+    {
+      "source": "tests/test_no_default_db_check.py",
+      "expression": "subprocess.run([sys.executable, str(SCRIPT), str(tests_dir)], capture_output=True, text=True, check=False)",
+      "source_sha256": "bf632919eb28d09ae6a71ad5bf3e3eae8f941592eb99727a56bdb694f71e4e46",
+      "scope": "structural",
+      "reason": "Static test-source audit that forbids live default database access; no runtime host dispatch."
+    },
+    {
+      "source": "tests/test_note_writer.py",
+      "expression": "subprocess.run(command, input=input, capture_output=capture_output, text=text, timeout=timeout, cwd=cwd)",
+      "source_sha256": "7ec2288cf04f1ce54881b454ead34dd8001aa9e0fddb159eef0dbf428c7942f9",
+      "capability": "writer.atomic_revision"
+    },
+    {
+      "source": "tests/test_obsidian_utils.py",
+      "expression": "subprocess.run(['git', 'init', '-q'], cwd=path, check=True)",
+      "source_sha256": "cf4ff90e0b6793ba11f0b9d7bfdfbd3aed8f07819037682900851aad88fff562",
+      "scope": "support",
+      "reason": "Disposable Git repository/worktree setup for selected-context lookup or repository policy tests."
+    },
+    {
+      "source": "tests/test_obsidian_utils.py",
+      "expression": "subprocess.run(['git', 'config', 'user.email', 'test@example.com'], cwd=path, check=True)",
+      "source_sha256": "cf4ff90e0b6793ba11f0b9d7bfdfbd3aed8f07819037682900851aad88fff562",
+      "scope": "support",
+      "reason": "Disposable Git repository/worktree setup for selected-context lookup or repository policy tests."
+    },
+    {
+      "source": "tests/test_obsidian_utils.py",
+      "expression": "subprocess.run(['git', 'config', 'user.name', 'test'], cwd=path, check=True)",
+      "source_sha256": "cf4ff90e0b6793ba11f0b9d7bfdfbd3aed8f07819037682900851aad88fff562",
+      "scope": "support",
+      "reason": "Disposable Git repository/worktree setup for selected-context lookup or repository policy tests."
+    },
+    {
+      "source": "tests/test_obsidian_utils.py",
+      "expression": "subprocess.run(['git', 'add', '.'], cwd=path, check=True)",
+      "source_sha256": "cf4ff90e0b6793ba11f0b9d7bfdfbd3aed8f07819037682900851aad88fff562",
+      "scope": "support",
+      "reason": "Disposable Git repository/worktree setup for selected-context lookup or repository policy tests."
+    },
+    {
+      "source": "tests/test_obsidian_utils.py",
+      "expression": "subprocess.run(['git', 'commit', '-q', '-m', 'init'], cwd=path, check=True)",
+      "source_sha256": "cf4ff90e0b6793ba11f0b9d7bfdfbd3aed8f07819037682900851aad88fff562",
+      "scope": "support",
+      "reason": "Disposable Git repository/worktree setup for selected-context lookup or repository policy tests."
+    },
+    {
+      "source": "tests/test_obsidian_utils.py",
+      "expression": "subprocess.run(['git', 'worktree', 'add', '-b', 'feature/x', str(worktree)], cwd=repo, check=True, capture_output=True)",
+      "source_sha256": "cf4ff90e0b6793ba11f0b9d7bfdfbd3aed8f07819037682900851aad88fff562",
+      "scope": "support",
+      "reason": "Disposable Git repository/worktree setup for selected-context lookup or repository policy tests."
+    },
+    {
+      "source": "tests/test_obsidian_utils.py",
+      "expression": "subprocess.run(['git', 'worktree', 'add', '-b', 'feature/issue-93', str(worktree)], cwd=repo, check=True, capture_output=True)",
+      "source_sha256": "cf4ff90e0b6793ba11f0b9d7bfdfbd3aed8f07819037682900851aad88fff562",
+      "scope": "support",
+      "reason": "Disposable Git repository/worktree setup for selected-context lookup or repository policy tests."
+    },
+    {
+      "source": "tests/test_replay_cli.py",
+      "expression": "subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True, env=env, cwd=str(_REPO_ROOT), timeout=20)",
+      "source_sha256": "6de39e52c0c9cdc386f27aa7fe774684efa09921496df2f90af222c6e955af1a",
+      "capability": "claude_native_format"
+    },
+    {
+      "source": "tests/test_retro_gate.py",
+      "expression": "subprocess.run(_native_command(context), input=json.dumps(payload), capture_output=True, text=True, env=dict(os.environ), timeout=5)",
+      "capability": "skill.retro",
+      "source_sha256": "e51c296974d145c3739c255f2d18266cc935d719bd59690ac7b6497f672bd34a"
+    },
+    {
+      "source": "tests/test_retro_gate.py",
+      "expression": "subprocess.run(_native_command(__import__('runtime_context').current_runtime_context()), input='not valid json {{{{', capture_output=True, text=True, env=env, timeout=5)",
+      "capability": "skill.retro",
+      "source_sha256": "e51c296974d145c3739c255f2d18266cc935d719bd59690ac7b6497f672bd34a"
+    },
+    {
+      "source": "tests/test_retro_gate.py",
+      "expression": "subprocess.run(command, input=json.dumps({'session_id': selected.native_session_id, 'cwd': str(selected.worktree), 'stop_hook_active': active}), capture_output=True, text=True, env=env, timeout=5)",
+      "source_sha256": "e51c296974d145c3739c255f2d18266cc935d719bd59690ac7b6497f672bd34a",
+      "capability": "skill.retro"
+    },
+    {
+      "source": "tests/test_security.py",
+      "expression": "subprocess.run([sys.executable, str(Path('.claude/hooks') / f'{hook}.py')], input=payload, capture_output=True, text=True, timeout=60)",
+      "source_sha256": "73f20caa2c4b5a8d146a8615d6f980eb782638837f4a6ce1a2b84680fee400ba",
+      "scope": "structural",
+      "reason": "Repository Git-policy command grammar, closed-stream behavior, or timeout control; this call does not exercise plugin lifecycle capture or a vault writer."
+    },
+    {
+      "source": "tests/test_security.py",
+      "expression": "subprocess.run([sys.executable, str(Path('.claude/hooks') / f'{hook}.py')], input=payload, capture_output=True, timeout=60)",
+      "source_sha256": "73f20caa2c4b5a8d146a8615d6f980eb782638837f4a6ce1a2b84680fee400ba",
+      "scope": "structural",
+      "reason": "Repository Git-policy command grammar, closed-stream behavior, or timeout control; this call does not exercise plugin lifecycle capture or a vault writer."
+    },
+    {
+      "source": "tests/test_security.py",
+      "expression": "subprocess.run(['/bin/sh', '-c', 'exec \"$0\" \"$1\" <&-', sys.executable, script], capture_output=True, text=True, timeout=60)",
+      "source_sha256": "73f20caa2c4b5a8d146a8615d6f980eb782638837f4a6ce1a2b84680fee400ba",
+      "scope": "structural",
+      "reason": "Repository Git-policy command grammar, closed-stream behavior, or timeout control; this call does not exercise plugin lifecycle capture or a vault writer."
+    },
+    {
+      "source": "tests/test_security.py",
+      "expression": "subprocess.run(['/bin/sh', '-c', 'printf %s \"$2\" | exec \"$0\" \"$1\" 1>&-', sys.executable, script, payload], capture_output=True, text=True, timeout=60)",
+      "source_sha256": "73f20caa2c4b5a8d146a8615d6f980eb782638837f4a6ce1a2b84680fee400ba",
+      "scope": "structural",
+      "reason": "Repository Git-policy command grammar, closed-stream behavior, or timeout control; this call does not exercise plugin lifecycle capture or a vault writer."
+    },
+    {
+      "source": "tests/test_security.py",
+      "expression": "subprocess.run(['/bin/bash', '-c', 'printf %s \"$2\" | python3 \"$1\" 2>&1 | true; exit ${PIPESTATUS[1]}', 'bash', script, '{\"tool_name\":'], capture_output=True, text=True, timeout=60)",
+      "source_sha256": "73f20caa2c4b5a8d146a8615d6f980eb782638837f4a6ce1a2b84680fee400ba",
+      "scope": "structural",
+      "reason": "Repository Git-policy command grammar, closed-stream behavior, or timeout control; this call does not exercise plugin lifecycle capture or a vault writer."
+    },
+    {
+      "source": "tests/test_security.py",
+      "expression": "subprocess.run([sys.executable, str(work / '.claude/hooks' / f'{hook}.py')], input=json.dumps({'tool_name': 'Bash', 'tool_input': {'command': command}}), capture_output=True, text=True, timeout=60, cwd=work, env=env)",
+      "source_sha256": "73f20caa2c4b5a8d146a8615d6f980eb782638837f4a6ce1a2b84680fee400ba",
+      "scope": "structural",
+      "reason": "Repository Git-policy command grammar, closed-stream behavior, or timeout control; this call does not exercise plugin lifecycle capture or a vault writer."
+    },
+    {
+      "source": "tests/test_security.py",
+      "expression": "subprocess.run(['git', '-C', str(work), 'checkout', '-q', '-b', 'develop'], env=env, check=True, capture_output=True)",
+      "source_sha256": "73f20caa2c4b5a8d146a8615d6f980eb782638837f4a6ce1a2b84680fee400ba",
+      "scope": "support",
+      "reason": "Disposable Git repository/worktree setup for selected-context lookup or repository policy tests."
+    },
+    {
+      "source": "tests/test_security.py",
+      "expression": "subprocess.run(['git', '-C', str(work), 'checkout', '-q', '-b', self.MAIN], env=env, check=True, capture_output=True)",
+      "source_sha256": "73f20caa2c4b5a8d146a8615d6f980eb782638837f4a6ce1a2b84680fee400ba",
+      "scope": "support",
+      "reason": "Disposable Git repository/worktree setup for selected-context lookup or repository policy tests."
+    },
+    {
+      "source": "tests/test_security.py",
+      "expression": "subprocess.run(['git', '-C', str(work), 'checkout', '-q', '-b', 'release/1.0.0'], env=env, check=True, capture_output=True)",
+      "source_sha256": "73f20caa2c4b5a8d146a8615d6f980eb782638837f4a6ce1a2b84680fee400ba",
+      "scope": "support",
+      "reason": "Disposable Git repository/worktree setup for selected-context lookup or repository policy tests."
+    },
+    {
+      "source": "tests/test_security.py",
+      "expression": "subprocess.Popen([_BASH, '-c', template.replace('VERB', f'touch {marker}')], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=work, start_new_session=True)",
+      "source_sha256": "73f20caa2c4b5a8d146a8615d6f980eb782638837f4a6ce1a2b84680fee400ba",
+      "scope": "structural",
+      "reason": "Repository Git-policy command grammar, closed-stream behavior, or timeout control; this call does not exercise plugin lifecycle capture or a vault writer."
+    },
+    {
+      "source": "tests/test_security.py",
+      "expression": "subprocess.Popen([sys.executable, str(Path('.claude/hooks') / f'{hook}.py')], stdin=subprocess.PIPE, stdout=write_fd, stderr=subprocess.PIPE, text=True)",
+      "source_sha256": "73f20caa2c4b5a8d146a8615d6f980eb782638837f4a6ce1a2b84680fee400ba",
+      "scope": "structural",
+      "reason": "Repository Git-policy command grammar, closed-stream behavior, or timeout control; this call does not exercise plugin lifecycle capture or a vault writer."
+    },
+    {
+      "source": "tests/test_security.py",
+      "expression": "subprocess.run(['git', '-C', str(work), *args], env=env, check=True, capture_output=True)",
+      "source_sha256": "73f20caa2c4b5a8d146a8615d6f980eb782638837f4a6ce1a2b84680fee400ba",
+      "scope": "support",
+      "reason": "Disposable Git repository/worktree setup for selected-context lookup or repository policy tests."
+    },
+    {
+      "source": "tests/test_security.py",
+      "expression": "subprocess.run([sys.executable, str(work / '.claude/hooks' / f'{hook}.py')], input=json.dumps({'tool_name': 'Bash', 'tool_input': {'command': command}}), capture_output=True, text=True, timeout=cls.SUBPROCESS_TIMEOUT_S, cwd=work, env=env)",
+      "source_sha256": "73f20caa2c4b5a8d146a8615d6f980eb782638837f4a6ce1a2b84680fee400ba",
+      "scope": "structural",
+      "reason": "Repository Git-policy command grammar, closed-stream behavior, or timeout control; this call does not exercise plugin lifecycle capture or a vault writer."
+    },
+    {
+      "source": "tests/test_security.py",
+      "expression": "subprocess.run([sys.executable, str(work / '.claude/hooks' / f'{hook}.py')], input=json.dumps({'tool_name': 'Bash', 'tool_input': {'command': command}}), capture_output=True, text=True, timeout=self.SUBPROCESS_TIMEOUT_S, cwd=work, env=env)",
+      "source_sha256": "73f20caa2c4b5a8d146a8615d6f980eb782638837f4a6ce1a2b84680fee400ba",
+      "scope": "structural",
+      "reason": "Repository Git-policy command grammar, closed-stream behavior, or timeout control; this call does not exercise plugin lifecycle capture or a vault writer."
+    },
+    {
+      "source": "tests/test_security.py",
+      "expression": "subprocess.run([sys.executable, '-c', _PATTERN_TIMER_SRC], input=json.dumps({'pattern': pattern, 'text': text}), capture_output=True, text=True, timeout=self.SUBPROCESS_TIMEOUT_S)",
+      "source_sha256": "73f20caa2c4b5a8d146a8615d6f980eb782638837f4a6ce1a2b84680fee400ba",
+      "scope": "structural",
+      "reason": "Repository Git-policy command grammar, closed-stream behavior, or timeout control; this call does not exercise plugin lifecycle capture or a vault writer."
+    },
+    {
+      "source": "tests/test_security.py",
+      "expression": "subprocess.run([sys.executable, '-c', wrapper, str(work_dir / '.claude/hooks/prevent-direct-push.py')], input=json.dumps({'tool_name': 'Bash', 'tool_input': {'command': command}}), capture_output=True, text=True, timeout=self.SUBPROCESS_TIMEOUT_S, cwd=work_dir, env=env)",
+      "source_sha256": "73f20caa2c4b5a8d146a8615d6f980eb782638837f4a6ce1a2b84680fee400ba",
+      "scope": "structural",
+      "reason": "Repository Git-policy command grammar, closed-stream behavior, or timeout control; this call does not exercise plugin lifecycle capture or a vault writer."
+    },
+    {
+      "source": "tests/test_session_end_telemetry.py",
+      "expression": "subprocess.run(command, input=raw, capture_output=True, text=True, cwd=context.worktree, env=dict(os.environ, CLAUDE_CODE_SESSION_ID='foreign-id', CODEX_THREAD_ID='foreign-thread'), timeout=5)",
+      "capability": "capture.normalization",
+      "source_sha256": "9224914ed45b48bf4442772bdf03abb530c067a42b3026b4c56d82c041041fae"
+    },
+    {
+      "source": "tests/test_session_hint_bootstrap.py",
+      "expression": "subprocess.run(command, input=json.dumps(payload), env=dict(os.environ, CLAUDE_CODE_SESSION_ID='foreign-inherited-session', CODEX_THREAD_ID='foreign-inherited-thread'), capture_output=True, text=True, timeout=5, cwd=context.worktree)",
+      "capability": "capture.normalization",
+      "source_sha256": "e05f073e9842690a3c48d819e226102331834239a35da49119d0d242904174e8"
+    },
+    {
+      "source": "tests/test_skill_shell_blocks.py",
+      "expression": "subprocess.run([BASH, '-c', command], cwd=tmp_path, env=environment, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)",
+      "source_sha256": "7fc715ece4e6f79bd4ea0d23cc734e109c431e577f2e595ee4308e85171a5df1",
+      "capability": "skill.dispatch"
+    },
+    {
+      "source": "tests/test_snapshot_e2e.py",
+      "expression": "subprocess.run(command, input=json.dumps({'session_id': context.native_session_id, 'cwd': str(context.worktree), 'transcript_path': str(context.transcript_path), 'trigger': 'manual'}), env=dict(os.environ, CLAUDE_CODE_SESSION_ID='foreign-inherited-id', CODEX_THREAD_ID='foreign-inherited-thread'), cwd=context.worktree, capture_output=True, text=True, timeout=10)",
+      "capability": "capture.normalization",
+      "source_sha256": "68e558a376bed2bfecbd67272df0b42610163c97feb7e0b9c20c999a7246e694"
+    },
+    {
+      "source": "tests/test_vault_doctor_audit_historic_repairs.py",
+      "expression": "subprocess.run([sys.executable, str(script), '--check', 'audit-historic-repairs', '--json', '--vault', str(vault), '--sessions-folder', 'claude-sessions', '--insights-folder', 'claude-insights'], capture_output=True, text=True, env=env)",
+      "source_sha256": "5af7dcfd34adc203b66e74e452b7288c76b4af903dee3cb7b7dab2ddd355dd7b",
+      "capability": "cli.doctor"
+    },
+    {
+      "source": "tests/test_vault_doctor_audit_historic_repairs.py",
+      "expression": "subprocess.run([sys.executable, str(script), '--json', '--vault', str(vault), '--sessions-folder', 'claude-sessions', '--insights-folder', 'claude-insights'], capture_output=True, text=True, env=env)",
+      "source_sha256": "5af7dcfd34adc203b66e74e452b7288c76b4af903dee3cb7b7dab2ddd355dd7b",
+      "capability": "cli.doctor"
+    },
+    {
+      "source": "tests/test_vault_doctor_audit_historic_repairs.py",
+      "expression": "subprocess.run([sys.executable, str(script), '--check', 'audit-historic-repairs', '--apply', '--yes', '--vault', str(vault), '--sessions-folder', 'claude-sessions', '--insights-folder', 'claude-insights'], capture_output=True, text=True, env=env)",
+      "source_sha256": "5af7dcfd34adc203b66e74e452b7288c76b4af903dee3cb7b7dab2ddd355dd7b",
+      "capability": "cli.doctor"
+    },
+    {
+      "source": "tests/test_vault_doctor_audit_historic_repairs.py",
+      "expression": "subprocess.run([sys.executable, str(_SCRIPT), '--check', 'audit-historic-repairs', '--json'], capture_output=True, text=True, env=env)",
+      "source_sha256": "5af7dcfd34adc203b66e74e452b7288c76b4af903dee3cb7b7dab2ddd355dd7b",
+      "capability": "cli.doctor"
+    },
+    {
+      "source": "tests/test_vault_doctor_audit_historic_repairs.py",
+      "expression": "subprocess.run([sys.executable, str(_SCRIPT), '--check', 'audit-historic-repairs', '--min-confidence', '0.5', '--apply', '--yes', '--json'], capture_output=True, text=True, env=env)",
+      "source_sha256": "5af7dcfd34adc203b66e74e452b7288c76b4af903dee3cb7b7dab2ddd355dd7b",
+      "capability": "cli.doctor"
+    },
+    {
+      "source": "tests/test_vault_doctor_audit_historic_repairs.py",
+      "expression": "subprocess.run([sys.executable, str(_SCRIPT), '--check', 'audit-historic-repairs', '--min-confidence', '0.5', '--json'], capture_output=True, text=True, env=env)",
+      "source_sha256": "5af7dcfd34adc203b66e74e452b7288c76b4af903dee3cb7b7dab2ddd355dd7b",
+      "capability": "cli.doctor"
+    },
+    {
+      "source": "tests/test_vault_doctor_audit_historic_repairs.py",
+      "expression": "subprocess.run([sys.executable, str(_SCRIPT), '--check', 'audit-historic-repairs', '--min-confidence', '0.5'], capture_output=True, text=True, env=env)",
+      "source_sha256": "5af7dcfd34adc203b66e74e452b7288c76b4af903dee3cb7b7dab2ddd355dd7b",
+      "capability": "cli.doctor"
+    },
+    {
+      "source": "tests/test_vault_doctor_memory_index.py",
+      "expression": "subprocess.run([sys.executable, '-c', child, actor.host, actor.client, str(actor.config_path), str(root), actor.native_session_id, str(actor.canonical_project_root), vault, *command[2:]], stdin=subprocess.DEVNULL, timeout=30, **kwargs)",
+      "capability": "cli.doctor",
+      "source_sha256": "afb28e520df0f571e872eab7c512d46ef2a4f2e73a1a0e120ce90197e74de043"
+    },
+    {
+      "source": "tests/test_vault_doctor_project_name_canonicalization.py",
+      "expression": "subprocess.run(['git', 'init', '-q'], cwd=path, check=True)",
+      "source_sha256": "0333756741c579cc2bb0c9defd75a0003a552c3ae4276e2de67ce99e4ebc4872",
+      "scope": "support",
+      "reason": "Bounded or disposable-repository Git metadata/setup. The enclosing native operation keeps its separate host contract."
+    },
+    {
+      "source": "tests/test_vault_doctor_project_name_canonicalization.py",
+      "expression": "subprocess.run(['git', 'config', 'user.email', 'test@example.com'], cwd=path, check=True)",
+      "source_sha256": "0333756741c579cc2bb0c9defd75a0003a552c3ae4276e2de67ce99e4ebc4872",
+      "scope": "support",
+      "reason": "Bounded or disposable-repository Git metadata/setup. The enclosing native operation keeps its separate host contract."
+    },
+    {
+      "source": "tests/test_vault_doctor_project_name_canonicalization.py",
+      "expression": "subprocess.run(['git', 'config', 'user.name', 'test'], cwd=path, check=True)",
+      "source_sha256": "0333756741c579cc2bb0c9defd75a0003a552c3ae4276e2de67ce99e4ebc4872",
+      "scope": "support",
+      "reason": "Bounded or disposable-repository Git metadata/setup. The enclosing native operation keeps its separate host contract."
+    },
+    {
+      "source": "tests/test_vault_doctor_project_name_canonicalization.py",
+      "expression": "subprocess.run(['git', 'add', '.'], cwd=path, check=True)",
+      "source_sha256": "0333756741c579cc2bb0c9defd75a0003a552c3ae4276e2de67ce99e4ebc4872",
+      "scope": "support",
+      "reason": "Bounded or disposable-repository Git metadata/setup. The enclosing native operation keeps its separate host contract."
+    },
+    {
+      "source": "tests/test_vault_doctor_project_name_canonicalization.py",
+      "expression": "subprocess.run(['git', 'commit', '-q', '-m', 'init'], cwd=path, check=True)",
+      "source_sha256": "0333756741c579cc2bb0c9defd75a0003a552c3ae4276e2de67ce99e4ebc4872",
+      "scope": "support",
+      "reason": "Bounded or disposable-repository Git metadata/setup. The enclosing native operation keeps its separate host contract."
+    },
+    {
+      "source": "tests/test_vault_doctor_project_name_canonicalization.py",
+      "expression": "subprocess.run(['git', 'worktree', 'add', '-b', 'feature/x', str(worktree)], cwd=repo, check=True, capture_output=True)",
+      "source_sha256": "0333756741c579cc2bb0c9defd75a0003a552c3ae4276e2de67ce99e4ebc4872",
+      "scope": "support",
+      "reason": "Bounded or disposable-repository Git metadata/setup. The enclosing native operation keeps its separate host contract."
+    },
+    {
+      "source": "tests/test_vault_doctor_project_name_canonicalization.py",
+      "expression": "subprocess.run(['git', 'worktree', 'add', '-b', 'feature/y', str(worktree)], cwd=repo, check=True, capture_output=True)",
+      "source_sha256": "0333756741c579cc2bb0c9defd75a0003a552c3ae4276e2de67ce99e4ebc4872",
+      "scope": "support",
+      "reason": "Bounded or disposable-repository Git metadata/setup. The enclosing native operation keeps its separate host contract."
+    },
+    {
+      "source": "tests/test_vault_doctor_project_name_canonicalization.py",
+      "expression": "subprocess.run(['git', 'worktree', 'add', '-b', 'feature/z', str(worktree)], cwd=repo, check=True, capture_output=True)",
+      "source_sha256": "0333756741c579cc2bb0c9defd75a0003a552c3ae4276e2de67ce99e4ebc4872",
+      "scope": "support",
+      "reason": "Bounded or disposable-repository Git metadata/setup. The enclosing native operation keeps its separate host contract."
+    },
+    {
+      "source": "tests/test_vault_doctor_project_name_canonicalization.py",
+      "expression": "subprocess.run(['git', 'worktree', 'add', '-b', 'feature/tag', str(worktree)], cwd=repo, check=True, capture_output=True)",
+      "source_sha256": "0333756741c579cc2bb0c9defd75a0003a552c3ae4276e2de67ce99e4ebc4872",
+      "scope": "support",
+      "reason": "Bounded or disposable-repository Git metadata/setup. The enclosing native operation keeps its separate host contract."
+    },
+    {
+      "source": "tests/test_vault_doctor_project_name_canonicalization.py",
+      "expression": "subprocess.run(['git', 'worktree', 'add', '-b', 'feature/body', str(worktree)], cwd=repo, check=True, capture_output=True)",
+      "source_sha256": "0333756741c579cc2bb0c9defd75a0003a552c3ae4276e2de67ce99e4ebc4872",
+      "scope": "support",
+      "reason": "Bounded or disposable-repository Git metadata/setup. The enclosing native operation keeps its separate host contract."
+    },
+    {
+      "source": "tests/test_vault_doctor_project_name_canonicalization.py",
+      "expression": "subprocess.run(['git', 'worktree', 'add', '-b', 'feature/dry', str(worktree)], cwd=repo, check=True, capture_output=True)",
+      "source_sha256": "0333756741c579cc2bb0c9defd75a0003a552c3ae4276e2de67ce99e4ebc4872",
+      "scope": "support",
+      "reason": "Bounded or disposable-repository Git metadata/setup. The enclosing native operation keeps its separate host contract."
+    },
+    {
+      "source": "tests/test_vault_doctor_project_name_canonicalization.py",
+      "expression": "subprocess.run(['git', 'worktree', 'add', '-b', 'feature/apply', str(worktree)], cwd=repo, check=True, capture_output=True)",
+      "source_sha256": "0333756741c579cc2bb0c9defd75a0003a552c3ae4276e2de67ce99e4ebc4872",
+      "scope": "support",
+      "reason": "Bounded or disposable-repository Git metadata/setup. The enclosing native operation keeps its separate host contract."
+    },
+    {
+      "source": "tests/test_vault_doctor_project_name_canonicalization.py",
+      "expression": "subprocess.run(['git', 'worktree', 'add', '-b', 'feature/cache', str(worktree)], cwd=repo, check=True, capture_output=True)",
+      "source_sha256": "0333756741c579cc2bb0c9defd75a0003a552c3ae4276e2de67ce99e4ebc4872",
+      "scope": "support",
+      "reason": "Bounded or disposable-repository Git metadata/setup. The enclosing native operation keeps its separate host contract."
+    },
+    {
+      "source": "tests/test_vault_doctor_project_name_canonicalization.py",
+      "expression": "subprocess.run(['git', 'worktree', 'add', '-b', 'feature/summary', str(worktree)], cwd=repo, check=True, capture_output=True)",
+      "source_sha256": "0333756741c579cc2bb0c9defd75a0003a552c3ae4276e2de67ce99e4ebc4872",
+      "scope": "support",
+      "reason": "Bounded or disposable-repository Git metadata/setup. The enclosing native operation keeps its separate host contract."
+    },
+    {
+      "source": "tests/test_vault_doctor_project_name_canonicalization.py",
+      "expression": "subprocess.run(['git', 'worktree', 'add', '-b', 'feature/backup', str(worktree)], cwd=repo, check=True, capture_output=True)",
+      "source_sha256": "0333756741c579cc2bb0c9defd75a0003a552c3ae4276e2de67ce99e4ebc4872",
+      "scope": "support",
+      "reason": "Bounded or disposable-repository Git metadata/setup. The enclosing native operation keeps its separate host contract."
+    },
+    {
+      "source": "tests/test_vault_doctor_project_name_canonicalization.py",
+      "expression": "subprocess.run(['git', 'worktree', 'add', '-b', 'feature/del', str(worktree)], cwd=repo, check=True, capture_output=True)",
+      "source_sha256": "0333756741c579cc2bb0c9defd75a0003a552c3ae4276e2de67ce99e4ebc4872",
+      "scope": "support",
+      "reason": "Bounded or disposable-repository Git metadata/setup. The enclosing native operation keeps its separate host contract."
+    },
+    {
+      "source": "tests/test_vault_doctor_project_name_canonicalization.py",
+      "expression": "subprocess.run(['git', 'worktree', 'add', '-b', 'feature/extra', str(worktree)], cwd=repo, check=True, capture_output=True)",
+      "source_sha256": "0333756741c579cc2bb0c9defd75a0003a552c3ae4276e2de67ce99e4ebc4872",
+      "scope": "support",
+      "reason": "Bounded or disposable-repository Git metadata/setup. The enclosing native operation keeps its separate host contract."
+    },
+    {
+      "source": "tests/test_vault_doctor_project_name_canonicalization.py",
+      "expression": "subprocess.run(['git', 'worktree', 'add', '-b', 'issue/81', str(worktree)], cwd=repo, check=True, capture_output=True)",
+      "source_sha256": "0333756741c579cc2bb0c9defd75a0003a552c3ae4276e2de67ce99e4ebc4872",
+      "scope": "support",
+      "reason": "Bounded or disposable-repository Git metadata/setup. The enclosing native operation keeps its separate host contract."
+    },
+    {
+      "source": "tests/test_vault_doctor_project_name_canonicalization.py",
+      "expression": "subprocess.run(['git', 'worktree', 'add', '-b', 'issue/81b', str(worktree)], cwd=repo, check=True, capture_output=True)",
+      "source_sha256": "0333756741c579cc2bb0c9defd75a0003a552c3ae4276e2de67ce99e4ebc4872",
+      "scope": "support",
+      "reason": "Bounded or disposable-repository Git metadata/setup. The enclosing native operation keeps its separate host contract."
+    },
+    {
+      "source": "tests/test_vault_doctor_project_name_canonicalization.py",
+      "expression": "subprocess.run(['git', 'worktree', 'add', '-b', 'feature/f', str(worktree)], cwd=repo, check=True, capture_output=True)",
+      "source_sha256": "0333756741c579cc2bb0c9defd75a0003a552c3ae4276e2de67ce99e4ebc4872",
+      "scope": "support",
+      "reason": "Bounded or disposable-repository Git metadata/setup. The enclosing native operation keeps its separate host contract."
+    },
+    {
+      "source": "tests/test_vault_doctor_project_name_canonicalization.py",
+      "expression": "subprocess.run(['git', 'worktree', 'add', '-b', 'feature/g', str(worktree)], cwd=repo, check=True, capture_output=True)",
+      "source_sha256": "0333756741c579cc2bb0c9defd75a0003a552c3ae4276e2de67ce99e4ebc4872",
+      "scope": "support",
+      "reason": "Bounded or disposable-repository Git metadata/setup. The enclosing native operation keeps its separate host contract."
+    },
+    {
+      "source": "tests/test_vault_doctor_project_name_canonicalization.py",
+      "expression": "subprocess.run(['git', 'worktree', 'add', '-b', 'feature/e2e', str(worktree)], cwd=repo, check=True, capture_output=True)",
+      "source_sha256": "0333756741c579cc2bb0c9defd75a0003a552c3ae4276e2de67ce99e4ebc4872",
+      "scope": "support",
+      "reason": "Bounded or disposable-repository Git metadata/setup. The enclosing native operation keeps its separate host contract."
+    },
+    {
+      "source": "tests/test_vault_doctor_project_name_canonicalization.py",
+      "expression": "subprocess.run(base_cmd + ['--check', 'project-name-canonicalization'], capture_output=True, text=True, timeout=60)",
+      "source_sha256": "0333756741c579cc2bb0c9defd75a0003a552c3ae4276e2de67ce99e4ebc4872",
+      "capability": "cli.doctor"
+    },
+    {
+      "source": "tests/test_vault_doctor_project_name_canonicalization.py",
+      "expression": "subprocess.run(base_cmd, capture_output=True, text=True, timeout=120)",
+      "source_sha256": "0333756741c579cc2bb0c9defd75a0003a552c3ae4276e2de67ce99e4ebc4872",
+      "capability": "cli.doctor"
+    },
+    {
+      "source": "tests/test_vault_doctor_project_name_canonicalization.py",
+      "expression": "subprocess.run(['git', 'worktree', 'add', '-b', 'feature/snap', str(worktree)], cwd=repo, check=True, capture_output=True)",
+      "source_sha256": "0333756741c579cc2bb0c9defd75a0003a552c3ae4276e2de67ce99e4ebc4872",
+      "scope": "support",
+      "reason": "Bounded or disposable-repository Git metadata/setup. The enclosing native operation keeps its separate host contract."
+    },
+    {
+      "source": "tests/test_vault_doctor_project_name_canonicalization.py",
+      "expression": "subprocess.run(['git', 'worktree', 'add', '-b', 'feature/inline', str(worktree)], cwd=repo, check=True, capture_output=True)",
+      "source_sha256": "0333756741c579cc2bb0c9defd75a0003a552c3ae4276e2de67ce99e4ebc4872",
+      "scope": "support",
+      "reason": "Bounded or disposable-repository Git metadata/setup. The enclosing native operation keeps its separate host contract."
+    },
+    {
+      "source": "tests/test_vault_doctor_project_name_canonicalization.py",
+      "expression": "subprocess.run(['git', 'worktree', 'add', '-b', 'feature/dedupe', str(worktree)], cwd=repo, check=True, capture_output=True)",
+      "source_sha256": "0333756741c579cc2bb0c9defd75a0003a552c3ae4276e2de67ce99e4ebc4872",
+      "scope": "support",
+      "reason": "Bounded or disposable-repository Git metadata/setup. The enclosing native operation keeps its separate host contract."
+    },
+    {
+      "source": "tests/test_vault_doctor_project_name_canonicalization.py",
+      "expression": "subprocess.run(['git', 'worktree', 'add', '-b', 'feature/env', str(worktree)], cwd=repo, check=True, capture_output=True)",
+      "source_sha256": "0333756741c579cc2bb0c9defd75a0003a552c3ae4276e2de67ce99e4ebc4872",
+      "scope": "support",
+      "reason": "Bounded or disposable-repository Git metadata/setup. The enclosing native operation keeps its separate host contract."
+    },
+    {
+      "source": "tests/test_vault_doctor_project_name_canonicalization.py",
+      "expression": "subprocess.run(['git', 'worktree', 'add', '-b', 'feature/url', str(worktree)], cwd=repo, check=True, capture_output=True)",
+      "source_sha256": "0333756741c579cc2bb0c9defd75a0003a552c3ae4276e2de67ce99e4ebc4872",
+      "scope": "support",
+      "reason": "Bounded or disposable-repository Git metadata/setup. The enclosing native operation keeps its separate host contract."
+    },
+    {
+      "source": "tests/test_vault_doctor_transactions.py",
+      "expression": "subprocess.run([sys.executable, str(script), '--vault', str(tmp_path), '--sessions-folder', 'claude-sessions', '--insights-folder', 'claude-insights', '--check', 'encoding-corruption', '--apply', '--yes'], env=environment, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=20)",
+      "source_sha256": "808c8b5e02da809aaf0763a4161ceb844746572346e276333e7caf5449c4062a",
+      "capability": "cli.doctor"
+    },
+    {
+      "source": "tests/test_vault_scan.py",
+      "expression": "subprocess.run([sys.executable, '-c', child, str(VAULT_SCAN.parent), selected.host, selected.client, selected.native_session_id, str(selected.worktree), str(selected.config_path), str(selected.resource_root), str(selected.index_path), str(selected.state_path), *map(str, args)], capture_output=True, text=True, timeout=60, cwd=cwd)",
+      "source_sha256": "7fde1add41fdf6e2b901dee44dab3fd62b6743b715f6833b3a4f165e0b27225d",
+      "capability": "skill.vault-search"
+    },
+    {
+      "source": "tests/test_vault_scan.py",
+      "expression": "subprocess.run([sys.executable, str(lone / 'vault_scan.py'), 'grep', str(tmp_path), 'x', '--pattern=x'], capture_output=True, text=True, timeout=60, cwd=str(tmp_path), env=env)",
+      "source_sha256": "7fde1add41fdf6e2b901dee44dab3fd62b6743b715f6833b3a4f165e0b27225d",
+      "scope": "structural",
+      "reason": "Standalone script with missing dependencies must fail before runtime imports; no native operation is executed."
+    },
+    {
+      "source": "tests/test_wiki_cli.py",
+      "expression": "subprocess.run([sys.executable, '-c', child, selected.host, selected.client, str(config), str(REPO), str(db or selected.index_path), selected.native_session_id, str(selected.canonical_project_root), *args], input=stdin, capture_output=True, text=True, env=env, timeout=60)",
+      "source_sha256": "502ec748a1a5761a215baee4d3a9849802e1d125f0b8cf8030638fab068f551b",
+      "capability": "cli.wiki"
+    },
+    {
+      "source": "scripts/dev-test/capture-synthetic-host-fixtures.py",
+      "expression": "subprocess.run(['git', 'rev-parse', 'HEAD'], cwd=root, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=5)",
+      "source_sha256": "bf1097c066d286e117e2338ea30346707821d1a91e1963bcfbf3b6572b01e8b1",
+      "scope": "support",
+      "reason": "Bounded Git metadata for synthetic evidence; does not certify native dispatch or execute a vault operation."
+    },
+    {
+      "source": "scripts/dev-test/capture-synthetic-host-fixtures.py",
+      "expression": "subprocess.run(['git', 'status', '--porcelain', '--untracked-files=no'], cwd=root, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=5)",
+      "source_sha256": "bf1097c066d286e117e2338ea30346707821d1a91e1963bcfbf3b6572b01e8b1",
+      "scope": "support",
+      "reason": "Bounded Git metadata for synthetic evidence; does not certify native dispatch or execute a vault operation."
+    },
+    {
+      "source": "scripts/dev-test/capture-synthetic-host-fixtures.py",
+      "expression": "subprocess.run([sys.executable, '-m', 'pytest', '-p', 'parity_collection_plugin', *TESTS, '-q', '--parity-matrix', 'docs/parity/capabilities.json'], cwd=root, env=environment, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=180)",
+      "source_sha256": "bf1097c066d286e117e2338ea30346707821d1a91e1963bcfbf3b6572b01e8b1",
+      "capability": "capture.normalization"
+    },
+    {
+      "source": "tests/test_security.py",
+      "expression": "subprocess.run([sys.executable, str(work / '.claude/hooks/require-preflight.py')], input=json.dumps(payload), capture_output=True, text=True, timeout=60, cwd=work, env=env)",
+      "source_sha256": "73f20caa2c4b5a8d146a8615d6f980eb782638837f4a6ce1a2b84680fee400ba",
+      "scope": "structural",
+      "reason": "Exact disposable repository preflight-token HEAD format and Git-policy acceptance probe. The copied preflight executes its actual mandatory lint and reviewed contracts; no vault writer or lifecycle capture is invoked."
+    },
+    {
+      "source": "tests/test_security.py",
+      "expression": "subprocess.run(['git', '-C', str(nested), 'init', '-q'], env=env, check=True)",
+      "source_sha256": "73f20caa2c4b5a8d146a8615d6f980eb782638837f4a6ce1a2b84680fee400ba",
+      "scope": "support",
+      "reason": "Disposable Git fixture setup for exact repository preflight-token HEAD tests; no vault paths or lifecycle calls."
+    },
+    {
+      "source": "tests/test_security.py",
+      "expression": "subprocess.run(['git', '-C', str(work), 'init', '-q', '--object-format=sha256', '-b', 'feature/probe'], env=env, capture_output=True)",
+      "source_sha256": "73f20caa2c4b5a8d146a8615d6f980eb782638837f4a6ce1a2b84680fee400ba",
+      "scope": "support",
+      "reason": "Disposable Git fixture setup for exact repository preflight-token HEAD tests; no vault paths or lifecycle calls."
+    },
+    {
+      "source": "tests/test_security.py",
+      "expression": "subprocess.run(['bash', 'scripts/commit-preflight.sh', '--skip-tests', 'probe'], cwd=work, env=env, capture_output=True, text=True, timeout=60)",
+      "source_sha256": "73f20caa2c4b5a8d146a8615d6f980eb782638837f4a6ce1a2b84680fee400ba",
+      "scope": "structural",
+      "reason": "Exact disposable repository preflight-token HEAD format and Git-policy acceptance probe. The copied preflight executes its actual mandatory lint and reviewed contracts; no vault writer or lifecycle capture is invoked."
+    },
+    {
+      "source": "tests/test_security.py",
+      "expression": "subprocess.run(['git', '-C', str(work), '-c', 'user.email=t@example.invalid', '-c', 'user.name=t', *args], env=env, check=True, capture_output=True, text=True)",
+      "source_sha256": "73f20caa2c4b5a8d146a8615d6f980eb782638837f4a6ce1a2b84680fee400ba",
+      "scope": "support",
+      "reason": "Disposable Git fixture setup for exact repository preflight-token HEAD tests; no vault paths or lifecycle calls."
+    },
+    {
+      "source": "tests/conftest.py",
+      "expression": "original(args, *positional, **kwargs)",
+      "source_sha256": "ada0ed25eff9056f6e173557cf839b1d702359b1c04786752f31cbaf3184aa99",
+      "scope": "support",
+      "reason": "Autouse test transport guard rejects unmocked claude/codex commands before forwarding non-native subprocesses. This guard proves no client capability; actual process callers retain their own actor contracts."
+    },
+    {
+      "source": "tests/test_check_items_cache.py",
+      "expression": "original_popen(command, *args, **kwargs)",
+      "source_sha256": "288b0a33bf2765a2a411dadbd47250872d7d40860ad36b9ddef0310f0567df9c",
+      "scope": "support",
+      "reason": "Autouse cache-test transport guard forwards only named disposable Python lock-holder tests and rejects every live native AI launch. Cache actor contracts remain required."
+    },
+    {
+      "source": "tests/test_host_ai_backend.py",
+      "expression": "real_popen(*args, **kwargs)",
+      "source_sha256": "577ae70065792ca0a23cf02cbf1f116bb35f049f9b166b21a73314fae76cd693",
+      "scope": "support",
+      "reason": "Paired deadline test records and terminates a disposable Python sleep child. The actual backend invocation remains actor-scoped."
+    },
+    {
+      "source": "tests/test_standup_deep.py",
+      "expression": "original_run(cmd, **kwargs)",
+      "source_sha256": "6b22e1060f8d47e50fb721f8272f812b1f201083c0cec00f455c6964622dc8d0",
+      "scope": "support",
+      "reason": "Paired standup test intercepts git-log and gh failures, forwarding remaining fixture repository commands. The real native pipeline remains actor-scoped."
+    },
+    {
+      "source": "tests/test_review_coordination_recovery.py",
+      "expression": "subprocess.run([sys.executable, '-c', 'raise SystemExit(99)'], env=environment, stdin=subprocess.DEVNULL, capture_output=True, timeout=5)",
+      "source_sha256": "e670a3aa583ce487f59dbccfbeeff21e84edde9ca40bb90c25f28d8ed00f3af4",
+      "scope": "support",
+      "reason": "Scratch transport refusal control requests a disposable Python child with missing private coordination state and asserts the autouse guard rejects it before process creation. It exercises no native client capability."
+    },
+    {
+      "source": "tests/test_review_native_classifier_retry.py",
+      "expression": "_NATIVE_POPEN(command, *args, **kwargs)",
+      "source_sha256": "0bc49b6250b9f3cecc808c9870dfb2cca6a83427ab75294a368e60eb2d9b2527",
+      "capability": "ai.native_selection"
+    },
+    {
+      "source": "tests/test_host_package_install.py",
+      "expression": "subprocess.run([sys.executable, '-S', '-c', driver, str(public_script), mode, str(source), str(cache)], env=environment, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)",
+      "source_sha256": "60fe212364d18a0f28dd19f0401515e332057ea8f973ab0d3a01810ea08bd1bb",
+      "scope": "support",
+      "reason": "Runs only the copied installer in disposable home/cache/config with metadata-only native inventory. No installed client, AI, source capture or live vault runs; validates Python 3.9 stdlib packaging and exact backup restoration."
+    },
+    {
+      "source": "tests/test_ci_test_shards.py",
+      "expression": "subprocess.run(['bash', '-c', prefix + block + tail], cwd=tmp_path, env=environment, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=20)",
+      "source_sha256": "e111d92f8c4a5c6cda9705cb4b83e35338fb9e3d9e4e5b143dcd44298e84135d",
+      "scope": "structural",
+      "reason": "Private preflight shell control: executes the production parallel, serial, coverage and token blocks with a disposable phase driver, controlled exits, fake coverage bytes and a private token. It runs no native client or live service and proves no client capability."
+    },
+    {
+      "source": "tests/test_ci_test_shards.py",
+      "expression": "subprocess.run(['bash', '-c', command], cwd=tmp_path, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=20)",
+      "source_sha256": "e111d92f8c4a5c6cda9705cb4b83e35338fb9e3d9e4e5b143dcd44298e84135d",
+      "scope": "structural",
+      "reason": "Private preflight token control: runs the production startup invalidation stanza against a disposable seeded token, then returns controlled failure or interruption exit codes. It kills no process, touches no live approval token and proves no client capability."
+    },
+    {
+      "source": "tests/test_ci_test_shards.py",
+      "expression": "subprocess.run(['bash', '-c', compatibility + block.replace('${{ matrix.shard }}', str(index))], cwd=work, env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=20)",
+      "source_sha256": "e111d92f8c4a5c6cda9705cb4b83e35338fb9e3d9e4e5b143dcd44298e84135d",
+      "scope": "structural",
+      "reason": "Private workflow shard control: executes the production Bash block at every matrix index with disposable fake pytest drivers and private artifact bytes. The Python driver runs only the local partition helper. Wrong-owner and missing-serial mutations must fail. No native client, model, live service or client capability is exercised."
+    },
+    {
+      "source": "tests/test_ci_test_shards.py",
+      "expression": "subprocess.run(['bash', '-c', block], cwd=tmp_path, env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=20)",
+      "source_sha256": "e111d92f8c4a5c6cda9705cb4b83e35338fb9e3d9e4e5b143dcd44298e84135d",
+      "scope": "structural",
+      "reason": "Private dedicated timing workflow control: executes the production Bash block with a disposable fake pytest driver, argv receipt and coverage bytes. Checks exact serial selectors, collection plugin and artifact copy; broken command mutations must fail. No native client, live service or client capability is exercised."
+    },
+    {
+      "source": "tests/test_ci_test_shards.py",
+      "expression": "subprocess.run(['bash', '-c', 'set -eu\\n' + command], cwd=tmp_path, env=environment, stdin=subprocess.DEVNULL, capture_output=True, timeout=10)",
+      "source_sha256": "e111d92f8c4a5c6cda9705cb4b83e35338fb9e3d9e4e5b143dcd44298e84135d",
+      "scope": "structural",
+      "reason": "Private aggregate workflow result control: executes only the production shell success checks with synthetic ordinary and timing job results. It launches no tests, native client, model or live service and proves no client capability."
+    },
+    {
+      "source": "tests/test_ci_test_shards.py",
+      "expression": "subprocess.run(['bash', '-c', command], cwd=tmp_path, env=environment, stdin=subprocess.DEVNULL, capture_output=True, timeout=10)",
+      "source_sha256": "e111d92f8c4a5c6cda9705cb4b83e35338fb9e3d9e4e5b143dcd44298e84135d",
+      "scope": "structural",
+      "reason": "Private aggregate workflow command control: executes the production Bash command with a disposable fake Python driver and argv receipt. Requires both ordinary and timing artifact arguments; omission must fail. It launches no coverage runner, native client, model or live service and proves no client capability."
+    },
+    {
+      "source": "tests/test_host_skill_contracts.py",
+      "expression": "subprocess.run(['bash', '-c', commands[0]], env=environment, cwd=unrelated, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10)",
+      "source_sha256": "66acb7b6c62948e94d195b40b67973c3283bfbaae2ff106de66517ad7bd0376a",
+      "scope": "structural",
+      "reason": "Private Claude setup-reference controls: run only the authored Bash canary and project hookify rule commands against disposable selected homes and projects. Check empty selection, spaces, unrelated cwd, preserved sentinels and repeated invocation. No native client, model, live configuration or client capability is exercised."
+    },
+    {
+      "source": "tests/test_host_skill_contracts.py",
+      "expression": "subprocess.run(['bash', '-c', commands[1]], env=environment, cwd=unrelated, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10)",
+      "source_sha256": "66acb7b6c62948e94d195b40b67973c3283bfbaae2ff106de66517ad7bd0376a",
+      "scope": "structural",
+      "reason": "Private Claude setup-reference controls: run only the authored Bash canary and project hookify rule commands against disposable selected homes and projects. Check empty selection, spaces, unrelated cwd, preserved sentinels and repeated invocation. No native client, model, live configuration or client capability is exercised."
+    },
+    {
+      "source": "tests/test_readonly_dev_install.py",
+      "expression": "subprocess.run(['bash', str(source / 'scripts/test-dev-skill.sh'), 'restore', '--host', selected_host_context.host, '--source', str(source), '--cache-path', str(cache)], env=metadata_environment(home), stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)",
+      "source_sha256": "e98f9fc524f7da5227ba418ba879ea283795c47faa6ee34d33e85ccf9e31fcb9",
+      "scope": "support",
+      "reason": "Runs only the copied restore script against a disposable private home and read-only partial cache, with metadata-only native inventory. Checks exact backup restoration and unchanged source permissions. No installed native client, AI, live configuration or vault runs; the enclosing paired test retains its host context."
+    },
+    {
+      "source": "tests/test_review_skill_requests.py",
+      "expression": "subprocess.run(command, env=metadata_environment(home), stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)",
+      "source_sha256": "dc448eb9f80610de28faaa46bba6fec4d9bc1b232dd54534d77b022bce8a3291",
+      "capability": "installation.rollback"
+    }
+  ]
+}

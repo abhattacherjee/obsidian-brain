@@ -2,7 +2,7 @@
 obsidian_utils.py — Shared utilities for obsidian-brain hook scripts.
 
 Extracted from the validated spike (spike_session_log.py) with these changes:
-  - No hardcoded config; uses load_config() reading ~/.claude/obsidian-brain-config.json
+  - Native config comes from the selected runtime; legacy defaults live in its adapter
   - All functions take explicit parameters (vault_path, model, etc.) — no global state
   - File extraction uses tool_use blocks instead of regex heuristics
   - Python stdlib only
@@ -24,11 +24,13 @@ import stat
 import subprocess
 import sys
 import tempfile
+import uuid
 import threading
 import time
 from typing import Optional
 from collections.abc import Sequence
 from pathlib import Path
+from note_transactions import LockBusy
 
 try:
     import vault_index as _vault_index
@@ -51,7 +53,7 @@ from frontmatter import (  # noqa: E402
 )
 
 # Session IDs are CC UUIDs (or test fixtures). Restrict to safe filename chars
-# so the marker path never escapes ~/.claude/obsidian-brain/sessions/.
+# so the legacy marker path never escapes its private session directory.
 _SID_FILENAME_SAFE = re.compile(r"\A[A-Za-z0-9._-]{1,128}\Z")
 
 
@@ -132,6 +134,15 @@ def _first_seen_date(sid: str) -> str:
 
     Marker location: ~/.claude/obsidian-brain/sessions/<sid>.json (0o600).
     """
+    from runtime_context import current_runtime_context
+    context = current_runtime_context()
+    if context is not None:
+        from session_auxiliary_state import first_seen_date
+        try:
+            return first_seen_date(context)
+        except (OSError, ValueError):
+            print("[obsidian-brain] first-seen state unavailable; using today's date", file=sys.stderr)
+            return datetime.date.today().isoformat()
     if not _SID_FILENAME_SAFE.fullmatch(sid):
         print(
             f"[obsidian-brain] _first_seen_date: refusing unsafe sid shape; "
@@ -201,6 +212,15 @@ def _first_seen_date(sid: str) -> str:
 # Sanitize session_id to safe filename characters.
 _RETRO_SID_SAFE = re.compile(r"[^A-Za-z0-9._-]")
 
+
+def _retro_sentinel_key(session_id):
+    from runtime_context import current_runtime_context
+    context = current_runtime_context()
+    if context:
+        import hashlib
+        return hashlib.sha256((context.host + "\0" + session_id).encode()).hexdigest()
+    return _RETRO_SID_SAFE.sub("_", session_id)
+
 # Single source of truth for the retro-gate TTL. Imported by
 # hooks/obsidian_retro_gate.py so the value is never duplicated.
 RETRO_GATE_TTL_SECONDS = 7200  # 2 hours
@@ -208,6 +228,11 @@ RETRO_GATE_TTL_SECONDS = 7200  # 2 hours
 
 def _retro_gate_dir() -> Path:
     """Return the retro-gate sentinel directory, computed at call time."""
+    from runtime_context import current_runtime_context
+    context = current_runtime_context()
+    if context:
+        from session_auxiliary_state import directory
+        return directory(context, "retro-gate")
     return Path.home() / ".claude" / "obsidian-brain" / "retro-gate"
 
 
@@ -218,8 +243,12 @@ def _reap_stale_retro_sentinels() -> int:
     Best-effort: OSErrors on individual files are swallowed.  Returns the count of
     files reaped (0 when the gate dir is absent or no files qualify).
     """
-    gate_dir = _retro_gate_dir()
-    if not gate_dir.exists():
+    try:
+        gate_dir = _retro_gate_dir()
+        if not gate_dir.exists():
+            return 0
+    except OSError:
+        print("Retro gate cleanup could not access private state", file=sys.stderr)
         return 0
     cutoff = time.time() - RETRO_GATE_TTL_SECONDS
     reaped = 0
@@ -239,7 +268,7 @@ def _reap_stale_retro_sentinels() -> int:
     return reaped
 
 
-def mark_retro_classification_pending(session_id: str, retro_path: str) -> str:
+def mark_retro_classification_pending(session_id: str, retro_path: str, turn_id=None) -> str:
     """Write a retro-classification-pending sentinel atomically.
 
     Sentinel location: ~/.claude/obsidian-brain/retro-gate/<sanitized_sid>.json
@@ -275,7 +304,10 @@ def mark_retro_classification_pending(session_id: str, retro_path: str) -> str:
     if session_id.strip() == "unknown":
         return "Failed: refusing to arm retro gate — session_id is \"unknown\" (unresolved session); gate NOT armed, Stop hook will not enforce classification for this session"
 
-    sanitized = _RETRO_SID_SAFE.sub("_", session_id)
+    if turn_id is not None and (not isinstance(turn_id, str) or not turn_id.strip() or len(turn_id) > 512):
+        return "Failed: refusing to arm retro gate — turn_id must be a nonempty native turn ID"
+
+    sanitized = _retro_sentinel_key(session_id)
     if not sanitized:
         # Unreachable by construction, kept as belt-and-braces: the guards
         # above reject empty/whitespace-only ids, and _RETRO_SID_SAFE.sub()
@@ -288,8 +320,8 @@ def mark_retro_classification_pending(session_id: str, retro_path: str) -> str:
                 "to an empty string; gate NOT armed, Stop hook will not "
                 "enforce classification for this session")
 
-    gate_dir = _retro_gate_dir()
     try:
+        gate_dir = _retro_gate_dir()
         gate_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         if gate_dir.stat().st_mode & 0o077:
             os.chmod(gate_dir, 0o700)
@@ -321,6 +353,8 @@ def mark_retro_classification_pending(session_id: str, retro_path: str) -> str:
         "retro_path": retro_path,
         "created_at": time.time(),
     }
+    if turn_id is not None:
+        payload["turn_id"] = turn_id
     tmp_path = None
     try:
         fd, tmp_path = tempfile.mkstemp(
@@ -353,11 +387,15 @@ def clear_retro_classification_pending(session_id: str) -> bool:
     if not session_id:
         return False
 
-    sanitized = _RETRO_SID_SAFE.sub("_", session_id)
+    sanitized = _retro_sentinel_key(session_id)
     if not sanitized:
         return False
 
-    gate_dir = _retro_gate_dir()
+    try:
+        gate_dir = _retro_gate_dir()
+    except OSError:
+        print("Retro gate could not be cleared: private state is unavailable", file=sys.stderr)
+        return False
     sentinel = gate_dir / f"{sanitized}.json"
 
     # Path-containment check.
@@ -384,11 +422,15 @@ def get_retro_classification_pending(session_id: str) -> dict | None:
     if not session_id:
         return None
 
-    sanitized = _RETRO_SID_SAFE.sub("_", session_id)
+    sanitized = _retro_sentinel_key(session_id)
     if not sanitized:
         return None
 
-    gate_dir = _retro_gate_dir()
+    try:
+        gate_dir = _retro_gate_dir()
+    except OSError:
+        print("Retro gate could not be checked: private state is unavailable", file=sys.stderr)
+        return None
     sentinel = gate_dir / f"{sanitized}.json"
 
     # Path-containment check.
@@ -866,6 +908,10 @@ def _resolve_project_basename_with_source() -> tuple[str | None, str]:
     layers instead of triggering an unscoped cross-project glob (which would
     silently mis-attribute the active session).
     """
+    from runtime_context import current_runtime_context
+    context = current_runtime_context()
+    if context is not None:
+        return context.canonical_project_root.name or None, "context"
     try:
         cwd_base = os.path.basename(os.getcwd())
         return (cwd_base, "cwd") if cwd_base else (None, "none")
@@ -950,10 +996,11 @@ def _recent_bootstrap_sid(window_seconds: int = 600) -> str | None:
 
 
 # --- Secure working directory ---
-# All temp/cache files use ~/.claude/obsidian-brain/ (0o700) instead of /tmp.
+# Legacy temporary/cache files use the native adapter private directory (0o700).
 # This prevents symlink attacks and cache poisoning on multi-user systems.
 
-_SECURE_DIR = os.path.expanduser("~/.claude/obsidian-brain")
+from runtime_adapters.claude import legacy_private_directory, legacy_config_path, legacy_foreign_host_markers
+_SECURE_DIR = str(legacy_private_directory())
 
 
 def _ensure_secure_dir() -> str:
@@ -996,9 +1043,16 @@ def _lock_path(event_type: str, session_id: str) -> str:
 
     Sanitizes both components so they cannot escape _LOCK_DIR. Shared by
     claim_hook_run() and release_hook_run() so the two never drift."""
-    safe_sid = re.sub(r"[^A-Za-z0-9_-]", "_", session_id)[:64]
+    from runtime_context import current_runtime_context
+    context = current_runtime_context()
+    safe_sid = context.session_key if context else re.sub(r"[^A-Za-z0-9_-]", "_", session_id)[:64]
     safe_event = re.sub(r"[^A-Za-z0-9_-]", "_", event_type)[:32]
-    return os.path.join(_LOCK_DIR, f"{safe_sid}-{safe_event}")
+    if context:
+        from session_auxiliary_state import directory
+        lock_dir = str(directory(context, "locks"))
+    else:
+        lock_dir = _LOCK_DIR
+    return os.path.join(lock_dir, f"{safe_sid}-{safe_event}")
 
 
 def claim_hook_run(event_type: str, session_id: str,
@@ -1022,13 +1076,12 @@ def claim_hook_run(event_type: str, session_id: str,
     """
     if not session_id:
         return True
+    lock_path = _lock_path(event_type, session_id)
     try:
-        os.makedirs(_LOCK_DIR, mode=0o700, exist_ok=True)
+        os.makedirs(os.path.dirname(lock_path), mode=0o700, exist_ok=True)
     except OSError as exc:
         print(f"[obsidian-brain] dedup lock dir unavailable, proceeding: {exc}", file=sys.stderr)
         return True
-
-    lock_path = _lock_path(event_type, session_id)
 
     payload = f"{os.getpid()} {time.time():.3f}\n".encode("utf-8")
 
@@ -1038,7 +1091,9 @@ def claim_hook_run(event_type: str, session_id: str,
             os.write(fd, payload)
         finally:
             os.close(fd)
-        _cleanup_stale_locks()  # only the winner scans the locks dir
+        from runtime_context import current_runtime_context
+        if current_runtime_context() is None:
+            _cleanup_stale_locks()  # only the winner scans the legacy locks dir
         return True
 
     try:
@@ -1131,14 +1186,21 @@ def _append_sessionend_log(
 ) -> None:
     """Append a one-line SessionEnd outcome record; rotate when oversized.
 
-    Writes to ~/.claude/obsidian-brain-hook.log alongside SessionStart entries
-    and the future Reaped entries (issue #125 reaper).
+    Bound contexts write to their versioned per-session logs directory. Explicit
+    unbound Claude compatibility uses its legacy hook-log path.
 
     Best-effort: catches any exception (OSError from filesystem, TypeError
     from bad input types, etc.) and prints a stderr warning. Failure to log
     must not block the SessionEnd hook contract — the hook always exits 0.
     """
-    log_dir = os.path.join(os.path.expanduser("~"), ".claude")
+    from runtime_context import current_runtime_context
+    context = current_runtime_context()
+    if context:
+        from session_auxiliary_state import directory
+        log_dir = str(directory(context, "logs"))
+    else:
+        from runtime_adapters.claude import selected_home
+        log_dir = str(selected_home())
     log_path = os.path.join(log_dir, _HOOK_LOG_NAME)
     try:
         os.makedirs(log_dir, exist_ok=True)
@@ -1180,7 +1242,14 @@ def _append_reaper_log(project: str, sid: Optional[str], event: str, detail: str
     to stderr so the reaper itself is never interrupted by a log write error.
     """
     try:
-        log_dir = Path.home() / ".claude"
+        from runtime_context import current_runtime_context
+        context = current_runtime_context()
+        if context:
+            from session_auxiliary_state import directory
+            log_dir = directory(context, "logs")
+        else:
+            from runtime_adapters.claude import selected_home
+            log_dir = selected_home()
         log_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         log_path = log_dir / _HOOK_LOG_NAME
 
@@ -1347,18 +1416,7 @@ _env_sid_malformed_warned: set[str] = set()
 # Keyed by the Codex marker variable that fired (#362).
 _foreign_host_warned: set[str] = set()
 
-# Environment variables Codex sets in the shells it runs tools in (#362).
-# Checked against the codex-cli 0.155.1 binary. The two sandbox variables are
-# set only when the sandbox is on, so an unsandboxed run is detected by
-# CODEX_THREAD_ID alone. An unsandboxed run of a Codex build older than
-# CODEX_THREAD_ID is therefore not detected. CODEX_HOME is deliberately NOT
-# here: it is user configuration and is often exported in an ordinary shell
-# profile, so its presence says nothing about which host launched this process.
-_CODEX_HOST_MARKERS = (
-    "CODEX_THREAD_ID",
-    "CODEX_SANDBOX",
-    "CODEX_SANDBOX_NETWORK_DISABLED",
-)
+_CODEX_HOST_MARKERS = legacy_foreign_host_markers()
 
 
 def _foreign_host_marker() -> str | None:
@@ -1394,9 +1452,9 @@ def _hook_payload_codex_reason(hook_input: dict) -> str | None:
 
 # Memo for the env-layer transcript check below, keyed by (project, env_sid).
 #
-# WHY: CLAUDE_CODE_SESSION_ID is constant for the life of a process, and the
+# WHY: the native session environment ID is constant for the life of a process, and the
 # resolved project basename is too — but only because nothing in this module
-# calls os.chdir(); it is derived from os.getcwd() (or CLAUDE_PROJECT_DIR)
+# calls os.chdir(); it is derived from os.getcwd() or the native project variable
 # fresh on every call, and would change mid-run if the process's cwd did
 # (#354 review item 5c/6c). Given that, the answer to "does this sid have a
 # transcript yet" cannot change mid-run. Without this cache, the same
@@ -1548,6 +1606,10 @@ def _current_session_cwd() -> str:
     CLAUDE_PROJECT_DIR) so the transcript comparison and the encoding pre-filter
     can never be judging against two different directories.
     """
+    from runtime_context import current_runtime_context
+    context = current_runtime_context()
+    if context is not None:
+        return str(context.worktree)
     cwd = _safe_getcwd()
     if cwd:
         return cwd.rstrip("/") or "/"
@@ -2029,6 +2091,10 @@ def _resolve_session_id(allow_bootstrap: bool = True, allow_env: bool = True) ->
     inherits the markers and resolves 'unknown'; the two cases look identical
     from inside the process, and 'unknown' is the answer that is never wrong.
     """
+    from runtime_context import current_runtime_context
+    context = current_runtime_context()
+    if context is not None:
+        return context.native_session_id
     marker = _foreign_host_marker()
     if marker is not None:
         _warn_once(
@@ -2121,6 +2187,10 @@ def _get_session_id_fast(allow_env: bool = True) -> str:
     `allow_env` is threaded straight through to _resolve_session_id; see its
     docstring for the CLAUDE_CODE_SESSION_ID layer-0 fast path (#330).
     """
+    from runtime_context import current_runtime_context
+    context = current_runtime_context()
+    if context:
+        return context.native_session_id
     return _resolve_session_id(allow_bootstrap=True, allow_env=allow_env)
 
 
@@ -2134,10 +2204,15 @@ def _get_session_id_fast(allow_env: bool = True) -> str:
 _UNCACHEABLE_SIDS = frozenset({"", "unknown"})
 
 
-def cache_get(session_id: str, key: str):
+def cache_get(session_id: str, key: str, context=None):
     """Read a key from the session cache. Returns None on miss, and always
     for an uncacheable id (see _UNCACHEABLE_SIDS)."""
-    if session_id in _UNCACHEABLE_SIDS:
+    from runtime_context import current_runtime_context
+    context = context or current_runtime_context()
+    if context is not None:
+        from session_auxiliary_state import cache_get as scoped_cache_get
+        return scoped_cache_get(context, key)
+    if context is None and session_id in _UNCACHEABLE_SIDS:
         return None
     cache_path = f"{_CACHE_PREFIX}{session_id}.json"
     try:
@@ -2148,12 +2223,26 @@ def cache_get(session_id: str, key: str):
         return None
 
 
-def cache_set(session_id: str, key: str, value) -> None:
+def cache_set(session_id: str, key: str, value, context=None) -> None:
     """Write a key to the session cache. Atomic write. No-op for an
     uncacheable id (see _UNCACHEABLE_SIDS)."""
-    if session_id in _UNCACHEABLE_SIDS:
+    from runtime_context import current_runtime_context
+    context = context or current_runtime_context()
+    if context is not None:
+        from session_auxiliary_state import cache_update
+        try:
+            cache_update(context, key, value)
+        except (OSError, ValueError):
+            print("[obsidian-brain] session cache write failed", file=sys.stderr)
         return
-    _ensure_secure_dir()
+    if context is None and session_id in _UNCACHEABLE_SIDS:
+        return
+    try:
+        _ensure_secure_dir()
+    except OSError as exc:
+        print(f"[obsidian-brain] cache write failed: {exc}", file=sys.stderr)
+        return
+    secure_dir = _SECURE_DIR
     cache_path = f"{_CACHE_PREFIX}{session_id}.json"
     try:
         with open(cache_path, 'r') as f:
@@ -2165,7 +2254,11 @@ def cache_set(session_id: str, key: str, value) -> None:
 
     data[key] = value
 
-    fd, tmp = tempfile.mkstemp(prefix='.ob-cache-', suffix='.json.tmp', dir=_SECURE_DIR)
+    try:
+        fd, tmp = tempfile.mkstemp(prefix='.ob-cache-', suffix='.json.tmp', dir=secure_dir)
+    except OSError as exc:
+        print(f"[obsidian-brain] cache write failed: {exc}", file=sys.stderr)
+        return
     try:
         with os.fdopen(fd, 'w') as f:
             json.dump(data, f)
@@ -2181,6 +2274,15 @@ def cache_set(session_id: str, key: str, value) -> None:
 def cache_invalidate(session_id: str, *keys: str) -> None:
     """Remove specific keys from cache. No keys = clear all. No-op for an
     uncacheable id, which never has a cache (see _UNCACHEABLE_SIDS)."""
+    from runtime_context import current_runtime_context
+    context = current_runtime_context()
+    if context is not None:
+        from session_auxiliary_state import cache_update
+        try:
+            cache_update(context, remove=keys, clear=not keys)
+        except (OSError, ValueError):
+            print("[obsidian-brain] session cache invalidation failed", file=sys.stderr)
+        return
     if session_id in _UNCACHEABLE_SIDS:
         return
     cache_path = f"{_CACHE_PREFIX}{session_id}.json"
@@ -2224,7 +2326,7 @@ def cache_invalidate(session_id: str, *keys: str) -> None:
 # message-filtering heuristics.
 RAW_NOTE_MAX_TURNS = 120
 
-_CONFIG_PATH = Path.home() / ".claude" / "obsidian-brain-config.json"
+_CONFIG_PATH = legacy_config_path()
 
 _DEFAULTS: dict = {
     "vault_path": "",
@@ -2236,8 +2338,8 @@ _DEFAULTS: dict = {
     "min_messages": 3,
     "min_duration_minutes": 2,
     "summary_model": "haiku",
-    "summary_pipeline": "auto",  # "auto" = Haiku claude -p + sub-agent fallback; "subagent" = skip Haiku pipeline. Consumed by /recall SKILL.md Step 2 (summarization is deferred to /recall), #84
-    "summary_batch_size": 3,  # notes per claude -p spawn in upgrade_batch (#166); 1 = legacy per-note fan-out
+    "summary_pipeline": "auto",  # "auto" = native analysis + interactive fallback; "subagent" = skip native analysis. Consumed by /recall SKILL.md Step 2; #84
+    "summary_batch_size": 3,  # notes per native analysis request in upgrade_batch (#166); 1 = legacy per-note fan-out
     "summary_recovery": True,  # #167: post-process loose summaries (heading normalization, synth missing sections, default importance) before escalating/falling back. Set false to disable.
     "consolidate_cluster_threshold": 0.5,  # cosine sim for single-linkage edge in /consolidate
     "consolidate_min_cluster_size": 3,  # smallest cluster that becomes a theme
@@ -2258,7 +2360,7 @@ _DEFAULTS: dict = {
 # ---------------------------------------------------------------------------
 
 
-def load_config(fresh: bool = False) -> dict:
+def load_config(fresh: bool = False, context=None) -> dict:
     """Read ~/.claude/obsidian-brain-config.json, returning defaults for missing keys.
 
     Session-scoped caching: first call loads from disk and writes to cache;
@@ -2277,6 +2379,15 @@ def load_config(fresh: bool = False) -> dict:
     ``config`` without touching ``config_defaults_sig``. So a cached dict
     must also carry every current default key.
     """
+    from runtime_context import current_runtime_context
+    context = context or current_runtime_context()
+    if context:
+        import copy as _copy
+        config = _copy.deepcopy(_DEFAULTS)
+        config.update(_copy.deepcopy(dict(context.config)))
+        config["vault_path"] = str(context.vault_path)
+        config["index_path"] = str(context.index_path)
+        return config
     sid = _get_session_id_fast()
     sig = _defaults_signature()
     cached = None
@@ -2522,6 +2633,22 @@ def get_session_context(vault_path: str | None = None, sessions_folder: str | No
     `cwd` is the working directory the entry was resolved from. It is a guard,
     not a payload (see below); callers read the other four fields.
     """
+    from runtime_context import current_runtime_context
+    context = current_runtime_context()
+    if context is not None:
+        if vault_path is not None and Path(vault_path).resolve() != context.vault_path.resolve():
+            raise ValueError("Session lookup cannot switch the selected vault")
+        selected_folder = str(context.config.get("sessions_folder", "claude-sessions"))
+        if sessions_folder is not None and sessions_folder != selected_folder:
+            raise ValueError("Session lookup cannot switch the selected sessions folder")
+        from session_lookup import find_existing_session
+        existing = find_existing_session(context, time.monotonic() + 0.1)
+        from capture import planned_note_path
+        planned = existing if existing is not None else planned_note_path(context)
+        return {"session_id": context.native_session_id, "hash": context.session_key[:16],
+                "project": context.project_name,
+                "session_note_name": planned.stem,
+                "cwd": str(context.worktree)}
     sid = _get_session_id_fast()
     cwd_now = _safe_getcwd()
     # Include args in cache key so different call signatures don't collide
@@ -3067,15 +3194,16 @@ _snapshot_index_cache: dict[str, tuple[int, _SnapshotIndex]] = {}
 def _build_snapshot_index(sessions_folder_path: Path) -> _SnapshotIndex:
     """One pass over ``*-snapshot*.md``, grouped by frontmatter session_id.
 
-    Returns ``(by_session_id, malformed)``. Filenames are appended in sorted
-    order, so every per-session list inherits the same lexicographic ordering
-    ``sorted(Path.glob(...))`` gives the uncached path. ``malformed`` holds
+    Returns ``(by_session_id, malformed)``. Each session uses explicit native
+    creation time or the legacy filename time, matching the uncached path.
+    ``malformed`` holds
     ``(filename, already-rendered detail)`` pairs — rendered here (never the
     raw reason, which can embed up to 60 characters of the note's own text)
     so the caller only decides WHETHER to print, not what.
     """
     by_sid: dict[str | None, list[tuple[str, str]]] = {}
     malformed: list[tuple[str, str]] = []
+    chronology = {}
     for p in sorted(sessions_folder_path.glob("*-snapshot*.md")):
         try:
             meta, reason, _cacheable = _parse_note_metadata_uncached(str(p))
@@ -3088,6 +3216,7 @@ def _build_snapshot_index(sessions_folder_path: Path) -> _SnapshotIndex:
             # No default: a missing key must stay None so the index answers
             # exactly as the uncached `meta.get("session_id") == session_id`
             # test does. See ``_SnapshotIndex``.
+            chronology[p.name] = _snapshot_sort_key(p.name, meta)
             by_sid.setdefault(meta.get("session_id"), []).append(
                 (p.name, meta.get("project", ""))
             )
@@ -3098,6 +3227,8 @@ def _build_snapshot_index(sessions_folder_path: Path) -> _SnapshotIndex:
             detail = getattr(exc, "strerror", None) or type(exc).__name__
             malformed.append((p.name, detail))
             continue
+    for entries in by_sid.values():
+        entries.sort(key=lambda item: chronology[item[0]])
     return by_sid, malformed
 
 
@@ -3142,8 +3273,8 @@ def find_snapshots_for_session(
     - Malformed snapshots are logged to stderr and skipped — one bad file
       must not block back-reference writing.
 
-    Sorted lexicographically by filename stem; HHMMSS suffix makes this
-    chronological for post-spec snapshots. Pre-spec (no HHMMSS) sorts first.
+    Native snapshots use explicit UTC created_at. Legacy snapshots use their
+    HHMMSS filename suffix; older untimed snapshots retain deterministic order.
 
     If `date` is None, discovery is date-agnostic: globs `*-{slug}-*-snapshot*.md`
     and relies entirely on frontmatter session_id+project filtering. Use this
@@ -3156,7 +3287,7 @@ def find_snapshots_for_session(
     exactly — the same filename pattern is re-applied with ``fnmatch``, the
     same frontmatter session_id+project test runs, malformed snapshots matching
     the pattern are still logged to stderr and skipped, and the ordering is the
-    same because the memo stores filenames in ``sorted()`` order. It is opt-in
+    same because the memo stores each session in chronological order. It is opt-in
     because the memo must stay unreachable from write paths that create a
     snapshot and then read the list back; see ``_snapshot_index_cache``.
     """
@@ -3164,6 +3295,7 @@ def find_snapshots_for_session(
         return []
     slug = slugify(project)
     wikilinks: list[str] = []
+    chronology = {}
     if date is None:
         glob_pattern = f"*-{slug}-*-snapshot*.md"
     else:
@@ -3222,7 +3354,9 @@ def find_snapshots_for_session(
                 meta.get("project", "").lower() == project.lower()
                 or slugify(meta.get("project", "")) == slug
             ):
-                wikilinks.append(f"[[{p.stem}]]")
+                link = f"[[{p.stem}]]"
+                chronology[link] = _snapshot_sort_key(p.name, meta)
+                wikilinks.append(link)
         except Exception as exc:  # noqa: BLE001
             # The exception TYPE (plus strerror when there is one), never
             # str(exc): str(OSError) embeds the full path argument, which
@@ -3234,7 +3368,7 @@ def find_snapshots_for_session(
             print(f"[obsidian-brain] skipping malformed snapshot {p.name}: {detail}",
                   file=sys.stderr)
             continue
-    return wikilinks
+    return sorted(wikilinks, key=lambda link: chronology[link])
 
 
 _SECTION_RE_CACHE: dict[tuple[str, ...], re.Pattern] = {}
@@ -3263,6 +3397,33 @@ def _extract_hhmmss_from_filename(filename: str) -> str:
     """Return the HHMMSS suffix from a post-spec snapshot filename, or '??????'."""
     m = re.search(r"-snapshot-(\d{6})\.md$", filename)
     return m.group(1) if m else "??????"
+
+
+def _snapshot_created_time(meta):
+    from datetime import datetime, timezone
+    value = meta.get("created_at")
+    if not isinstance(value, str):
+        return None
+    try:
+        instant = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return instant.astimezone(timezone.utc) if instant.tzinfo is not None else None
+    except (ValueError, OverflowError):
+        return None
+
+
+def _snapshot_hhmmss(filename, meta):
+    instant = _snapshot_created_time(meta)
+    return instant.strftime("%H%M%S") if instant is not None else _extract_hhmmss_from_filename(filename)
+
+
+def _snapshot_sort_key(filename, meta):
+    instant = _snapshot_created_time(meta)
+    if instant is not None:
+        return (instant.date().isoformat(), 1, instant.isoformat(), filename)
+    hh = _extract_hhmmss_from_filename(filename)
+    day = filename[:10]
+    # Legacy snapshots without a time retain their old deterministic order.
+    return (day, int(hh != "??????"), day + "T" + hh, filename)
 
 
 def _augment_session_input_with_snapshots(
@@ -3305,8 +3466,8 @@ def _augment_session_input_with_snapshots(
             body = snap_path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
-        hh = _extract_hhmmss_from_filename(snap_path.name)
         meta = read_note_metadata(str(snap_path)) or {}
+        hh = _snapshot_hhmmss(snap_path.name, meta)
         # Default missing `trigger:` to "auto" (consistent with _snapshot_stats
         # and fetch_snapshot_summaries) so legacy/malformed notes don't get
         # mislabeled as compact. Copilot PR #43 round 2 finding.
@@ -3375,7 +3536,7 @@ def fetch_snapshot_summaries(
         except OSError:
             continue
         meta = read_note_metadata(str(path)) or {}
-        hh = _extract_hhmmss_from_filename(path.name)
+        hh = _snapshot_hhmmss(path.name, meta)
         summary = ""
         key_context = ""
 
@@ -3446,9 +3607,8 @@ def gather_session_evidence(
     /retro (see #285) — the most recent one demarcates where a previous
     retro's analysis left off — and are not themselves evidence to mine.
 
-    Snapshots are returned sorted ascending by stem (YYYY-MM-DD-... prefix),
-    which gives correct chronological order including across-midnight sessions.
-    Pre-spec snapshots (hhmmss == '??????') sort before all post-spec ones.
+    Native snapshots use explicit UTC creation time. Legacy snapshots use
+    filename dates and HHMMSS; untimed snapshots retain deterministic ordering.
     Insights/decisions/error-fixes/retros are returned sorted ascending by
     filename. File-read failures are captured in `discovery_errors` and
     never raised.
@@ -3524,14 +3684,15 @@ def gather_session_evidence(
                 snap_by_stem[stem] = {
                     "path": str(snap_path),
                     "stem": stem,
-                    "hhmmss": _extract_hhmmss_from_filename(snap_path.name),
+                    "hhmmss": _snapshot_hhmmss(snap_path.name, meta),
+                    "created_at": meta.get("created_at"),
                     "trigger": meta.get("trigger", "auto"),
                     "body": body,
                     "session_id": meta.get("session_id", ""),
                 }
         bundle["snapshots"] = sorted(
             snap_by_stem.values(),
-            key=lambda s: (0 if s["hhmmss"] == "??????" else 1, s["stem"]),
+            key=lambda s: _snapshot_sort_key(s["stem"] + ".md", s),
         )
     insights_path = Path(vault_path) / insights_folder
     if insights_path.is_dir():
@@ -4060,7 +4221,7 @@ OUTPUT EXACTLY these two sections with no preamble, no commentary:
 # (summary_model, default "haiku") fails with a *quality* reason, retry with a
 # more capable model. Sonnet is the first fallback (~3x cost) before Opus (~5x),
 # replacing the old behavior where the recall Phase-2 sub-agent fell straight to
-# Opus. CLI aliases passed to `claude -p --model`.
+# Opus. Legacy aliases are passed through the native Claude analysis adapter.
 _SUMMARY_FALLBACK_CHAIN = ("sonnet", "opus")
 # Only these generate_summary failure reasons warrant escalating to a more
 # capable model. Timeouts (haiku_timeout) are NOT escalated — a larger model is
@@ -4078,6 +4239,10 @@ def _escalation_models(primary: str) -> list[str]:
     """Ordered model list: the primary, then any fallback-chain model strictly
     more capable than the primary (#165). e.g. haiku -> [haiku, sonnet, opus];
     sonnet -> [sonnet, opus]; opus -> [opus]."""
+    from runtime_context import current_runtime_context
+    context = current_runtime_context()
+    if context is not None and context.host == "codex":
+        return [primary]
     base = _MODEL_RANK.get(primary, 0)
     return [primary] + [m for m in _SUMMARY_FALLBACK_CHAIN if _MODEL_RANK.get(m, 0) > base]
 
@@ -4251,6 +4416,41 @@ def _summary_recovery_enabled() -> bool:
         return True
 
 
+from contextvars import ContextVar
+
+_SUMMARY_NATIVE_MODEL = ContextVar("obsidian_brain_summary_native_model", default=None)
+
+
+def _execute_summary_ai(prompt, operation, model, timeout, input_revision="", expected_count=None):
+    """Keep legacy return formats while dispatching only the bound native host."""
+    from runtime_context import current_runtime_context
+    from types import SimpleNamespace
+    context = current_runtime_context()
+    _SUMMARY_NATIVE_MODEL.set(None)
+    if context is None:
+        return SimpleNamespace(returncode=1, stdout="", stderr="native context unavailable", failure_reason="haiku_subprocess_error")
+    from ai_backend import AIRequest, execute_ai
+    selected_model = model if context.host == "claude" else context.config.get("codex_summary_model")
+    options = {} if expected_count is None else {"expected_count": expected_count}
+    result = execute_ai(context, operation, AIRequest(
+        input=prompt, input_revision=input_revision or hashlib.sha256(prompt.encode()).hexdigest(), timeout=timeout,
+        model=selected_model, options=options,
+    ))
+    _SUMMARY_NATIVE_MODEL.set(result.model)
+    if result.status == "timeout":
+        raise subprocess.TimeoutExpired([context.host], timeout)
+    if result.status != "ok":
+        reason = result.error_code if result.error_code in {"empty_output", "parse_error", "count_mismatch", "missing_section", "native_auth_error"} else "haiku_subprocess_error"
+        return SimpleNamespace(returncode=1, stdout="", stderr=result.status, failure_reason=reason)
+    output = result.data
+    if operation == "theme_names":
+        output = json.dumps(output)
+    elif operation == "session_summaries":
+        output = "\n\n".join("===== SUMMARY %d =====\n%s" % (index, text)
+                              for index, text in sorted(output.items()))
+    return SimpleNamespace(returncode=0, stdout=output, stderr="", model=result.model, failure_reason=None)
+
+
 def generate_snapshot_summary(
     user_msgs: list[str],
     assistant_msgs: list[str],
@@ -4258,7 +4458,7 @@ def generate_snapshot_summary(
     model: str = "haiku",
     timeout: int = 120,
 ) -> tuple[str | None, str | None]:
-    """Call ``claude -p --model <model>`` with the snapshot-specific prompt.
+    """Ask the bound native backend with the snapshot-specific prompt.
 
     Returns ``(summary_text, fallback_reason)``:
       * On success: ``(text, None)``
@@ -4285,34 +4485,33 @@ def generate_snapshot_summary(
     last_reason: str | None = None
     for i, attempt_timeout in enumerate(attempts):
         try:
-            result = subprocess.run(
-                ["claude", "-p", "--model", model],
-                input=prompt, capture_output=True, text=True, timeout=attempt_timeout,
-            )
+            result = _execute_summary_ai(prompt, 'snapshot_summary', model, attempt_timeout, input_revision=metadata.get("input_revision", ""))
+            if result.failure_reason:
+                return None, result.failure_reason
             if result.returncode == 0 and result.stdout.strip():
                 return result.stdout.strip(), None
             if result.returncode != 0:
                 last_reason = "haiku_subprocess_error"
             else:
                 last_reason = "empty_output"
-            print(f"[obsidian-brain] claude -p (snapshot) failed (rc={result.returncode})",
+            print(f"[obsidian-brain] native AI (snapshot) failed (rc={result.returncode})",
                   file=sys.stderr)
             break
         except FileNotFoundError:
             last_reason = "haiku_subprocess_error"
-            print("[obsidian-brain] claude CLI not found", file=sys.stderr)
+            print("[obsidian-brain] native backend not found", file=sys.stderr)
             break
         except subprocess.TimeoutExpired:
             last_reason = "haiku_timeout"
             if i < len(attempts) - 1:
-                print(f"[obsidian-brain] claude -p (snapshot) timed out at {attempt_timeout}s, retrying...",
+                print(f"[obsidian-brain] native AI (snapshot) timed out at {attempt_timeout}s, retrying...",
                       file=sys.stderr)
                 continue
-            print(f"[obsidian-brain] claude -p (snapshot) timed out at {attempt_timeout}s",
+            print(f"[obsidian-brain] native AI (snapshot) timed out at {attempt_timeout}s",
                   file=sys.stderr)
         except Exception as exc:  # noqa: BLE001
             last_reason = "haiku_subprocess_error"
-            print(f"[obsidian-brain] claude -p (snapshot) error: {exc}", file=sys.stderr)
+            print(f"[obsidian-brain] native AI (snapshot) error: {exc}", file=sys.stderr)
             break
     return None, last_reason or "unknown_failure"
 
@@ -4322,7 +4521,7 @@ def generate_theme_names(
     model: str = "haiku",
     timeout: int = 120,
 ) -> tuple[list[dict] | None, str | None]:
-    """Name + summarize N clusters in ONE ``claude -p --model <model>`` spawn.
+    """Name + summarize N clusters in ONE ``native AI --model <model>`` spawn.
 
     ``clusters`` items: ``{"top_terms": [...], "sample_titles": [...]}``.
     Returns ``([{"name","summary"}, ...], None)`` with exactly ``len(clusters)``
@@ -4350,10 +4549,9 @@ def generate_theme_names(
     last_reason = "unknown_failure"
     for idx, attempt_timeout in enumerate(attempts):
         try:
-            result = subprocess.run(
-                ["claude", "-p", "--model", model],
-                input=prompt, capture_output=True, text=True, timeout=attempt_timeout,
-            )
+            result = _execute_summary_ai(prompt, 'theme_names', model, attempt_timeout, input_revision="", expected_count=len(clusters))
+            if result.failure_reason:
+                return None, result.failure_reason
         except FileNotFoundError:
             return None, "haiku_subprocess_error"
         except subprocess.TimeoutExpired:
@@ -4392,7 +4590,7 @@ def generate_summary(
     model: str = "haiku",
     timeout: int = 120,
 ) -> tuple[str | None, str | None]:
-    """Call ``claude -p --model <model>`` to summarize the session.
+    """Call ``native AI --model <model>`` to summarize the session.
 
     Returns ``(summary_text, fallback_reason)``:
       * On success: ``(text, None)``
@@ -4433,7 +4631,7 @@ def generate_summary(
             "three disjoint summaries.\n"
         )
 
-    prompt = f"""You are a technical summarizer. You will be given the transcript of a Claude Code coding session. Your job is to produce a structured summary. Do NOT respond conversationally. Do NOT ask questions. Just output the summary.
+    prompt = f"""You are a technical summarizer. You will be given the retained transcript of a coding session. Your job is to produce a structured summary. Do NOT respond conversationally. Do NOT ask questions. Just output the summary.
 {cohesion_hint}
 SESSION METADATA:
 - Project: {metadata.get('project', 'unknown')}
@@ -4500,13 +4698,9 @@ Rate this session 1-10. 1-3: trivial (config, interrupted). 4-6: standard work. 
     last_reason: str | None = None
     for i, attempt_timeout in enumerate(attempts):
         try:
-            result = subprocess.run(
-                ["claude", "-p", "--model", model],
-                input=prompt,
-                capture_output=True,
-                text=True,
-                timeout=attempt_timeout,
-            )
+            result = _execute_summary_ai(prompt, 'session_summary', model, attempt_timeout, input_revision=metadata.get("input_revision", ""))
+            if result.failure_reason:
+                return None, result.failure_reason
             if result.returncode == 0 and result.stdout.strip():
                 summary_text = result.stdout.strip()
                 # Layer 2: Post-generation dedup pass (string-based, pre-write)
@@ -4516,14 +4710,14 @@ Rate this session 1-10. 1-3: trivial (config, interrupted). 4-6: standard work. 
             if result.returncode != 0:
                 last_reason = "haiku_subprocess_error"
                 print(
-                    f"[obsidian-brain] claude -p failed (rc={result.returncode}): "
+                    f"[obsidian-brain] native AI failed (rc={result.returncode}): "
                     f"{result.stderr[:200]}",
                     file=sys.stderr,
                 )
                 break  # non-timeout failure, don't retry
             last_reason = "empty_output"
             print(
-                f"[obsidian-brain] claude -p failed (rc={result.returncode}): "
+                f"[obsidian-brain] native AI failed (rc={result.returncode}): "
                 f"{result.stderr[:200]}",
                 file=sys.stderr,
             )
@@ -4531,7 +4725,7 @@ Rate this session 1-10. 1-3: trivial (config, interrupted). 4-6: standard work. 
         except FileNotFoundError:
             last_reason = "haiku_subprocess_error"
             print(
-                "[obsidian-brain] claude CLI not found, summarization unavailable",
+                "[obsidian-brain] native backend not found, summarization unavailable",
                 file=sys.stderr,
             )
             break  # won't succeed on retry
@@ -4539,12 +4733,12 @@ Rate this session 1-10. 1-3: trivial (config, interrupted). 4-6: standard work. 
             last_reason = "haiku_timeout"
             stderr_snippet = f" stderr: {exc.stderr[:200]}" if exc.stderr else ""
             if i < len(attempts) - 1:
-                print(f"[obsidian-brain] claude -p timed out at {attempt_timeout}s, retrying with {attempts[i+1]}s{stderr_snippet}", file=sys.stderr)
+                print(f"[obsidian-brain] native AI timed out at {attempt_timeout}s, retrying with {attempts[i+1]}s{stderr_snippet}", file=sys.stderr)
                 continue
-            print(f"[obsidian-brain] claude -p timed out at {attempt_timeout}s, giving up{stderr_snippet}", file=sys.stderr)
+            print(f"[obsidian-brain] native AI timed out at {attempt_timeout}s, giving up{stderr_snippet}", file=sys.stderr)
         except Exception as exc:
             last_reason = "haiku_subprocess_error"
-            print(f"[obsidian-brain] claude -p error ({type(exc).__name__}): {exc}", file=sys.stderr)
+            print(f"[obsidian-brain] native AI error ({type(exc).__name__}): {exc}", file=sys.stderr)
             break  # unknown error, don't retry
 
     return None, last_reason or "unknown_failure"
@@ -4555,6 +4749,15 @@ Rate this session 1-10. 1-3: trivial (config, interrupted). 4-6: standard work. 
 # ---------------------------------------------------------------------------
 
 _SECRET_PATTERNS = [
+    # A header alone is not enough: private key material can span many lines.
+    (re.compile(r'-----BEGIN ((?:[A-Z0-9]+ )*PRIVATE KEY)-----[\s\S]*?(?:-----END \1-----|\Z)'),
+     '[REDACTED:private-key]'),
+    # Preserve connection details while removing URI userinfo passwords.
+    (re.compile(r'([A-Za-z][A-Za-z0-9+.-]*://[^/\s:@]+:)[^/\s]+@'), r'\1[REDACTED]@'),
+    (re.compile(r'(?i)("(?:password|passwd|secret|token|api[_-]?key|client[_-]?secret)"\s*:\s*)"(?:\\.|[^"\\])*"'),
+     r'\1"[REDACTED]"'),
+    (re.compile(r"(?i)('(?:password|passwd|secret|token|api[_-]?key|client[_-]?secret)'\s*:\s*)'(?:\\.|[^'\\])*'"),
+     r"\1'[REDACTED]'"),
     (re.compile(r'gh[ps]_[A-Za-z0-9_]{36,}'), '[REDACTED:github-token]'),
     (re.compile(r'AKIA[0-9A-Z]{16}'), '[REDACTED:aws-key]'),
     (re.compile(r'(?i)(password|passwd|secret|token|api[_-]?key)\s*[=:]\s*\S+'), r'\1=[REDACTED]'),
@@ -4585,107 +4788,82 @@ def escape_wikilinks(text: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def write_vault_note(
-    vault_path: str, folder: str, filename: str, content: str
-) -> Optional[str]:
-    """Atomic write: temp file + chmod 0o600 + rename into vault folder.
-
-    Creates the target folder if it does not exist.
-
-    Returns:
-        None on success.
-        A non-empty error string on failure (F2 contract — callers check ``if err:``).
-    """
-    dest_dir = Path(vault_path) / folder
-    dest = dest_dir / filename
-
-    # Path traversal check — BEFORE any filesystem side effects
-    vault_real = Path(vault_path).resolve()
-    if not dest.resolve().is_relative_to(vault_real):
+def write_vault_note(vault_path: str, folder: str, filename: str, content: str,
+                     expected_revision="unspecified") -> Optional[str]:
+    """Publish through the shared writer; return an error for pending/conflict."""
+    from note_transactions import (
+        NoteMutation, apply_mutations, context_for_vault, read_revision,
+    )
+    import uuid
+    dest = Path(vault_path) / folder / filename
+    if not dest.resolve().is_relative_to(Path(vault_path).resolve()):
         msg = f"path traversal blocked: {dest}"
         print(f"[obsidian-brain] {msg}", file=sys.stderr)
         return msg
-
     try:
-        dest_dir.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        msg = f"cannot create vault dir {dest_dir}: {exc}"
-        print(f"[obsidian-brain] {msg}", file=sys.stderr)
-        return msg
-
-    try:
-        fd, tmp_path = tempfile.mkstemp(
-            dir=str(dest_dir), prefix=".ob-", suffix=".md.tmp"
-        )
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                fh.write(content)
-            os.chmod(tmp_path, 0o600)
-            os.rename(tmp_path, str(dest))
-        except Exception:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-            raise
-    except Exception as exc:
+        context = context_for_vault(vault_path)
+        if expected_revision == "unspecified":
+            expected_revision = read_revision(context, dest)
+        result = apply_mutations(context, [NoteMutation(
+            dest, expected_revision, {"document": content}, "write-" + uuid.uuid4().hex, file_mode=0o600,
+        )])
+        if result.status not in {"applied", "unchanged"}:
+            details = "; ".join(result.warnings)
+            msg = f"write {result.status} for {dest}: {details}"
+            print(f"[obsidian-brain] {msg}", file=sys.stderr)
+            return msg
+    except (OSError, ValueError, RuntimeError) as exc:
         msg = f"write failed for {dest}: {exc}"
         print(f"[obsidian-brain] {msg}", file=sys.stderr)
         return msg
-
     print(f"[obsidian-brain] wrote {dest}", file=sys.stderr)
     return None
 
 
-def flip_note_status(path: str, old_status: str, new_status: str) -> bool:
-    """Atomically change a note's frontmatter status field.
+def _note_write_context(path: str, vault_path: str | None = None):
+    from runtime_context import current_runtime_context
+    from note_transactions import context_for_vault
+    context = current_runtime_context()
+    if context is not None:
+        if vault_path is not None:
+            return context_for_vault(vault_path)
+        return context
+    selected = vault_path or load_config().get("vault_path")
+    return context_for_vault(selected or Path(path).resolve().parent)
 
-    Reads the file, replaces 'status: <old>' with 'status: <new>' in the
-    frontmatter, and writes back via temp file + rename.
-    Returns True on success.
-    """
+
+def flip_note_status(path: str, old_status: str, new_status: str,
+                     vault_path: str | None = None) -> bool:
+    """Change frontmatter only if the source read is still current."""
+    from note_transactions import NoteMutation, apply_mutations, record_read
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            content = f.read()
-    except OSError as exc:
-        print(f"[obsidian-brain] cannot read {path}: {exc}", file=sys.stderr)
-        return False
-
-    old_line = f"status: {old_status}"
-    new_line = f"status: {new_status}"
-
-    # Constrain replacement to the frontmatter block (between --- delimiters)
-    if not content.startswith("---"):
-        return False
-    end_idx = content.index("\n---", 3) + 1 if "\n---" in content[3:] else -1
-    if end_idx < 0:
-        return False
-    frontmatter = content[:end_idx]
-    if old_line not in frontmatter:
-        return False
-
-    new_content = frontmatter.replace(old_line, new_line, 1) + content[end_idx:]
-
-    dir_path = os.path.dirname(path)
-    try:
-        fd, tmp_path = tempfile.mkstemp(dir=dir_path, prefix=".ob-flip-", suffix=".tmp")
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                fh.write(new_content)
-            orig_mode = stat.S_IMODE(os.stat(path).st_mode)
-            os.chmod(tmp_path, orig_mode)
-            os.rename(tmp_path, path)
-        except Exception:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-            raise
-    except Exception as exc:
+        context = _note_write_context(path, vault_path)
+        with open(path, "r", encoding="utf-8", newline="") as handle:
+            content = handle.read()
+        revision = record_read(context, Path(path), content)
+        match = re.match(r"---\r?\n(.*?)\r?\n---(?:\r?\n|$)", content, re.DOTALL)
+        if match is None:
+            return False
+        old_line = f"status: {old_status}"
+        if old_line not in match.group(1):
+            return False
+        new_frontmatter = match.group(1).replace(old_line, f"status: {new_status}", 1)
+        updated = content[:match.start(1)] + new_frontmatter + content[match.end(1):]
+        result = apply_mutations(context, [NoteMutation(
+            Path(path), revision, {"document": updated}, uuid.uuid4().hex,
+        )])
+        return result.status in {"applied", "unchanged"}
+    except (OSError, ValueError, LockBusy) as exc:
         print(f"[obsidian-brain] flip_note_status failed for {path}: {exc}", file=sys.stderr)
         return False
 
-    return True
+
+def owned_summary_source(content: str) -> str:
+    """Read the owned summary before legacy headings elsewhere in the note."""
+    from note_transactions import _REGION
+    owned = next((match.group(2) for match in _REGION.finditer(content)
+                  if match.group(1) == "summary"), None)
+    return owned if owned is not None else content
 
 
 def find_latest_session(
@@ -4730,7 +4908,7 @@ def find_latest_session(
         # Extract summary section
         summary = ""
         summary_match = re.search(
-            r"## Summary\n(.+?)(?=\n## |\Z)", text, re.DOTALL
+            r"## Summary\n(.+?)(?=\n## |\Z)", owned_summary_source(text), re.DOTALL
         )
         if summary_match:
             summary = summary_match.group(1).strip()
@@ -4738,7 +4916,7 @@ def find_latest_session(
         # Extract next steps section
         next_steps = ""
         ns_match = re.search(
-            r"## Open Questions / Next Steps\n(.+?)(?=\n## |\Z)", text, re.DOTALL
+            r"## Open Questions / Next Steps\n(.+?)(?=\n## |\Z)", owned_summary_source(text), re.DOTALL
         )
         if ns_match:
             next_steps = ns_match.group(1).strip()
@@ -4798,11 +4976,15 @@ def _note_has_inbound_links(basename_stem: str, db_path: str | None = None) -> b
     """
     try:
         if db_path is None:
-            if _vault_index is not None:
+            from runtime_context import current_runtime_context
+            context = current_runtime_context()
+            if context is not None:
+                db_path = str(context.index_path)
+            elif _vault_index is not None:
                 db_path = _vault_index._default_db_path()
             else:
-                # Fall back to the known default path string directly
-                db_path = os.path.join(os.path.expanduser("~"), ".claude", "obsidian-brain-vault.db")
+                from runtime_adapters.claude import legacy_index_path
+                db_path = str(legacy_index_path())
         if not os.path.exists(db_path):
             return True  # conservative: assume referenced
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5.0)  # noqa: vault-db-connect — opens via uri=True (file:...?mode=ro) which _connect() does not accept (plain-path connect + realpath guard can't parse a URI); read-only, so it cannot pollute
@@ -4896,8 +5078,8 @@ def find_unsummarized_notes(
         # Read ENTIRE file from disk — DO NOT use read_note_metadata() which
         # has a persistent cache that may be stale after status changes.
         try:
-            content = f.read_text(encoding='utf-8', errors='replace')
-        except OSError as exc:
+            content = f.read_bytes().decode('utf-8')
+        except (OSError, UnicodeDecodeError) as exc:
             print(f"[obsidian-brain] cannot read {f.name}: {exc}", file=sys.stderr)
             continue
 
@@ -4909,9 +5091,14 @@ def find_unsummarized_notes(
             continue
         frontmatter = content[:fm_end]
 
-        # Must be auto-logged
+        # Native summaries name their exact capture region. A later capture
+        # needs another summary even when the older status says summarized.
+        from note_transactions import _regions
+        capture_digest = _regions(content).get('capture')
+        summary_digest = parse_frontmatter_field(frontmatter, 'summary_revision')
+        stale_summary = capture_digest is not None and summary_digest != capture_digest
         status_val = parse_frontmatter_field(frontmatter, "status")
-        if status_val != "auto-logged":
+        if status_val != "auto-logged" and not (status_val == "summarized" and stale_summary):
             continue
 
         # Type filter — accept both sessions and snapshots. Legacy notes
@@ -4929,12 +5116,23 @@ def find_unsummarized_notes(
             continue
 
         # Defense-in-depth: check if already has a real summary
-        has_summary = bool(re.search(r'^## Summary', content, re.MULTILINE))
-        has_unavailable = 'AI summary unavailable' in content
+        summary_source = owned_summary_source(content)
+        summary_sections = re.finditer(
+            r'^## Summary[ \t]*\r?\n(.*?)(?=^#{1,6}[ \t]|\Z)',
+            summary_source, re.MULTILINE | re.DOTALL,
+        )
+        has_summary = any(
+            re.sub(r'<!--.*?-->', '', match.group(1), flags=re.DOTALL).strip()
+            and 'AI summary unavailable' not in match.group(1)
+            for match in summary_sections
+        )
 
-        if has_summary and not has_unavailable:
+        if has_summary and not stale_summary:
             # Already summarized by legacy code path — fix status on disk
             try:
+                from note_transactions import NoteMutation, apply_mutations, record_read
+                context = _note_write_context(str(f), vault_path)
+                revision = record_read(context, f, content)
                 fixed = re.sub(
                     r'^status: auto-logged',
                     'status: summarized',
@@ -4942,26 +5140,17 @@ def find_unsummarized_notes(
                     count=1,
                     flags=re.MULTILINE,
                 )
-                # Atomic write: temp file + rename (per CLAUDE.md convention)
-                fd, tmp = tempfile.mkstemp(
-                    prefix='.ob-fix-', suffix='.md.tmp', dir=str(f.parent)
-                )
-                try:
-                    with os.fdopen(fd, 'w', encoding='utf-8') as fw:
-                        fw.write(fixed)
-                    os.replace(tmp, str(f))
-                except Exception:
-                    try:
-                        os.unlink(tmp)
-                    except OSError:
-                        pass
+                result = apply_mutations(context, [NoteMutation(
+                    f, revision, {"document": fixed}, uuid.uuid4().hex,
+                )])
+                if result.status not in {"applied", "unchanged"}:
                     continue
                 # Invalidate cache for this file
                 sid = _get_session_id_fast()
                 cache_key = f"metadata:{os.path.realpath(str(f))}"
                 cache_set(sid, cache_key, None)
                 auto_fixed += 1
-            except OSError:
+            except (OSError, ValueError, LockBusy):
                 pass
             continue
 
@@ -5019,6 +5208,34 @@ def find_unsummarized_notes(
 _OPEN_ITEM_EVIDENCE_WINDOW = 10
 
 
+def _recall_project_decisions(db_path: str, vault_path: Path, insights_dir: Path, project: str,
+                              ranked_notes: list) -> list:
+    """Add up to three recent active decisions after the contextual hits."""
+    remaining = min(3, max(0, 20 - len(ranked_notes)))
+    if not remaining or _vault_index is None:
+        return []
+    root = insights_dir.resolve()
+    if vault_path.resolve() not in root.parents:
+        return []
+    prefix = str(root) + os.sep
+    excluded = [note["path"] for note in ranked_notes]
+    exclusion = " AND path NOT IN (" + ",".join("?" for _ in excluded) + ")" if excluded else ""
+    conn = _vault_index._connect(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT path, title FROM notes WHERE project=? AND type='claude-decision' "
+            "AND status='active' AND path>=? AND path<?" + exclusion +
+            " ORDER BY date DESC, path ASC LIMIT ?",
+            [project, prefix, prefix + "\U0010ffff", *excluded, remaining],
+        ).fetchall()
+    finally:
+        conn.close()
+    # The index is a lookup aid, not permission to follow a path outside the vault.
+    return [dict(row) for row in rows
+            if Path(row["path"]).is_file() and not Path(row["path"]).is_symlink()
+            and root in Path(row["path"]).resolve().parents]
+
+
 def build_context_brief(
     vault_path: str,
     sessions_folder: str,
@@ -5048,6 +5265,24 @@ def build_context_brief(
     """
     sessions_dir = Path(vault_path) / sessions_folder
     insights_dir = Path(vault_path) / insights_folder
+
+    def summary_pending(content):
+        from note_transactions import _regions
+        match = re.match(r'\ufeff?---[ \t]*\r?\n(.*?)\r?\n---[ \t]*(?:\r?\n|\Z)', content, re.DOTALL)
+        frontmatter = match.group(1) if match else ''
+        capture = _regions(content).get('capture') or parse_frontmatter_field(frontmatter, 'capture_revision')
+        return capture is not None and parse_frontmatter_field(frontmatter, 'summary_revision') != capture
+
+    def summary_source(content):
+        from note_transactions import _REGION
+        owned = next((match.group(2) for match in _REGION.finditer(content)
+                      if match.group(1) == 'summary'), None)
+        return owned if owned is not None else content
+
+    def historical_summary(summary):
+        return '(Summary stale; refresh pending.)\n\nHistorical summary:\n' + summary
+
+    most_recent_pending = False
 
     # --- 1. Scan and filter sessions ---
     def _safe_sort_key(p: Path) -> tuple:
@@ -5092,13 +5327,17 @@ def build_context_brief(
         if meta.get('git_branch'):
             most_recent_title += f" ({meta['git_branch']})"
         try:
-            text = Path(most_recent_path).read_text(encoding='utf-8', errors='replace')
-            m = _summary_re.search(text)
+            text = Path(most_recent_path).read_bytes().decode('utf-8', errors='replace')
+            most_recent_pending = summary_pending(text)
+            m = _summary_re.search(summary_source(text))
             if m:
                 most_recent_summary = m.group(1).strip()
                 # Use first sentence of summary as title
                 first_line = most_recent_summary.split('\n')[0].strip()
-                if first_line:
+                if most_recent_pending:
+                    most_recent_summary = historical_summary(most_recent_summary)
+                    most_recent_title += ' (Summary stale; refresh pending)'
+                elif first_line:
                     most_recent_title = first_line
             m = _next_steps_re.search(text)
             if m:
@@ -5122,15 +5361,18 @@ def build_context_brief(
         if meta.get('git_branch'):
             second_title += f" ({meta['git_branch']})"
         try:
-            with open(second_path, 'r', encoding='utf-8', errors='replace') as f:
-                lines = [f.readline() for _ in range(50)]
-            text = ''.join(lines)
-            m = _summary_re.search(text)
+            full_text = Path(second_path).read_bytes().decode('utf-8', errors='replace')
+            text = ''.join(full_text.splitlines(keepends=True)[:50])
+            second_pending = summary_pending(full_text)
+            m = _summary_re.search(summary_source(full_text) if "<!-- obsidian-brain:summary:start -->" in full_text else text)
             if m:
                 second_summary = m.group(1).strip()
                 # Use first sentence of summary as title
                 first_line = second_summary.split('\n')[0].strip()
-                if first_line:
+                if second_pending:
+                    second_summary = historical_summary(second_summary)
+                    second_title += ' (Summary stale; refresh pending)'
+                elif first_line:
                     second_title = first_line
         except OSError:
             second_summary = "(could not read session note)"
@@ -5164,11 +5406,12 @@ def build_context_brief(
         else:
             duration = ""
         try:
-            with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
-                content_text = f.read()
+            content_text = Path(fpath).read_bytes().decode('utf-8', errors='replace')
             # Prefer first sentence of ## Summary as title (more descriptive)
-            summary_match = re.search(r'## Summary\n+(.+)', content_text)
-            if summary_match:
+            summary_match = re.search(r'## Summary\n+(.+)', summary_source(content_text))
+            if summary_pending(content_text):
+                title += ' (Summary stale; refresh pending)'
+            elif summary_match:
                 title = summary_match.group(1).strip()
             else:
                 # Fall back to H1 heading
@@ -5214,7 +5457,7 @@ def build_context_brief(
                 _session_tags.append(tag)
 
     # Build summary from loaded sessions
-    if most_recent_summary:
+    if most_recent_summary and not most_recent_pending:
         _session_summary = most_recent_summary
 
     _use_vault_index = True
@@ -5241,6 +5484,7 @@ def build_context_brief(
                 note_types=["claude-insight", "claude-decision", "claude-error-fix", "claude-retro"],
                 limit=20,
             )
+            ranked_notes.extend(_recall_project_decisions(db_path, Path(vault_path), insights_dir, project, ranked_notes))
             insight_count = len(ranked_notes)
             for note in ranked_notes:
                 title = note["title"]
@@ -5406,10 +5650,12 @@ def build_context_brief(
                 if not _date:
                     continue
                 try:
-                    _content = Path(_fpath).read_text(encoding='utf-8', errors='replace')
+                    _content = Path(_fpath).read_bytes().decode('utf-8', errors='replace')
                 except OSError:
                     continue
-                _m = _summary_re.search(_content)
+                if summary_pending(_content):
+                    continue
+                _m = _summary_re.search(summary_source(_content))
                 if not _m:
                     continue
                 _summary_text = _m.group(1).strip()
@@ -5639,6 +5885,12 @@ def find_transcript_jsonl(session_id: str) -> Path | None:
     Returns the Path if found, None otherwise. Uses find(1) so it is
     agnostic to project-path encoding (hyphens vs underscores).
     """
+    from runtime_context import current_runtime_context
+    context = current_runtime_context()
+    if context is not None:
+        if session_id != context.native_session_id or context.transcript_path is None:
+            return None
+        return context.transcript_path
     if not session_id or session_id == "unknown":
         return None
     projects_dir = Path.home() / ".claude" / "projects"
@@ -6061,12 +6313,14 @@ def upgrade_note_with_summary(
     project: str,
     source: str = "sub-agent fallback",
     warnings: list[str] | None = None,
+    expected_revision: str | None = None,
 ) -> str:
     """Apply a pre-generated summary to a raw session note.
 
     Handles the pipeline finish: read raw note, validate summary has
-    ## Summary, rebuild note (frontmatter with status: summarized, title,
-    summary sections, audit trail), run dedup, atomic write.
+    ## Summary, preserve user prose and capture, update summary metadata,
+    run dedup, and publish conditionally.
+    Pass the pre-model ``expected_revision`` when generation runs separately.
 
     Returns a one-line status string.
 
@@ -6085,82 +6339,41 @@ def upgrade_note_with_summary(
 
     # Read the raw note
     try:
-        with open(note_path, 'r', encoding='utf-8') as f:
-            raw_lines = f.readlines()
-    except OSError as exc:
+        from note_transactions import NoteMutation, apply_mutations, record_read
+        context = _note_write_context(note_path, vault_path)
+        with open(note_path, 'r', encoding='utf-8', newline='') as f:
+            raw_text = f.read()
+        raw_lines = raw_text.splitlines(keepends=True)
+        source_revision = record_read(context, Path(note_path), raw_text)
+        if expected_revision is None:
+            expected_revision = source_revision
+    except (OSError, ValueError, LockBusy) as exc:
         return f"Failed: cannot read {os.path.basename(note_path)}: {exc}"
 
-    # Build upgraded note: original frontmatter + new summary + original audit trail
-    new_lines: list[str] = []
+    if not re.match(r"\ufeff?---[ \t]*\r?\n(.*?)\r?\n---[ \t]*(?:\r?\n|\Z)", raw_text, re.DOTALL):
+        return f"Failed: YAML frontmatter not found in {os.path.basename(note_path)}"
 
-    # Copy frontmatter, flipping status
-    past_first_marker = False
-    frontmatter_end = 0
-    for i, line in enumerate(raw_lines):
-        if line.strip() == '---':
-            if not past_first_marker:
-                past_first_marker = True
-                new_lines.append(line)
-                continue
-            else:
-                # End of frontmatter
-                new_lines.append(line)
-                frontmatter_end = i + 1
-                break
-        if past_first_marker:
-            if line.strip().startswith('status:'):
-                new_lines.append(re.sub(r'^(\s*status:\s*).*', r'\1summarized', line) + '\n' if not line.endswith('\n') else re.sub(r'^(\s*status:\s*).*', r'\1summarized', line))
-            else:
-                new_lines.append(line)
-
-    if frontmatter_end == 0:
-        return f"Failed: malformed frontmatter in {os.path.basename(note_path)} (missing closing ---)"
-
-    # Add title from original
-    title_found = False
-    for line in raw_lines[frontmatter_end:]:
-        if line.strip().startswith('# '):
-            new_lines.append('\n')
-            new_lines.append(line)
-            title_found = True
-            break
-    if not title_found:
-        new_lines.append('\n# Untitled Session\n')
-
-    # Add warnings if any
+    # Publish only the owned summary and preserve capture and user prose.
+    from note_transactions import connect_coordination, ownership_lock
+    try:
+        with ownership_lock(context):
+            connection = connect_coordination(context)
+            try:
+                row = connection.execute("SELECT regions FROM revisions WHERE path=? AND revision=?",
+                                         (str(Path(note_path).resolve()), expected_revision)).fetchone()
+                capture_revision = json.loads(row[0]).get("capture") if row else None
+            finally:
+                connection.close()
+    except LockBusy:
+        return f"Failed: vault ownership busy for {os.path.basename(note_path)}"
+    summary_body = summary_text.rstrip() + "\n\n_(Summary source: " + source + ")_\n"
     if warnings:
-        new_lines.append('\n## ⚠️ Transcript re-parse warnings\n')
-        for w in warnings:
-            new_lines.append(f'- {w}\n')
-
-    # Add summary sections
-    new_lines.append('\n')
-    new_lines.append(summary_text + '\n')
-
-    # Add source note
-    new_lines.append(f'\n_(Summary source: {source})_\n')
-
-    # Preserve original audit trail sections (skip frontmatter).
-    # Only exclude ## Changes Made / ## Errors Encountered if summary_text
-    # actually contains them — otherwise preserve the raw audit data.
-    audit_sections = [
-        '## Tool Usage', '## Conversation (raw)',
-        '## Session Metadata', '## Files Touched',
-    ]
-    if '## Changes Made' not in summary_text:
-        audit_sections.append('## Changes Made')
-    if '## Errors Encountered' not in summary_text:
-        audit_sections.append('## Errors Encountered')
-
-    in_audit = False
-    for line in raw_lines[frontmatter_end:]:
-        stripped = line.strip()
-        if any(stripped.startswith(s) for s in audit_sections):
-            in_audit = True
-        elif stripped.startswith('## '):
-            in_audit = False
-        if in_audit:
-            new_lines.append(line)
+        summary_body += "\n## ⚠️ Transcript re-parse warnings\n" + "".join("- " + w + "\n" for w in warnings)
+    summary_operation_id = uuid.uuid4().hex
+    metadata_changes = {"status": "summarized", "author_host": context.host,
+                        "operation_id": summary_operation_id}
+    if capture_revision is not None:
+        metadata_changes["summary_revision"] = capture_revision
 
     # Extract the summary body signature BEFORE writing so we can fail the
     # upgrade with a clear "malformed summary" error rather than silently
@@ -6200,49 +6413,19 @@ def upgrade_note_with_summary(
 
     importance = parse_importance(summary_text)
 
-    # Atomic write with fsync + post-write verification.
-    # Guarantees the summary actually landed on disk before returning success.
-    # `or "."` handles the case where note_path is a bare filename (no
-    # directory component), which would otherwise produce `dir=""` and
-    # crash tempfile.mkstemp on every platform.
-    note_dir = os.path.dirname(note_path) or "."
+    changes = {"summary": summary_body, "metadata": json.dumps(metadata_changes)}
+    if capture_revision is None:
+        # Legacy model input comes from the full source, without an owned
+        # capture baseline. Preserve prose while requiring its exact revision.
+        from note_transactions import _render
+        changes = {"document": _render(raw_text, changes)}
     try:
-        fd, tmp_path = tempfile.mkstemp(prefix='.ob-upgrade-', suffix='.md.tmp', dir=note_dir)
-    except OSError as exc:
-        return f"Failed: cannot create temp file in {note_dir}: {exc}"
-    try:
-        try:
-            orig_mode = os.stat(note_path).st_mode
-        except OSError:
-            orig_mode = 0o600
-        with os.fdopen(fd, 'w', encoding='utf-8') as f:
-            f.writelines(new_lines)
-            f.flush()
-            os.fsync(f.fileno())
-        os.chmod(tmp_path, orig_mode)
-        os.replace(tmp_path, note_path)
-        # fsync the containing directory so the rename itself is durable
-        # across a crash, not just the file contents.
-        try:
-            dir_fd = os.open(note_dir, os.O_RDONLY)
-            try:
-                os.fsync(dir_fd)
-            finally:
-                os.close(dir_fd)
-        except OSError:
-            # Directory fsync is best-effort on filesystems that don't
-            # support it (e.g. some network mounts). The in-process
-            # verification below is the real guarantee for non-crash
-            # failure modes.
-            pass
-    except OSError as exc:
-        try:
-            os.unlink(tmp_path)
-        except OSError as cleanup_exc:
-            print(
-                f"[obsidian-brain] failed to clean up temp file {tmp_path}: {cleanup_exc}",
-                file=sys.stderr,
-            )
+        result = apply_mutations(context, [NoteMutation(
+            Path(note_path), expected_revision, changes, summary_operation_id,
+        )])
+        if result.status not in {"applied", "unchanged"}:
+            return f"Failed: summary publication {result.status} for {os.path.basename(note_path)}"
+    except (OSError, ValueError, LockBusy) as exc:
         return f"Failed: atomic write error for {os.path.basename(note_path)}: {exc}"
 
     # Post-write verification: re-read the target file and confirm the
@@ -6261,14 +6444,14 @@ def upgrade_note_with_summary(
     # UTF-8 BOM) so a Markdown horizontal rule `---` in the body cannot
     # be mistaken for the opening frontmatter delimiter.
     fm_match = re.match(
-        r'\ufeff?---[ \t]*\n(.*?)\n---[ \t]*(?:\n|\Z)',
+        r'\ufeff?---[ \t]*\r?\n(.*?)\r?\n---[ \t]*(?:\r?\n|\Z)',
         verify_content,
         re.DOTALL,
     )
     if fm_match is None:
         return f"Failed: post-write verification — YAML frontmatter not found at start of {os.path.basename(note_path)}"
     frontmatter_block = fm_match.group(1)
-    if not re.search(r'^\s*status:\s*summarized\s*$', frontmatter_block, re.MULTILINE):
+    if not re.search(r'^\s*status:\s*["\']?summarized["\']?\s*$', frontmatter_block, re.MULTILINE):
         return f"Failed: post-write verification — status not flipped to summarized in {os.path.basename(note_path)}"
 
     # Scope the signature check to the ## Summary section specifically.
@@ -6278,9 +6461,12 @@ def upgrade_note_with_summary(
     # Boundary uses `##(?:\s|$)` to be consistent with ATX-heading rules —
     # tab-separated or multi-space-separated next sections still terminate
     # the Summary block extraction cleanly.
+    from note_transactions import _REGION
+    owned_summary = next((match.group(2) for match in _REGION.finditer(verify_content)
+                          if match.group(1) == "summary"), "")
     summary_match = re.search(
         r'^## Summary\s*\n(.*?)(?=^##(?:\s|$)|\Z)',
-        verify_content,
+        owned_summary,
         re.MULTILINE | re.DOTALL,
     )
     if summary_match is None:
@@ -6549,26 +6735,28 @@ def _prepare_note_for_summary(
     "note_type": str, "source": str, "warnings": [...]}.
 
     Extracted from upgrade_unsummarized_note (#166) so the multi-note batch path
-    can reuse identical preparation. Pure: no model calls, no writes.
+    can reuse identical preparation. No model calls or vault writes; records the source revision.
     """
     # Read the raw note
     try:
-        with open(note_path, 'r', encoding='utf-8') as f:
-            raw_lines = f.readlines()
-    except (OSError, UnicodeDecodeError) as exc:
+        from note_transactions import record_read
+        context = _note_write_context(note_path, vault_path)
+        with open(note_path, 'r', encoding='utf-8', newline='') as f:
+            raw_text = f.read()
+        raw_lines = raw_text.splitlines(keepends=True)
+        expected_revision = record_read(context, Path(note_path), raw_text)
+        from note_transactions import _regions
+        input_capture_revision = _regions(raw_text).get("capture", expected_revision)
+    except (OSError, ValueError) as exc:
         return {
             "ok": False,
             "status": f"Failed: cannot read {os.path.basename(note_path)}: {exc}",
             "fallback_reason": "unreadable_note",
         }
 
-    # Extract session_id from frontmatter
-    session_id = None
-    for line in raw_lines[:20]:
-        stripped = line.strip()
-        if stripped.startswith('session_id:'):
-            session_id = stripped.split(':', 1)[1].strip().strip('"').strip("'")
-            break
+    # IDs can follow user fields or expanded native provenance metadata.
+    frontmatter_match = re.match(r'\ufeff?---[ \t]*\r?\n(.*?)\r?\n---[ \t]*(?:\r?\n|\Z)', raw_text, re.DOTALL)
+    session_id = parse_frontmatter_field(frontmatter_match.group(1), 'session_id') if frontmatter_match else None
     if not session_id:
         return {
             "ok": False,
@@ -6576,15 +6764,28 @@ def _prepare_note_for_summary(
             "fallback_reason": "no_session_id",
         }
 
-    # Find and parse the JSONL transcript
-    jsonl_path = find_transcript_jsonl(session_id)
+    # Native capture is frozen at the pre-AI revision. A transcript lookup
+    # could read later facts or the other host's storage.
+    from note_transactions import _REGION
+    retained_capture = next((match.group(2) for match in _REGION.finditer(raw_text)
+                             if match.group(1) == 'capture'), None)
+    from runtime_context import current_runtime_context
+    native_context = current_runtime_context()
+    jsonl_path = (None if retained_capture is not None or
+                  (native_context is not None and native_context.host == 'codex')
+                  else find_transcript_jsonl(session_id))
     parsed: dict = {}
     warnings: list[str] = []
     user_msgs: list[str] = []
     assistant_msgs: list[str] = []
     source = "raw note"
 
-    if jsonl_path:
+    if retained_capture is not None:
+        # Roles and tool categories remain in the retained text; do not
+        # recast tool observations as assistant actions.
+        user_msgs = [retained_capture] if retained_capture.strip() else []
+        source = "retained native capture"
+    elif jsonl_path:
         parsed = parse_full_transcript(jsonl_path)
         user_msgs = parsed.get("user_msgs", [])
         assistant_msgs = parsed.get("assistant_msgs", [])
@@ -6691,6 +6892,8 @@ def _prepare_note_for_summary(
     return {
         "ok": True,
         "raw_lines": raw_lines,
+        "expected_revision": expected_revision,
+        "input_capture_revision": input_capture_revision,
         "session_id": session_id,
         "user_msgs": user_msgs,
         "assistant_msgs": assistant_msgs,
@@ -6746,6 +6949,7 @@ def upgrade_unsummarized_note(
       Summarizer subprocess (set inside ``generate_summary`` / ``generate_snapshot_summary``):
         ``"haiku_timeout"``           — ``claude -p`` exceeded the per-call timeout
         ``"haiku_subprocess_error"``  — ``claude -p`` returned non-zero or unexpected I/O
+        ``"native_auth_error"``       — the selected native provider requires authentication
         ``"empty_output"``            — model returned empty / whitespace-only text
         ``"unknown_failure"``         — defensive default returned by ``generate_summary`` / ``generate_snapshot_summary`` when the retry loop exits without setting ``last_reason`` (should be unreachable)
 
@@ -6778,7 +6982,8 @@ def upgrade_unsummarized_note(
         return _ret(prep["status"], fallback_reason=prep["fallback_reason"])
     user_msgs = prep["user_msgs"]
     assistant_msgs = prep["assistant_msgs"]
-    metadata = prep["metadata"]
+    metadata = dict(prep["metadata"])
+    metadata["input_revision"] = prep.get("input_capture_revision") or ""
     note_type = prep["note_type"]
     source = prep["source"]
     warnings = prep["warnings"]
@@ -6805,22 +7010,26 @@ def upgrade_unsummarized_note(
                 summary_text, _rec = _normalize_summary(summary_text)
                 if _rec:
                     warnings = warnings + [f"summary recovered (#167): {', '.join(_rec)}"]
-            model_used = _model
+            from runtime_context import current_runtime_context
+            native = current_runtime_context()
+            model_used = _SUMMARY_NATIVE_MODEL.get() if native is not None and native.host == "codex" else _model
             break
         if fallback_reason not in _MODEL_ESCALATION_REASONS:
             # timeout / subprocess error — escalating model won't help
             break
 
     if not summary_text:
+        failure = ("native AI authentication required" if fallback_reason == "native_auth_error"
+                   else "AI summarization returned empty")
         return _ret(
-            f"Failed: AI summarization returned empty for {os.path.basename(note_path)}",
+            f"Failed: {failure} for {os.path.basename(note_path)}",
             model_used=None,
             fallback_reason=fallback_reason,
         )
 
     status = upgrade_note_with_summary(
         note_path, summary_text, vault_path, sessions_folder, project,
-        source=source, warnings=warnings,
+        source=source, warnings=warnings, expected_revision=prep.get("expected_revision"),
     )
     # model_used is the CLI alias of the model that produced the accepted
     # summary — "haiku" on the common path, "sonnet"/"opus" when escalated (#165).
@@ -6835,7 +7044,7 @@ def generate_summaries_batch(
     vault_path: str = "",
     sessions_folder: str = "",
 ) -> list[tuple[str | None, str | None]]:
-    """Summarize N SESSION notes in ONE ``claude -p --model <model>`` spawn.
+    """Summarize N SESSION notes in ONE ``native AI --model <model>`` spawn.
 
     ``prepared_notes`` is a list of ok=True session-note prep dicts (caller
     guarantees: not snapshots, not prep failures).  Returns a list of
@@ -6944,48 +7153,44 @@ def generate_summaries_batch(
 
     for i, attempt_timeout in enumerate(attempts):
         try:
-            result = subprocess.run(
-                ["claude", "-p", "--model", model],
-                input=prompt,
-                capture_output=True,
-                text=True,
-                timeout=attempt_timeout,
-            )
+            result = _execute_summary_ai(prompt, 'session_summaries', model, attempt_timeout, input_revision=hashlib.sha256(json.dumps([p.get("input_capture_revision", "") for p in prepared_notes]).encode()).hexdigest(), expected_count=n)
+            if result.failure_reason:
+                return [(None, result.failure_reason)] * n
             if result.returncode == 0 and result.stdout.strip():
                 stdout_text = result.stdout.strip()
                 break
             if result.returncode != 0:
                 last_reason = "haiku_subprocess_error"
                 print(
-                    f"[obsidian-brain] claude -p batch failed (rc={result.returncode}): "
+                    f"[obsidian-brain] native AI batch failed (rc={result.returncode}): "
                     f"{result.stderr[:200]}",
                     file=sys.stderr,
                 )
                 break
             # rc==0 but empty stdout
             last_reason = "empty_output"
-            print("[obsidian-brain] claude -p batch returned empty stdout", file=sys.stderr)
+            print("[obsidian-brain] native AI batch returned empty stdout", file=sys.stderr)
             break
         except FileNotFoundError:
             last_reason = "haiku_subprocess_error"
-            print("[obsidian-brain] claude CLI not found, batch summarization unavailable", file=sys.stderr)
+            print("[obsidian-brain] native backend not found, batch summarization unavailable", file=sys.stderr)
             break
         except subprocess.TimeoutExpired:
             last_reason = "haiku_timeout"
             if i < len(attempts) - 1:
                 print(
-                    f"[obsidian-brain] claude -p batch timed out at {attempt_timeout}s, retrying...",
+                    f"[obsidian-brain] native AI batch timed out at {attempt_timeout}s, retrying...",
                     file=sys.stderr,
                 )
                 continue
             print(
-                f"[obsidian-brain] claude -p batch timed out at {attempt_timeout}s, giving up",
+                f"[obsidian-brain] native AI batch timed out at {attempt_timeout}s, giving up",
                 file=sys.stderr,
             )
             break
         except Exception as exc:  # noqa: BLE001
             last_reason = "haiku_subprocess_error"
-            print(f"[obsidian-brain] claude -p batch error ({type(exc).__name__}): {exc}", file=sys.stderr)
+            print(f"[obsidian-brain] native AI batch error ({type(exc).__name__}): {exc}", file=sys.stderr)
             break
 
     # Whole-spawn failure — return same reason for all notes.
@@ -7105,6 +7310,7 @@ def upgrade_batch(
         raise ValueError(f"max_workers must be >= 1, got {max_workers}")
 
     from concurrent.futures import ThreadPoolExecutor
+    from contextvars import copy_context
     from datetime import datetime, timezone
 
     # Resolve batch size.
@@ -7130,7 +7336,7 @@ def upgrade_batch(
         with ThreadPoolExecutor(max_workers=workers) as ex:
             futs = [
                 ex.submit(
-                    upgrade_unsummarized_note,
+                    copy_context().run, upgrade_unsummarized_note,
                     p,
                     vault_path,
                     sessions_folder,
@@ -7178,15 +7384,13 @@ def upgrade_batch(
 
     # ---- Batched path (batch_size >= 2) ---------------------------------------
 
-    # Step 1: Prepare all notes concurrently.
-    workers = min(max_workers, len(paths))
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        prep_futs = {p: ex.submit(_prepare_note_for_summary, p, vault_path, sessions_folder, project)
-                     for p in paths}
+    # Step 1: Record source revisions in order before any model work.
+    # Sibling preparers share the vault lock; racing them can exhaust the
+    # external-writer deadline on our own batch. AI work below stays parallel.
     preps: dict[str, dict] = {}
-    for p, fut in prep_futs.items():
+    for p in paths:
         try:
-            preps[p] = fut.result()
+            preps[p] = copy_context().run(_prepare_note_for_summary, p, vault_path, sessions_folder, project)
         except Exception as exc:  # noqa: BLE001
             preps[p] = {
                 "ok": False,
@@ -7216,7 +7420,7 @@ def upgrade_batch(
         snap_workers = min(max_workers, len(snapshot_paths))
         with ThreadPoolExecutor(max_workers=snap_workers) as ex:
             snap_futs = {
-                p: ex.submit(upgrade_unsummarized_note, p, vault_path, sessions_folder, project, summary_model, summary_timeout)
+                p: ex.submit(copy_context().run, upgrade_unsummarized_note, p, vault_path, sessions_folder, project, summary_model, summary_timeout)
                 for p in snapshot_paths
             }
         for p, fut in snap_futs.items():
@@ -7279,7 +7483,9 @@ def upgrade_batch(
             if all(text is None and reason == "empty_output" for text, reason in batch_out):
                 if _model != models_to_try[-1]:
                     continue  # try next model
-            used_model = _model
+            from runtime_context import current_runtime_context
+            native = current_runtime_context()
+            used_model = _SUMMARY_NATIVE_MODEL.get() if native is not None and native.host == "codex" else _model
             group_results = batch_out
             break
 
@@ -7304,6 +7510,7 @@ def upgrade_batch(
                     write_status = upgrade_note_with_summary(
                         p, summary_text, vault_path, sessions_folder, project,
                         source=prep["source"], warnings=prep["warnings"],
+                        expected_revision=prep.get("expected_revision"),
                     )
                     if write_status.startswith("Upgraded "):
                         results_by_path[p] = {
@@ -7316,6 +7523,15 @@ def upgrade_batch(
                     else:
                         # Write-back failed — route to solo fallback.
                         solo_fallback_paths.append(p)
+                elif parse_reason == "native_auth_error":
+                    # Authentication cannot recover through a second solo call.
+                    results_by_path[p] = {
+                        "path": p,
+                        "status": f"Failed: native AI authentication required for {os.path.basename(p)}",
+                        "elapsed_s": per_note_elapsed,
+                        "model_used": None,
+                        "fallback_reason": parse_reason,
+                    }
                 else:
                     # No usable summary — route to solo fallback.
                     solo_fallback_paths.append(p)
@@ -7332,7 +7548,7 @@ def upgrade_batch(
             solo_workers = min(max_workers, len(solo_fallback_paths))
             with ThreadPoolExecutor(max_workers=solo_workers) as ex:
                 solo_futs = {
-                    p: ex.submit(upgrade_unsummarized_note, p, vault_path, sessions_folder, project, summary_model, summary_timeout)
+                    p: ex.submit(copy_context().run, upgrade_unsummarized_note, p, vault_path, sessions_folder, project, summary_model, summary_timeout)
                     for p in solo_fallback_paths
                 }
             for p, fut in solo_futs.items():
@@ -7387,7 +7603,7 @@ def upgrade_batch(
 # from a 3.4.1 cache while hooks resolved from 3.5.0, every step ran, and
 # nothing warned.
 #
-# Ruling R5: the original design gated this probe on CLAUDE_PLUGIN_ROOT,
+# Ruling R5: the original design gated this probe on a hook-only plugin-root variable,
 # verified NOT set in a skill's Bash block (Claude Code interpolates it into
 # hooks.json command strings, not skill shells) -- that guard would never
 # fire. A skill also cannot introspect which copy of its own SKILL.md was
@@ -7408,6 +7624,10 @@ def _default_plugin_install_paths() -> list[str]:
     caller passes ``install_paths`` explicitly to
     :func:`describe_plugin_install_divergence`.
     """
+    from runtime_context import current_runtime_context
+    context = current_runtime_context()
+    if context is not None:
+        return [str(context.resource_root)]
     paths: list[str] = []
     try:
         marketplaces_path = os.path.expanduser("~/.claude/plugins/known_marketplaces.json")

@@ -3,11 +3,11 @@
 Two commands:
 
 - ``grep``: list the ``*.md`` files under one or more vault folders that
-  match a regex. It is the fallback for sessions with no Grep tool (#375),
+  match a regex. It is the fallback for sessions with no native search tool (#375),
   and the only way to restrict a search to frontmatter (``--frontmatter-only``),
-  which the Grep tool cannot do (#312).
+  which a native search tool cannot do (#312).
 - ``meta``: print the frontmatter fields the skills rank and display by, as
-  JSON Lines. It replaces fixed ``Read(limit=40)`` reads, which silently drop
+  JSON Lines. It replaces fixed 40-line reads, which silently drop
   fields: frontmatter can run past line 40, and /emerge notes close their
   fence as deep as line 461 (/standup notes as deep as line 272).
 
@@ -17,7 +17,7 @@ Usage::
                           [--ignore-case] [--frontmatter-only]
     python3 vault_scan.py meta <vault> <file> [<file> ...]
 
-``grep`` matches one line at a time, like ripgrep behind the Grep tool, so
+``grep`` matches one line at a time, like ripgrep behind a native search tool, so
 ``^key:.*value`` anchors per line and a pattern never spans two lines. Use the
 ``--pattern=<regex>`` form: with a space, a pattern that starts with ``-`` is
 read as a flag. Stdout is the sorted list of matching paths. On success

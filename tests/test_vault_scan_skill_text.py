@@ -18,22 +18,6 @@ SKILLS = {
     "vault-search": REPO / "skills" / "vault-search" / "SKILL.md",
 }
 
-_FALLBACK_HEAD = "**If the Grep tool is not available in this session**"
-_FALLBACK_CMD = {
-    "vault-ask": (
-        "python3 \"$HOOKS/vault_scan.py\" grep '<vault_path>' '<sessions_folder>' "
-        "'<insights_folder>' '<wiki_folder>' --pattern='<term>' --ignore-case"
-    ),
-    "vault-search": (
-        "python3 \"$HOOKS/vault_scan.py\" grep '<vault_path>' '<sessions_folder>' "
-        "'<insights_folder>' --pattern='<pattern>' --ignore-case"
-    ),
-}
-_META_CMD = "python3 \"$HOOKS/vault_scan.py\" meta '<vault_path>' '<file_1>' '<file_2>'"
-_NO_GREP_FIRST = (
-    "If the Grep tool is not in your tool list, go straight to vault_scan.py grep "
-    "— do not call Grep first."
-)
 _SKIPPED_LINE = "K note(s) were not searched (see the breakdown) — run /vault-doctor"
 
 
@@ -49,20 +33,25 @@ def _step(skill: str, number: str) -> str:
 def _fallback_section(skill: str) -> str:
     """From the fallback paragraph to the end of the code block that follows it."""
     step = _step(skill, "4")
-    start = step.index(_FALLBACK_HEAD)
+    start = step.index("Request for `grep`")
     block_open = step.index("```bash\n", start)
     block_close = step.index("\n```", block_open + len("```bash\n"))
     return step[start:block_close]
 
 
-def _scan_calls(text: str) -> list[str]:
-    return [ln for ln in text.splitlines() if ln.startswith('python3 "$HOOKS/vault_scan.py"')]
+def _scan_calls(text):
+    return [line for line in text.splitlines() if line.startswith('python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py"') and ("--operation 'grep'" in line or "--operation 'metadata'" in line)]
+
 
 
 @pytest.mark.parametrize("skill", sorted(SKILLS))
 def test_step4_fallback_command_is_exact(skill):
-    section = _fallback_section(skill)
-    assert _scan_calls(section) == [_FALLBACK_CMD[skill]]
+    section=_fallback_section(skill)
+    calls=_scan_calls(section)
+    assert len(calls)==1 and "--operation 'grep'" in calls[0]
+    assert '< "$REQUEST_PATH"' in calls[0]
+    assert '"pattern": "<pattern>"' in section and '"ignore_case": true' in section
+
 
 
 def test_vault_search_tag_command_does_not_satisfy_the_fallback_pin():
@@ -74,17 +63,18 @@ def test_vault_search_tag_command_does_not_satisfy_the_fallback_pin():
 
 def test_vault_ask_step4_keeps_the_agent3_tag_search():
     step = _step("vault-ask", "4")
-    assert 'Grep(pattern="claude/topic/.*<term>", path=SESSIONS_DIR' in step
-    assert 'Grep(pattern="claude/topic/.*<term>", path=INSIGHTS_DIR' in step
-    assert "--pattern='claude/topic/.*<term>'" in _fallback_section("vault-ask")
+    assert "**Job 3 — Tag search:**" in step
+    assert '"pattern": "claude/topic/.*<term>"' in step
+    assert '"frontmatter_only": true' in step
+    assert "both source folders and enabled wiki pages" in step
 
 
 @pytest.mark.parametrize("skill", sorted(SKILLS))
 def test_step4_says_skip_grep_when_it_is_not_in_the_tool_list(skill):
     step = _step(skill, "4")
-    assert _NO_GREP_FIRST in step
-    # Said before the first Grep( call, so it is read before one is made.
-    assert step.index(_NO_GREP_FIRST) < step.index("Grep(")
+    assert "Use the fixed `grep` operation." in step
+    assert "Grep(" not in step
+    assert step.index("Use the fixed `grep` operation.") < step.index("--operation 'grep'")
 
 
 @pytest.mark.parametrize("skill", sorted(SKILLS))
@@ -97,10 +87,12 @@ def test_step4_grep_success_check_and_skipped_line(skill):
 
 @pytest.mark.parametrize("skill", sorted(SKILLS))
 def test_step5_reads_metadata_with_exact_meta_command(skill):
-    step = _step(skill, "5")
-    assert _scan_calls(step) == [_META_CMD]
-    assert "Read(" not in step
-    assert "exited 0 and printed one JSON row per file" in step
+    step=_step(skill,'5')
+    calls=_scan_calls(step)
+    assert len(calls)==1 and "--operation 'metadata'" in calls[0]
+    assert '"paths"' in step and 'Read(' not in step
+    assert 'exited 0 and printed one JSON row per file' in step
+
 
 
 @pytest.mark.parametrize("skill", sorted(SKILLS))
@@ -120,14 +112,13 @@ def test_rationale_says_frontmatter_runs_past_a_fixed_limit(skill, number):
 
 
 def test_vault_search_tag_mode_is_frontmatter_only():
-    assert "--frontmatter-only" in _step("vault-search", "2")
-    step4 = _step("vault-search", "4")
-    tag_part = step4.split("**For tag mode:**", 1)[1].split("**For structured mode:**", 1)[0]
-    # The command itself, not just the prose, must carry the flag.
-    cmds = _scan_calls(tag_part)
-    assert len(cmds) == 1, cmds
-    assert cmds[0].split()[-1] == "--frontmatter-only"
-    assert "Grep(" not in tag_part
+    assert '--frontmatter-only' in _step('vault-search','2')
+    part=_step('vault-search','4').split('**Tag mode:**',1)[1].split('**Structured mode:**',1)[0]
+    calls=_scan_calls(part)
+    assert len(calls)==1 and "--operation 'grep'" in calls[0]
+    assert '"frontmatter_only": true' in part
+    assert 'Grep(' not in part
+
 
 
 def test_vault_search_tag_pattern_is_a_regex():
@@ -143,42 +134,55 @@ def test_vault_search_step5_null_and_empty_rules():
 
 @pytest.mark.parametrize("skill", sorted(SKILLS))
 def test_vault_scan_blocks_resolve_hooks_and_check_the_script(skill):
-    text = SKILLS[skill].read_text(encoding="utf-8")
-    blocks = re.findall(r"^```bash\n(.*?)^```", text, re.M | re.S)
-    scan_blocks = [b for b in blocks if "vault_scan.py" in b]
-    assert len(scan_blocks) >= 2, skill
-    for b in scan_blocks:
-        assert b.startswith('cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"\n')
-        assert '\nHOOKS=$(python3 -c "\n' in b
-        assert 'test -f "$HOOKS/vault_scan.py" ||' in b
+    text=SKILLS[skill].read_text()
+    calls=_scan_calls(text)
+    assert len(calls)>=2
+    for call in calls:
+        assert '--resource-root "$OB_RESOURCE_ROOT"' in call
+        assert '--skill-path "$OB_SKILL_PATH"' in call
+    assert 'p.is_absolute()' in text
+    assert 'known_marketplaces.json' not in text and 'default="hooks"' not in text
+
 
 
 @pytest.mark.parametrize("skill", sorted(SKILLS))
 def test_vault_scan_calls_single_quote_pasted_values(skill):
-    # #386: values pasted from earlier steps go in single quotes, never "$VAR".
-    text = SKILLS[skill].read_text(encoding="utf-8")
-    calls = _scan_calls(text)
-    assert calls, skill
-    for ln in calls:
-        rest = ln[len('python3 "$HOOKS/vault_scan.py"'):]
-        assert '"' not in rest, ln
-        assert "'<vault_path>'" in rest, ln
+    text=SKILLS[skill].read_text()
+    calls=_scan_calls(text)
+    assert calls
+    for call in calls:
+        assert '< "$REQUEST_PATH"' in call
+        assert '<pattern>' not in call and '<term>' not in call
+    assert 'Content is JSON data, never shell code.' in text
+
 
 
 @pytest.mark.parametrize("skill", sorted(SKILLS))
-def test_pattern_uses_the_equals_form(skill):
-    # `--pattern '<x>'` breaks when x starts with "-": argparse reads it as a flag.
-    text = SKILLS[skill].read_text(encoding="utf-8")
-    assert "--pattern '" not in text
-    grep_calls = [c for c in _scan_calls(text) if " grep " in c]
-    assert grep_calls, skill
-    for ln in grep_calls:
-        assert "--pattern='" in ln, ln
+def test_pattern_uses_the_equals_form(skill, tmp_path, monkeypatch):
+    import skill_procedures, vault_scan
+    from note_transactions import context_for_vault
+    captured=[]
+    monkeypatch.setattr(vault_scan,'main',lambda argv: captured.append(argv) or 0)
+    pattern='-dangerous "quotes" $(touch marker)'
+    skill_procedures._grep(context_for_vault(tmp_path), {'pattern':pattern})
+    assert '--pattern='+pattern in captured[0]
+    assert '--pattern' not in captured[0]
+    assert any("--operation 'grep'" in line for line in _scan_calls(SKILLS[skill].read_text()))
 
 
-def test_vault_import_reads_whole_frontmatter_for_session_ids():
-    """#312: vault-import used `head -20` to collect session ids, which
-    silently misses a session_id below line 20 and re-imports the session."""
-    text = (REPO / "skills" / "vault-import" / "SKILL.md").read_text(encoding="utf-8")
-    assert "head -20" not in text
-    assert """awk 'NR==1 { if ($0 != "---") exit; next } $0 == "---" { exit } { print }'""" in text
+
+def test_vault_import_reads_whole_frontmatter_for_session_ids(tmp_path):
+    import time
+    import session_lookup
+    text=(REPO / 'skills/vault-import/SKILL.md').read_text()
+    assert 'head -20' not in text
+    assert 'complete bounded frontmatter' in text and 'full provider/native ID' in text
+    folder=tmp_path / 'claude-sessions'
+    folder.mkdir()
+    note=folder / 'historic.md'
+    note.write_text('---\ntype: claude-session\n' + ''.join('custom_%s: value\n' % i for i in range(80)) + 'session_id: deeply-nested-native-id\n---\nBody\n')
+    fields=session_lookup._identity(note, tmp_path, folder, time.monotonic()+1)
+    assert fields['session_id']=='deeply-nested-native-id'
+
+from selected_legacy_vault import selected_host_context
+pytestmark = pytest.mark.usefixtures("selected_host_context")

@@ -4,7 +4,7 @@ obsidian_session_log.py -- SessionEnd hook for obsidian-brain plugin.
 
 Reads the session transcript and writes a raw note to the Obsidian vault.
 AI summarization is deferred to /recall (SessionEnd hooks are fire-and-forget;
-slow subprocess calls like `claude -p` get killed when the process tree exits).
+slow subprocess calls like native analysis get killed when the process tree exits).
 Always exits 0.
 """
 
@@ -101,7 +101,9 @@ def _cleanup_session_cache(session_id: str) -> None:
         return
     try:
         import obsidian_utils
-        cache_path = f"{obsidian_utils._CACHE_PREFIX}{session_id}.json"
+        from runtime_context import current_runtime_context
+        context = current_runtime_context()
+        cache_path = str(context.state_path / ("cache-" + context.session_key + ".json")) if context else f"{obsidian_utils._CACHE_PREFIX}{session_id}.json"
         if os.path.exists(cache_path):
             os.unlink(cache_path)
     except Exception as exc:  # noqa: BLE001 — best-effort cleanup, never fatal
@@ -206,7 +208,17 @@ def main() -> None:
     sys.exit(0)
 
 
-def _run() -> None:
+def _run(context=None, payload=None) -> None:
+    if os.environ.get("OBSIDIAN_BRAIN_NESTED_AI") == "1":
+        return
+    from runtime_context import current_runtime_context, using_runtime_context
+    if context is not None:
+        with using_runtime_context(context):
+            return _run(payload=payload)
+    context = current_runtime_context()
+    if context is not None:
+        from native_lifecycle import emit_bound
+        return emit_bound(context, "session_end", payload)
     global _LAST_PROJECT, _LAST_SESSION_ID
     # Reset so a stale value from a prior invocation in the same process does
     # not bleed into this run's EXCEPTION telemetry.
@@ -215,8 +227,11 @@ def _run() -> None:
 
     # 1. Read hook input from stdin
     try:
-        raw = sys.stdin.read(1_000_000)
-        hook_input = json.loads(raw) if raw.strip() else {}
+        if payload is None:
+            raw = sys.stdin.read(1_000_000)
+            hook_input = json.loads(raw) if raw.strip() else {}
+        else:
+            hook_input = payload
     except (json.JSONDecodeError, ValueError) as exc:
         print(f"[obsidian-brain] invalid stdin JSON: {exc}", file=sys.stderr)
         hook_input = {}
@@ -229,16 +244,16 @@ def _run() -> None:
 
     # Extract session_id up front so the finally block can always clean up,
     # regardless of which early-return path below we take.
-    session_id = hook_input.get("session_id", "")
+    session_id = context.native_session_id if context else hook_input.get("session_id", "")
     if session_id:
         _LAST_SESSION_ID = session_id
 
     # Codex currently auto-discovers these Claude lifecycle handlers. Do not
     # interpret its rollout as a malformed Claude transcript while adapters
     # and explicit Codex hook selection are being built under #272.
-    codex_reason = obsidian_utils._hook_payload_codex_reason(hook_input)
+    codex_reason = obsidian_utils._hook_payload_codex_reason(hook_input) if context is None else None
     if codex_reason:
-        cwd = hook_input.get("cwd", "")
+        cwd = str(context.worktree) if context else hook_input.get("cwd", "")
         project = _project_slug_for_log(cwd)
         print(f"[obsidian-brain] SessionEnd outcome=SKIPPED_CODEX_HOST reason={codex_reason}", file=sys.stderr)
         _append_sessionend_log(
@@ -262,10 +277,10 @@ def _run() -> None:
         cwd = hook_input.get("cwd", "")
         if cwd:
             _LAST_PROJECT = _project_slug_for_log(cwd)
-        transcript_path = hook_input.get("transcript_path", "")
+        transcript_path = str(context.transcript_path) if context and context.transcript_path else hook_input.get("transcript_path", "")
 
         # Validate transcript_path stays inside ~/.claude/projects/
-        if transcript_path:
+        if transcript_path and context is None:
             allowed_root = os.path.realpath(os.path.expanduser("~/.claude/projects"))
             if not os.path.realpath(transcript_path).startswith(allowed_root + os.sep):
                 print("[obsidian-brain] transcript_path outside ~/.claude/projects, skipping", file=sys.stderr)
@@ -442,6 +457,11 @@ def _run() -> None:
         date_str = obsidian_utils._first_seen_date(session_id)
         project_slug = slugify(metadata.get("project", "session"))
         filename = make_filename(date_str, project_slug, session_id)
+        from note_transactions import context_for_vault, read_revision
+        write_context = context_for_vault(vault_path)
+        expected_revision = read_revision(
+            write_context, Path(vault_path) / sessions_folder / filename,
+        )
 
         # 9. Cross-plugin dedup guard — if a sibling install already claimed
         # this (SessionEnd, session_id) trigger, skip before doing the
@@ -468,7 +488,8 @@ def _run() -> None:
             tool_uses = extract_tool_uses(messages)
             raw_body = build_raw_fallback(user_msgs, metadata, assistant_msgs=assistant_msgs, tool_uses=tool_uses, config=config)
             raw_content = _build_note(session_id, metadata, raw_body, resumed=resumed)
-            write_err = write_vault_note(vault_path, sessions_folder, filename, raw_content)
+            write_err = write_vault_note(vault_path, sessions_folder, filename, raw_content,
+                                         expected_revision=expected_revision)
             if write_err is not None:
                 print(f"[obsidian-brain] failed to write raw note: {write_err}", file=sys.stderr)
                 _append_sessionend_log(

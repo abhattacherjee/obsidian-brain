@@ -4,7 +4,7 @@ obsidian_context_snapshot.py -- PreCompact hook for obsidian-brain plugin.
 
 Captures a snapshot of the current session context before compaction or
 context clear, writing it to the Obsidian vault. Uses raw message extraction
-(no claude -p call) to avoid timing issues. Always exits 0.
+(no native analysis call) to avoid timing issues. Always exits 0.
 """
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ from __future__ import annotations
 import datetime
 import json
 import os
+from pathlib import Path
 import sys
 
 # ---------------------------------------------------------------------------
@@ -189,29 +190,42 @@ def main() -> None:
     sys.exit(0)
 
 
-def _run() -> None:
+def _run(context=None, payload=None) -> None:
+    if os.environ.get("OBSIDIAN_BRAIN_NESTED_AI") == "1":
+        return
+    from runtime_context import current_runtime_context, using_runtime_context
+    if context is not None:
+        with using_runtime_context(context):
+            return _run(payload=payload)
+    context = current_runtime_context()
+    if context is not None:
+        from native_lifecycle import emit_bound
+        return emit_bound(context, "pre_compact", payload)
     # 1. Read hook input from stdin
     try:
-        raw = sys.stdin.read(1_000_000)
-        hook_input = json.loads(raw)
+        if payload is None:
+            raw = sys.stdin.read(1_000_000)
+            hook_input = json.loads(raw)
+        else:
+            hook_input = payload
     except (json.JSONDecodeError, ValueError) as exc:
         print(f"[obsidian-brain] invalid stdin JSON: {exc}", file=sys.stderr)
         return
 
     if not isinstance(hook_input, dict):
         return
-    codex_reason = _hook_payload_codex_reason(hook_input)
+    codex_reason = _hook_payload_codex_reason(hook_input) if context is None else None
     if codex_reason:
         print(f"[obsidian-brain] PreCompact outcome=SKIPPED_CODEX_HOST reason={codex_reason}", file=sys.stderr)
         return
 
-    session_id = hook_input.get("session_id", "")
-    cwd = hook_input.get("cwd", "")
-    transcript_path = hook_input.get("transcript_path", "")
+    session_id = context.native_session_id if context else hook_input.get("session_id", "")
+    cwd = str(context.worktree) if context else hook_input.get("cwd", "")
+    transcript_path = str(context.transcript_path) if context and context.transcript_path else hook_input.get("transcript_path", "")
     source = hook_input.get("source", "compact")
 
     # Validate transcript_path stays inside ~/.claude/projects/
-    if transcript_path:
+    if transcript_path and context is None:
         allowed_root = os.path.realpath(os.path.expanduser("~/.claude/projects"))
         if not os.path.realpath(transcript_path).startswith(allowed_root + os.sep):
             print("[obsidian-brain] transcript_path outside ~/.claude/projects, skipping", file=sys.stderr)
@@ -219,10 +233,6 @@ def _run() -> None:
 
     if not session_id or not transcript_path:
         print("[obsidian-brain] missing session_id or transcript_path, skipping", file=sys.stderr)
-        return
-
-    if not claim_hook_run("PreCompact", session_id):
-        print("[obsidian-brain] snapshot skipped: sibling plugin already handled this compact", file=sys.stderr)
         return
 
     # 2. Load config
@@ -267,17 +277,25 @@ def _run() -> None:
     hhmmss = now.strftime("%H%M%S")
     project_slug = slugify(metadata.get("project", "session"))
 
-    body = _build_snapshot_body(user_msgs, metadata, trigger,
-                                assistant_msgs=assistant_msgs)
-    content = _build_snapshot_note(session_id, metadata, body, trigger, date_str=date_str)
-
-    # 6. Write to vault with -snapshot-<HHMMSS> suffix (seconds-resolution avoids
-    # collisions between multiple /compact invocations in the same day).
     filename = make_filename(date_str, project_slug, session_id, suffix=f"-snapshot-{hhmmss}")
+    from note_transactions import context_for_vault, read_revision
+    write_context = context_for_vault(vault_path)
+    expected_revision = read_revision(
+        write_context, Path(vault_path) / sessions_folder / filename,
+    )
 
+    if not claim_hook_run("PreCompact", session_id):
+        print("[obsidian-brain] snapshot skipped: sibling plugin already handled this compact", file=sys.stderr)
+        return
+
+    # Seconds-resolution suffix preserves the legacy snapshot filename.
     snapshot_written = False
     try:
-        result = write_vault_note(vault_path, sessions_folder, filename, content)
+        body = _build_snapshot_body(user_msgs, metadata, trigger,
+                                    assistant_msgs=assistant_msgs)
+        content = _build_snapshot_note(session_id, metadata, body, trigger, date_str=date_str)
+        result = write_vault_note(vault_path, sessions_folder, filename, content,
+                                  expected_revision=expected_revision)
         if result is None:
             snapshot_written = True
             print(f"[obsidian-brain] snapshot written: {filename}", file=sys.stderr)

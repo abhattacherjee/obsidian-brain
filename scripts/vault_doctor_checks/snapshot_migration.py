@@ -14,6 +14,8 @@ filenames still resolve after migration.
 """
 from __future__ import annotations
 
+from . import vault_scan, repair_batch, repair_write, repair_read, repair_move, _repair_context
+
 import datetime
 import os
 import re
@@ -72,6 +74,7 @@ def _hhmmss_from_mtime(p: Path) -> str:
     return datetime.datetime.fromtimestamp(ts).strftime("%H%M%S")
 
 
+@vault_scan
 def scan(vault_path, sessions_folder, insights_folder, days, project=None):
     sess_dir = Path(vault_path) / sessions_folder
     if not sess_dir.is_dir():
@@ -286,18 +289,7 @@ def _backup_file(path: str, backup_root: str, check_name: str) -> str:
 
 
 def _atomic_write(path: str, text: str) -> None:
-    p = Path(path)
-    fd, tmp = tempfile.mkstemp(prefix=".ob-doctor-", suffix=".md.tmp", dir=str(p.parent))
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(text)
-        os.replace(tmp, str(p))
-    except Exception:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
+    repair_write(path, text)
 
 
 def _rewrite_wikilinks_in_vault(
@@ -347,8 +339,14 @@ def _rewrite_wikilinks_in_vault(
         ):
             continue
         try:
-            text = p.read_text(encoding="utf-8", errors="replace")
-        except OSError as exc:
+            if p.is_symlink() or any(parent.is_symlink() for parent in p.parents if parent != Path(vault_path).parent):
+                continue
+            p_resolved.relative_to(Path(vault_path).resolve())
+            raw = p.read_bytes()
+            if ("[[" + old_stem + "]]").encode("utf-8") not in raw:
+                continue
+            text = repair_read(p, vault_path)
+        except (OSError, ValueError) as exc:
             failed.append(f"{p}: {exc}")
             continue
         if pattern.search(text):
@@ -372,6 +370,7 @@ def _rewrite_wikilinks_in_vault(
     return count, modified
 
 
+@repair_batch
 def apply(issues, backup_root):
     results = []
     order = {
@@ -432,12 +431,12 @@ def apply(issues, backup_root):
                 # Scan() stashed the resolved vault root; fall back to
                 # ``src.parents[1]`` for backwards compatibility with Issue
                 # objects constructed by older code paths.
-                vault_root = issue.extra.get("vault_path") or str(src.parents[1])
+                vault_root = str(_repair_context(issue).vault_path)
                 backup = _backup_file(str(src), backup_root, issue.check)
                 # Rename FIRST so a wikilink-rewrite failure can — when
                 # safe — roll back the filesystem move without leaving
                 # other files pointing at a non-existent dst.
-                os.rename(str(src), str(dst))
+                moved = repair_move(src, dst)
                 try:
                     # Exclude backup_root so the just-created backup copy
                     # (which lives under <backup_root>/snapshot-legacy-filename/)
@@ -474,18 +473,26 @@ def apply(issues, backup_root):
                     # Zero rewrites succeeded — safe to roll back the
                     # rename so the vault stays consistent.
                     try:
-                        os.rename(str(dst), str(src))
-                    except OSError:
-                        pass
+                        repair_move(dst, src, expected_revision=moved.revision)
+                    except OSError as rollback_error:
+                        result_note_path = str(dst)
+                        raise RuntimeError(
+                            f"wikilink rewrite failed; rollback refused; "
+                            f"destination preserved at {dst}: {rollback_error}"
+                        ) from rollback_error
                     raise
                 except Exception:
                     # Non-RuntimeError surprises: best-effort rollback
                     # (we have no modified_paths signal here, so we err
                     # on the side of rolling back).
                     try:
-                        os.rename(str(dst), str(src))
-                    except OSError:
-                        pass
+                        repair_move(dst, src, expected_revision=moved.revision)
+                    except OSError as rollback_error:
+                        result_note_path = str(dst)
+                        raise RuntimeError(
+                            f"wikilink rewrite failed; rollback refused; "
+                            f"destination preserved at {dst}: {rollback_error}"
+                        ) from rollback_error
                     raise
                 renamed_paths[str(src)] = str(dst)
                 renamed_stems[src.stem] = dst.stem
@@ -494,7 +501,7 @@ def apply(issues, backup_root):
                 # path no longer exists after os.rename).
                 result_note_path = str(dst)
             elif issue.check == "snapshot-missing-status":
-                text = _read_text(effective_note_path) or ""
+                text = repair_read(effective_note_path)
                 parts = text.split("---\n", 2)
                 if len(parts) < 3:
                     raise RuntimeError("could not locate frontmatter")
@@ -515,7 +522,7 @@ def apply(issues, backup_root):
                 backup = _backup_file(effective_note_path, backup_root, issue.check)
                 _atomic_write(effective_note_path, new_text)
             elif issue.check == "snapshot-missing-backlink":
-                text = _read_text(effective_note_path) or ""
+                text = repair_read(effective_note_path)
                 parts = text.split("---\n", 2)
                 if len(parts) < 3:
                     raise RuntimeError("could not locate frontmatter")
@@ -531,7 +538,7 @@ def apply(issues, backup_root):
                 backup = _backup_file(effective_note_path, backup_root, issue.check)
                 _atomic_write(effective_note_path, new_text)
             elif issue.check == "session-missing-snapshots-list":
-                text = _read_text(effective_note_path) or ""
+                text = repair_read(effective_note_path)
                 parts = text.split("---\n", 2)
                 if len(parts) < 3:
                     raise RuntimeError("could not locate frontmatter")
@@ -579,7 +586,7 @@ def apply(issues, backup_root):
             ))
         except Exception as exc:  # noqa: BLE001
             results.append(Result(
-                check=issue.check, note_path=effective_note_path, status="error",
+                check=issue.check, note_path=result_note_path, status="error",
                 error=f"{type(exc).__name__}: {exc}",
             ))
             print(

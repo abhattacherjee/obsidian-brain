@@ -24,7 +24,7 @@ mid-session resume.
 Before doing the live flow, run:
 
 ```bash
-bash scripts/dev-test/test-issue-101-manual.sh
+OB_CACHE_PATH=/absolute/package/root bash scripts/dev-test/test-issue-101-manual.sh
 ```
 
 All automated checks should pass. Only proceed to the live phases below

@@ -28,6 +28,7 @@ class Scope:
     # suggestion (SKILL.md Step 1) can reuse it instead of re-querying the
     # vault index and re-walking every workspace root a second time.
     known_projects: set[str] = field(default_factory=set)
+    json_output: bool = False
 
 
 _WINDOW_RE = re.compile(r"^(\d+)d$")
@@ -84,6 +85,9 @@ def parse_scope(argv):
     projects = _known_projects() | _vault_known_projects()
     scope.known_projects = projects
     for tok in argv:
+        if tok == "--json":
+            scope.json_output = True
+            continue
         if tok == "--show-all":
             scope.show_all = True
             continue

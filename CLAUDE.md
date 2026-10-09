@@ -1,16 +1,16 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides shared development rules for this repository. Native Codex guidance is in `AGENTS.md`.
 
 ## Project Overview
 
-Obsidian Brain is a Claude Code plugin that turns an Obsidian vault into a persistent knowledge base across sessions. It auto-logs sessions, captures curated knowledge, and enables project-scoped context resume via structured markdown notes.
+Obsidian Brain provides Claude Code and Codex plugin packages that turn an Obsidian vault into a persistent knowledge base across sessions. It auto-logs sessions, captures curated knowledge, and enables project-scoped context resume via structured markdown notes.
 
 **Integration pattern:** Direct filesystem writes only — no MCP server, no REST API, no Obsidian plugins required (except Dataview for dashboards).
 
 ## Development Commands
 
-There is no build step or linter. This is a Python (stdlib only) + Markdown plugin with a pytest suite and a 90% coverage gate. Run `./scripts/commit-preflight.sh` before committing. Individual checks include:
+There is no build step. This Python (stdlib only) + Markdown plugin has a pytest suite, a 90% coverage gate, and a strict host-neutral source check. Run `./scripts/commit-preflight.sh` before committing. Individual checks include:
 
 ```bash
 # Verify hook registration is valid JSON
@@ -19,37 +19,91 @@ python3 -c "import json; json.load(open('hooks/hooks.json'))"
 # Verify plugin manifest
 python3 -c "import json; json.load(open('.claude-plugin/plugin.json'))"
 
-# Test a hook script directly (requires config at ~/.claude/obsidian-brain-config.json)
-python3 hooks/obsidian_session_log.py
-python3 hooks/obsidian_session_hint.py
-python3 hooks/obsidian_context_snapshot.py
+# Test the registered native entry with a disposable configured home and synthetic transcript
+# Set HOME, CLAUDE_CONFIG_DIR or CODEX_HOME, and XDG_STATE_HOME to disposable
+# directories first. Supply explicit --host/--client and native ID in stdin JSON.
+python3 hooks/native_entry.py --host claude --client claude-code < "$SYNTHETIC_HOOK_INPUT"
+# Inspect a selected scratch context; no model call.
+python3 hooks/brain_cli.py --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" context < /dev/null
 ```
 
 ## Architecture
 
 ### Two execution modes
 
-1. **Hooks (auto-running Python scripts)** — Triggered by Claude Code lifecycle events. Registered in `hooks/hooks.json`. Must exit 0, use only Python stdlib, and write atomically (temp file + rename).
-2. **Skills (prompt-based procedures)** — Each `skills/*/SKILL.md` is a step-by-step prompt that Claude Code follows. No code files — skills use standard CC tools (Bash, Read, Write, Grep). Changes to SKILL.md directly change skill behavior.
+1. **Native hooks** use `hooks/native_entry.py` and `hooks/native_lifecycle.py`.
+   Claude registers `hooks/hooks.json`; Codex registers `hooks/codex-hooks.json`
+   through `.codex-plugin/plugin.json`. Entry time is recorded before shared
+   imports. Capture failures fail open, and Stop policy output uses the native
+   JSON contract. Without verified current-client binding, capture is skipped
+   and stderr says no source was retained. Bound SessionEnd handlers append one
+   private outcome log entry, including pending, skipped, and failed captures.
+   Bootstrap failures without a verified context report only to stderr.
+   Codex launchers declare `OB_CLIENT` before startup. Registered commands pass
+   it explicitly as `--client`; missing, invalid, or conflicting values skip
+   capture before reading the payload. CLI launchers use
+   `OB_CLIENT=codex-cli codex --no-daemon`. Registered capture requires that
+   isolated CLI in actual process ancestry and refuses shared-server ancestors,
+   unreadable ancestry, and Desktop dispatch. Ancestry never chooses a client.
+   An independent hook ancestry/argument observation is still required for
+   acceptance; the declaration alone does not prove current-event binding.
+2. **Skills** use the loaded `skills/*/SKILL.md`, explicit runtime context, and
+   named operations in `hooks/skill_procedures.py`. The loaded skill and imported
+   runtime must belong to the same installation. Paired host references contain
+   native setup details.
 
 ### Key files
 
-- `hooks/obsidian_utils.py` — Shared utility module used by the lifecycle hooks. Contains transcript parsing, metadata extraction, summarization (shells out to `claude -p --model haiku`), and atomic vault writes.
-- `hooks/obsidian_session_log.py` — SessionEnd: writes raw session note immediately (AI summarization deferred to `/recall`), and appends a structured outcome line to `~/.claude/obsidian-brain-hook.log` for every exit path.
-- `hooks/obsidian_session_hint.py` — SessionStart: injects last-session context hint for the current project.
-- `hooks/obsidian_context_snapshot.py` — PreCompact: saves context snapshot before compression.
-- `templates/` — Markdown templates for each note type (session, insight, decision, error-fix, snapshot, imported-session).
-- `dashboards/` — Dataview query templates installed to the user's vault.
+- `hooks/brain_cli.py` and `hooks/skill_procedures.py` — loaded-skill entry and fixed operations.
+- `hooks/native_entry.py` and `hooks/native_lifecycle.py` — native hook dispatch.
+- `hooks/runtime_adapters/` — named host configuration and source adapters.
+- `hooks/runtime_context.py` — immutable invoking host, client, full native session
+  ID, project, worktree, config, vault, resource, index, and state selection.
+- `hooks/transcripts/` — native source parsing and visible-record normalization.
+- `hooks/capture.py` — checkpoints, retained events, committed cursors, recovery,
+  and snapshots. Partial input remains pending.
+- `hooks/note_transactions.py` — revision checks and vault publication locks.
+- `hooks/ai_backend.py` and `hooks/ai_adapters/` — bounded native analysis with
+  strict output validation and no cross-host fallback.
+- `hooks/operation_state.py` and `hooks/session_auxiliary_state.py` — private,
+  versioned state scoped by vault, provider, full session identity, and project.
+- `hooks/obsidian_utils.py` and `hooks/obsidian_session_*.py` — shared utilities
+  and legacy compatibility entry points.
+- `templates/` and `dashboards/` — compatible vault notes and Dataview views.
 
 ### Data flow
 
-Sessions are logged with a **write-first pattern**: the raw note (with conversation excerpts, tool usage, metadata) is always saved to the vault immediately. AI summarization is deferred entirely: notes are written in raw form and upgraded by `/recall` on demand.
+Native capture retains normalized visible events before advancing the committed
+cursor. Revision checks preserve user edits. Recovery replays retained input;
+partial or unavailable input never becomes a completed session claim. Well-formed
+unknown or ownership-ambiguous rows retain bounded private source references.
+Verified later rows can publish while the source stays partial. Replay checks
+the original byte range and hash before accepting a newly supported row.
+Malformed or truncated input still blocks its cursor. SessionStart and doctor
+report unresolved rows with safe type labels. Native hooks do not run AI. Summary upgrades use the invoking host's analysis adapter
+and publish only after output and source revisions pass validation.
 
-Structured outcome telemetry is appended to `~/.claude/obsidian-brain-hook.log` for every SessionEnd exit path (success, all skip reasons, write failure, exception) and every SessionStart bootstrap event. The log uses one line per event with grep-friendly `key=value` fields, rotates at 100 KB to `obsidian-brain-hook.log.1`, and is the primary diagnostic surface for sessions that did not produce a vault note. Inspect with `awk '/SessionEnd/ {print $5}' ~/.claude/obsidian-brain-hook.log | sort | uniq -c` for a SessionEnd outcome distribution.
+Private runtime state stays outside the vault. Bound diagnostics follow the
+selected session's `<state>/v1/<vault>/<host>/<session>/<project>/logs/obsidian-brain-hook.log`.
+Each session has its own log. Bound SessionEnd writes one outcome line, including
+`exception` when capture raises. Other native outcomes include `ok_raw_note_only`,
+`pending_capture`, and `write_failed`. Unbound bootstrap failures report on stderr.
+Legacy path diagnostics do not aggregate native sessions. The legacy Claude compatibility log remains
+`~/.claude/obsidian-brain-hook.log`, rotates at 100 KB, and uses `key=value` fields.
 
 ### Configuration
 
-Machine-local config at `~/.claude/obsidian-brain-config.json` (outside the vault, outside this repo). Created by `/obsidian-setup`. Contains vault path, folder names, filtering thresholds, and feature flags.
+Native storage uses the selected `CLAUDE_CONFIG_DIR` or `CODEX_HOME`, with the
+corresponding default home when unset. `OBSIDIAN_BRAIN_CONFIG` selects an
+independent config file; `OBSIDIAN_BRAIN_DB` and `OBSIDIAN_BRAIN_STATE_DIR` select
+index and private state independently. An already-bound context retains its
+selection when environment variables change. Native skills and operations
+cannot switch that context to another vault or loaded installation.
+
+Legacy Claude config remains `~/.claude/obsidian-brain-config.json`. Vault folder
+names, tags, and note types are taxonomy and stay compatible across hosts.
+Full parity is not certified by the current source changes. See
+`docs/parity/acceptance-evidence.md` for the required native checks.
 
 ### Tag convention
 
@@ -74,7 +128,7 @@ All frontmatter tags use the `claude/` prefix: `claude/session`, `claude/insight
 - **Commits:** Use conventional commit format — `feat(obsidian-brain):`, `fix:`, `chore:`, `docs:`
 - **Python:** stdlib only, no pip dependencies. All hooks must be deterministic and safe to run at session boundaries.
 - **Atomic writes:** All vault writes must use temp file + rename pattern (see `write_vault_note()` in `obsidian_utils.py`).
-- **Version:** Bump `plugin.json` and `.claude-plugin/marketplace.json` in lockstep (use `scripts/bump-version.sh`), and update `CHANGELOG.md` for releases.
+- **Version:** Bump `.claude-plugin/plugin.json`, `.codex-plugin/plugin.json`, `.claude-plugin/marketplace.json`, and `docs/architecture/architecture.json` and its generated HTML in lockstep (use `scripts/bump-version.sh`), and update `CHANGELOG.md` for releases.
 - **Branching:** Never commit directly to develop/main — use feature branches.
 
 ## Security Patterns
@@ -82,7 +136,7 @@ All frontmatter tags use the `claude/` prefix: `claude/session`, `claude/insight
 When writing new hooks, skills, or scripts, follow these rules:
 
 - **Path containment:** Never construct file paths from user input without `resolve()` + `is_relative_to()` containment check against the vault root.
-- **No predictable /tmp paths:** Use `~/.claude/obsidian-brain/` (0o700) or `tempfile.mkstemp` — never hardcoded `/tmp/ob-*` paths.
+- **No predictable /tmp paths:** Use selected owner-only native state (0o700) or `tempfile.mkstemp` — never hardcoded `/tmp/ob-*` paths.
 - **No path interpolation in python3 -c:** Always pass paths via `sys.argv`, never as string literals in the source code.
 - **JSON via stdin, not shell args:** Use `printf '%s' "$VAR" | python3 -c '... json.load(sys.stdin)'` — never pass JSON arrays as shell arguments.
 - **Atomic writes only:** All vault file writes must use temp file + rename — never `sed -i` or direct overwrite.
@@ -108,11 +162,16 @@ claude-code-skills monorepo**.
 
 Release flow (Git Flow):
 1. `release/*` branch from `develop`; run `scripts/bump-version.sh <part>` to
-   bump `plugin.json` and `.claude-plugin/marketplace.json` in lockstep.
+   bump `.claude-plugin/plugin.json`, `.codex-plugin/plugin.json`,
+   `.claude-plugin/marketplace.json`, and architecture JSON/HTML in lockstep.
 2. Update `CHANGELOG.md`.
 3. Merge to `main`, tag `vX.Y.Z`, publish a GitHub Release.
 4. Back-merge `main` into `develop`.
 
-Users update via `/plugin marketplace update`. Local dev testing uses
+Claude users update via `/plugin marketplace update`. Local dev testing uses
 `/dev-test install` (which calls `scripts/test-dev-skill.sh`, now
 source-agnostic about the cache directory).
+
+Codex distribution uses its own descriptor and selected hooks manifest. Installed
+Codex use remains blocked on verified current-client binding; no CLI/Desktop
+installation or update instruction here certifies that missing native evidence.

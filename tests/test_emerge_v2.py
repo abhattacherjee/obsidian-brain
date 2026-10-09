@@ -26,8 +26,8 @@ NOW = datetime.combine(NOW_D, datetime.min.time(), tzinfo=timezone.utc).isoforma
 
 
 @pytest.fixture
-def db(tmp_vault, monkeypatch):
-    p = str(tmp_vault / "c.db")
+def db(tmp_vault, monkeypatch, selected_host_context):
+    p = str(selected_host_context.index_path)
     vault_index.ensure_index(str(tmp_vault), ["claude-sessions"], db_path=p)
     monkeypatch.setenv("OBSIDIAN_BRAIN_DB", p)
     monkeypatch.setenv("HOME", str(tmp_vault))
@@ -299,14 +299,13 @@ def test_get_unassigned_notes_window_and_limit(db):
 # --- run_emerge_themes ----------------------------------------------------
 
 @pytest.fixture
-def emerge_db(db, tmp_vault, monkeypatch):
-    """db fixture + load_config patched to point /emerge at the temp vault."""
-    monkeypatch.setattr(
-        emerge_cli,
-        "load_config",
-        lambda: {"vault_path": str(tmp_vault), "insights_folder": "claude-insights"},
-    )
-    return db
+def emerge_db(db, tmp_vault, monkeypatch, selected_host_context):
+    from operation_state import operation_directory
+    _, directory = operation_directory(selected_host_context, 'e' * 32)
+    monkeypatch.setattr(emerge_cli, '_themes_json_path', lambda: str(directory / 'emerge-themes.json'))
+    monkeypatch.setattr(emerge_cli, '_analysis_path', lambda: str(directory / 'emerge-analysis.md'))
+    monkeypatch.setattr(emerge_cli, '_emerge_dir', lambda: str(directory))
+    yield db
 
 
 def _recent(days_ago):
@@ -319,7 +318,7 @@ def test_run_emerge_themes_sparse(emerge_db, capsys):
     conn.commit()
     conn.close()
 
-    emerge_cli.run_emerge_themes(30)
+    emerge_cli.run_emerge_themes(30, operation_id='e' * 32)
 
     out = capsys.readouterr().out
     assert "STATUS=SPARSE:1" in out
@@ -345,7 +344,7 @@ def test_run_emerge_themes_ok(emerge_db, capsys):
     assert conn.execute("SELECT MAX(activation) FROM themes").fetchone()[0] == 0.0
     conn.close()
 
-    emerge_cli.run_emerge_themes(30)
+    emerge_cli.run_emerge_themes(30, operation_id='e' * 32)
 
     out = capsys.readouterr().out
     assert "STATUS=OK:2:1" in out
@@ -408,15 +407,14 @@ def test_run_build_note(emerge_db, tmp_vault, capsys):
         "themes": [{"id": 1, "name": "T1"}, {"id": 2, "name": "T2"}],
         "unassigned_candidates": [],
     }
-    with open(emerge_cli._themes_json_path(), "w") as f:
-        json.dump(corpus, f)
-    with open(emerge_cli._analysis_path(), "w") as f:
-        # Sub-agent mistakenly prepended its own YAML frontmatter. The final
-        # note must contain exactly ONE frontmatter block (the run_build_note
-        # claude-emerge block); the injected `title: T` must not appear.
-        f.write("---\ntitle: T\n---\n\n## Growing Themes\n- T1 is hot\n")
+    from operation_state import store_artifact
+    from runtime_context import current_runtime_context
+    store_artifact(current_runtime_context(), 'e' * 32, 'emerge-themes.json', json.dumps(corpus))
+    # A generated analysis may accidentally include its own frontmatter.
+    store_artifact(current_runtime_context(), 'e' * 32, 'emerge-analysis.md',
+                   "---\ntitle: T\n---\n\n## Growing Themes\n- T1 is hot\n")
 
-    emerge_cli.run_build_note()
+    emerge_cli.run_build_note(operation_id='e' * 32)
 
     out = capsys.readouterr().out
     assert "SAVED:" in out
@@ -453,7 +451,7 @@ def test_run_emerge_themes_recompute_failure_exits_clean(emerge_db, capsys, monk
 
     monkeypatch.setattr(emerge_cli.themes, "recompute_activation", _boom)
     with pytest.raises(SystemExit) as exc:
-        emerge_cli.run_emerge_themes(30)
+        emerge_cli.run_emerge_themes(30, operation_id='e' * 32)
     assert exc.value.code == 1
     err = capsys.readouterr().err
     assert "ERROR" in err
@@ -463,7 +461,9 @@ def test_run_build_note_missing_artifact_exits_clean(emerge_db, tmp_vault, capsy
     # Fresh HOME, no emerge-themes.json present.
     assert not os.path.exists(emerge_cli._themes_json_path())
     with pytest.raises(SystemExit) as exc:
-        emerge_cli.run_build_note()
+        emerge_cli.run_build_note(operation_id='e' * 32)
     assert exc.value.code == 1
     err = capsys.readouterr().err
     assert "ERROR could not read emerge artifacts" in err
+
+from selected_legacy_vault import selected_host_context  # noqa: E402,F401

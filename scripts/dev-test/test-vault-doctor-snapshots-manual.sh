@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Manual smoke test for vault-doctor Phase B + C (PR #63)
 # Run AFTER: /dev-test install + start a new Claude Code session
-# Usage: bash scripts/dev-test/test-vault-doctor-snapshots-manual.sh
+# Usage: OB_CACHE_PATH=/absolute/package/root bash scripts/dev-test/test-vault-doctor-snapshots-manual.sh
 #
 # Validates the snapshot-integrity and snapshot-migration check modules
 # end-to-end against a throwaway fixture vault. Does NOT touch the user's
@@ -19,41 +19,14 @@ FAIL=0
 pass() { echo "  ✅ $1"; PASS=$((PASS + 1)); }
 fail() { echo "  ❌ $1"; FAIL=$((FAIL + 1)); }
 
-# ─── Locate code surface ────────────────────────────────────────────
-# Prefer the installed plugin cache (validates the distribution path).
-# Fall back to the local repo so this script works before /dev-test install,
-# emitting a warning so the user knows what's being exercised.
-REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-SCRIPTS_ROOT=""
-SKILL_ROOT=""
-
-CACHE_DIR=$(find ~/.claude/plugins/cache -type d -path "*/obsidian-brain/*" \
-    -not -path "*.bak*" 2>/dev/null | sort -V | tail -1 | xargs dirname 2>/dev/null || true)
-
-if [ -n "$CACHE_DIR" ] && [ -d "$CACHE_DIR" ]; then
-    CACHE_SCRIPTS=$(find "$CACHE_DIR" -maxdepth 2 -type d -name scripts | sort -V | tail -1)
-    if [ -f "$CACHE_SCRIPTS/vault_doctor_checks/snapshot_integrity.py" ]; then
-        SCRIPTS_ROOT="$CACHE_SCRIPTS"
-        SKILL_ROOT=$(find "$CACHE_DIR" -maxdepth 2 -type d -name skills | sort -V | tail -1)
-        echo "Using installed plugin cache: $CACHE_DIR"
-    else
-        echo "⚠️  Installed plugin cache does NOT contain snapshot_integrity.py yet."
-        echo "    Run /dev-test install in a fresh Claude Code session to copy"
-        echo "    the feature-branch code into the cache. Falling back to local repo."
-    fi
-fi
-
-if [ -z "$SCRIPTS_ROOT" ]; then
-    if [ -f "$REPO_ROOT/scripts/vault_doctor_checks/snapshot_integrity.py" ]; then
-        SCRIPTS_ROOT="$REPO_ROOT/scripts"
-        SKILL_ROOT="$REPO_ROOT/skills"
-        echo "Using local repo: $REPO_ROOT"
-    else
-        echo "❌ Could not locate snapshot_integrity.py in cache OR local repo."
-        echo "   Are you on the feature/snapshot-phase-b-c branch?"
-        exit 1
-    fi
-fi
+# This checks only the explicitly selected distribution, not current client binding.
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+CACHE_DIR=$(python3 "$SCRIPT_DIR/loaded_resource_root.py" --cache-path "${OB_CACHE_PATH:-}")
+HOOK_DIR="$CACHE_DIR/hooks"
+SKILL_ROOT="$CACHE_DIR/skills"
+SCRIPTS_ROOT="$CACHE_DIR/scripts"
+export HOOK_DIR SCRIPTS_ROOT SKILL_ROOT
+export PYTHONPATH="$CACHE_DIR:$HOOK_DIR:$SCRIPTS_ROOT"
 
 echo "═══════════════════════════════════════════════════════════════"
 echo "vault-doctor snapshot Phase B + C — Automated Validation"
@@ -65,22 +38,35 @@ echo ""
 
 # ─── Throwaway fixture vault ────────────────────────────────────────
 FIXTURE=$(mktemp -d -t ob-vd-snapshots.XXXXXX)
-trap 'rm -rf "$FIXTURE"' EXIT
+PRIVATE_HOME=$(mktemp -d -t ob-vd-home.XXXXXX)
+FIXTURE="$(cd "$FIXTURE" && pwd -P)"
+PRIVATE_HOME="$(cd "$PRIVATE_HOME" && pwd -P)"
+trap 'rm -rf "$FIXTURE" "$PRIVATE_HOME"' EXIT
+export FIXTURE
+export HOME="$PRIVATE_HOME"
+export CLAUDE_CONFIG_DIR="$HOME/.claude" CODEX_HOME="$HOME/.codex"
+export XDG_STATE_HOME="$HOME/.local/state"
+mkdir -p "$CLAUDE_CONFIG_DIR" "$CODEX_HOME" "$XDG_STATE_HOME"
+# Explicit isolated legacy-format distribution probe, not native frontend proof.
+unset CODEX_THREAD_ID CODEX_WORKER_ID CODEX_SANDBOX CODEX_SANDBOX_NETWORK_DISABLED CLAUDE_SESSION_ID CLAUDE_CODE_SESSION_ID
 SESS="$FIXTURE/claude-sessions"
 INSIGHTS="$FIXTURE/claude-insights"
 mkdir -p "$SESS" "$INSIGHTS"
 BACKUP_ROOT="$FIXTURE/.backup"
+export BACKUP_ROOT SESS INSIGHTS
 
 # ─── Test 1: Module discovery via registry ──────────────────────────
 echo "Test 1: Module registry exposes both new checks"
 
-DISCOVERED=$(python3 -c "
+DISCOVERED=$(python3 - 2>&1 <<'PY_OB_MANUAL'
+import os
 import sys
-sys.path.insert(0, '$SCRIPTS_ROOT/../scripts' if '$SCRIPTS_ROOT/../scripts' else '$SCRIPTS_ROOT')
-sys.path.insert(0, '$SCRIPTS_ROOT')
+sys.path.insert(0, os.environ['SCRIPTS_ROOT'] + '/../scripts' if os.environ['SCRIPTS_ROOT'] + '/../scripts' else os.environ['SCRIPTS_ROOT'])
+sys.path.insert(0, os.environ['SCRIPTS_ROOT'])
 from vault_doctor_checks import list_checks
 print(' '.join(list_checks()))
-" 2>&1)
+PY_OB_MANUAL
+)
 
 if echo "$DISCOVERED" | grep -q "snapshot-integrity"; then
     pass "snapshot-integrity registered"
@@ -115,21 +101,24 @@ test body
 EOF
 
 # Set deterministic mtime so HHMMSS derivation is predictable
-python3 -c "
+python3 - <<'PY_OB_MANUAL'
+import os
 import os, datetime
 ts = datetime.datetime(2026, 4, 5, 14, 30, 27).timestamp()
-os.utime('$SESS/2026-04-05-demo-aaaa-snapshot.md', (ts, ts))
-"
+os.utime(os.environ['SESS'] + '/2026-04-05-demo-aaaa-snapshot.md', (ts, ts))
+PY_OB_MANUAL
 
 # Compute parent stem the way the migration check does
-PARENT_STEM=$(python3 -c "
+PARENT_STEM=$(python3 - <<'PY_OB_MANUAL'
+import os
 import hashlib
 sid = 'aaaa-1111-2222'
 proj = 'demo'
 date = '2026-04-05'
 hash4 = hashlib.sha256(sid.encode()).hexdigest()[:4]
 print(f'{date}-{proj}-{hash4}')
-")
+PY_OB_MANUAL
+)
 
 # Parent session WITHOUT snapshots: list (Phase C check 4 will backfill)
 cat > "$SESS/${PARENT_STEM}.md" <<EOF
@@ -166,13 +155,15 @@ fi
 echo ""
 echo "Test 3: snapshot-migration scan detects 4 issue kinds"
 
-SCAN_JSON=$(python3 -c "
+SCAN_JSON=$(python3 - <<'PY_OB_MANUAL'
+import os
 import sys, json
-sys.path.insert(0, '$SCRIPTS_ROOT')
+sys.path.insert(0, os.environ['SCRIPTS_ROOT'])
 from vault_doctor_checks import snapshot_migration
-issues = snapshot_migration.scan('$FIXTURE', 'claude-sessions', 'claude-insights', 3650)
+issues = snapshot_migration.scan(os.environ['FIXTURE'], 'claude-sessions', 'claude-insights', 3650)
 print(json.dumps([{'check': i.check, 'note_path': i.note_path, 'extra': dict(i.extra)} for i in issues]))
-")
+PY_OB_MANUAL
+)
 
 for check in snapshot-legacy-filename snapshot-missing-status snapshot-missing-backlink session-missing-snapshots-list; do
     if echo "$SCAN_JSON" | grep -q "\"check\": \"$check\""; then
@@ -186,17 +177,18 @@ done
 echo ""
 echo "Test 4: snapshot-migration apply produces post-spec state"
 
-python3 -c "
+python3 - <<'PY_OB_MANUAL'
+import os
 import sys
-sys.path.insert(0, '$SCRIPTS_ROOT')
+sys.path.insert(0, os.environ['SCRIPTS_ROOT'])
 from vault_doctor_checks import snapshot_migration
-issues = snapshot_migration.scan('$FIXTURE', 'claude-sessions', 'claude-insights', 3650)
-results = snapshot_migration.apply(issues, '$BACKUP_ROOT')
+issues = snapshot_migration.scan(os.environ['FIXTURE'], 'claude-sessions', 'claude-insights', 3650)
+results = snapshot_migration.apply(issues, os.environ['BACKUP_ROOT'])
 applied = [r for r in results if r.status == 'applied']
 print(f'Applied: {len(applied)} of {len(results)}')
 for r in results:
-    print(f'  {r.status}: {r.check} on {r.note_path}')
-"
+    print(f'  {r.status}: {r.check} on {r.note_path}; error={r.error}')
+PY_OB_MANUAL
 
 # Renamed file exists with HHMMSS=143027
 if [ -f "$SESS/2026-04-05-demo-aaaa-snapshot-143027.md" ]; then
@@ -254,14 +246,16 @@ fi
 echo ""
 echo "Test 5: snapshot-migration is idempotent"
 
-REISSUES=$(python3 -c "
+REISSUES=$(python3 - <<'PY_OB_MANUAL'
+import os
 import sys
-sys.path.insert(0, '$SCRIPTS_ROOT')
+sys.path.insert(0, os.environ['SCRIPTS_ROOT'])
 from vault_doctor_checks import snapshot_migration
-issues = snapshot_migration.scan('$FIXTURE', 'claude-sessions', 'claude-insights', 3650)
+issues = snapshot_migration.scan(os.environ['FIXTURE'], 'claude-sessions', 'claude-insights', 3650)
 actionable = [i for i in issues if not i.extra.get('unresolved')]
 print(len(actionable))
-")
+PY_OB_MANUAL
+)
 
 if [ "$REISSUES" -eq 0 ]; then
     pass "Re-scan returns 0 actionable issues (idempotent)"
@@ -273,13 +267,15 @@ fi
 echo ""
 echo "Test 6: snapshot-integrity scan finds no issues on clean post-migration vault"
 
-INTEGRITY_ISSUES=$(python3 -c "
+INTEGRITY_ISSUES=$(python3 - <<'PY_OB_MANUAL'
+import os
 import sys
-sys.path.insert(0, '$SCRIPTS_ROOT')
+sys.path.insert(0, os.environ['SCRIPTS_ROOT'])
 from vault_doctor_checks import snapshot_integrity
-issues = snapshot_integrity.scan('$FIXTURE', 'claude-sessions', 'claude-insights', 30)
+issues = snapshot_integrity.scan(os.environ['FIXTURE'], 'claude-sessions', 'claude-insights', 30)
 print(len(issues))
-")
+PY_OB_MANUAL
+)
 
 if [ "$INTEGRITY_ISSUES" -eq 0 ]; then
     pass "Integrity scan reports 0 issues on freshly-migrated vault"
@@ -292,22 +288,25 @@ echo ""
 echo "Test 7: snapshot-integrity broken-backlink scan + apply round-trip"
 
 # Corrupt the backlink in the migrated snapshot
-python3 -c "
+python3 - <<'PY_OB_MANUAL'
+import os
 import re
-p = '$SESS/2026-04-05-demo-aaaa-snapshot-143027.md'
+p = os.environ['SESS'] + '/2026-04-05-demo-aaaa-snapshot-143027.md'
 text = open(p).read()
-text = re.sub(r'source_session_note:.*', 'source_session_note: \"[[wrong-stem-here]]\"', text, count=1)
+text = re.sub('source_session_note:.*', 'source_session_note: "[[wrong-stem-here]]"', text, count=1)
 open(p, 'w').write(text)
-"
+PY_OB_MANUAL
 
-BROKEN=$(python3 -c "
+BROKEN=$(python3 - <<'PY_OB_MANUAL'
+import os
 import sys, json
-sys.path.insert(0, '$SCRIPTS_ROOT')
+sys.path.insert(0, os.environ['SCRIPTS_ROOT'])
 from vault_doctor_checks import snapshot_integrity
-issues = snapshot_integrity.scan('$FIXTURE', 'claude-sessions', 'claude-insights', 30)
+issues = snapshot_integrity.scan(os.environ['FIXTURE'], 'claude-sessions', 'claude-insights', 30)
 broken = [i for i in issues if i.check == 'snapshot-broken-backlink']
 print(len(broken))
-")
+PY_OB_MANUAL
+)
 
 if [ "$BROKEN" -eq 1 ]; then
     pass "Broken-backlink detected after corruption"
@@ -315,14 +314,15 @@ else
     fail "Broken-backlink scan returned $BROKEN (expected 1)"
 fi
 
-python3 -c "
+python3 - <<'PY_OB_MANUAL'
+import os
 import sys
-sys.path.insert(0, '$SCRIPTS_ROOT')
+sys.path.insert(0, os.environ['SCRIPTS_ROOT'])
 from vault_doctor_checks import snapshot_integrity
-issues = snapshot_integrity.scan('$FIXTURE', 'claude-sessions', 'claude-insights', 30)
+issues = snapshot_integrity.scan(os.environ['FIXTURE'], 'claude-sessions', 'claude-insights', 30)
 broken = [i for i in issues if i.check == 'snapshot-broken-backlink']
-snapshot_integrity.apply(broken, '$BACKUP_ROOT')
-"
+snapshot_integrity.apply(broken, os.environ['BACKUP_ROOT'])
+PY_OB_MANUAL
 
 if grep -q "source_session_note: \"\[\[${PARENT_STEM}\]\]\"" "$SESS/2026-04-05-demo-aaaa-snapshot-143027.md"; then
     pass "Broken backlink auto-repaired to correct parent stem"

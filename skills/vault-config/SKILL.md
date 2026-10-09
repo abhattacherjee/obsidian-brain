@@ -5,11 +5,73 @@ metadata:
   version: 1.0.0
 ---
 
+## Native runtime and installed resources
+
+Use the absolute path of this loaded `SKILL.md` as `OB_SKILL_PATH`. Read the
+reference for the invoking host when this skill has paired host references.
+Set `OB_HOST`, `OB_SESSION_ID`, and `OB_CWD` from that native invocation.
+Claude has one frontend: use the fixed host client `claude-code`. Reject an
+inherited `OB_CLIENT` that differs, including an empty declaration.
+For Codex, read the operator-declared, inherited `OB_CLIENT`; never choose or
+export it yourself. It must be `codex-cli` or `codex-desktop`; if missing or
+invalid, stop with "Current native client binding is unavailable". Never label a Desktop
+invocation as a CLI invocation or infer the frontend from transcript creation
+metadata or inherited environment markers. Use the selected host's own session ID. Keep curated note taxonomy
+separate from `agent_provider` and `agent_session_id` provenance.
+
+```bash
+case "$OB_HOST" in
+  claude)
+    if [ "${OB_CLIENT+x}" = x ] && [ "$OB_CLIENT" != claude-code ]; then
+      printf '%s\n' 'Current native client binding is unavailable: conflicting Claude declaration.' >&2
+      exit 1
+    fi
+    OB_CLIENT=claude-code
+    ;;
+  codex)
+    case "${OB_CLIENT:-}" in
+      codex-cli|codex-desktop) ;;
+      *) printf '%s\n' 'Current native client binding is unavailable; stop without choosing a frontend.' >&2; exit 1 ;;
+    esac
+    ;;
+  *) printf '%s\n' 'Current native client binding is unavailable: unknown host.' >&2; exit 1 ;;
+esac
+OB_SKILL_PATH='<absolute path of this loaded SKILL.md>'
+OB_RESOURCE_ROOT=$(python3 -c 'import pathlib,sys; p=pathlib.Path(sys.argv[1]); assert p.is_absolute(); p=p.resolve(); assert p.name == "SKILL.md" and p.parent.parent.name == "skills"; print(p.parents[2])' "$OB_SKILL_PATH")
+python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" context < /dev/null
+```
+
+Use the returned `config_path`, `vault_path`, `index_path`, and `state_path`.
+Create the operation with this fixed literal request:
+
+```bash
+printf '{}' | python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'prepare'
+```
+
+Call `prepare` to create a private operation under native state. Retain its
+`operation_id` and `operation_dir`. Register approved helper output names with `artifact-store`;
+inputs are read through the immutable artifact manifest. Do not discover resources from the current directory or another plugin
+cache. Each shell invocation supplies the same explicit values; a previous
+shell's variables are not assumed to persist.
+
+Each data operation uses the installed launcher with a JSON request on stdin:
+
+```bash
+python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation '<fixed operation>' < "$REQUEST_PATH"
+```
+
+Map config JSON `vault_path`, `sessions_folder`, and `insights_folder` to the
+procedure variables `VAULT_PATH`/`VAULT`, `SESSIONS_FOLDER`/`SESS`, and
+`INSIGHTS_FOLDER`/`INS`. Use the canonical project returned in config JSON (and native `session` when available),
+not the basename of an unrelated shell working directory.
+
+Use only the operations documented for this skill. Their writes bind the source revisions before analysis and preserve manual edits on conflict. Content is JSON data, never shell code. Read `references/host-claude.md` or `references/host-codex.md` when present. Codex has no native memory-file API; shared vault retrieval and wiki filing continue without borrowing another host's memory.
+
 # Vault Config — Manage obsidian-brain Settings
 
 Interactive menu for viewing and changing obsidian-brain configuration, one setting at a time.
 
-**Tools needed:** Bash, Read, Write
+**Tools needed:** native shell, native file reading, trusted publication
 
 ## Procedure
 
@@ -17,35 +79,14 @@ Interactive menu for viewing and changing obsidian-brain configuration, one sett
 
 Run:
 
+Request for `config` (substitute the values as data):
+
+```json
+{}
+```
+
 ```bash
-cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-python3 -c '
-import sys, os, json
-import glob, json, os, re, sys
-def _ob_hooks():
-    try:
-        for _m in json.load(open(os.path.expanduser("~/.claude/plugins/known_marketplaces.json"))).values():
-            _s = _m.get("source") if isinstance(_m, dict) else None
-            if not (isinstance(_s, dict) and _s.get("source") == "directory"):
-                continue
-            _i = _m.get("installLocation") if isinstance(_m, dict) else None
-            if not (isinstance(_i, str) and os.path.isabs(_i)):
-                continue
-            _h = os.path.join(_i, "hooks")
-            if os.path.isfile(os.path.join(_h, "obsidian_utils.py")):
-                return _h
-    except Exception:
-        pass
-    _c = [_d for _d in glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")) if re.fullmatch("[0-9]+([.][0-9]+)*", _d.split("/")[-2])]
-    return max(_c, key=lambda _p: ([int(_n) for _n in _p.split("/")[-2].split(".")], _p), default="hooks")
-sys.path.insert(0, _ob_hooks())
-from obsidian_utils import load_config
-c = load_config()
-if not c.get("vault_path"):
-    print("ERROR: not configured", file=sys.stderr)
-    sys.exit(1)
-print(json.dumps(c, indent=2))
-'
+python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'config' < "$REQUEST_PATH"
 ```
 
 Parse the JSON output into a config dict.
@@ -101,22 +142,19 @@ Wait for user input.
 
 Run:
 
+Request for `configure`:
+
+```json
+{
+  "expected_revision": "<config-read SHA256>",
+  "settings": {
+    "<setting>": "<value>"
+  }
+}
+```
+
 ```bash
-python3 -c '
-import sys, os, json
-config_path = os.path.expanduser("~/.claude/obsidian-brain-config.json")
-with open(config_path, "r") as f:
-    config = json.load(f)
-config[sys.argv[1]] = json.loads(sys.argv[2])
-import tempfile
-fd, tmp = tempfile.mkstemp(dir=os.path.dirname(config_path), suffix=".tmp")
-with os.fdopen(fd, "w") as f:
-    json.dump(config, f, indent=2)
-    f.write("\n")
-os.chmod(tmp, 0o600)
-os.rename(tmp, config_path)
-print("OK")
-' "$KEY" "$JSON_VALUE"
+python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'configure' < "$REQUEST_PATH"
 ```
 
 Where `$KEY` is the setting name and `$JSON_VALUE` is the new value as a JSON literal (e.g., `"false"`, `"3"`, `'"/path/to/vault"'`).
@@ -124,3 +162,14 @@ Where `$KEY` is the setting name and `$JSON_VALUE` is the new value as a JSON li
 If the changed key is `sessions_folder`, `insights_folder` or `wiki_folder`: other skills in this session read a cached copy of the config, so tell the user to run `/vault-reindex`, which reads the config fresh and re-indexes the new folders. For `wiki_folder`, first check the value: it must be a relative folder name with no `..`, `~` or dot-prefixed segment (an empty value turns the wiki folder off). `/vault-reindex` refuses an invalid value and names it.
 
 Confirm the change, then go back to Step 2 to redisplay the table.
+
+## Fixed request shapes
+
+Pass these objects through the installed launcher for the named operation. Keep
+one operation ID across source reads, analysis and reviewed publication.
+
+Request for `config-read`:
+
+```json
+{}
+```

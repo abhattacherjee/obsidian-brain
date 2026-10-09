@@ -151,7 +151,7 @@ class TestImportanceParsing:
 
 
 class TestImportanceWriteBack:
-    def test_upgrade_note_writes_importance_to_db(self, tmp_vault, mock_config):
+    def test_upgrade_note_writes_importance_to_db(self, tmp_vault, mock_config, selected_host_context):
         """upgrade_note_with_summary() writes parsed importance to vault index DB."""
         note_path = str(tmp_vault / "claude-sessions" / "2026-04-15-test-wb-a1b2.md")
         # Write a raw unsummarized note
@@ -177,7 +177,7 @@ class TestImportanceWriteBack:
         )
 
         # Index the vault so the note is in the DB
-        db_path = str(tmp_vault / "test.db")
+        db_path = str(selected_host_context.index_path)
         vault_index.ensure_index(str(tmp_vault), ["claude-sessions"], db_path=db_path)
 
         # Patch _default_db_path to point to our test DB
@@ -203,3 +203,5 @@ class TestImportanceWriteBack:
         conn.close()
         assert row is not None
         assert row[0] == 9
+
+from selected_legacy_vault import selected_host_context  # noqa: E402,F401

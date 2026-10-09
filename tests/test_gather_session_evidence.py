@@ -1132,3 +1132,7 @@ def test_gather_session_evidence_retro_not_in_other_buckets(tmp_vault: Path) -> 
     assert [i["path"] for i in bundle["insights"]] == [str(ins)]
     assert bundle["decisions"] == []
     assert bundle["error_fixes"] == []
+
+from selected_legacy_vault import selected_host_context  # noqa: E402,F401
+
+pytestmark = pytest.mark.usefixtures("selected_host_context")

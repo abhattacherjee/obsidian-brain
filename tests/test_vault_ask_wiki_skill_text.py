@@ -7,13 +7,19 @@ def test_read_only_statement_is_gone():
     assert "this skill is read-only" not in SKILL
 
 
-def test_wiki_commands_are_used():
-    for cmd in ("wiki.py\" lookup", "wiki.py\" stale", "wiki.py\" count", "wiki.py\" rule", "wiki.py\" file", "--caller"):
-        assert cmd in SKILL, cmd
+def test_wiki_commands_are_used(selected_host_context):
+    import skill_procedures
+    for command in ('lookup','stale','count','rule','file'):
+        assert 'wiki-' + command in SKILL
+        assert 'wiki-' + command in skill_procedures.OPERATIONS['vault-ask']
+    assert '--caller' in SKILL
+
 
 
 def test_payload_goes_through_a_file_not_a_shell_string():
-    assert "wiki-payload-" in SKILL and "Never build the JSON in a shell string" in SKILL
+    assert '< "$REQUEST_PATH"' in SKILL
+    assert 'Never build' in SKILL and 'JSON in a shell string' in SKILL
+
 
 
 def test_candidate_cap_and_index_exclusion():
@@ -57,15 +63,33 @@ def test_reviewed_page_save_as_new_branch():
 
 
 def test_payload_dir_created_private():
-    assert "run `mkdir -m 700 -p ~/.claude/obsidian-brain`" in SKILL
-    assert "mkdir -m 700 -p ~/.claude/obsidian-brain\npython3 '<hooks_dir>/wiki.py'" in SKILL
+    import inspect, skill_procedures, operation_state
+    assert 'artifact-store' in SKILL and 'prepare' in SKILL
+    assert 'operation_directory(context)' in inspect.getsource(skill_procedures._operation_prepare)
+    source=inspect.getsource(operation_state)
+    assert '0o700' in source and '0o600' in source
 
 
-def test_wiki_folder_comes_from_validated_helper():
-    assert "folders = indexed_folders(c, strict=True)" in SKILL
-    assert 'print("WIKI=" + wiki)' in SKILL
-    assert 'c.get("wiki_folder") or ""' not in SKILL
-    assert "WIKI= is printed empty" in SKILL
+
+def test_wiki_folder_comes_from_validated_helper(selected_host_context):
+    from dataclasses import replace
+    from types import MappingProxyType
+    import io, json, skill_procedures
+    from runtime_context import using_runtime_context
+    original = dict(selected_host_context.config)
+    original.pop('wiki_folder', None)
+    for settings, expected in ((original, 'claude-wiki'),
+                               (dict(original,wiki_folder='custom-wiki'), 'custom-wiki'),
+                               (dict(original,wiki_folder=''), '')):
+        context = replace(selected_host_context,config=MappingProxyType(settings))
+        output, error = io.StringIO(), io.StringIO()
+        with using_runtime_context(context):
+            assert skill_procedures.run_operation(context,'vault-ask','config',{},output,error) == 0, error.getvalue()
+        result = json.loads(output.getvalue())
+        assert result['wiki_folder'] == expected
+        assert (expected in result['folders']) if expected else ('claude-wiki' not in result['folders'])
+    assert 'empty validated `wiki_folder`' in SKILL
+
 
 
 def test_missing_wiki_py_skips_wiki_steps():
@@ -85,11 +109,11 @@ def test_refresh_leaves_the_page_out_of_sources():
 
 
 def test_memory_search_uses_memgrep_on_every_ask_that_reaches_step_3():
-    assert 'wiki.py" memgrep' in SKILL
-    assert "The memory search runs on every ask that reaches Step 3" in SKILL
-    # Step 3's fast path must not skip it; only a fresh wiki answer does.
-    assert "even when Step 3 skipped the Grep searches" in SKILL
-    assert "a fresh wiki answer from Step 2b stops before it, by design" in SKILL
+    assert 'wiki-memgrep' in SKILL
+    assert 'The memory search runs on every ask that reaches Step 3' in SKILL
+    assert 'even when Step 3 skipped the pattern searches' in SKILL
+    assert 'a fresh wiki answer from Step 2b stops before it, by design' in SKILL
+
 
 
 def test_memory_citation_is_plain_text():
@@ -127,7 +151,7 @@ def test_memory_reason_forms_are_listed():
 def test_memgrep_skipped_and_host_are_reported():
     assert '"host"' in SKILL and '"skipped"' in SKILL
     assert "N memory file(s) could not be read" in SKILL
-    assert "this host has no memory files" in SKILL
+    assert "native memory discovery is unsupported for this host" in SKILL
 
 
 def test_rejected_names_bullet_covers_memory_sources():

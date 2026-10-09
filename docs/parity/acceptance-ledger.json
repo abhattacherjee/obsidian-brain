@@ -1,0 +1,53 @@
+{
+  "tested_sha": null,
+  "clients": {
+    "claude-code": {
+      "status": "pending",
+      "version": null,
+      "evidence": [],
+      "dispatch_verified": false
+    },
+    "codex-cli": {
+      "status": "pending",
+      "version": null,
+      "evidence": [],
+      "dispatch_verified": false
+    },
+    "codex-desktop": {
+      "status": "blocked",
+      "version": null,
+      "evidence": [],
+      "dispatch_verified": false
+    }
+  },
+  "criteria": {
+    "1": {
+      "status": "pending",
+      "evidence": []
+    },
+    "2": {
+      "status": "pending",
+      "evidence": []
+    },
+    "3": {
+      "status": "pending",
+      "evidence": []
+    },
+    "4": {
+      "status": "pending",
+      "evidence": []
+    },
+    "5": {
+      "status": "pending",
+      "evidence": []
+    },
+    "6": {
+      "status": "pending",
+      "evidence": []
+    },
+    "7": {
+      "status": "pending",
+      "evidence": []
+    }
+  }
+}

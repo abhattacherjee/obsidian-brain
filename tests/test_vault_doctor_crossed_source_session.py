@@ -73,7 +73,7 @@ def _vault(tmp_path: Path) -> dict:
     return {"root": vault, "sessions": vault / SESSIONS, "insights": vault / INSIGHTS}
 
 
-def test_crossed_pair_detected(tmp_path):
+def test_crossed_pair_detected(selected_host_context, tmp_path):
     """Case 1: source_session != target's session_id -> exactly one Issue,
     naming both ids."""
     v = _vault(tmp_path)
@@ -95,7 +95,7 @@ def test_crossed_pair_detected(tmp_path):
     assert issue.extra["target_session_id"] == "session-B"
 
 
-def test_matching_pair_no_issue(tmp_path, capsys):
+def test_matching_pair_no_issue(selected_host_context, tmp_path, capsys):
     """Case 2: source_session == target's session_id -> no issues.
 
     Also pins the three previously-unasserted summary counters (#354 review
@@ -130,7 +130,7 @@ def test_matching_pair_no_issue(tmp_path, capsys):
     ), err
 
 
-def test_dangling_link_no_issue(tmp_path, capsys):
+def test_dangling_link_no_issue(selected_host_context, tmp_path, capsys):
     """Case 3 (negative control): the wikilink target does not exist on
     disk at all. This is the scoping decision this check makes on purpose
     — dangling links belong to snapshot-integrity/#214, not here. A
@@ -168,7 +168,7 @@ def test_dangling_link_no_issue(tmp_path, capsys):
     ), err
 
 
-def test_target_missing_session_id_no_issue(tmp_path):
+def test_target_missing_session_id_no_issue(selected_host_context, tmp_path):
     """Case 4: target note exists but has no session_id frontmatter ->
     no issue (nothing to compare against)."""
     v = _vault(tmp_path)
@@ -184,7 +184,7 @@ def test_target_missing_session_id_no_issue(tmp_path):
     assert issues == []
 
 
-def test_source_session_unknown_no_issue(tmp_path):
+def test_source_session_unknown_no_issue(selected_host_context, tmp_path):
     """Case 5: source_session: unknown -> no issue, even with a crossing
     target."""
     v = _vault(tmp_path)
@@ -200,7 +200,7 @@ def test_source_session_unknown_no_issue(tmp_path):
     assert issues == []
 
 
-def test_apply_skips_and_writes_nothing(tmp_path):
+def test_apply_skips_and_writes_nothing(selected_host_context, tmp_path):
     """Case 6: apply() returns status="skipped" for every issue and never
     writes — the note file is byte-identical before and after."""
     v = _vault(tmp_path)
@@ -236,7 +236,7 @@ def test_registered_and_discoverable():
     assert "crossed-source-session" in all_names
 
 
-def test_realistic_live_fixture(tmp_path):
+def test_realistic_live_fixture(selected_host_context, tmp_path):
     """Case 8: realistic fixture using the REAL live vault values —
     the one genuine crossing found in production (#330 plan)."""
     v = _vault(tmp_path)
@@ -265,7 +265,7 @@ def test_realistic_live_fixture(tmp_path):
     assert issue.note_path.endswith("2026-08-27-retro-d205.md")
 
 
-def test_confidence_pinned_at_0_95(tmp_path):
+def test_confidence_pinned_at_0_95(selected_host_context, tmp_path):
     """#330 review item 12c: pin the actual confidence value on a crossed
     finding. A confidence of 0.0 would still make every assertion above
     pass, silently defeating the DEFAULT_MIN_CONFIDENCE filter this check
@@ -284,7 +284,7 @@ def test_confidence_pinned_at_0_95(tmp_path):
     assert issues[0].confidence == 0.95
 
 
-def test_unreadable_sessions_dir_warns_instead_of_reporting_silent_clean(
+def test_unreadable_sessions_dir_warns_instead_of_reporting_silent_clean(selected_host_context,
     tmp_path, capsys
 ):
     """#330 review item 11: Path.glob() silently swallows OSError while
@@ -335,7 +335,7 @@ def test_unreadable_sessions_dir_warns_instead_of_reporting_silent_clean(
     )
 
 
-def test_unreadable_insights_dir_only_warns_scan_loop_not_stem_index(
+def test_unreadable_insights_dir_only_warns_scan_loop_not_stem_index(selected_host_context,
     tmp_path, capsys
 ):
     """#354 review item 5b, part 2: isolate the scan-loop "could not list"
@@ -366,7 +366,7 @@ def test_unreadable_insights_dir_only_warns_scan_loop_not_stem_index(
     assert "not reported — dangling links are excluded by design" not in err
 
 
-def test_unparsable_source_note_is_counted_and_warned_not_silently_skipped(
+def test_unparsable_source_note_is_counted_and_warned_not_silently_skipped(selected_host_context,
     tmp_path, capsys
 ):
     """#330 review item 11: a source-side note (insight/session) that fails
@@ -394,7 +394,7 @@ def test_unparsable_source_note_is_counted_and_warned_not_silently_skipped(
     assert "1 source note unreadable" in err
 
 
-def test_unparsable_link_target_is_counted_and_warned(tmp_path, capsys):
+def test_unparsable_link_target_is_counted_and_warned(selected_host_context, tmp_path, capsys):
     """#330 review item 11: the link TARGET failing to parse (present on
     disk, broken frontmatter) is a distinct, worth-reporting case from a
     dangling link — the note exists, so 'cannot tell' is a scan gap, not
@@ -420,7 +420,7 @@ def test_unparsable_link_target_is_counted_and_warned(tmp_path, capsys):
     assert "2026-08-26-demo-df46.md" in err
     assert "1 target unreadable" in err
 
-def test_rescan_after_hand_edit_sees_new_value_not_stale_cache(tmp_path):
+def test_rescan_after_hand_edit_sees_new_value_not_stale_cache(selected_host_context, tmp_path):
     """#354 review item 3: after a human hand-edits a crossed note's
     source_session to match the target (the check's whole workflow — it
     never auto-repairs) and re-runs the check in the SAME process, the
@@ -482,7 +482,7 @@ def test_stem_index_survives_is_dir_permission_error(tmp_path, monkeypatch):
     assert err is None
 
 
-def test_scan_loop_survives_is_dir_permission_error_on_first_folder(
+def test_scan_loop_survives_is_dir_permission_error_on_first_folder(selected_host_context,
     tmp_path, monkeypatch
 ):
     """#354 review item 5: the scan() loop's is_dir() call sits inside

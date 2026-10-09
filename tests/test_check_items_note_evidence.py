@@ -18,6 +18,7 @@ subprocess.run-mocking pattern for a repo-less project).
 
 from __future__ import annotations
 
+from tests.native_pipeline_test_adapter import private_pipeline_output, run_native_pipeline
 import json as _json
 import os
 import time as _time
@@ -28,6 +29,19 @@ import pytest
 import check_items_cli
 import check_items_prefilter
 import open_item_dedup as oid
+
+
+@pytest.fixture
+def selected_host_context(host, selected_host_context, tmp_path, tmp_path_factory):
+    from dataclasses import replace
+    from runtime_context import using_runtime_context
+    private = tmp_path_factory.mktemp("evidence-private")
+    vault = tmp_path / "v"
+    selected = replace(selected_host_context, vault_path=vault,
+        state_path=private / "state", index_path=private / "index.sqlite3",
+        config=dict(selected_host_context.config, vault_path=str(vault)))
+    with using_runtime_context(selected):
+        yield selected
 
 
 def _session(path, date, project, summary="Did some work.", open_items=None):
@@ -137,7 +151,7 @@ def _fake_completed(stdout="", returncode=0):
     return cp
 
 
-def test_pipeline_attaches_note_completions_for_repo_less_project(tmp_path):
+def test_pipeline_attaches_note_completions_for_repo_less_project(selected_host_context, tmp_path):
     """End-to-end through deep_analysis_pipeline for a project with no local
     git repo (_resolve_project_paths -> {}). The gap is still named in
     evidence_gaps, but the project is no longer evidence-less: it has a
@@ -154,7 +168,7 @@ def test_pipeline_attaches_note_completions_for_repo_less_project(tmp_path):
         summary="Shipped the foo exporter service end to end.",
     )
 
-    output_path = str(tmp_path / "pipeline-out.json")
+    output_path = str(private_pipeline_output(vault, "pipeline-out.json"))
 
     fake_vi = MagicMock()
     fake_vi.ensure_index.return_value = str(tmp_path / "vault.db")
@@ -165,7 +179,7 @@ def test_pipeline_attaches_note_completions_for_repo_less_project(tmp_path):
          patch.dict("sys.modules", {"vault_index": fake_vi}), \
          patch.object(oid, "_resolve_project_paths", return_value={}):
 
-        result = oid.deep_analysis_pipeline(
+        result = run_native_pipeline(
             basenames=[],
             projects_json=_json.dumps(["notes-only"]),
             output_path=output_path,
@@ -395,7 +409,7 @@ def test_note_evidence_only_caps_every_off_template_bypass_at_med(citation):
     assert tier == "MED", (citation, tier)
 
 
-def test_repo_backed_project_never_gets_note_completions(tmp_path):
+def test_repo_backed_project_never_gets_note_completions(selected_host_context, tmp_path):
     """#318 I3 ruling, REPLACES test_off_template_citation_still_reaches_high_with_git_evidence
     (deliberately removed -- it pinned the exact behaviour this closes).
 
@@ -436,7 +450,7 @@ def test_repo_backed_project_never_gets_note_completions(tmp_path):
     repo_dir = tmp_path / "repo"
     repo_dir.mkdir()
 
-    output_path = str(tmp_path / "pipeline-out.json")
+    output_path = str(private_pipeline_output(vault, "pipeline-out.json"))
 
     fake_vi = MagicMock()
     fake_vi.ensure_index.return_value = str(tmp_path / "vault.db")
@@ -447,7 +461,7 @@ def test_repo_backed_project_never_gets_note_completions(tmp_path):
          patch.dict("sys.modules", {"vault_index": fake_vi}), \
          patch.object(oid, "_resolve_project_paths", return_value={"git-proj": str(repo_dir)}):
 
-        result = oid.deep_analysis_pipeline(
+        result = run_native_pipeline(
             basenames=[],
             projects_json=_json.dumps(["git-proj"]),
             output_path=output_path,
@@ -468,7 +482,13 @@ def test_repo_backed_project_never_gets_note_completions(tmp_path):
     assert data["evidence_gaps"]["projects_without_repo"] == []
 
 
-def test_bundle_note_completions_only_flags_note_evidence_only(tmp_path):
+@pytest.fixture
+def invoking_ai_context(selected_host_context, tmp_path, monkeypatch):
+    from check_items_test_helpers import native_ai_context
+    yield from native_ai_context.__wrapped__(selected_host_context, tmp_path, monkeypatch)
+
+
+def test_bundle_note_completions_only_flags_note_evidence_only(tmp_path, invoking_ai_context):
     """F7 bundle-level test, via check_items_cli.run_classifier(): a project
     whose evidence bundle is note_completions-ONLY (no git-derived bucket)
     is stamped note_evidence_only=True on its output record; a project
@@ -506,7 +526,8 @@ def test_bundle_note_completions_only_flags_note_evidence_only(tmp_path):
             },
         },
     }
-    output_path = str(tmp_path / "classout.json")
+    from check_items_test_helpers import private_output
+    output_path = str(private_output("classout.json"))
 
     rc = check_items_cli.run_classifier(_json.dumps(stdin_payload), output_path)
     assert rc == 0, rc
@@ -804,3 +825,30 @@ def test_cached_record_for_git_project_still_reaches_high():
         record["note_evidence_only"],
     )
     assert tier == "HIGH", tier
+
+
+@pytest.mark.parametrize('body, expected', [
+    ('<!-- obsidian-brain:summary:start -->\n## Summary\nShipped the foo exporter service.\n<!-- obsidian-brain:summary:end -->\n\n## Summary\nUnowned manual prose.\n', 'Shipped the foo exporter service.'),
+    ('<!-- obsidian-brain:summary:start -->\n## Summary\n\n## Key Decisions\nShipped the foo exporter service.\n<!-- obsidian-brain:summary:end -->\n', None),
+    ('<!-- obsidian-brain:summary:start -->\n## Key Decisions\nShipped the foo exporter service.\n<!-- obsidian-brain:summary:end -->\n\n## Summary\nShipped the foo exporter service.\n', None),
+    ('## Summary\n\n## Key Decisions\nShipped the foo exporter service.\n', None),
+    ('## Summary\nShipped the foo exporter service.\n\n## Key Decisions\nManual extra text.\n', 'Shipped the foo exporter service.'),
+], ids=['managed-summary', 'empty-managed', 'no-managed-summary', 'empty-legacy', 'legacy-summary'])
+def test_completion_evidence_uses_only_nonempty_owned_summary(selected_host_context, tmp_path, monkeypatch, body, expected):
+    vault, sessions = _vault(tmp_path)
+    _session(sessions / '2026-01-01-source.md', '2026-01-01', 'notes-only',
+             summary='', open_items=['wire up the foo exporter service'])
+    _session(sessions / '2026-02-01-newer.md', '2026-02-01', 'notes-only')
+    newer = sessions / '2026-02-01-newer.md'
+    original = newer.read_text()
+    newer.write_text(original[:original.index('## Summary')] + body)
+    observed = []
+    def match(summary, items):
+        observed.append(summary)
+        return [{'confidence': 5, 'has_completion_phrase': True}]
+    monkeypatch.setattr(oid, 'match_items_against_evidence', match)
+    result = oid.gather_note_completion_evidence(str(vault), 'claude-sessions', 'notes-only')
+    assert observed == ([] if expected is None else [expected])
+    assert len(result) == (0 if expected is None else 1)
+    if result:
+        assert result[0]['contradicted_by_title'] == expected

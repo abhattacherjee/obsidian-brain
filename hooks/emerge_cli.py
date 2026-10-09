@@ -13,6 +13,7 @@ import os
 import sqlite3
 import sys
 import tempfile
+from pathlib import Path
 from datetime import datetime, timezone, timedelta
 
 import themes
@@ -20,24 +21,21 @@ from obsidian_utils import load_config, write_vault_note
 from vault_index import _connect, _default_db_path
 
 
-def _emerge_dir() -> str:
-    """Path to the working directory for emerge temp artifacts.
-
-    Callers that create artifacts here pass ``mode=0o700`` to ``os.makedirs``
-    so the directory is created with owner-only permissions.
-    """
-    return os.path.expanduser("~/.claude/obsidian-brain")
+def _emerge_dir(operation_id):
+    from runtime_context import current_runtime_context
+    from operation_state import operation_directory
+    return str(operation_directory(current_runtime_context(), operation_id)[1])
 
 
-def _themes_json_path() -> str:
-    return os.path.join(_emerge_dir(), "emerge-themes.json")
+def _themes_json_path(operation_id):
+    return os.path.join(_emerge_dir(operation_id), 'emerge-themes.json')
 
 
-def _analysis_path() -> str:
-    return os.path.join(_emerge_dir(), "emerge-analysis.md")
+def _analysis_path(operation_id):
+    return os.path.join(_emerge_dir(operation_id), 'emerge-analysis.md')
 
 
-def run_emerge_themes(days: int = 30) -> None:
+def run_emerge_themes(days: int = 30, *, operation_id=None) -> None:
     """Refresh activation and write a theme-structured corpus for /emerge.
 
     Prints ``VAULT=``, ``INS=`` and a ``STATUS=`` line for SKILL.md to parse.
@@ -95,6 +93,7 @@ def run_emerge_themes(days: int = 30) -> None:
                     "updated_date": t["updated_date"],
                     "members": [
                         {
+                            "note_path": m["note_path"],
                             "title": m["title"],
                             "excerpt": m["excerpt"],
                             "similarity": m["similarity"],
@@ -114,6 +113,7 @@ def run_emerge_themes(days: int = 30) -> None:
 
     unassigned_records = [
         {
+            "note_path": n["note_path"],
             "title": n["title"],
             "excerpt": n["excerpt"],
             "project": n["project"],
@@ -139,27 +139,36 @@ def run_emerge_themes(days: int = 30) -> None:
     # The DB connection is closed above (all data is gathered), so the atomic
     # JSON write below holds no connection. Clean up the temp file if any
     # filesystem step fails and exit with the clean ERROR contract.
-    out = _themes_json_path()
-    tmp = None
-    try:
-        os.makedirs(_emerge_dir(), mode=0o700, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(dir=_emerge_dir(), suffix=".tmp")
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(corpus, f, indent=2)
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, out)
-    except OSError as exc:
-        if tmp is not None:
-            try:
-                os.remove(tmp)
-            except OSError:
-                pass
-        print(f"ERROR {exc}", file=sys.stderr)
-        sys.exit(1)
+    from runtime_context import current_runtime_context
+    from operation_state import operation_directory, store_artifact
+    context = current_runtime_context()
+    identity, directory = operation_directory(context, operation_id)
+    semantic = {'algorithm': 'emerge-v1', 'days': days,
+                'corpus_sha256': hashlib.sha256(json.dumps(corpus, sort_keys=True).encode()).hexdigest(),
+                'sources': _corpus_revisions(vault, corpus)}
+    out = store_artifact(context, identity, 'emerge-themes.json', json.dumps(corpus, indent=2), semantic=semantic)
+    print(json.dumps({'operation_id': identity, 'operation_dir': str(directory),
+                      'themes_path': str(out), 'analysis_path': str(directory / 'emerge-analysis.md')}))
 
     print("VAULT=" + vault)
     print("INS=" + ins)
     print("STATUS=OK:" + str(len(theme_records)) + ":" + str(len(unassigned_records)))
+
+
+def _corpus_revisions(vault_path, corpus):
+    vault = Path(vault_path).resolve()
+    names = [member.get('note_path') for theme in corpus.get('themes', [])
+             for member in theme.get('members', [])]
+    names += [item.get('note_path') for item in corpus.get('unassigned_candidates', [])]
+    revisions = {}
+    for name in names:
+        if name is None:
+            continue
+        path = vault / name
+        if path.is_symlink() or vault not in path.resolve().parents:
+            raise ValueError('Emerge source escapes selected vault')
+        revisions[name] = hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
+    return revisions
 
 
 def _strip_leading_frontmatter(text: str) -> str:
@@ -190,7 +199,7 @@ def _strip_leading_frontmatter(text: str) -> str:
     return text
 
 
-def run_build_note() -> None:
+def run_build_note(*, operation_id=None, themes_path=None, analysis_path=None) -> None:
     """Build the emerge vault note from emerge-themes.json + emerge-analysis.md.
 
     Prints SAVED:<path> then ---REPORT--- then the analysis body. Cleans up both
@@ -200,18 +209,24 @@ def run_build_note() -> None:
     vault = config["vault_path"]
     ins = config.get("insights_folder", "claude-insights")
 
-    corpus_path = _themes_json_path()
-    analysis_path = _analysis_path()
-
+    from runtime_context import current_runtime_context
+    from operation_state import operation_directory, operation_semantic, read_artifact
+    context = current_runtime_context()
+    if operation_id is None:
+        raise ValueError('Emerge publication requires explicit operation identity')
+    identity, directory = operation_directory(context, operation_id)
+    corpus_path = str(directory / 'emerge-themes.json')
+    resolved_analysis = str(directory / 'emerge-analysis.md')
     try:
-        with open(corpus_path, encoding="utf-8") as f:
-            corpus = json.load(f)
-        with open(analysis_path, encoding="utf-8") as f:
-            analysis = f.read()
-    except (OSError, json.JSONDecodeError) as exc:
-        print(f"ERROR could not read emerge artifacts ({exc}); re-run /emerge to regenerate",
-              file=sys.stderr)
+        corpus = json.loads(read_artifact(context, identity, 'emerge-themes.json', supplied_path=themes_path))
+        analysis = read_artifact(context, identity, 'emerge-analysis.md', supplied_path=analysis_path).decode('utf-8')
+        semantic = operation_semantic(context, identity)
+        if semantic is not None and semantic.get('sources') != _corpus_revisions(vault, corpus):
+            raise ValueError('Emerge source revision changed')
+    except (OSError, ValueError) as exc:
+        print(f"ERROR could not read emerge artifacts ({exc}); re-run /emerge to regenerate", file=sys.stderr)
         sys.exit(1)
+    analysis_path = resolved_analysis
 
     # Belt-and-suspenders: the sub-agent is told not to emit frontmatter, but
     # strip a stray leading block so it never embeds as double-frontmatter.
@@ -221,10 +236,12 @@ def run_build_note() -> None:
     projects = corpus.get("projects", [])
     date_range = corpus.get("date_range", "")
     theme_count = len(corpus.get("themes", []))
+    author_host = context.host
     tags = ["claude/emerge"] + ["claude/project/" + p for p in projects]
 
     fm = (
-        "---\ntype: claude-emerge\ndate: " + today
+        "---\ntype: claude-emerge\nauthor_host: " + author_host
+        + "\noperation_id: " + identity + "\ndate: " + today
         + '\ndate_range: "' + date_range + '"'
         + "\nprojects:\n" + "\n".join("  - " + p for p in projects)
         + "\ntheme_count: " + str(theme_count)
@@ -238,10 +255,9 @@ def run_build_note() -> None:
     )
     body = fm + "\n\n" + title + "\n\n" + header + "\n\n" + analysis
 
-    h = hashlib.md5(today.encode()).hexdigest()[-4:]
-    filename = today + "-emerge-patterns-" + h + ".md"
+    filename = today + "-emerge-patterns-" + identity + ".md"
 
-    result = write_vault_note(vault, ins, filename, body)
+    result = write_vault_note(vault, ins, filename, body, expected_revision=None)
     if result is None:
         print("SAVED:" + os.path.join(vault, ins, filename))
         print("---REPORT---")

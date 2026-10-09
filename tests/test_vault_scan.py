@@ -29,9 +29,9 @@ def _note(fm: str, body: str = "# Title\n\nBody text.\n") -> str:
 
 
 @pytest.fixture
-def vault(tmp_path):
+def vault(tmp_path, selected_host_context):
     v = tmp_path / "vault"
-    (v / "claude-sessions").mkdir(parents=True)
+    (v / "claude-sessions").mkdir(parents=True, exist_ok=True)
     (v / "claude-insights" / "sub").mkdir(parents=True)
     (v / "claude-sessions" / "s1.md").write_text(
         _note("type: claude-session\ndate: 2026-01-01\n", "# S1\n\nRedis caching here.\n"))
@@ -43,11 +43,32 @@ def vault(tmp_path):
     return v
 
 
+
+def _native_scan(args, *, cwd=None):
+    from runtime_context import current_runtime_context
+    selected = current_runtime_context()
+    assert selected is not None
+    child = """import json,sys
+from pathlib import Path
+sys.path.insert(0,sys.argv[1])
+from runtime_context import resolve_runtime_context,using_runtime_context,current_runtime_context
+import vault_scan
+context=resolve_runtime_context(sys.argv[2],sys.argv[3],
+    {'session_id':sys.argv[4],'cwd':sys.argv[5]},
+    {'config_path':sys.argv[6],'resource_root':sys.argv[7],
+     'index_path':sys.argv[8],'state_path':sys.argv[9]})
+with using_runtime_context(context):
+    assert current_runtime_context() is context
+    raise SystemExit(vault_scan.main(sys.argv[10:]))
+"""
+    return subprocess.run([sys.executable, "-c", child, str(VAULT_SCAN.parent),
+        selected.host, selected.client, selected.native_session_id,
+        str(selected.worktree), str(selected.config_path), str(selected.resource_root),
+        str(selected.index_path), str(selected.state_path), *map(str, args)],
+        capture_output=True, text=True, timeout=60, cwd=cwd)
+
 def _run(*args):
-    return subprocess.run(
-        [sys.executable, str(VAULT_SCAN), *map(str, args)],
-        capture_output=True, text=True, timeout=60,
-    )
+    return _native_scan(args)
 
 
 def _main(capsys, *args):
@@ -61,6 +82,7 @@ def _main(capsys, *args):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("selected_host_context")
 def test_grep_subprocess_content_match(vault):
     r = _run("grep", vault, "claude-sessions", "claude-insights", "--pattern", "Redis")
     assert r.returncode == 0, r.stderr
@@ -68,6 +90,7 @@ def test_grep_subprocess_content_match(vault):
     assert "vault_scan: 1 match(es)" in r.stderr
 
 
+@pytest.mark.usefixtures("selected_host_context")
 def test_grep_ignore_case_and_recursive(capsys, vault):
     rc, out, err = _main(capsys, "grep", vault, "claude-sessions", "claude-insights",
                          "--pattern", "redis", "--ignore-case")
@@ -80,6 +103,7 @@ def test_grep_ignore_case_and_recursive(capsys, vault):
     assert "notes.txt" not in out
 
 
+@pytest.mark.usefixtures("selected_host_context")
 def test_grep_anchor_matches_per_line(capsys, vault):
     rc, out, _ = _main(capsys, "grep", vault, "claude-sessions", "claude-insights",
                        "--pattern", "^type:.*decision", "--ignore-case")
@@ -87,6 +111,7 @@ def test_grep_anchor_matches_per_line(capsys, vault):
     assert out.splitlines() == [str(vault / "claude-insights" / "i1.md")]
 
 
+@pytest.mark.usefixtures("selected_host_context")
 def test_grep_does_not_match_across_lines(capsys, vault):
     # ripgrep matches one line at a time. "# S1" and "Redis caching" sit on
     # different lines, so `S1\s+Redis` must not match; it would if the whole
@@ -98,6 +123,7 @@ def test_grep_does_not_match_across_lines(capsys, vault):
     assert "0 match(es)" in err
 
 
+@pytest.mark.usefixtures("selected_host_context")
 def test_grep_crlf_line_end_does_not_break_dollar_anchor(capsys, tmp_path):
     v = tmp_path / "v"
     (v / "f").mkdir(parents=True)
@@ -107,6 +133,7 @@ def test_grep_crlf_line_end_does_not_break_dollar_anchor(capsys, tmp_path):
     assert out.splitlines() == [str(v / "f" / "a.md")]
 
 
+@pytest.mark.usefixtures("selected_host_context")
 def test_grep_zero_matches_still_prints_summary(capsys, vault):
     rc, out, err = _main(capsys, "grep", vault, "claude-sessions", "--pattern", "zzzz-none")
     assert rc == 0
@@ -117,6 +144,7 @@ def test_grep_zero_matches_still_prints_summary(capsys, vault):
     )
 
 
+@pytest.mark.usefixtures("selected_host_context")
 def test_grep_invalid_regex_exits_2(vault):
     r = _run("grep", vault, "claude-sessions", "--pattern", "(unclosed")
     assert r.returncode == 2
@@ -124,6 +152,7 @@ def test_grep_invalid_regex_exits_2(vault):
     assert r.stdout == ""
 
 
+@pytest.mark.usefixtures("selected_host_context")
 def test_grep_requires_pattern_and_folder(capsys, vault):
     rc, _, err = _main(capsys, "grep", vault, "claude-sessions")
     assert rc == 2 and err.startswith("ERROR:")
@@ -131,6 +160,7 @@ def test_grep_requires_pattern_and_folder(capsys, vault):
     assert rc == 2 and err.startswith("ERROR:")
 
 
+@pytest.mark.usefixtures("selected_host_context")
 @pytest.mark.parametrize("folder", ["..", "/etc", "~", "", ".", "a/../..", ".obsidian"])
 def test_grep_rejects_unsafe_folder(capsys, vault, folder):
     rc, out, err = _main(capsys, "grep", vault, folder, "--pattern", "x")
@@ -139,12 +169,14 @@ def test_grep_rejects_unsafe_folder(capsys, vault, folder):
     assert err.startswith("ERROR: invalid folder")
 
 
+@pytest.mark.usefixtures("selected_host_context")
 def test_grep_rejects_missing_folder(capsys, vault):
     rc, _, err = _main(capsys, "grep", vault, "no-such-folder", "--pattern", "x")
     assert rc == 2
     assert err.startswith("ERROR: folder not found")
 
 
+@pytest.mark.usefixtures("selected_host_context")
 @pytest.mark.parametrize("bad", ["", "relative/vault"])
 def test_grep_rejects_bad_vault(capsys, bad):
     rc, _, err = _main(capsys, "grep", bad, "claude-sessions", "--pattern", "x")
@@ -152,6 +184,7 @@ def test_grep_rejects_bad_vault(capsys, bad):
     assert err.startswith("ERROR: invalid vault path")
 
 
+@pytest.mark.usefixtures("selected_host_context")
 def test_grep_skips_symlinked_file_outside_vault(capsys, vault, tmp_path):
     outside = tmp_path / "outside.md"
     outside.write_text("Redis secret outside the vault\n")
@@ -163,6 +196,7 @@ def test_grep_skips_symlinked_file_outside_vault(capsys, vault, tmp_path):
     assert "1 skipped (too_large=0, unreadable=0, outside_vault=1," in err
 
 
+@pytest.mark.usefixtures("selected_host_context")
 def test_grep_rejects_symlinked_folder_outside_vault(capsys, vault, tmp_path):
     outside = tmp_path / "outside-dir"
     outside.mkdir()
@@ -174,6 +208,7 @@ def test_grep_rejects_symlinked_folder_outside_vault(capsys, vault, tmp_path):
     assert err.startswith("ERROR: folder resolves outside the vault")
 
 
+@pytest.mark.usefixtures("selected_host_context")
 def test_grep_does_not_descend_symlinked_subdir(capsys, vault, tmp_path):
     outside = tmp_path / "outside-dir"
     outside.mkdir()
@@ -191,6 +226,7 @@ def test_grep_does_not_descend_symlinked_subdir(capsys, vault, tmp_path):
     )
 
 
+@pytest.mark.usefixtures("selected_host_context")
 def test_grep_skips_oversized_file(capsys, vault, monkeypatch):
     monkeypatch.setattr(vault_scan, "MAX_FILE_BYTES", 10)
     rc, out, err = _main(capsys, "grep", vault, "claude-sessions", "--pattern", "Redis")
@@ -199,6 +235,7 @@ def test_grep_skips_oversized_file(capsys, vault, monkeypatch):
     assert "1 skipped (too_large=1, unreadable=0," in err
 
 
+@pytest.mark.usefixtures("selected_host_context")
 def test_grep_skips_unreadable_file(capsys, vault, monkeypatch):
     def boom(_path):
         raise OSError("nope")
@@ -209,6 +246,7 @@ def test_grep_skips_unreadable_file(capsys, vault, monkeypatch):
     assert "0 file(s) scanned, 1 skipped (too_large=0, unreadable=1," in err
 
 
+@pytest.mark.usefixtures("selected_host_context")
 def test_grep_dedups_overlapping_folders(capsys, vault):
     rc, out, _ = _main(capsys, "grep", vault, "claude-insights", "claude-insights/sub",
                        "--pattern", "REDIS")
@@ -225,6 +263,7 @@ def _deep_tag_note(tag_line: int, extra_fm: str = "") -> str:
     return _note(fm, "# Deep\n\nbody mentions claude/topic/bodyonly here\n")
 
 
+@pytest.mark.usefixtures("selected_host_context")
 def test_frontmatter_only_finds_deep_tag(capsys, tmp_path):
     v = tmp_path / "v"
     (v / "ins").mkdir(parents=True)
@@ -238,6 +277,7 @@ def test_frontmatter_only_finds_deep_tag(capsys, tmp_path):
     assert out.splitlines() == [str(note)]
 
 
+@pytest.mark.usefixtures("selected_host_context")
 def test_frontmatter_only_ignores_body(capsys, tmp_path):
     v = tmp_path / "v"
     (v / "ins").mkdir(parents=True)
@@ -251,6 +291,7 @@ def test_frontmatter_only_ignores_body(capsys, tmp_path):
     assert out.splitlines() == [str(v / "ins" / "deep.md")]
 
 
+@pytest.mark.usefixtures("selected_host_context")
 def test_frontmatter_only_skips_broken_fence(capsys, tmp_path):
     v = tmp_path / "v"
     (v / "ins").mkdir(parents=True)
@@ -269,6 +310,7 @@ def test_frontmatter_only_skips_broken_fence(capsys, tmp_path):
     )
 
 
+@pytest.mark.usefixtures("selected_host_context")
 def test_grep_unexpected_error_exits_1(capsys, vault, monkeypatch):
     def boom(*_a, **_k):
         raise RuntimeError("kaboom")
@@ -300,6 +342,7 @@ def _deep_meta_note(fm_len: int = 460) -> str:
     return _note("\n".join(lines) + "\n", "# Emerge Title\n\n" + "word " * 100)
 
 
+@pytest.mark.usefixtures("selected_host_context")
 def test_meta_reads_fields_deep_in_frontmatter(tmp_path):
     v = tmp_path / "v"
     (v / "ins").mkdir(parents=True)
@@ -328,6 +371,7 @@ def test_meta_reads_fields_deep_in_frontmatter(tmp_path):
     assert len(row["snippet"]) == 200
 
 
+@pytest.mark.usefixtures("selected_host_context")
 def test_meta_flow_tags_title_fallback_and_missing_fields(capsys, tmp_path):
     v = tmp_path / "v"
     (v / "ins").mkdir(parents=True)
@@ -344,6 +388,7 @@ def test_meta_flow_tags_title_fallback_and_missing_fields(capsys, tmp_path):
     assert row["error"] is None
 
 
+@pytest.mark.usefixtures("selected_host_context")
 def test_meta_empty_tags_is_empty_list(capsys, tmp_path):
     v = tmp_path / "v"
     (v / "ins").mkdir(parents=True)
@@ -355,6 +400,7 @@ def test_meta_empty_tags_is_empty_list(capsys, tmp_path):
     assert row["date"] == "2026-01-01"
 
 
+@pytest.mark.usefixtures("selected_host_context")
 def test_meta_bad_files_do_not_abort_the_rest(capsys, vault, tmp_path):
     outside = tmp_path / "outside.md"
     outside.write_text(_note("type: claude-insight\n"))
@@ -388,6 +434,7 @@ def test_meta_bad_files_do_not_abort_the_rest(capsys, vault, tmp_path):
             assert r["type"] is None and r["tags"] is None and r["title"] is None
 
 
+@pytest.mark.usefixtures("selected_host_context")
 def test_meta_oversized_and_unreadable(capsys, vault, monkeypatch):
     good = vault / "claude-sessions" / "s1.md"
     monkeypatch.setattr(vault_scan, "MAX_FILE_BYTES", 10)
@@ -403,6 +450,7 @@ def test_meta_oversized_and_unreadable(capsys, vault, monkeypatch):
     assert json.loads(out)["error"] == "unreadable: Permission denied"
 
 
+@pytest.mark.usefixtures("selected_host_context")
 def test_meta_requires_files_and_valid_vault(capsys, vault):
     rc, _, err = _main(capsys, "meta", vault)
     assert rc == 2 and err.startswith("ERROR:")
@@ -410,6 +458,7 @@ def test_meta_requires_files_and_valid_vault(capsys, vault):
     assert rc == 2 and err.startswith("ERROR: invalid vault path")
 
 
+@pytest.mark.usefixtures("selected_host_context")
 def test_unknown_command_exits_2(capsys):
     rc, _, err = _main(capsys, "frobnicate")
     assert rc == 2 and err.startswith("ERROR:")
@@ -417,18 +466,21 @@ def test_unknown_command_exits_2(capsys):
     assert rc == 2 and err.startswith("ERROR:")
 
 
+@pytest.mark.usefixtures("selected_host_context")
 def test_help_exits_0(capsys):
     rc, out, _ = _main(capsys, "--help")
     assert rc == 0
     assert "grep" in out and "meta" in out
 
 
+@pytest.mark.usefixtures("selected_host_context")
 def test_meta_subprocess_error_path(tmp_path):
     r = _run("meta", tmp_path / "missing-vault", "x.md")
     assert r.returncode == 2
     assert r.stderr.startswith("ERROR: invalid vault path")
 
 
+@pytest.mark.usefixtures("selected_host_context")
 def test_non_utf8_bytes_are_replaced_not_fatal(capsys, tmp_path):
     v = tmp_path / "v"
     (v / "f").mkdir(parents=True)
@@ -439,13 +491,11 @@ def test_non_utf8_bytes_are_replaced_not_fatal(capsys, tmp_path):
     assert json.loads(out)["error"] is None
 
 
+@pytest.mark.usefixtures("selected_host_context")
 def test_module_has_no_cwd_dependency(tmp_path, vault):
     # Run from an unrelated cwd: the CLI must not depend on being inside the repo.
-    r = subprocess.run(
-        [sys.executable, str(VAULT_SCAN), "grep", str(vault), "claude-sessions",
-         "--pattern", "Redis"],
-        capture_output=True, text=True, timeout=60, cwd=str(tmp_path),
-    )
+    r = _native_scan(["grep", str(vault), "claude-sessions", "--pattern", "Redis"],
+                     cwd=str(tmp_path))
     assert r.returncode == 0, r.stderr
     assert r.stdout.strip() == str(vault / "claude-sessions" / "s1.md")
     assert os.path.isabs(r.stdout.strip())
@@ -474,12 +524,14 @@ def test_parse_fields_shapes():
     assert vault_scan._scalar('"open # not a comment') == "open # not a comment"
 
 
+@pytest.mark.usefixtures("selected_host_context")
 def test_grep_invalid_regex_in_process(capsys, vault):
     rc, out, err = _main(capsys, "grep", vault, "claude-sessions", "--pattern", "[")
     assert rc == 2 and out == ""
     assert err.startswith("ERROR: invalid regex")
 
 
+@pytest.mark.usefixtures("selected_host_context")
 def test_meta_block_tags_in_process(capsys, tmp_path):
     v = tmp_path / "v"
     (v / "ins").mkdir(parents=True)
@@ -503,6 +555,7 @@ def test_is_inside_handles_resolve_errors(monkeypatch, tmp_path):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("selected_host_context")
 def test_pattern_equals_form_accepts_leading_dash(vault):
     (vault / "claude-sessions" / "d.md").write_text(
         _note("type: claude-session\n", "# D\n\nran the tool with --no-verify\n"))
@@ -533,6 +586,7 @@ def test_import_failure_prints_error_not_traceback(tmp_path):
     assert "Traceback" not in r.stderr
 
 
+@pytest.mark.usefixtures("selected_host_context")
 def test_skip_counter_outside_vault_and_bad_frontmatter(capsys, vault, tmp_path):
     outside = tmp_path / "outside.md"
     outside.write_text(_note("tags:\n  - claude/topic/x\n"))
@@ -547,6 +601,7 @@ def test_skip_counter_outside_vault_and_bad_frontmatter(capsys, vault, tmp_path)
     )
 
 
+@pytest.mark.usefixtures("selected_host_context")
 def test_symlinked_dir_inside_vault_is_counted_once(capsys, vault):
     # A symlinked subdir pointing back inside the vault is still not descended,
     # and overlapping folder arguments do not count it twice.
@@ -570,6 +625,7 @@ def _meta_row(capsys, tmp_path, fm, body="# T\n\nb\n"):
     return json.loads(out), err
 
 
+@pytest.mark.usefixtures("selected_host_context")
 def test_meta_strips_inline_comment_from_unquoted_scalars(capsys, tmp_path):
     row, _ = _meta_row(capsys, tmp_path, (
         "date: 2026-01-01 # written by hand\n"
@@ -587,6 +643,7 @@ def test_meta_strips_inline_comment_from_unquoted_scalars(capsys, tmp_path):
     assert row["source_session_note"] is None
 
 
+@pytest.mark.usefixtures("selected_host_context")
 def test_meta_flow_tags_are_quote_aware(capsys, tmp_path):
     row, _ = _meta_row(capsys, tmp_path, "tags: [a, \"b, c\", 'd,e', f] # note\n")
     assert row["tags"] == ["a", "b, c", "d,e", "f"]
@@ -596,6 +653,7 @@ def test_meta_flow_tags_are_quote_aware(capsys, tmp_path):
     assert row["tags"] == []
 
 
+@pytest.mark.usefixtures("selected_host_context")
 def test_meta_warns_once_when_obsidian_utils_missing(capsys, vault, monkeypatch):
     monkeypatch.setitem(sys.modules, "obsidian_utils", None)  # import -> ImportError
     monkeypatch.setattr(vault_scan, "_UTILS_WARNED", False)
@@ -628,11 +686,13 @@ def test_meta_parse_failure_bug_is_not_swallowed(monkeypatch):
         vault_scan._describe_parse_failure("x")
 
 
+@pytest.mark.usefixtures("selected_host_context")
 def test_meta_duplicate_keys_last_wins(capsys, tmp_path):
     row, _ = _meta_row(capsys, tmp_path, "type: claude-session\ntype: claude-insight\n")
     assert row["type"] == "claude-insight"
 
 
+@pytest.mark.usefixtures("selected_host_context")
 def test_meta_title_skips_h2_before_h1(capsys, tmp_path):
     row, _ = _meta_row(capsys, tmp_path, "type: claude-insight\n",
                        "## Context\n\ntext\n\n# Real Title\n")
@@ -657,6 +717,7 @@ def locked(request):
         p.chmod(0o755)
 
 
+@pytest.mark.usefixtures("selected_host_context")
 @_NOT_ROOT
 def test_grep_counts_unreadable_subdir(capsys, vault, locked):
     sub = vault / "claude-insights" / "sub"
@@ -668,6 +729,7 @@ def test_grep_counts_unreadable_subdir(capsys, vault, locked):
     assert ", 1 skipped (" in err
 
 
+@pytest.mark.usefixtures("selected_host_context")
 @_NOT_ROOT
 def test_grep_counts_unreadable_passed_folder(capsys, vault, locked):
     folder = vault / "claude-insights"
@@ -699,6 +761,7 @@ def test_flow_items_quote_escapes():
     assert vault_scan._flow_items("'a'',b', c") == ["a',b", "c"]
 
 
+@pytest.mark.usefixtures("selected_host_context")
 def test_meta_quote_escapes_end_to_end(capsys, tmp_path):
     row, _ = _meta_row(capsys, tmp_path, (
         "project: 'Bob''s app'\n"

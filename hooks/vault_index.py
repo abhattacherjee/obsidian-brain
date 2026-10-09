@@ -3,7 +3,7 @@
 Provides full-text search over Obsidian vault notes, mtime-based incremental
 sync, and layered ranking for context-relevant note discovery.
 
-DB location: ~/.claude/obsidian-brain-vault.db (outside vault, alongside config).
+DB location: the selected runtime index, outside the vault.
 """
 
 from __future__ import annotations
@@ -51,6 +51,8 @@ CREATE TABLE IF NOT EXISTS notes (
     date            TEXT,
     project         TEXT,
     title           TEXT,
+    agent_provider  TEXT,
+    agent_session_id TEXT,
     source_session  TEXT,
     source_note     TEXT,
     tags            TEXT,
@@ -123,25 +125,27 @@ def _is_under(child: Path, parent: Path) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _default_db_path() -> str:
-    """Return default DB path: ~/.claude/obsidian-brain-vault.db.
+def _default_db_path(context=None) -> str:
+    """Return the bound runtime index or the named Claude compatibility default.
 
     Overridable via the OBSIDIAN_BRAIN_DB env var so tests, dev-test scripts,
     and subprocesses can isolate the index DB without threading db_path through
     every call site (#192).
     """
-    return os.environ.get("OBSIDIAN_BRAIN_DB") or os.path.join(
-        os.path.expanduser("~"), ".claude", "obsidian-brain-vault.db"
-    )
+    from runtime_context import current_runtime_context
+    context = context or current_runtime_context()
+    if context:
+        return str(context.index_path)
+    from runtime_adapters.claude import legacy_index_path
+    return legacy_index_path()
 
 
 # Hardcoded real production DB path, resolved once at import. The guard in
 # _connect() compares against THIS (not _default_db_path(), which the
 # OBSIDIAN_BRAIN_DB env override redirects), so test isolation cannot defeat
 # the guard (#192).
-_REAL_PROD_DB = os.path.realpath(
-    os.path.join(os.path.expanduser("~"), ".claude", "obsidian-brain-vault.db")
-)
+from runtime_adapters.claude import legacy_index_path
+_REAL_PROD_DB = os.path.realpath(legacy_index_path(use_override=False))
 
 # When a single _sync batch churns MORE than this fraction of the final corpus
 # (inserts + deletions), the stored IDF has drifted enough to be worth an O(N)
@@ -168,7 +172,7 @@ def _connect(db_path: str) -> sqlite3.Connection:
 
     Guard (#192): under a pytest context, refuse to open the REAL production
     index DB. Any test that reaches this path is leaking; fail loudly instead of
-    silently polluting ~/.claude/obsidian-brain-vault.db. Both path-equality
+    silently polluting the real legacy index. Both path-equality
     (realpath, catching symlinks) and inode-equality (samefile, catching hard
     links) are checked.
     """
@@ -201,7 +205,49 @@ def _init_schema(conn: sqlite3.Connection) -> None:
         stmt = stmt.strip()
         if stmt:
             cur.execute(stmt)
+    _ensure_identity_columns(conn)
     conn.commit()
+
+
+def _ensure_identity_columns(conn: sqlite3.Connection) -> None:
+    """Add derived origin fields without guessing from source references."""
+    columns = {row[1] for row in conn.execute('PRAGMA table_info(notes)')}
+    for name in ('agent_provider', 'agent_session_id'):
+        if name not in columns:
+            try:
+                conn.execute('ALTER TABLE notes ADD COLUMN ' + name + ' TEXT')
+            except sqlite3.OperationalError:
+                # Another writer may have completed this same migration.
+                current = {row[1] for row in conn.execute('PRAGMA table_info(notes)')}
+                if name not in current:
+                    raise
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_notes_origin_identity '
+                 'ON notes(agent_provider,agent_session_id,type,path)')
+
+
+def _origin_identity(lines):
+    fields = {}
+    for raw in lines:
+        if raw.startswith((' ', '\t')) or ':' not in raw:
+            continue
+        key, value = raw.rstrip('\r\n').split(':', 1)
+        if key not in {'agent_provider', 'agent_session_id', 'session_id'}:
+            continue
+        if key in fields:
+            return None, None
+        value = value.strip()
+        try:
+            value = json.loads(value)
+        except ValueError:
+            value = value.strip("'\"")
+        fields[key] = value if isinstance(value, str) and value.strip() else None
+    identity = fields.get('agent_session_id') if 'agent_session_id' in fields else fields.get('session_id')
+    provider = fields.get('agent_provider')
+    if 'agent_provider' not in fields and fields.get('session_id'):
+        provider = 'claude'
+    if provider not in {'claude', 'codex'}:
+        provider = None
+    return provider, identity
 
 
 def _needs_body_migration(conn: sqlite3.Connection) -> bool:
@@ -323,6 +369,13 @@ def _parse_note_detailed(file_path: str) -> tuple[dict | None, str | None]:
                 continue
             meta[key] = val
 
+    origin_provider, origin_session = _origin_identity(fm_lines)
+    for key, value in (("agent_provider", origin_provider), ("agent_session_id", origin_session)):
+        if value is None:
+            meta.pop(key, None)
+        else:
+            meta[key] = value
+
     if tags:
         meta["tags"] = ",".join(tags)
 
@@ -394,6 +447,7 @@ def _upsert_note(conn: sqlite3.Connection, rel_path: str, parsed: dict, mtime: f
     update we can issue the delete before inserting the new FTS row,
     keeping the FTS index from accumulating orphan entries across rewrites.
     """
+    _ensure_identity_columns(conn)
     row = conn.execute(
         "SELECT rowid, title, body, tags, importance FROM notes WHERE path = ?",
         (rel_path,),
@@ -449,15 +503,17 @@ def _upsert_note(conn: sqlite3.Connection, rel_path: str, parsed: dict, mtime: f
         conn.execute("DELETE FROM notes WHERE path = ?", (rel_path,))
 
     conn.execute(
-        "INSERT INTO notes (path, type, date, project, title, source_session, "
+        "INSERT INTO notes (path, type, date, project, title, agent_provider, agent_session_id, source_session, "
         "source_note, tags, status, mtime, size, body, importance, tfidf_vector) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             rel_path,
             parsed.get("type", "unknown"),
             parsed.get("date"),
             parsed.get("project"),
             parsed.get("title", ""),
+            parsed.get("agent_provider"),
+            parsed.get("agent_session_id"),
             parsed.get("source_session"),
             parsed.get("source_note"),
             parsed.get("tags", ""),
@@ -1434,6 +1490,8 @@ def index_note(db_path: str, note_path: str) -> bool:
             # (_prior_tokens_for → _update_term_df → SELECT COUNT → INSERT)
             # is serialized against other writers (concurrent hooks,
             # _sync runs). Matches assign_to_theme's locking discipline.
+            _ensure_identity_columns(conn)
+            conn.commit()
             conn.execute("BEGIN IMMEDIATE")
             _upsert_note(conn, note_path, parsed, st.st_mtime, st.st_size)
             conn.commit()
@@ -1522,35 +1580,40 @@ _TYPE_SCORES_BY_CONTEXT = {
         "claude-insight": 0.6, "claude-memory": 0.6, "claude-decision": 0.5,
         "claude-retro": 0.3, "claude-standup": 0.3, "claude-emerge": 0.1,
         "claude-wiki": 0.6,
-        "claude-stats": 0.0, "claude-check-items-report": 0.0,
+        # Generated reports and dashboard query scaffolding are not evidence.
+        "claude-stats": 0.0, "claude-check-items-report": 0.0, "claude-dashboard": 0.0,
     },
     "standup": {
         "claude-session": 1.0, "claude-decision": 0.8, "claude-insight": 0.7,
         "claude-retro": 0.6, "claude-snapshot": 0.6, "claude-error-fix": 0.5,
         "claude-emerge": 0.4, "claude-standup": 0.3, "claude-memory": 0.3,
         "claude-wiki": 0.7,
-        "claude-stats": 0.0, "claude-check-items-report": 0.0,
+        # Generated reports and dashboard query scaffolding are not evidence.
+        "claude-stats": 0.0, "claude-check-items-report": 0.0, "claude-dashboard": 0.0,
     },
     "search": {
         "claude-insight": 1.0, "claude-decision": 0.9, "claude-memory": 0.9,
         "claude-error-fix": 0.8, "claude-session": 0.5, "claude-retro": 0.4,
         "claude-snapshot": 0.4, "claude-standup": 0.3, "claude-emerge": 0.3,
         "claude-wiki": 1.0,
-        "claude-stats": 0.0, "claude-check-items-report": 0.0,
+        # Generated reports and dashboard query scaffolding are not evidence.
+        "claude-stats": 0.0, "claude-check-items-report": 0.0, "claude-dashboard": 0.0,
     },
     "emerge": {
         "claude-insight": 1.0, "claude-decision": 0.9, "claude-error-fix": 0.8,
         "claude-memory": 0.8, "claude-session": 0.5, "claude-retro": 0.4,
         "claude-snapshot": 0.4, "claude-standup": 0.3, "claude-emerge": 0.0,
         "claude-wiki": 1.0,
-        "claude-stats": 0.0, "claude-check-items-report": 0.0,
+        # Generated reports and dashboard query scaffolding are not evidence.
+        "claude-stats": 0.0, "claude-check-items-report": 0.0, "claude-dashboard": 0.0,
     },
     "general": {
         "claude-insight": 1.0, "claude-decision": 1.0, "claude-error-fix": 0.9,
         "claude-memory": 0.9, "claude-session": 0.5, "claude-retro": 0.4,
         "claude-snapshot": 0.4, "claude-standup": 0.3, "claude-emerge": 0.3,
         "claude-wiki": 1.0,
-        "claude-stats": 0.0, "claude-check-items-report": 0.0,
+        # Generated reports and dashboard query scaffolding are not evidence.
+        "claude-stats": 0.0, "claude-check-items-report": 0.0, "claude-dashboard": 0.0,
     },
 }
 
@@ -2123,4 +2186,3 @@ def query_related_notes(
         return results[:limit]
     finally:
         conn.close()
-

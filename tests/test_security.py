@@ -20,19 +20,10 @@ import pytest
 class TestSecureDirectory:
     """C1: All temp/cache files use ~/.claude/obsidian-brain/ instead of /tmp."""
 
-    def test_secure_dir_constant_points_to_claude_dir(self):
-        # Read the source to verify the constant is defined as the real path.
-        # We check the source rather than the live module attribute because the
-        # global _isolate_secure_dir_globally autouse fixture patches _SECURE_DIR
-        # to a per-test tmp dir; the invariant we care about is the *definition*
-        # in source, not the runtime value under test isolation.
-        import inspect
-        import obsidian_utils
-        src = inspect.getsource(obsidian_utils)
-        expected_def = '_SECURE_DIR = os.path.expanduser("~/.claude/obsidian-brain")'
-        assert expected_def in src, (
-            f"_SECURE_DIR definition not found in source; expected:\n  {expected_def!r}"
-        )
+    def test_secure_dir_constant_uses_the_named_legacy_adapter(self, tmp_path, monkeypatch):
+        from runtime_adapters.claude import legacy_private_directory
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        assert legacy_private_directory() == tmp_path / ".claude" / "obsidian-brain"
 
     def test_cache_prefix_under_secure_dir(self):
         from obsidian_utils import _CACHE_PREFIX, _SECURE_DIR
@@ -54,6 +45,8 @@ class TestSecureDirectory:
     def test_ensure_secure_dir_fixes_wrong_permissions(self, tmp_path, monkeypatch):
         test_dir = str(tmp_path / "secure-test")
         os.makedirs(test_dir, mode=0o755)
+        os.chmod(test_dir, 0o755)
+        assert stat.S_IMODE(os.stat(test_dir).st_mode) == 0o755
         monkeypatch.setattr("obsidian_utils._SECURE_DIR", test_dir)
         from obsidian_utils import _ensure_secure_dir
         _ensure_secure_dir()
@@ -81,6 +74,23 @@ class TestEnvVarOverrideRemoved:
         assert prefix.startswith(_SECURE_DIR)
 
 
+@pytest.fixture
+def selected_host_context(selected_host_context, host, tmp_path, tmp_path_factory):
+    from dataclasses import replace
+    from types import MappingProxyType
+    from runtime_context import using_runtime_context
+    private = tmp_path_factory.mktemp("security-private")
+    config = dict(selected_host_context.config, vault_path=str(tmp_path))
+    config_path = private / "config.json"
+    config_path.write_text(json.dumps(config))
+    selected = replace(selected_host_context, vault_path=tmp_path,
+                       state_path=private / "state", index_path=private / "index.sqlite3",
+                       config_path=config_path, config=MappingProxyType(config))
+    with using_runtime_context(selected):
+        yield selected
+
+
+@pytest.mark.usefixtures("selected_host_context")
 class TestPathTraversal:
     """H1: write_vault_note blocks path traversal."""
 
@@ -363,7 +373,7 @@ class TestStdinCap:
         return aliases
 
     @classmethod
-    def _consumption_sites(cls, tree, aliases):
+    def _consumption_sites(cls, tree, aliases, outbound_registrations=()):
         """Yield ``(node, size_arg_or_None, kind)`` for every construct that
         drains stdin.
 
@@ -379,6 +389,8 @@ class TestStdinCap:
         """
         for node in ast.walk(tree):
             if isinstance(node, ast.Call):
+                if node in outbound_registrations:
+                    continue
                 if isinstance(node.func, ast.Attribute) and cls._is_stdin_expr(
                     node.func.value, aliases
                 ):
@@ -440,6 +452,36 @@ class TestStdinCap:
             return left + right if isinstance(arg.op, ast.Add) else left - right
         return None
 
+    @staticmethod
+    def _outbound_registrations(tree, path):
+        # One proven write-only native subprocess registration is not a read.
+        if str(path) != "hooks/ai_backend.py":
+            return set()
+        function = next((node for node in tree.body if isinstance(node, ast.FunctionDef)
+                         and node.name == "_run_bounded"), None)
+        if function is None:
+            return set()
+        owns_pipe = any(isinstance(node, ast.Assign)
+                        and [ast.unparse(target) for target in node.targets] == ["process"]
+                        and isinstance(node.value, ast.Call)
+                        and ast.unparse(node.value.func) == "subprocess.Popen"
+                        and any(keyword.arg == "stdin" and ast.unparse(keyword.value) == "subprocess.PIPE"
+                                for keyword in node.value.keywords)
+                        for node in ast.walk(function))
+        owns_selector = any(isinstance(node, ast.With)
+                            and any(ast.unparse(item.context_expr) == "selectors.DefaultSelector()"
+                                    and item.optional_vars is not None
+                                    and ast.unparse(item.optional_vars) == "selector"
+                                    for item in node.items)
+                            for node in ast.walk(function))
+        if not owns_pipe or not owns_selector:
+            return set()
+        return {node for node in ast.walk(function) if isinstance(node, ast.Call)
+                and ast.unparse(node.func) == "selector.register"
+                and not node.keywords
+                and [ast.unparse(arg) for arg in node.args]
+                == ["process.stdin", "selectors.EVENT_WRITE", "'input'"]}
+
     @classmethod
     def _all_stdin_reads(cls):
         """``[(path, lineno, bound_or_None, kind)]`` for the whole codebase."""
@@ -448,7 +490,7 @@ class TestStdinCap:
             tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
             consts = cls._int_constants(tree)
             aliases = cls._stdin_aliases(tree)
-            for node, size_arg, kind in cls._consumption_sites(tree, aliases):
+            for node, size_arg, kind in cls._consumption_sites(tree, aliases, cls._outbound_registrations(tree, path)):
                 bound = cls._resolve_bound(size_arg, consts) if size_arg else None
                 found.append((str(path), node.lineno, bound, kind))
         return found
@@ -524,18 +566,25 @@ class TestStdinCap:
             "hooks/hook_bootstrap.py",
             # #395: the wiki CLI reads its JSON payload from stdin.
             "hooks/wiki.py",
+            # #272: the shared host CLI reads one bounded native JSON payload.
+            "hooks/brain_cli.py",
+            # #272: bound legacy hooks read their native payload before dispatch.
+            "hooks/native_lifecycle.py",
         ):
             assert expected in paths, f"stdin read in {expected} no longer discovered"
         # Exact, not >=. What >= permits is SUBSTITUTION: an existing read
         # reformatted past the AST extractor at the same moment a new entry
-        # point lands keeps the total at 15 and the suite green, while the
+        # point lands keeps the total at 17 and the suite green, while the
         # reformatted file's cap silently stops being verified. Every one of
-        # the 15 is named above, so a new entry point should fail here and be
+        # the 17 is named above, so a new entry point should fail here and be
         # added deliberately. (tests/test_hooks_resolver_drift.py makes the
         # same call for the same reason.)
         found = self._all_stdin_reads()
-        assert len(found) == 15, (
-            f"expected exactly 15 stdin read sites, found {len(found)}: "
+        native_bounds = [bound for path, _, bound, _ in found
+                         if path == "hooks/native_lifecycle.py"]
+        assert native_bounds == [1_000_001]
+        assert len(found) == 17, (
+            f"expected exactly 17 stdin read sites, found {len(found)}: "
             + ", ".join(f"{path}:{lineno}" for path, lineno, _, _ in sorted(found)[:5])
             + " ... . A RISE means a new stdin entry point landed — name it in the "
             "list above, deliberately, because a new place the process reads "
@@ -545,6 +594,24 @@ class TestStdinCap:
             "since that file's cap stops being verified while the suite stays "
             "green."
         )
+
+    def test_only_owned_native_write_pipe_registration_is_excluded(self):
+        path = Path("hooks/ai_backend.py")
+        source = path.read_text()
+        tree = ast.parse(source)
+        excluded = self._outbound_registrations(tree, path)
+        assert len(excluded) == 1
+        assert list(self._consumption_sites(tree, self._stdin_aliases(tree), excluded)) == []
+        for mutated in (source.replace("stdin=subprocess.PIPE", "stdin=sys.stdin", 1),
+                        source.replace('selectors.EVENT_WRITE, "input"', 'selectors.EVENT_READ, "input"', 1)):
+            changed = ast.parse(mutated)
+            assert not self._outbound_registrations(changed, path)
+            assert list(self._consumption_sites(changed, self._stdin_aliases(changed)))
+        changed = ast.parse(source + "\njson.load(sys.stdin)\n")
+        assert len(list(self._consumption_sites(changed, self._stdin_aliases(changed),
+                                               self._outbound_registrations(changed, path)))) == 1
+        assert not self._outbound_registrations(tree, Path("hooks/new_writer.py"))
+
 
 class TestFilePermissions:
     """M1, M2: Files use 0o600 permissions."""
@@ -568,6 +635,7 @@ class TestFilePermissions:
         src = inspect.getsource(load_config)
         assert "0o077" in src or "0o600" in src, "config permission fix missing"
 
+    @pytest.mark.usefixtures("selected_host_context")
     def test_vault_note_written_with_0o600(self, tmp_path):
         from obsidian_utils import write_vault_note
         write_vault_note(
@@ -588,6 +656,7 @@ class TestLikeEscaping:
         assert "ESCAPE" in src, "LIKE ESCAPE clause missing"
 
 
+@pytest.mark.usefixtures("selected_host_context")
 class TestFlipNoteStatus:
     """M5: flip_note_status uses atomic write."""
 
@@ -595,7 +664,7 @@ class TestFlipNoteStatus:
         from obsidian_utils import flip_note_status
         note = tmp_path / "test-note.md"
         note.write_text("---\nstatus: auto-logged\nproject: test\n---\nContent here\n")
-        flip_note_status(str(note), "auto-logged", "summarized")
+        assert flip_note_status(str(note), "auto-logged", "summarized", vault_path=str(tmp_path))
         content = note.read_text()
         assert "status: summarized" in content
         assert "status: auto-logged" not in content
@@ -605,7 +674,7 @@ class TestFlipNoteStatus:
         from obsidian_utils import flip_note_status
         note = tmp_path / "test-note.md"
         note.write_text("---\nstatus: auto-logged\nproject: my-project\ntags:\n  - claude/session\n---\n# Title\nBody\n")
-        flip_note_status(str(note), "auto-logged", "summarized")
+        assert flip_note_status(str(note), "auto-logged", "summarized", vault_path=str(tmp_path))
         content = note.read_text()
         assert "project: my-project" in content
         assert "claude/session" in content
@@ -619,7 +688,7 @@ class TestFlipNoteStatus:
             "---\nstatus: auto-logged\nproject: test\n---\n"
             "The old status: auto-logged was changed.\n"
         )
-        flip_note_status(str(note), "auto-logged", "summarized")
+        assert flip_note_status(str(note), "auto-logged", "summarized", vault_path=str(tmp_path))
         content = note.read_text()
         assert "status: summarized" in content.split("---")[1]  # frontmatter
         assert "status: auto-logged was changed" in content  # body preserved
@@ -632,7 +701,7 @@ class TestFlipNoteStatus:
             "---\nstatus: summarized\nproject: test\n---\n"
             "Previously it was status: auto-logged\n"
         )
-        result = flip_note_status(str(note), "auto-logged", "summarized")
+        result = flip_note_status(str(note), "auto-logged", "summarized", vault_path=str(tmp_path))
         assert result is False  # not found in frontmatter
         content = note.read_text()
         assert "Previously it was status: auto-logged" in content  # body untouched
@@ -641,15 +710,16 @@ class TestFlipNoteStatus:
         from obsidian_utils import flip_note_status
         note = tmp_path / "test-note.md"
         note.write_text("---\nstatus: summarized\n---\nContent\n")
-        result = flip_note_status(str(note), "auto-logged", "summarized")
+        result = flip_note_status(str(note), "auto-logged", "summarized", vault_path=str(tmp_path))
         assert result is False
 
     def test_flip_note_status_returns_false_for_missing_file(self, tmp_path):
         from obsidian_utils import flip_note_status
-        result = flip_note_status(str(tmp_path / "nonexistent.md"), "auto-logged", "summarized")
+        result = flip_note_status(str(tmp_path / "nonexistent.md"), "auto-logged", "summarized", vault_path=str(tmp_path))
         assert result is False
 
 
+@pytest.mark.usefixtures("selected_host_context")
 class TestPathTraversalFilename:
     """Additional path traversal tests for filename and symlink vectors."""
 
@@ -2121,9 +2191,10 @@ class TestDecisionTimeIsBounded:
     # observed taking 4:00 idle and 6:09 with several agents running, and a
     # loaded machine is exactly when a hook feels slow to a human -- so the
     # budget has to be set loose enough to survive load, which blunts it.
-    # Measuring an honest baseline command in the SAME run and subtracting it
-    # cancels most of that: interpreter start-up, git calls and scheduler
-    # contention move the baseline and the sample together.
+    # Subtracting an independent wall baseline amplifies startup and git-wait
+    # jitter when useful work is only a few milliseconds. Child Python CPU
+    # around the real hook measures guard growth; the tests above still bound
+    # the whole hook's wall time, including subprocess waits.
     #
     # And it only fires once the input is already big enough to blow it. The
     # quadratic term this class failed to catch was visible as a RATIO at
@@ -2149,12 +2220,18 @@ class TestDecisionTimeIsBounded:
         work_dir, env = TestHookBlockingPathsFire._repo(tmp_path)
 
         def measure(command):
+            # Child CPU measures Python guard work without parent scheduling,
+            # pipe I/O, or git waits. Whole-hook wall budgets above stay intact.
+            wrapper = (
+                "import runpy,sys,time; start=time.process_time();\n"
+                "try: runpy.run_path(sys.argv[1],run_name='__main__')\n"
+                "finally: print('HOOK_CPU_MS='+str((time.process_time()-start)*1000),file=sys.stderr)"
+            )
             best = None
             for _ in range(_GROWTH_REPS):
-                start = time.perf_counter()
                 try:
                     proc = subprocess.run(
-                        [sys.executable,
+                        [sys.executable, "-c", wrapper,
                          str(work_dir / ".claude/hooks/prevent-direct-push.py")],
                         input=json.dumps({"tool_name": "Bash",
                                           "tool_input": {"command": command}}),
@@ -2168,7 +2245,11 @@ class TestDecisionTimeIsBounded:
                     f"prevent-direct-push exited {proc.returncode}: "
                     f"{proc.stderr[-400:]!r}"
                 )
-                elapsed = (time.perf_counter() - start) * 1000
+                marker = [line for line in proc.stderr.splitlines()
+                          if line.startswith("HOOK_CPU_MS=")]
+                assert len(marker) == 1, "child hook CPU measurement missing"
+                elapsed = float(marker[0].partition("=")[2])
+                assert elapsed >= 0
                 best = elapsed if best is None else min(best, elapsed)
             return best
 
@@ -2185,10 +2266,14 @@ class TestDecisionTimeIsBounded:
                     f"prevent-direct-push did not finish {unit!r} at {kb}KB "
                     f"within {self.SUBPROCESS_TIMEOUT_S}s -- superlinear "
                     f"growth over separator or quote density (the fixed code "
-                    f"costs single-digit milliseconds of work here)"
+                    f"costs bounded Python CPU work here)"
                 )
             works.append((kb, max(elapsed - baseline, 0.0), baseline))
 
+        self._assert_linear_growth(works, unit)
+
+    @staticmethod
+    def _assert_linear_growth(works, unit):
         compared = 0
         for (kb_a, work_a, base_a), (kb_b, work_b, baseline) in zip(works, works[1:]):
             if work_a < max(_GROWTH_MIN_WORK_MS, _GROWTH_MIN_WORK_FRACTION * base_a):
@@ -2210,6 +2295,20 @@ class TestDecisionTimeIsBounded:
             pytest.skip(f"{unit!r}: the smaller cell of every pair was under the "
                         f"noise floor (kb, work ms, baseline ms): "
                         f"{[(kb, round(w, 1), round(bs, 1)) for kb, w, bs in works]}")
+
+    def test_growth_guard_rejects_quadratic_work(self):
+        # A quadratic guard quadruples work when input doubles, even when
+        # every cell remains under the separate whole-hook stall ceiling.
+        self._assert_linear_growth([(225, 8.0, 10.0), (450, 16.0, 10.0),
+                                    (900, 32.0, 10.0)], "linear")
+        with pytest.raises(AssertionError, match="work grew 4.00x"):
+            self._assert_linear_growth([(225, 8.0, 10.0), (450, 32.0, 10.0),
+                                        (900, 128.0, 10.0)], "quadratic")
+
+    def test_growth_guard_reports_no_measured_pairs(self):
+        with pytest.raises(pytest.skip.Exception, match="under the noise floor"):
+            self._assert_linear_growth([(225, 1.0, 10.0), (450, 2.0, 10.0),
+                                        (900, 4.0, 10.0)], "noise")
 
 
 def _hook_regex_constants(hook):
@@ -5045,12 +5144,19 @@ class TestPreflightTokenSurvivesADeniedCall:
         work, env, token = repo
         (work / "scripts").mkdir()
         shutil.copy("scripts/commit-preflight.sh", work / "scripts")
+        # The real producer always checks reviewed host boundaries, even
+        # on this disposable token probe's skip-tests path.
+        shutil.copytree("scripts/ci-checks", work / "scripts/ci-checks")
+        for directory in ("hooks", "skills", "docs/parity",
+                          ".claude-plugin", ".codex-plugin"):
+            shutil.copytree(directory, work / directory)
         (work / "f.txt").write_text("x")
         self._git(work, env, "add", "f.txt")
         proc = subprocess.run(
             ["bash", "scripts/commit-preflight.sh", "--skip-tests", "probe"],
             cwd=work, env=env, capture_output=True, text=True, timeout=60)
         assert proc.returncode == 0, proc.stdout[-400:] + proc.stderr[-400:]
+        assert "Host boundary passed:" in proc.stdout
         assert json.loads(token.read_text())["head"] == self._git(
             work, env, "rev-parse", "HEAD")
         assert self._decide(work, env, self.REG) == "allow"

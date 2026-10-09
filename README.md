@@ -1,6 +1,6 @@
 # Obsidian Brain
 
-A Claude Code plugin that turns your Obsidian vault into a persistent brain across sessions. Auto-logs sessions, captures curated knowledge, enables project-scoped context resume, and provides fast search across all historical context.
+Claude Code and Codex plugin packages that turn your Obsidian vault into a persistent brain across sessions. Auto-logs sessions, captures curated knowledge, enables project-scoped context resume, and provides fast search across all historical context.
 
 ## Why
 
@@ -16,7 +16,7 @@ Obsidian Brain bridges this gap by writing structured markdown notes to your Obs
 ## How It Works
 
 ```
-CC Session Lifecycle
+Native lifecycle via native_entry.py / native_lifecycle.py
     |
     |-- SessionStart --> Injects last-session context hint
     |-- PreCompact ---> Saves context snapshot before compression
@@ -33,6 +33,18 @@ CC Session Lifecycle
 ```
 
 All data flows are **one-directional filesystem writes** — no MCP server, no REST API, no Obsidian plugins required (except Dataview for dashboards). A local SQLite + FTS5 index enables fast full-text search as the vault scales. Works even when Obsidian isn't running.
+
+## Codex parity status
+
+The shared runtime and native analysis adapters are implemented on this branch.
+Full Codex CLI/Desktop parity has not shipped. Native Codex hooks skip capture without retaining a source
+until the current frontend can be bound reliably; Desktop dispatch and the
+final acceptance checks remain unverified. See the
+[acceptance evidence](docs/parity/acceptance-evidence.md).
+
+Shared skills use the loaded plugin's runtime and an explicit invoking host,
+client, and session. Native analysis uses that host's CLI; it does not fall back
+to another host. Existing vault folders, tags, and note types remain compatible.
 
 ## Installation
 
@@ -61,10 +73,57 @@ marketplace, switching is seamless — your config and vault are untouched, so
 > suppressing a duplicate rather than writing two — but the supported
 > configuration is a single enabled version.
 
+### Codex installation
+
+The native installation contract was observed with CLI `0.159.0-alpha.12.1`.
+The Desktop bundle has that version too; Desktop hook dispatch is unverified.
+The native marketplace metadata accepted `obsidian-brain@obsidian-brain-repo`
+in a disposable home. There is no certified Codex install-and-use recipe yet:
+the invoking runtime does not supply a verified current-client binding. Do not
+invent `OB_CLIENT` or use another frontend's identity. Packaging and trust-screen
+checks alone do not make the skills or capture ready for installed Codex use. `.codex-plugin/plugin.json`
+selects `hooks/codex-hooks.json`.
+
+Codex CLI launchers must declare the client before launch and disable the shared
+server: `OB_CLIENT=codex-cli codex --no-daemon`. Registered hooks require an
+observed `codex --no-daemon` process in their ancestry. Shared-server ancestors,
+unreadable ancestry, and Desktop capture skip without retaining a source.
+Ancestry only permits or refuses capture; it never chooses the client.
+This launch contract still needs native dispatch evidence. Trusting the hooks
+does not certify parity. Skills require the actual invoking client/session and the
+loaded `SKILL.md` root. Stop when that client binding is unavailable. Run
+`/obsidian-setup` under the selected host; do not borrow another host's config.
+
+The [seven acceptance criteria](docs/parity/acceptance-evidence.md) remain the
+release gate. Synthetic tests verify context isolation, transactions, source
+capture/recovery and restricted native AI transport. Desktop dispatch,
+shared-home frontend handoff, and complete live skill/hook dogfood remain
+unverified. Source tests do not certify those native checks.
+
+### Native storage and analysis
+
+Claude selects `CLAUDE_CONFIG_DIR` (default `~/.claude`); Codex selects
+`CODEX_HOME` (default `~/.codex`). Config is `obsidian-brain-config.json` under
+that home, unless `OBSIDIAN_BRAIN_CONFIG` selects another file. An existing
+legacy index is reused; otherwise the default is
+`$XDG_DATA_HOME/obsidian-brain/vaults/<vault-digest>/index.sqlite3`
+(default data home `~/.local/share`). Config, index and state overrides are
+independent and frozen in the invoking context.
+
+Private state uses versioned vault/provider/session/project directories.
+Vault coordination is under the frozen `coordination_root`:
+`<coordination_root>/obsidian-brain/vaults/<physical-vault-digest>/state.sqlite3`.
+The root uses absolute `XDG_STATE_HOME` or the account's `.local/state`; if that
+lies inside the vault, it uses `/var/tmp/obsidian-brain-state-<UID>` instead.
+The vault key hashes device and inode, independent of native home and index.
+Matching legacy journals migrate only after vault identity checks. Native logs are per-session with lowercase outcomes.
+Summary analysis uses the invoking host's bounded native CLI; Codex never
+retries through Claude. Hooks do not call a model.
+
 ### Prerequisites
 
 - **Obsidian** with the [Dataview](https://github.com/blacksmithgu/obsidian-dataview) community plugin installed
-- **Claude Code** CLI available on PATH
+- The invoking **Claude Code or Codex** CLI available on PATH
 - **Python 3.9 or newer** as `python3` on PATH (the macOS system `python3` is 3.9 and works). Hooks and skills need only the standard library (numpy/scipy are optional speed-ups for clustering).
 - Dataview settings: enable **JavaScript Queries** and **Inline Queries**
 
@@ -75,7 +134,7 @@ Run `/obsidian-setup` after installation. It will:
 1. Ask for your Obsidian vault path
 2. Create folders: `claude-sessions/`, `claude-insights/`, `claude-dashboards/`, `claude-check-items/`
 3. Copy Dataview dashboard templates into your vault
-4. Write machine-local config to `~/.claude/obsidian-brain-config.json`
+4. Write machine-local config under the selected native home
 5. Verify write access with a test file
 
 ## Skills
@@ -213,7 +272,7 @@ Contains Obsidian Dataview dashboard templates that auto-update as notes are add
 
 Holds per-run reports produced by `/check-items`: a markdown note per scope (project or `all`) per day, listing the open-item groups, AI classifications (DONE / NEEDS-ACTION / REVIEW / STALE / ACTIVE), and the audit trail of any auto-applied checkoffs. `REVIEW` items name a shipped-looking component, branch, or feature that couldn't be confirmed `DONE` — they surface in their own `## Review` section for a human look rather than landing silently in `Active`. These are notes you read, not Dataview queries — they live in their own folder so dashboards stay browseable.
 
-**Configuration:** Folder name is set by `check_items_folder` in `~/.claude/obsidian-brain-config.json` (default `claude-check-items`). To keep the legacy v2.5.0 location, set it to `"claude-dashboards"`. Existing files in `claude-dashboards/check-items-*.md` are not migrated automatically.
+**Configuration:** Folder name is set by `check_items_folder` in the selected native home's `obsidian-brain-config.json` (default `claude-check-items`). To keep the legacy v2.5.0 location, set it to `"claude-dashboards"`. Existing files in `claude-dashboards/check-items-*.md` are not migrated automatically.
 
 ### Context Loading Summary
 
@@ -263,7 +322,9 @@ These use [Dataview](https://github.com/blacksmithgu/obsidian-dataview) queries 
 
 ## Configuration
 
-Machine-local config at `~/.claude/obsidian-brain-config.json`:
+Machine-local config is under the selected native home: Claude uses
+`$CLAUDE_CONFIG_DIR/obsidian-brain-config.json` (default `~/.claude`); Codex uses
+`$CODEX_HOME/obsidian-brain-config.json` (default `~/.codex`). For example:
 
 ```json
 {
@@ -282,16 +343,20 @@ Machine-local config at `~/.claude/obsidian-brain-config.json`:
 }
 ```
 
+Claude's `summary_model` accepts Claude model names or aliases. Codex ignores
+that alias: `codex_ai_model` selects native analysis, and `codex_summary_model`
+selects summaries; when unset, its native configured model is used.
+
 ### Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `CHECK_ITEMS_PREFILTER` | `on` | Set to `off` to disable the L2 evidence-presence pre-filter and route all L1-miss items to the `claude -p` sub-agent. Useful for debugging or A/B comparison. L1 cache is unaffected. |
-| `CHECK_ITEMS_SUBAGENT_TIMEOUT_SEC` | `180` | Timeout in seconds for each `claude -p` sub-agent call during `/check-items` Stage 4 classification. |
+| `CHECK_ITEMS_PREFILTER` | `on` | Set to `off` to disable the L2 evidence-presence pre-filter and route all L1-miss items to the invoking host's native analysis backend. Useful for debugging or A/B comparison. L1 cache is unaffected. |
+| `CHECK_ITEMS_SUBAGENT_TIMEOUT_SEC` | `180` | Timeout in seconds for each native backend call during `/check-items` Stage 4 classification. |
 
 ## Multi-Device Support
 
-- **Obsidian Sync:** Works seamlessly — all vault writes are new markdown files (no conflict risk). Config lives at `~/.claude/` (machine-local, outside the vault).
+- **Obsidian Sync:** Works seamlessly — new notes and revision-checked updates remain local filesystem writes. Sync conflicts still need review. Config lives under the selected native home, outside the vault.
 - **New machine setup:** Install the plugin, run `/obsidian-setup` with your vault path on that machine.
 
 ## Troubleshooting
@@ -346,9 +411,27 @@ Replace `/Users/you` with your actual home directory (run `echo $HOME` to find i
 
 - **Integration pattern:** Direct filesystem writes (no MCP, no REST API, no Obsidian plugins needed)
 - **Hook scripts:** Pure Python (stdlib only), deterministic behavior
-- **Summarization:** Best-effort at SessionEnd, deferred to `/recall` for reliable upgrade
-- **Vault index:** SQLite + FTS5 full-text search database (`~/.claude/obsidian-brain-vault.db`) for fast search and context-driven insight ranking. Lazy mtime sync keeps the index current without rebuilding on every access. Powers `/vault-search`, `/vault-ask`, and smart insight ranking in `/recall`.
+- **Summarization:** Deferred to explicit skills such as `/recall`; hooks never call a model
+- **Vault index:** SQLite + FTS5 full-text search database (the existing legacy index or `$XDG_DATA_HOME/obsidian-brain/vaults/<vault-digest>/index.sqlite3`) for fast search and context-driven insight ranking. Lazy mtime sync keeps the index current without rebuilding on every access. Powers `/vault-search`, `/vault-ask`, and smart insight ranking in `/recall`.
 - **Complements** existing CC memory system — runs alongside, not replacing
+
+### Coordination migration limits
+
+Doctor's clean result does not certify that legacy journal migration completed.
+Its read-only inspection can miss an old index-adjacent journal or conflicting
+prior receipts, including the reviewed 248 MB case. The old index-adjacent path
+is `<index-parent>/.<index-filename>.coordination/state.sqlite3`; the earlier
+path-keyed namespace is
+`<coordination_root>/obsidian-brain/vaults/<SHA256(canonical-vault-path)>/state.sqlite3`.
+The selected journal is
+`<coordination_root>/obsidian-brain/vaults/<physical-vault-digest>/state.sqlite3`.
+Writer migration checks vault identity and refuses conflicting rows. A large
+journal can exceed its bounded budget. Doctor cannot choose a winning receipt
+or repair these conflicts. Preserve every journal and its SQLite WAL/SHM
+sidecars for operator review; do not delete or replace them based on a clean
+doctor result.
+Unknown-row partial capture remains visible pending under policy (b); doctor
+rechecking does not acknowledge or suppress unresolved source records.
 
 ## License
 

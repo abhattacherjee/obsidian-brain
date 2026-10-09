@@ -3,7 +3,12 @@ __pycache__/
 .DS_Store
 .claude/scheduled_tasks.lock
 .coverage
+.coverage.*
 .pytest_cache/
 
 # superpowers working docs (specs/plans) — not tracked
 docs/superpowers/
+
+# Version publication state
+.version-sync.lock
+.version-sync.pending.json

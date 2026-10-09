@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Manual smoke test for Issue #105 — _get_session_id_fast cwd-gone resilience
 # Run AFTER: /dev-test install
-# Usage: bash scripts/dev-test/test-issue-105-manual.sh
+# Usage: OB_CACHE_PATH=/absolute/package/root bash scripts/dev-test/test-issue-105-manual.sh
 #
 # Validates the parts that can be checked without a fresh CC session:
 #   Phase A: _resolve_project_basename — happy / env-fallback / both-fail
@@ -21,22 +21,12 @@ FAIL=0
 pass() { echo "  ✅ $1"; PASS=$((PASS + 1)); }
 fail() { echo "  ❌ $1"; FAIL=$((FAIL + 1)); }
 
-CACHE_DIR=$(find ~/.claude/plugins/cache -type d -path "*/obsidian-brain/*" \
-    -not -path "*.bak*" 2>/dev/null | sort -V | tail -1 | xargs dirname 2>/dev/null || true)
-if [ -z "$CACHE_DIR" ] || [ ! -d "$CACHE_DIR" ]; then
-    echo "❌ Could not locate obsidian-brain plugin cache."
-    echo "   Run /dev-test install first."
-    exit 1
-fi
-
-HOOK_DIR=$(find "$CACHE_DIR" -maxdepth 2 -type d -name hooks | sort -V | tail -1)
-if [ -z "$HOOK_DIR" ] || [ ! -d "$HOOK_DIR" ] || [ ! -r "$HOOK_DIR/obsidian_utils.py" ]; then
-    echo "❌ Could not locate a valid hooks directory in the obsidian-brain plugin cache."
-    echo "   Expected a readable file at: $HOOK_DIR/obsidian_utils.py"
-    echo "   Run /dev-test install first, or verify the plugin cache layout under:"
-    echo "   $CACHE_DIR"
-    exit 1
-fi
+# This checks only the explicitly selected distribution, not current client binding.
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+CACHE_DIR=$(python3 "$SCRIPT_DIR/loaded_resource_root.py" --cache-path "${OB_CACHE_PATH:-}")
+HOOK_DIR="$CACHE_DIR/hooks"
+SKILL_ROOT="$CACHE_DIR/skills"
+SCRIPTS_ROOT="$CACHE_DIR/scripts"
 
 # Sanity-check that the cache has the issue #105 functions before running
 # Phase A-E. Without this, AttributeErrors get swallowed by the per-assertion

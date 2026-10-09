@@ -1,7 +1,7 @@
 """Tests for scripts/test-dev-skill.sh — verify it syncs the right files.
 
 The script is critical for local plugin testing: it copies the dev
-working tree into the installed plugin cache so the next CC session
+working tree into the installed plugin cache so the selected host
 runs the dev code instead of the released version. Historically it
 only copied hooks/ and skills/, leaving scripts/vault_doctor.py and
 scripts/vault_doctor_checks/*.py stale — so newly-added vault_doctor
@@ -9,11 +9,13 @@ check modules wouldn't show up in /vault-doctor invocations even
 after /dev-test install.
 
 These tests exercise the install branch in an isolated HOME + REPO
-so they don't touch the real ~/.claude/ cache.
+so they never touch installed client state. Codex uses metadata-only fake RPC.
 """
 from __future__ import annotations
 
 import os
+import json
+from tests.native_install_test_helpers import native_folder, metadata_environment
 import shutil
 import subprocess
 from pathlib import Path
@@ -25,18 +27,31 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_PATH = REPO_ROOT / "scripts" / "test-dev-skill.sh"
 
 
+@pytest.fixture(autouse=True)
+def selected_host_context(host, selected_host_context, tmp_path):
+    from dataclasses import replace
+    from runtime_context import using_runtime_context
+    selected = replace(selected_host_context, resource_root=_stage_repo(tmp_path),
+        worktree=tmp_path / 'repo', canonical_project_root=tmp_path / 'repo')
+    with using_runtime_context(selected):
+        yield selected
+
+
 def _stage_repo(tmp_path: Path) -> Path:
     """Create a minimal repo layout the script can install from."""
     repo = tmp_path / "repo"
-    (repo / "hooks").mkdir(parents=True)
+    if repo.exists():
+        return repo
+    shutil.copytree(REPO_ROOT / 'hooks', repo / 'hooks', ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
     (repo / "hooks" / "obsidian_utils.py").write_text("# fake hook\n")
     (repo / "hooks" / "hooks.json").write_text('{"hooks": {"SessionEnd": []}}\n')
 
     (repo / "skills" / "test-skill").mkdir(parents=True)
     (repo / "skills" / "test-skill" / "SKILL.md").write_text("# fake skill\n")
 
-    (repo / "scripts" / "vault_doctor_checks").mkdir(parents=True)
+    shutil.copytree(REPO_ROOT / "scripts/vault_doctor_checks", repo / "scripts/vault_doctor_checks", ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
     (repo / "scripts" / "vault_doctor.py").write_text("# fake dispatcher\n")
+    shutil.copy2(REPO_ROOT / "scripts/doctor_repair_state.py", repo / "scripts/doctor_repair_state.py")
     (repo / "scripts" / "vault_doctor_checks" / "__init__.py").write_text("")
     (repo / "scripts" / "vault_doctor_checks" / "snapshot_integrity.py").write_text(
         "# new check module from feature branch\n"
@@ -49,13 +64,23 @@ def _stage_repo(tmp_path: Path) -> Path:
     # REPO_ROOT correctly via $(dirname "$0")/..
     (repo / "scripts" / "test-dev-skill.sh").write_bytes(SCRIPT_PATH.read_bytes())
     (repo / "scripts" / "test-dev-skill.sh").chmod(0o755)
+    shutil.copytree(REPO_ROOT / "scripts/dev-test", repo / "scripts/dev-test", ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    for directory in ('.codex-plugin', '.claude-plugin'):
+        target = repo / directory
+        target.mkdir(exist_ok=True)
+        manifest = {'name':'obsidian-brain', 'version':'2.3.0'}
+        if directory == '.codex-plugin':
+            manifest['hooks'] = './.codex/hooks.json'
+        (target / 'plugin.json').write_text(json.dumps(manifest))
+    (repo / '.codex').mkdir(exist_ok=True)
+    (repo / '.codex/hooks.json').write_text('{"hooks":{}}')
     return repo
 
 
 def _stage_cache(tmp_path: Path) -> Path:
-    """Create a fake $HOME/.claude/plugins/cache layout matching the released version."""
+    """Create the selected host cache under an isolated native home."""
     home = tmp_path / "home"
-    cache_base = home / ".claude" / "plugins" / "cache" / "claude-code-skills" / "obsidian-brain"
+    cache_base = home / native_folder() / "plugins" / "cache" / "claude-code-skills" / "obsidian-brain"
     cache_dir = cache_base / "2.3.0"
     (cache_dir / "hooks").mkdir(parents=True)
     (cache_dir / "hooks" / "obsidian_utils.py").write_text("# released hook (will be overwritten)\n")
@@ -67,38 +92,41 @@ def _stage_cache(tmp_path: Path) -> Path:
     (cache_dir / "scripts" / "vault_doctor_checks" / "source_sessions.py").write_text(
         "# released check that's still in repo\n"
     )
+    if native_folder() == '.codex':
+        (cache_dir / '.claude-plugin').mkdir()
+        (cache_dir / '.claude-plugin/plugin.json').write_text('{"name":"obsidian-brain"}')
+        (cache_dir / 'hooks/hooks.json').write_text('{"hooks":{}}')
+        (home / '.codex/config.toml').write_text('[plugins."obsidian-brain@claude-code-skills"]\nenabled = true\n')
     return home
 
 
-def _run_install(tmp_path: Path) -> subprocess.CompletedProcess:
+def _run_install(tmp_path: Path, home=None) -> subprocess.CompletedProcess:
     repo = _stage_repo(tmp_path)
-    home = _stage_cache(tmp_path)
-    env = {
-        **os.environ,
-        "HOME": str(home),
-        # Defang the security-test invocation so it doesn't hit the real test suite.
-        "PATH": os.environ.get("PATH", ""),
-    }
+    home = _stage_cache(tmp_path) if home is None else home
+    from runtime_context import current_runtime_context
+    context = current_runtime_context()
+    env = metadata_environment(home)
     return subprocess.run(
-        ["bash", str(repo / "scripts" / "test-dev-skill.sh"), "install"],
+        ["bash", str(repo / "scripts" / "test-dev-skill.sh"), "install", "--host", context.host, "--source", str(repo), "--cache-path", str(home / native_folder() / "plugins/cache/claude-code-skills/obsidian-brain/2.3.0")],
         env=env,
         capture_output=True,
         text=True,
         timeout=30,
+        stdin=subprocess.DEVNULL,
     )
 
 
 def test_install_copies_hooks(tmp_path: Path) -> None:
     proc = _run_install(tmp_path)
     assert proc.returncode == 0, f"install failed: {proc.stderr}"
-    cache_hook = tmp_path / "home" / ".claude" / "plugins" / "cache" / "claude-code-skills" / "obsidian-brain" / "2.3.0" / "hooks" / "obsidian_utils.py"
+    cache_hook = tmp_path / "home" / native_folder() / "plugins" / "cache" / "claude-code-skills" / "obsidian-brain" / "2.3.0" / "hooks" / "obsidian_utils.py"
     assert "# fake hook" in cache_hook.read_text(encoding="utf-8")
 
 
 def test_install_copies_skills(tmp_path: Path) -> None:
     proc = _run_install(tmp_path)
     assert proc.returncode == 0
-    cache_skill = tmp_path / "home" / ".claude" / "plugins" / "cache" / "claude-code-skills" / "obsidian-brain" / "2.3.0" / "skills" / "test-skill" / "SKILL.md"
+    cache_skill = tmp_path / "home" / native_folder() / "plugins" / "cache" / "claude-code-skills" / "obsidian-brain" / "2.3.0" / "skills" / "test-skill" / "SKILL.md"
     assert "# fake skill" in cache_skill.read_text(encoding="utf-8")
 
 
@@ -106,7 +134,7 @@ def test_install_copies_vault_doctor_dispatcher(tmp_path: Path) -> None:
     """Regression: scripts/vault_doctor.py must be synced (was missing)."""
     proc = _run_install(tmp_path)
     assert proc.returncode == 0
-    cache_vd = tmp_path / "home" / ".claude" / "plugins" / "cache" / "claude-code-skills" / "obsidian-brain" / "2.3.0" / "scripts" / "vault_doctor.py"
+    cache_vd = tmp_path / "home" / native_folder() / "plugins" / "cache" / "claude-code-skills" / "obsidian-brain" / "2.3.0" / "scripts" / "vault_doctor.py"
     assert cache_vd.is_file()
     assert "# fake dispatcher" in cache_vd.read_text(encoding="utf-8")
 
@@ -117,7 +145,7 @@ def test_install_copies_new_check_modules(tmp_path: Path) -> None:
     a release. This was the original symptom that exposed the bug."""
     proc = _run_install(tmp_path)
     assert proc.returncode == 0, f"install failed: {proc.stderr}"
-    cache_checks = tmp_path / "home" / ".claude" / "plugins" / "cache" / "claude-code-skills" / "obsidian-brain" / "2.3.0" / "scripts" / "vault_doctor_checks"
+    cache_checks = tmp_path / "home" / native_folder() / "plugins" / "cache" / "claude-code-skills" / "obsidian-brain" / "2.3.0" / "scripts" / "vault_doctor_checks"
     for new_module in ("snapshot_integrity.py", "snapshot_migration.py"):
         target = cache_checks / new_module
         assert target.is_file(), f"{new_module} not synced to cache"
@@ -128,18 +156,19 @@ def test_install_preserves_existing_check_modules(tmp_path: Path) -> None:
     """Existing modules in the cache must remain after install (not deleted by sync)."""
     proc = _run_install(tmp_path)
     assert proc.returncode == 0
-    cache_checks = tmp_path / "home" / ".claude" / "plugins" / "cache" / "claude-code-skills" / "obsidian-brain" / "2.3.0" / "scripts" / "vault_doctor_checks"
-    # source_sessions.py was in the released cache. The repo doesn't have it
-    # (we only staged snapshot_*), so it should still be there post-install
-    # — sync must be additive/overwrite, never delete.
+    cache_checks = tmp_path / "home" / native_folder() / "plugins" / "cache" / "claude-code-skills" / "obsidian-brain" / "2.3.0" / "scripts" / "vault_doctor_checks"
+    # This released module also exists in the staged complete runtime.
+    # Both the additive Claude copy and Codex snapshot must retain it.
     assert (cache_checks / "source_sessions.py").is_file()
 
 
 def test_install_creates_backup_before_writing(tmp_path: Path) -> None:
-    """The install branch backs up the cache to <version>.bak before mutating."""
+    """The install branch preserves the released cache before mutating."""
     proc = _run_install(tmp_path)
     assert proc.returncode == 0
-    backup_dir = tmp_path / "home" / ".claude" / "plugins" / "cache" / "claude-code-skills" / "obsidian-brain" / "2.3.0.bak"
+    from tests.native_install_test_helpers import backup_path
+    home = tmp_path / "home"
+    backup_dir = backup_path(home, home / native_folder() / "plugins/cache/claude-code-skills/obsidian-brain/2.3.0")
     assert backup_dir.is_dir()
     # Backup retains the released hook content (not the fake repo content).
     backup_hook = backup_dir / "hooks" / "obsidian_utils.py"
@@ -151,17 +180,19 @@ def test_install_refuses_when_backup_already_exists(tmp_path: Path) -> None:
     repo = _stage_repo(tmp_path)
     home = _stage_cache(tmp_path)
     # Pre-create the backup
-    backup = home / ".claude" / "plugins" / "cache" / "claude-code-skills" / "obsidian-brain" / "2.3.0.bak"
+    backup = home / native_folder() / "plugins" / "cache" / "claude-code-skills" / "obsidian-brain" / "2.3.0.bak"
     backup.mkdir(parents=True)
     (backup / "marker").write_text("pre-existing")
 
-    env = {**os.environ, "HOME": str(home)}
+    from runtime_context import current_runtime_context
+    context = current_runtime_context()
+    env = metadata_environment(home)
     proc = subprocess.run(
-        ["bash", str(repo / "scripts" / "test-dev-skill.sh"), "install"],
-        env=env, capture_output=True, text=True, timeout=10,
+        ["bash", str(repo / "scripts" / "test-dev-skill.sh"), "install", "--host", context.host, "--source", str(repo), "--cache-path", str(home / native_folder() / "plugins/cache/claude-code-skills/obsidian-brain/2.3.0")],
+        env=env, capture_output=True, text=True, timeout=10, stdin=subprocess.DEVNULL,
     )
     assert proc.returncode != 0, "install should refuse when backup exists"
-    assert "Backup already exists" in proc.stdout
+    assert "Backup already exists" in proc.stdout + proc.stderr if context.host == 'claude' else "backup" in (proc.stdout + proc.stderr).lower()
     # Existing backup untouched
     assert (backup / "marker").read_text() == "pre-existing"
 
@@ -173,7 +204,7 @@ def test_install_copies_hooks_json(tmp_path: Path) -> None:
     cache_hooks_json = (
         tmp_path
         / "home"
-        / ".claude"
+        / native_folder()
         / "plugins"
         / "cache"
         / "claude-code-skills"
@@ -186,3 +217,23 @@ def test_install_copies_hooks_json(tmp_path: Path) -> None:
     import json
     cached = json.loads(cache_hooks_json.read_text(encoding="utf-8"))
     assert cached == {"hooks": {"SessionEnd": []}}
+
+
+def test_install_copies_required_repair_state(tmp_path):
+    proc = _run_install(tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    installed = tmp_path / "home" / native_folder() / "plugins/cache/claude-code-skills/obsidian-brain/2.3.0/scripts/doctor_repair_state.py"
+    assert installed.read_bytes() == (REPO_ROOT / "scripts/doctor_repair_state.py").read_bytes()
+
+
+def test_incomplete_source_leaves_cache_and_backup_unchanged(tmp_path):
+    repo = _stage_repo(tmp_path)
+    home = _stage_cache(tmp_path)
+    cache = home / native_folder() / "plugins/cache/claude-code-skills/obsidian-brain/2.3.0"
+    original = {str(p.relative_to(cache)): p.read_bytes() for p in cache.rglob('*') if p.is_file()}
+    (repo / "scripts/doctor_repair_state.py").unlink()
+    proc = _run_install(tmp_path, home=home)
+    assert proc.returncode != 0
+    assert 'Runtime package is incomplete' in proc.stderr
+    assert {str(p.relative_to(cache)): p.read_bytes() for p in cache.rglob('*') if p.is_file()} == original
+    assert not cache.with_name(cache.name + '.bak').exists()

@@ -593,3 +593,9 @@ def test_one_line_below_the_floor_is_not_flagged(tmp_path):
         encoding="utf-8",
     )
     assert mff._find_fenceless_frontmatter(note.read_text(encoding="utf-8")) is None
+
+
+@pytest.fixture(autouse=True)
+def _selected_doctor_actor(selected_host_context):
+    """Run each repair contract with the explicit invoking host active."""
+    return selected_host_context

@@ -1,78 +1,64 @@
-"""Claude lifecycle handlers fail open when Codex auto-discovers them."""
-
+"""Explicit native lifecycle selection resists inherited markers and foreign roots."""
 import json
 import os
+from pathlib import Path
 import subprocess
 import sys
-from pathlib import Path
 
 import pytest
-
+from test_snapshot_e2e import selected_host_context
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
-@pytest.mark.parametrize(
-    ("script", "event"),
-    [
-        ("obsidian_session_log.py", "SessionEnd"),
-        ("obsidian_session_hint.py", "SessionStart"),
-        ("obsidian_context_snapshot.py", "PreCompact"),
-        ("obsidian_retro_gate.py", "Stop"),
-    ],
-)
-@pytest.mark.parametrize(
-    ("case", "codex_marker", "codex_path", "should_skip"),
-    [
-        ("codex-marker", True, True, True),
-        ("codex-payload-only", False, True, True),
-        ("claude", False, False, False),
-        ("claude-inside-codex", True, False, False),
-    ],
-)
-def test_lifecycle_host_guard(tmp_path, script, event, case, codex_marker, codex_path, should_skip):
-    env = {
-        key: value for key, value in os.environ.items()
-        if not key.startswith(("GIT_", "CODEX_")) and key != "CLAUDE_CODE_SESSION_ID"
-    }
-    env.update(
-        HOME=str(tmp_path),
-        CODEX_HOME=str(tmp_path / ".codex"),
-        CLAUDE_CODE_SESSION_ID="inherited-claude-id",
-    )
-    if codex_marker:
-        env["CODEX_THREAD_ID"] = "codex-native-id"
-    if codex_path:
-        transcript_path = tmp_path / ".codex" / "sessions" / "2026" / "09" / "25" / "rollout-codex-native-id.jsonl"
-        session_id = "codex-native-id"
+@pytest.mark.parametrize('script,event', [
+    ('obsidian_session_log.py', 'session_end'),
+    ('obsidian_session_hint.py', 'session_start'),
+    ('obsidian_context_snapshot.py', 'pre_compact'),
+    ('obsidian_retro_gate.py', 'stop')])
+@pytest.mark.parametrize('foreign_source,foreign_markers', [(False, False), (False, True),
+                                                           (True, False), (True, True)])
+def test_lifecycle_host_guard(selected_host_context, tmp_path, script, event, foreign_source, foreign_markers):
+    context = selected_host_context
+    env = dict(os.environ)
+    if foreign_markers:
+        env.update(CLAUDE_CODE_SESSION_ID='foreign-session', CODEX_THREAD_ID='foreign-thread')
     else:
-        transcript_path = tmp_path / ".claude" / "projects" / "example" / "claude-native-id.jsonl"
-        session_id = "claude-native-id"
-    transcript_path.parent.mkdir(parents=True, exist_ok=True)
-    transcript_path.write_text("")
-    payload = {
-        "session_id": session_id,
-        "cwd": str(tmp_path),
-        "transcript_path": str(transcript_path),
-    }
-    result = subprocess.run(
-        [sys.executable, str(ROOT / "hooks" / script)],
-        input=json.dumps(payload),
-        text=True,
-        capture_output=True,
-        env=env,
-        check=False,
-    )
-
-    assert result.returncode == 0
-    assert result.stdout == ""
-    assert (f"{event} outcome=SKIPPED_CODEX_HOST" in result.stderr) is should_skip, case
-    assert "SKIPPED_TRANSCRIPT_OUTSIDE_PROJECTS" not in result.stderr
-    assert not list(tmp_path.rglob("*.md"))
-
-    if event == "SessionEnd":
-        log = tmp_path / ".claude" / "obsidian-brain-hook.log"
-        log_text = log.read_text()
-        assert ("SKIPPED_CODEX_HOST" in log_text) is should_skip
-        assert f"sid={session_id[:8]}" in log_text
-        assert "sid=inherite" not in log_text
+        env.pop('CLAUDE_CODE_SESSION_ID', None)
+        env.pop('CODEX_THREAD_ID', None)
+    source = context.transcript_path
+    if foreign_source:
+        source = tmp_path / 'unselected-native-home' / 'foreign.jsonl'
+        source.parent.mkdir()
+        source.write_bytes(context.transcript_path.read_bytes())
+        command = [sys.executable, str(ROOT / 'hooks' / 'brain_cli.py'),
+            '--host', context.host, '--client', context.client, '--event', event,
+            '--config', str(context.config_path), '--resource-root', str(context.resource_root),
+            '--index', str(context.index_path), '--state', str(context.state_path), 'hook']
+    else:
+        command = [sys.executable, str(ROOT / 'tests' / 'native_hook_test_driver.py'),
+            '--host', context.host, '--client', context.client,
+            '--session-id', context.native_session_id, '--cwd', str(context.worktree),
+            '--vault', str(context.vault_path), '--config', str(context.config_path),
+            '--resource-root', str(context.resource_root), '--index', str(context.index_path),
+            '--state', str(context.state_path), '--transcript', str(source), script]
+    result = subprocess.run(command, input=json.dumps({
+        'session_id': context.native_session_id, 'cwd': str(context.worktree),
+        'transcript_path': str(source), 'trigger': 'manual'}),
+        text=True, capture_output=True, env=env, cwd=context.worktree, timeout=5)
+    assert result.returncode == 0, result.stderr
+    notes = list(context.vault_path.rglob('*.md'))
+    if foreign_source:
+        assert notes == []
+        assert result.stdout == ''
+        assert json.loads(result.stderr)['code'] == 'transcript_outside_host'
+    else:
+        proof = json.loads(next(line.split(':', 1)[1] for line in result.stderr.splitlines()
+                                if line.startswith('NATIVE_CONTEXT_PROOF:')))
+        assert proof['host'] == context.host
+        assert proof['native_session_id'] == context.native_session_id
+        assert proof['mutation_contexts']
+        assert len(notes) == (2 if event == 'pre_compact' else 1)
+        assert all('foreign-session' not in path.read_text() and 'foreign-thread' not in path.read_text()
+                   for path in notes)
+    assert source.read_bytes() == context.transcript_path.read_bytes()
