@@ -297,6 +297,133 @@ def test_check_items_pipeline_preserves_pre_ai_revisions_and_reports_real_review
     assert all(hashlib.sha256(Path(path).read_bytes()).hexdigest() == revision for path, revision in original.items())
 
 
+def test_empty_git_marker_keeps_check_items_notes_only(context, monkeypatch):
+    from datetime import timedelta
+    import check_items_cli
+    import open_item_dedup
+
+    ancestor = context.canonical_project_root.parent / '.git'
+    ancestor.mkdir()
+    (ancestor / 'HEAD').write_text('ref: refs/heads/ancestor\n')
+    (context.canonical_project_root / '.git').mkdir()
+    other = context.canonical_project_root.parent / 'other'
+    (other / '.git').mkdir(parents=True)
+    assert context.project_name not in open_item_dedup._resolve_project_paths()
+    assert 'other' not in open_item_dedup._resolve_project_paths()
+    monkeypatch.setattr(procedures, '_project_head',
+        lambda path: pytest.fail('An empty marker must not trigger a HEAD lookup'))
+    old_date = (date.today() - timedelta(days=2)).isoformat()
+    first = note(context, old_date + '-open.md',
+        '## Open Questions / Next Steps\n- [ ] Validate cache expiry probe #42\n')
+    first.write_text(first.read_text().replace(
+        'date: ' + json.dumps(date.today().isoformat()), 'date: ' + json.dumps(old_date)))
+    note(context, date.today().isoformat() + '-completed.md',
+        '## Summary\nCompleted: Validate cache expiry probe #42. The validation passed.\n')
+    prepared = prepare(context, 'check-items')
+    operation, directory = prepared['operation_id'], Path(prepared['operation_dir'])
+    invoke(context, 'check-items', 'scope', {'operation_id': operation, 'argv': []})
+    status, _, errors = invoke(context, 'check-items', 'collect',
+        {'operation_id': operation, 'scope_path': str(directory / 'scope.json')}, success=False)
+    assert status == 1 and 'requires running inside a git repo' in errors
+    invoke(context, 'check-items', 'scope',
+        {'operation_id': operation, 'argv': ['all', '14d', '--show-all', '--no-cache']})
+    invoke(context, 'check-items', 'collect',
+        {'operation_id': operation, 'scope_path': str(directory / 'scope.json')})
+    invoke(context, 'check-items', 'stage-01', {'operation_id': operation, 'inputs': {
+        'SCOPE_PATH': str(directory / 'scope.json'), 'RAW_PATH': str(directory / 'raw_items.json')}})
+    partition = json.loads(read_artifact(context, operation, 'partition.json'))
+    evidence = json.loads(read_artifact(context, operation, 'evidence.json'))
+    gaps = json.loads(read_artifact(context, operation, 'gaps.json'))
+    assert partition['heads'] == {} and len(partition['needs']) == 1
+    assert gaps['projects_without_repo'] == [context.project_name]
+    assert evidence[context.project_name]['note_completions']
+    assert check_items_cli.note_evidence_only_for(evidence, context.project_name)
+    assert open_item_dedup.assign_tier('Completed #42', 'Validate cache expiry probe #42',
+        'DONE', 'agent', note_evidence_only=True) == 'MED'
+    assert '- [ ] Validate cache expiry probe #42' in first.read_text()
+
+
+@pytest.mark.parametrize('marker_kind', ['nonempty', 'unreadable', 'worktree-file'])
+def test_real_git_markers_still_refuse_unavailable_head(context, monkeypatch, marker_kind):
+    import open_item_dedup
+    from types import SimpleNamespace
+
+    marker = context.canonical_project_root / '.git'
+    if marker_kind == 'worktree-file':
+        marker.write_text('gitdir: ../missing-worktree-metadata\n')
+    else:
+        marker.mkdir()
+        (marker / 'HEAD').write_text('ref: refs/heads/unborn\n')
+    if marker_kind == 'unreadable':
+        original_iterdir = Path.iterdir
+        def guarded_iterdir(path):
+            if path == marker:
+                raise PermissionError('Repository metadata is unreadable')
+            return original_iterdir(path)
+        monkeypatch.setattr(Path, 'iterdir', guarded_iterdir)
+    assert open_item_dedup._resolve_project_paths()[context.project_name] == str(context.canonical_project_root)
+    looked_up = []
+    def unavailable_head(path):
+        looked_up.append(path)
+        return SimpleNamespace(returncode=1, stdout='')
+    monkeypatch.setattr(procedures, '_project_head', unavailable_head)
+    first = note(context, date.today().isoformat() + '-open.md',
+        '## Open Questions / Next Steps\n- [ ] Validate cache expiry probe #42\n')
+    original = first.read_bytes()
+    prepared = prepare(context, 'check-items')
+    operation, directory = prepared['operation_id'], Path(prepared['operation_dir'])
+    invoke(context, 'check-items', 'scope', {'operation_id': operation, 'argv': ['all', '--no-cache']})
+    invoke(context, 'check-items', 'collect',
+        {'operation_id': operation, 'scope_path': str(directory / 'scope.json')})
+    status, _, errors = invoke(context, 'check-items', 'stage-01', {'operation_id': operation, 'inputs': {
+        'SCOPE_PATH': str(directory / 'scope.json'), 'RAW_PATH': str(directory / 'raw_items.json')}}, success=False)
+    assert status == 1 and 'Repository HEAD unavailable; evidence remains pending.' in errors
+    assert looked_up == [str(context.canonical_project_root)]
+    assert first.read_bytes() == original
+
+
+@pytest.mark.parametrize('marker_kind', ['nonempty', 'unreadable', 'worktree-file'])
+def test_workspace_git_markers_retain_head_refusal(context, monkeypatch, marker_kind):
+    import open_item_dedup
+    from types import SimpleNamespace
+
+    workspace_project = context.canonical_project_root.parent / 'workspace-project'
+    workspace_project.mkdir()
+    marker = workspace_project / '.git'
+    if marker_kind == 'worktree-file':
+        marker.write_text('gitdir: ../missing-worktree-metadata\n')
+    else:
+        marker.mkdir()
+        (marker / 'HEAD').write_text('ref: refs/heads/unborn\n')
+    if marker_kind == 'unreadable':
+        original_iterdir = Path.iterdir
+        def guarded_iterdir(path):
+            if path == marker:
+                raise PermissionError('Repository metadata is unreadable')
+            return original_iterdir(path)
+        monkeypatch.setattr(Path, 'iterdir', guarded_iterdir)
+    assert open_item_dedup._resolve_project_paths()['workspace-project'] == str(workspace_project)
+    looked_up = []
+    def unavailable_head(path):
+        looked_up.append(path)
+        return SimpleNamespace(returncode=1, stdout='')
+    monkeypatch.setattr(procedures, '_project_head', unavailable_head)
+    first = note(context, date.today().isoformat() + '-workspace.md',
+        '## Open Questions / Next Steps\n- [ ] Validate cache expiry probe #42\n')
+    first.write_text(first.read_text().replace('project: "project"', 'project: "workspace-project"'))
+    original = first.read_bytes()
+    prepared = prepare(context, 'check-items')
+    operation, directory = prepared['operation_id'], Path(prepared['operation_dir'])
+    invoke(context, 'check-items', 'scope', {'operation_id': operation, 'argv': ['all', '--no-cache']})
+    invoke(context, 'check-items', 'collect',
+        {'operation_id': operation, 'scope_path': str(directory / 'scope.json')})
+    status, _, errors = invoke(context, 'check-items', 'stage-01', {'operation_id': operation, 'inputs': {
+        'SCOPE_PATH': str(directory / 'scope.json'), 'RAW_PATH': str(directory / 'raw_items.json')}}, success=False)
+    assert status == 1 and 'Repository HEAD unavailable; evidence remains pending.' in errors
+    assert looked_up == [str(workspace_project)]
+    assert first.read_bytes() == original
+
+
 def test_check_items_scope_typo_and_current_project_are_explicit_errors(context):
     prepared = prepare(context, 'check-items')
     operation = prepared['operation_id']

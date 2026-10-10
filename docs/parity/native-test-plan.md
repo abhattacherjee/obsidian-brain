@@ -138,6 +138,24 @@ mandatory for every native assertion. A client-owned record must come from the
 actual client and have an independently identified collector; an actor-written
 receipt or synthetic harness never becomes native evidence.
 
+### Native session capture prerequisite
+
+Before skill cases, read the actual selected config and record its capture
+thresholds. When omitted, `min_messages` defaults to `3` and
+`min_duration_minutes` to `2`. Both gates must pass. Send the approved synthetic
+setup turns separately, then check the visible user-message count and duration
+derived from actual native source records. Three quick replies or elapsed
+operator wall time alone do not prove eligibility.
+
+If the recorded duration is still short, preserve the below-threshold evidence,
+wait, then send an ordinary continuation using the approved synthetic facts.
+Let the registered Stop hook run naturally. Do not lower thresholds, call hooks
+manually, forge notes or timestamps, or substitute an older session's capture.
+Before proceeding, independently verify the current full native ID across the
+source, canonical note/checkpoint and observed registered hook origin. An
+ineligible setup blocks dependent skill cases; it is neither a product capture
+failure nor acceptance PASS.
+
 Order: B → I → early L.1/L.3 → K → remaining L → X/R/F/A → G → review.
 PAIRED tests run after both involved clients pass their basic checks.
 Record an interruption checkpoint before ending or compacting a session.
@@ -358,6 +376,11 @@ Read and invoke each **loaded** SKILL.md through its native skill mechanism.
 Record the actual invocation, loaded path/hash, operation IDs, backend and
 output bytes. Follow documented prepare/read/analyze/preview/save operations.
 Do not implement the effect yourself and count it as skill execution.
+
+If a prepared source changes and invalidates an operation, retain its refusal
+and pending evidence. Start a fresh normal skill operation, re-read the current
+source revisions and repeat the documented prepare/preview/save sequence.
+Do not reuse the invalidated operation's ID, source manifest or revision token.
 
 The operator's execution prompt can approve listed writes to the fixture.
 Honor any explicit preview gate that still needs an interactive response;

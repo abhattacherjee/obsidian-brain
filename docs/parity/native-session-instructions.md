@@ -140,6 +140,19 @@ Native evidence must match installed handler/operation receipt, client-owned
 session source with marker/hash/offset, result provenance and independent
 origin observation. Manual calls cannot substitute, even with the same ID.
 
+Before skill cases, read the actual selected config and record capture
+thresholds; omitted min_messages defaults to 3 and min_duration_minutes to 2.
+Both gates must pass. Send approved synthetic setup turns separately. Check
+the actual visible user-message count and native source-record duration;
+three quick replies or elapsed operator wall time alone are insufficient.
+If the recorded duration is short, retain the below-threshold evidence, wait,
+then send an ordinary continuation using the approved synthetic facts and let
+registered Stop run naturally. Never lower thresholds, manually call hooks,
+forge notes/timestamps or borrow an older session's capture. Independently
+verify the current full native ID in its source, canonical note/checkpoint and
+actual registered hook origin before dependent skill cases. Ineligible setup
+is a prerequisite blocker, not a product capture failure or acceptance PASS.
+
 Use the absolute loaded skill path and its documented launcher. Repeat all
 explicit context values for each shell invocation. Resolve helpers from that
 loaded installation, not cwd, newest cache, another provider or this source
@@ -157,6 +170,11 @@ synthetic fixture mutations within the sandbox. If the loaded skill requires
 an explicit interactive response you do not have, save that pending preview
 in handoff.json, ask a concise question and continue independent tests.
 Do not pretend I replied or silently drop the save step.
+
+If a prepared source changes and invalidates an operation, preserve its refusal
+and pending evidence. Begin a fresh normal skill operation, re-read current
+source revisions and repeat the documented prepare/preview/save sequence.
+Do not reuse the invalidated operation ID, source manifest or revision token.
 
 Run the plan in order and write one row per case, installed skill and AI path.
 Cover every fixed backend operation and authored analysis branch from the

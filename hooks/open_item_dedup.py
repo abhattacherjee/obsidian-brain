@@ -1242,6 +1242,20 @@ _ORPHAN_EXCLUDE_TYPES = frozenset({
 })
 
 
+def _has_repo_marker(directory):
+    marker = Path(directory) / '.git'
+    if marker.is_dir():
+        try:
+            # Empty directories have no Git metadata. Native tool sandboxes
+            # can expose one where the project has no repository.
+            return next(marker.iterdir(), None) is not None
+        except OSError:
+            # Keep unreadable markers so evidence still refuses a HEAD
+            # it cannot verify rather than treating the project as git-free.
+            return True
+    return marker.exists()
+
+
 def _resolve_project_paths() -> dict[str, str]:
     """Return dict mapping project name -> repo path for local git repos.
 
@@ -1249,6 +1263,7 @@ def _resolve_project_paths() -> dict[str, str]:
     containing .git.  Roots are supplied by get_workspace_roots() which reads
     ``workspace_roots`` from obsidian-brain-config.json when present.
     """
+
     result: dict[str, str] = {}
     scan_dirs = get_workspace_roots()
     for scan_dir in scan_dirs:
@@ -1257,13 +1272,13 @@ def _resolve_project_paths() -> dict[str, str]:
         try:
             for entry in os.listdir(scan_dir):
                 full = os.path.join(scan_dir, entry)
-                if os.path.isdir(full) and os.path.isdir(os.path.join(full, ".git")):
+                if (os.path.isdir(full) and _has_repo_marker(full)):
                     result[entry] = full
         except OSError:
             continue
     from runtime_context import current_runtime_context
     context = current_runtime_context()
-    if context is not None and (context.canonical_project_root / '.git').exists():
+    if context is not None and _has_repo_marker(context.canonical_project_root):
         result[context.project_name] = str(context.canonical_project_root)
     return result
 

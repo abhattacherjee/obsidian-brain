@@ -336,6 +336,7 @@ class TestResolveProjectPaths:
         repo = scan_dir / "my-project"
         repo.mkdir()
         (repo / ".git").mkdir()
+        (repo / ".git" / "HEAD").write_text("ref: refs/heads/unborn\n")
         non_repo = scan_dir / "plain-dir"
         non_repo.mkdir()
 

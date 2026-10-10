@@ -109,6 +109,7 @@ def test_stage01_second_operation_skips_merge_with_fresh_evidence(selected_host_
     context=selected_host_context
     project=context.canonical_project_root.name
     (context.canonical_project_root/'.git').mkdir(exist_ok=True)
+    (context.canonical_project_root/'.git'/'HEAD').write_text('ref: refs/heads/unborn\n')
     folder=context.vault_path/'claude-sessions';folder.mkdir()
     note=folder/'2099-01-01-session.md'
     note.write_text('---\nproject: '+project+'\ntype: claude-session\n---\n## Open Questions / Next Steps\n- [ ] Fix bug #87\n')
@@ -209,6 +210,7 @@ def test_evidence_repo_resolver_prefers_bound_canonical_repo(selected_host_conte
     import open_item_dedup
     context=selected_host_context
     (context.canonical_project_root/'.git').mkdir()
+    (context.canonical_project_root/'.git'/'HEAD').write_text('ref: refs/heads/unborn\n')
     monkeypatch.setattr(open_item_dedup,'get_workspace_roots',lambda:[])
     assert open_item_dedup._resolve_project_paths()[context.canonical_project_root.name]==str(context.canonical_project_root)
 

@@ -246,7 +246,7 @@ def _project_head(repo_path):
 def _check_items_stage_01(context, payload):
     import sys, os, glob, json, subprocess
     import glob, json, os, re, sys
-    from open_item_dedup import find_duplicates, cross_project_dedup
+    from open_item_dedup import find_duplicates, cross_project_dedup, _resolve_project_paths
     from check_items_cache import canonical_hash, load_cache, partition
     from obsidian_utils import get_workspace_roots
     scope_path = os.environ['SCOPE_PATH']
@@ -297,13 +297,9 @@ def _check_items_stage_01(context, payload):
     cache = load_cache()
     known, needs = ([], [])
     heads = {}
+    repo_paths = _resolve_project_paths()
     for proj, groups in coarse_by_proj.items():
-        repo_path = str(context.canonical_project_root) if proj == context.project_name and (context.canonical_project_root / '.git').exists() else None
-        for _root in get_workspace_roots():
-            _candidate = os.path.join(_root, proj)
-            if os.path.exists(os.path.join(_candidate, '.git')):
-                repo_path = _candidate
-                break
+        repo_path = repo_paths.get(proj)
         if not repo_path:
             print(f'[check-items] no repo found for {proj} in {get_workspace_roots()}; forcing reclassify', file=sys.stderr)
             for g in groups:
@@ -1066,7 +1062,7 @@ def _load_json(context, payload, path):
 
 def _check_collect(context, payload):
     from obsidian_utils import read_note_metadata_detailed, indexed_folders
-    from open_item_dedup import collect_open_item_records
+    from open_item_dedup import collect_open_item_records, _has_repo_marker
     scope = _load_json(context, payload, payload['scope_path'])
     config = dict(context.config)
     config['vault_path'] = str(context.vault_path)
@@ -1085,7 +1081,7 @@ def _check_collect(context, payload):
     elif scope['mode'] == 'project':
         projects = {scope['project']}
     else:
-        if not (context.worktree / '.git').exists() and context.canonical_project_root == context.worktree:
+        if not _has_repo_marker(context.worktree) and context.canonical_project_root == context.worktree:
             print('ERROR: /check-items current-project mode requires running inside a git repo.\nUse /check-items all (vault-wide) or /check-items <project>.', file=sys.stderr)
             return 1
         projects = {context.project_name}

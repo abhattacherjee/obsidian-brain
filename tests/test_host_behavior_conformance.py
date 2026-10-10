@@ -256,6 +256,7 @@ def test_native_project_repo_map_uses_logical_label(context, monkeypatch):
     root = context.canonical_project_root.parent / 'Parity_Lab'
     root.mkdir()
     (root / '.git').mkdir()
+    (root / '.git' / 'HEAD').write_text('ref: refs/heads/unborn\n')
     bound = replace(context, canonical_project_root=root, worktree=root)
     monkeypatch.setattr(open_item_dedup, 'get_workspace_roots', lambda: [])
     with using_runtime_context(bound):
