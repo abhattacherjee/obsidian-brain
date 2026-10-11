@@ -1332,21 +1332,21 @@ def test_parse_scope_vault_lookup_failure_is_not_fatal(monkeypatch, capsys):
     get_workspace_roots() would return [] there and this test would fail
     for reasons unrelated to what it's checking.
 
-    The failure is injected at the DB layer (vault_index._connect), the
+    The failure is injected at the read-only DB layer, the
     actual production failure mode, rather than by replacing
     _vault_known_projects wholesale — that exercises the real internal
     try/except in _vault_known_projects instead of a call-site guard that
     only a test double could ever trigger (Fix round 1, Finding C1).
     """
     import check_items_args
-    import vault_index
+    import session_lookup
 
-    def _raise(db_path):
+    def _raise(path, deadline):
         raise RuntimeError("vault index unavailable")
 
     monkeypatch.setattr(check_items_args, "_known_projects",
                         lambda: {"obsidian-brain"})
-    monkeypatch.setattr(vault_index, "_connect", _raise)
+    monkeypatch.setattr(session_lookup, "_readonly_index", _raise)
     scope = check_items_args.parse_scope(["obsidian-brain"])
     assert scope.mode == "project"
     assert scope.project == "obsidian-brain"

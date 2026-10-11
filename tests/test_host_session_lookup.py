@@ -277,3 +277,68 @@ def test_legacy_index_hint_refuses_wrong_coordination_identity(lookup, monkeypat
     calls = _cantopen_once(monkeypatch, context.index_path)
     assert _context_hint(context, time.monotonic() + 1) is None
     assert not calls
+
+
+def test_scope_lookup_missing_index_does_not_block_native_capture(selected_host_context):
+    import json
+    import capture
+    import check_items_args
+    from runtime_context import using_runtime_context
+
+    path = Path.home() / ('.claude/projects/synthetic/pristine.jsonl' if selected_host_context.host == 'claude' else '.codex/sessions/pristine.jsonl')
+    context = replace(selected_host_context, transcript_path=path)
+    assert not context.index_path.exists()
+    rows = []
+    if context.host == 'codex':
+        rows.append({'type': 'session_meta', 'payload': {'id': context.native_session_id}})
+    for number, role in enumerate(('user', 'assistant', 'user', 'assistant')):
+        stamp = '2026-10-10T00:0' + str(number) + ':00Z'
+        text = 'Synthetic pristine-index capture ' + str(number)
+        if context.host == 'claude':
+            rows.append({'type': role, 'uuid': str(number), 'sessionId': context.native_session_id,
+                         'timestamp': stamp, 'message': {'role': role, 'content': text}})
+        else:
+            rows.append({'type': 'response_item', 'timestamp': stamp,
+                         'payload': {'type': 'message', 'id': str(number), 'role': role,
+                                     'content': [{'type': 'input_text' if role == 'user' else 'output_text', 'text': text}]}})
+    if context.host == 'codex':
+        rows.append({'type': 'event_msg', 'timestamp': '2026-10-10T00:03:01Z',
+                     'payload': {'type': 'task_complete'}})
+    context.transcript_path.parent.mkdir(parents=True, exist_ok=True)
+    context.transcript_path.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+    with using_runtime_context(context):
+        assert check_items_args.parse_scope(['all']).mode == 'vault'
+        assert not context.index_path.exists()
+        result = capture.capture_checkpoint(context, capture.CaptureEvent('stop', min_messages=2), time.monotonic() + 3)
+    assert result.status == 'complete'
+    note = find_existing_session(context, time.monotonic() + 1)
+    assert note.is_file()
+    assert 'Synthetic pristine-index capture 0' in note.read_text()
+
+
+def test_scope_lookup_existing_index_is_read_only(lookup):
+    import check_items_args
+    from runtime_context import using_runtime_context
+    context, _ = lookup
+    with closing(sqlite3.connect(context.index_path)) as connection, connection:
+        connection.execute('ALTER TABLE notes ADD COLUMN project TEXT')
+        connection.execute("INSERT INTO notes VALUES ('fixture', 'claude-session', 'notes-only-project')")
+    before = context.index_path.read_bytes()
+    with using_runtime_context(context):
+        assert check_items_args._vault_known_projects() == {'notes-only-project'}
+    assert context.index_path.read_bytes() == before
+
+
+def test_scope_lookup_incompatible_index_keeps_capture_pending(lookup):
+    import check_items_args
+    from runtime_context import using_runtime_context
+    context, _ = lookup
+    with closing(sqlite3.connect(context.index_path)) as connection, connection:
+        connection.execute('DROP TABLE notes')
+        connection.execute('CREATE TABLE unrelated(value TEXT)')
+    before = context.index_path.read_bytes()
+    with using_runtime_context(context):
+        assert check_items_args._vault_known_projects() == set()
+        with pytest.raises(SessionLookupPending, match='OperationalError'):
+            find_existing_session(context, time.monotonic() + 1)
+    assert context.index_path.read_bytes() == before

@@ -9,6 +9,8 @@ from __future__ import annotations
 import os
 import re
 import sys
+import time
+from pathlib import Path
 from dataclasses import dataclass, field
 
 from obsidian_utils import get_workspace_roots
@@ -62,14 +64,13 @@ def _vault_known_projects() -> set[str]:
     """
     try:
         import vault_index
-        conn = vault_index._connect(vault_index._default_db_path())
-        try:
+        from session_lookup import _readonly_index
+        path = Path(vault_index._default_db_path())
+        with _readonly_index(path, time.monotonic() + 1) as conn:
             rows = conn.execute(
                 "SELECT DISTINCT project FROM notes "
                 "WHERE project IS NOT NULL AND project != ''"
             ).fetchall()
-        finally:
-            conn.close()
         return {str(r[0]) for r in rows if r and r[0]}
     except Exception as exc:  # noqa: BLE001 - see docstring
         print(f"[check-items] vault project lookup unavailable: {exc}",
