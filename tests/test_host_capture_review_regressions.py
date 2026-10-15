@@ -260,6 +260,7 @@ def test_native_child_dialogue_capture_and_lookup_preserve_manual_prose(selected
     """The observed Codex replay boundary excludes inherited parent dialogue."""
     from runtime_context import using_runtime_context
     from session_lookup import find_existing_session
+    from native_hook_test_driver import qualified_fixture_checkpoint
     selected = selected_host_context
     native = selected.native_session_id
     if selected.host == 'codex':
@@ -302,15 +303,15 @@ def test_native_child_dialogue_capture_and_lookup_preserve_manual_prose(selected
     source.write_bytes(raw)
     actor = replace(selected,transcript_path=source)
     with using_runtime_context(actor):
-        first = checkpoint(actor)
-        assert first.status == 'complete', first
+        first, first_observations = qualified_fixture_checkpoint(actor, capture.CaptureEvent('stop', min_messages=1))
+        assert first.status == 'complete', first_observations
         note = find_existing_session(actor,time.monotonic()+1)
         assert note is not None and not actor.index_path.exists()
         note.write_text(note.read_text()+'\nHuman prose outside capture.\n')
         with source.open('ab') as stream:
             stream.write((json.dumps(later)+'\n').encode())
-        second = checkpoint(actor)
-        assert second.status == 'complete', second
+        second, second_observations = qualified_fixture_checkpoint(actor, capture.CaptureEvent('stop', min_messages=1))
+        assert second.status == 'complete', second_observations
         assert find_existing_session(actor,time.monotonic()+1) == note
     text = note.read_text()
     assert 'Inherited parent question' not in text

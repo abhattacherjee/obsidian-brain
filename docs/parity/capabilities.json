@@ -1286,7 +1286,7 @@
     {
       "source": "tests/test_hook_dedup_guard.py",
       "expression": "subprocess.run(command, input=payload, capture_output=True, text=True, cwd=context.worktree, env=dict(os.environ, CLAUDE_CODE_SESSION_ID='foreign-inherited-id', CODEX_THREAD_ID='foreign-inherited-thread'), timeout=10)",
-      "source_sha256": "3ad1d07cd10aa898e9fe20d918e94bb5676515e56367224e26a436eca73b9291",
+      "source_sha256": "9e77280ec9780c3216c1769a73cf2081aa04e0c57864aa9d978e9880131ad0b8",
       "capability": "capture.normalization"
     },
     {

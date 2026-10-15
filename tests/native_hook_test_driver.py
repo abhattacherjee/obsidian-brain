@@ -29,6 +29,17 @@ def _owned_fixture_bytes(path):
     return data, signature(after)
 
 
+def _fixture_root_identities(context):
+    roots = {}
+    for name in ('canonical_project_root', 'worktree', 'resource_root', 'native_home', 'vault_path'):
+        path = Path(getattr(context, name))
+        assert path.resolve() == path and not path.is_symlink()
+        details = path.lstat()
+        assert stat.S_ISDIR(details.st_mode) and details.st_uid == os.getuid()
+        roots[name] = (str(path), details.st_dev, details.st_ino)
+    return roots
+
+
 def fixture_replay_baseline(context):
     import transcripts
     source = _owned_fixture_bytes(context.transcript_path)
@@ -37,22 +48,81 @@ def fixture_replay_baseline(context):
     assert batch.status == 'ok' and batch.source_complete and not batch.loss_of_input
     assert batch.metadata.get('native_session_id') == context.native_session_id
     assert _owned_fixture_bytes(context.transcript_path) == source
-    return {'source': source, 'config': config,
+    return {'source': source, 'config': config, 'roots': _fixture_root_identities(context),
             'context': {field: str(getattr(context, field)) for field in FIELDS}}
 
 
-def qualify_fixture_replay(context, pending, baseline):
+def qualify_fixture_replay(context, pending, baseline, *, publication_deadlines=False, applied_revision=False):
     assert pending['status'] == 'pending' and pending['pending_sources'] > 0
-    assert not pending['loss_of_input'] and not pending['applied_revision']
+    assert not pending['loss_of_input']
+    assert not pending['applied_revision'] or applied_revision
     warnings = set(pending['warnings'])
     deadlines = {'Capture deadline reached', 'Transcript deadline reached',
                  'Transcript deadline reached before reading', 'Facts retained; publication deadline reached'}
+    if publication_deadlines:
+        deadlines |= {'End snapshot deadline reached', 'Snapshot deadline reached'}
     assert warnings & deadlines and warnings <= deadlines | {'Native transcript identity is unverified'}
     selected = {field: str(getattr(context, field)) for field in FIELDS}
     assert pending['context'] == baseline['context'] == selected
+    assert _fixture_root_identities(context) == baseline['roots']
     assert _owned_fixture_bytes(context.transcript_path) == baseline['source']
     assert _owned_fixture_bytes(context.config_path) == baseline['config']
     assert pending['source_revision'] == hashlib.sha256(baseline['source'][0]).hexdigest()
+
+
+def qualified_fixture_checkpoint(context, event, *, first_deadline=None, before_replay=None):
+    """Functional fixture recovery only; never native timing/dispatch evidence."""
+    import capture
+    import note_transactions
+    from runtime_context import using_runtime_context
+    baseline = fixture_replay_baseline(context)
+    observations = []
+    with using_runtime_context(context):
+        first = capture.capture_checkpoint(context, event,
+            time.monotonic() + 2 if first_deadline is None else first_deadline)
+        assert isinstance(first, capture.CaptureResult)
+        observations.append(first)
+        if first.status == 'complete':
+            assert first.applied_revision, observations
+            return first, tuple(observations)
+        if before_replay is not None:
+            before_replay()
+        # Capture may have published the parent but deferred its End checkpoint.
+        # Qualify that partial revision only against the actual selected parent
+        # and its frozen End intent; conflicts and unrelated writes cannot pass.
+        if first.applied_revision:
+            with note_transactions.connect_coordination(context) as connection:
+                row = connection.execute('SELECT note,cursor FROM source_sessions WHERE scope=?',
+                                         (context.session_key,)).fetchone()
+            assert event.kind == 'session_end' and row, first
+            parent = Path(row[0])
+            intent = json.loads(row[1])['parser_state'].get('_capture_end_snapshot')
+            assert isinstance(intent, dict) and intent.get('parent') == str(parent), first
+            assert intent.get('metadata', {}).get('agent_provider') == context.host, first
+            assert intent.get('metadata', {}).get('agent_session_id') == context.native_session_id, first
+            assert note_transactions.read_revision(context, parent) == first.applied_revision, first
+            qualified_revision = first.applied_revision
+        else:
+            qualified_revision = None
+        pending = {'status': first.status, 'pending_sources': first.pending_sources,
+            'loss_of_input': first.loss_of_input, 'applied_revision': first.applied_revision,
+            'warnings': list(first.warnings), 'context': dict(baseline['context']),
+            'source_revision': hashlib.sha256(_owned_fixture_bytes(context.transcript_path)[0]).hexdigest()}
+        try:
+            qualify_fixture_replay(context, pending, baseline, publication_deadlines=True,
+                                   applied_revision=qualified_revision is not None)
+        except AssertionError as error:
+            raise AssertionError(('Unqualified fixture pending result', first)) from error
+        if qualified_revision:
+            assert note_transactions.read_revision(context, parent) == qualified_revision, first
+        # Exactly one ordinary production checkpoint with the same event/options.
+        second = capture.capture_checkpoint(context, event, time.monotonic() + 2)
+        assert isinstance(second, capture.CaptureResult)
+        observations.append(second)
+        assert second.status == 'complete' and second.applied_revision, observations
+        assert _owned_fixture_bytes(context.transcript_path) == baseline['source']
+        assert _owned_fixture_bytes(context.config_path) == baseline['config']
+        return second, tuple(observations)
 
 
 def main():

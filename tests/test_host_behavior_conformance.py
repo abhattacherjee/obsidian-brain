@@ -68,8 +68,9 @@ def test_capture_replay_preserves_manual_prose(host, context):
     legacy = '---\ntype: claude-session\nsession_id: synthetic-session\nagent_provider: ' + host + '\n---\n# Existing\n' + GOLDEN['manual_prose'] + '\n'
     note.write_text(legacy)
     for _ in range(2):
-        result = capture.capture_checkpoint(bound, capture.CaptureEvent('stop', note_path=note, min_messages=1), time.monotonic() + 2)
-        assert result.status == 'complete'
+        from native_hook_test_driver import qualified_fixture_checkpoint
+        result, observations = qualified_fixture_checkpoint(bound, capture.CaptureEvent('stop', note_path=note, min_messages=1))
+        assert result.status == 'complete', observations
     text = note.read_text()
     assert GOLDEN['manual_prose'] in text
     for role, message in GOLDEN['messages']:
@@ -261,3 +262,58 @@ def test_native_project_repo_map_uses_logical_label(context, monkeypatch):
     monkeypatch.setattr(open_item_dedup, 'get_workspace_roots', lambda: [])
     with using_runtime_context(bound):
         assert open_item_dedup._resolve_project_paths() == {'parity-lab': str(root)}
+
+
+@pytest.mark.parametrize('event', ['stop', 'session_end'])
+def test_fixture_deadline_still_requires_real_publication(host, context, event):
+    bound = source(context)
+    note = bound.vault_path / 'deadline-session.md'
+    note.write_text('---\ntype: claude-session\nsession_id: ' + bound.native_session_id + '\nagent_provider: ' + host + '\n---\nMANUAL DEADLINE SENTINEL\n')
+    from native_hook_test_driver import qualified_fixture_checkpoint
+    result, observations = qualified_fixture_checkpoint(bound,
+        capture.CaptureEvent(event, note_path=note, min_messages=1), first_deadline=time.monotonic() - 1)
+    assert observations[0].status == 'pending'
+    assert observations[0].warnings == ('Capture deadline reached',)
+    assert len(observations) == 2 and result.status == 'complete' and result.applied_revision, observations
+    assert 'MANUAL DEADLINE SENTINEL' in note.read_text()
+    for role, message in GOLDEN['messages']:
+        assert note.read_text().count(message) == 1
+
+
+@pytest.mark.parametrize('change', ['source', 'config', 'context'])
+def test_deadline_fixture_replay_refuses_changes(host, context, change):
+    from native_hook_test_driver import qualified_fixture_checkpoint
+    bound = source(context)
+    original_sid = bound.native_session_id
+    def changed():
+        if change == 'source':
+            bound.transcript_path.write_bytes(bound.transcript_path.read_bytes() + b'\n')
+        elif change == 'config':
+            bound.config_path.write_bytes(bound.config_path.read_bytes() + b'\n')
+        else:
+            object.__setattr__(bound, 'native_session_id', 'another-full-session')
+    try:
+        with pytest.raises(AssertionError, match='Unqualified fixture pending result'):
+            qualified_fixture_checkpoint(bound, capture.CaptureEvent('session_end', min_messages=1),
+                first_deadline=time.monotonic() - 1, before_replay=changed)
+    finally:
+        object.__setattr__(bound, 'native_session_id', original_sid)
+    assert not list(bound.vault_path.rglob('*.md'))
+
+
+@pytest.mark.parametrize('damage', ['wrong-id', 'malformed', 'unsupported'])
+def test_deadline_fixture_replay_refuses_unverified_source(host, context, damage):
+    from native_hook_test_driver import qualified_fixture_checkpoint
+    bound = source(context)
+    text = bound.transcript_path.read_text()
+    if damage == 'wrong-id':
+        text = text.replace(bound.native_session_id, 'another-native-session')
+    elif damage == 'malformed':
+        text += '{unfinished'
+    else:
+        text += json.dumps({'type': 'future-substantive-record', 'content': 'unknown fixture'}) + '\n'
+    bound.transcript_path.write_text(text)
+    with pytest.raises(AssertionError):
+        qualified_fixture_checkpoint(bound, capture.CaptureEvent('session_end', min_messages=1),
+                                     first_deadline=time.monotonic() - 1)
+    assert not list(bound.vault_path.rglob('*.md'))

@@ -405,7 +405,10 @@ import capture
 import note_transactions
 
 
-def test_native_loser_never_publishes_without_ownership(selected_host_context,native_batch):
+def test_native_loser_never_publishes_without_ownership(selected_host_context):
+    from test_host_behavior_conformance import source, GOLDEN
+    from native_hook_test_driver import qualified_fixture_checkpoint
+    selected_host_context = source(selected_host_context)
     from threading import Event
     entered=Event();release=Event()
     def holder():
@@ -424,8 +427,9 @@ def test_native_loser_never_publishes_without_ownership(selected_host_context,na
         finally:
             release.set()
         active.result(timeout=1)
-    assert checkpoint(selected_host_context,'session_end').status=='complete'
-    _assert_native_lifecycle_notes(selected_host_context, 'session_end', ('First native fact.',))
+    result, observations = qualified_fixture_checkpoint(selected_host_context, capture.CaptureEvent('session_end'))
+    assert result.status == 'complete', observations
+    _assert_native_lifecycle_notes(selected_host_context, 'session_end', tuple(text for _, text in GOLDEN['messages']))
 
 
 def _native_failed_writer_retry(context,module,event,monkeypatch,capsys):
