@@ -64,11 +64,11 @@ def _is_checkbox_flip(old_text: str, new_text: str) -> bool:
     return flipped == new_text
 
 
-def run_pipeline(vault_path: str, sessions_folder: str, insights_folder: str, *, operation_id=None) -> None:
+def run_pipeline(vault_path: str, sessions_folder: str, insights_folder: str, *, operation_id=None) -> int:
     """Run deep analysis pipeline for /standup deep.
 
     Reads ``{"basenames": [...], "projects": [...]}`` from stdin.
-    Prints status line: ``OK:<n>:<g>:<e>`` or ``CACHED:<n>:<g>:<e>``.
+    Prints the status line and returns 1 on ``ERROR:``; otherwise returns 0.
     """
     data = json.loads(_read_stdin_capped())
     basenames = data["basenames"]
@@ -82,6 +82,8 @@ def run_pipeline(vault_path: str, sessions_folder: str, insights_folder: str, *,
         raise ValueError('Pipeline cannot switch selected vault')
     output_path = str(directory / 'deep-pipeline.json')
     semantic = _pipeline_identity(vault_path, basenames, data['projects'])
+    from operation_state import bind_semantic
+    bind_semantic(context, identity, semantic)
 
     status = deep_analysis_pipeline(
         basenames,
@@ -92,6 +94,10 @@ def run_pipeline(vault_path: str, sessions_folder: str, insights_folder: str, *,
         insights_folder,
         operation_id=identity, operation_semantic=semantic,
     )
+
+    if status.startswith('ERROR:'):
+        print(status)
+        return 1
 
     # Filter out recently acted-on items so they aren't re-recommended
     acted = _load_acted_items()
@@ -121,6 +127,7 @@ def run_pipeline(vault_path: str, sessions_folder: str, insights_folder: str, *,
                           'pipeline_path': output_path,
                           'classifications_path': str(directory / 'deep-classifications.json')}))
     print(status)
+    return 0
 
 
 def _pipeline_identity(vault_path, basenames, projects):

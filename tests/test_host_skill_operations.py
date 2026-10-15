@@ -210,6 +210,11 @@ def test_retro_gate_and_source_evidence_use_native_identity(context):
     assert invoke(context, 'retro', 'classification-complete')[1].strip() == 'no-gate'
     evidence = json.loads(invoke(context, 'retro', 'evidence')[1])
     assert 'This session decision' in json.dumps(evidence)
+    session = json.loads(invoke(context, 'retro', 'session')[1])
+    assert evidence['_ctx'] == session
+    assert evidence['_ctx']['session_id'] == context.native_session_id
+    assert evidence['_ctx']['agent_provider'] == context.host
+    assert evidence['_ctx']['project'] == context.project_name
 
 
 def test_historical_discovery_filters_source_host_project_and_date(context, tmp_path):
@@ -522,6 +527,9 @@ def test_theme_operations_and_emerge_keep_registered_analysis_separate_from_orig
     assert 'UNASSIGNED=' in invoke(context, 'consolidate', 'consolidate')[1]
     prepared = prepare(context, 'emerge')
     operation, directory = prepared['operation_id'], Path(prepared['operation_dir'])
+    # A protected source read must not prevent the first typed corpus binding.
+    for member in members:
+        source_read(context, 'standup', member, operation)
     output = invoke(context, 'emerge', 'themes', {'operation_id': operation, 'days': 30})[1]
     assert 'STATUS=OK:2' in output
     corpus = json.loads(read_artifact(context, operation, 'emerge-themes.json'))

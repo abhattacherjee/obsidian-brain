@@ -34,13 +34,16 @@ def _config(context, payload):
     value['project'] = context.project_name
     _emit(value)
 
-def _session(context, payload):
+def _session_context(context):
     from obsidian_utils import get_session_context, resolve_source_session_note
     value = get_session_context(str(context.vault_path), context.config.get('sessions_folder', 'claude-sessions'))
     value['agent_provider'] = context.host
     value['agent_session_id'] = context.native_session_id
     value['resolved_source_session_note'] = resolve_source_session_note(value['session_note_name'], value['session_id'], str(context.vault_path), context.config.get('sessions_folder', 'claude-sessions'))
-    _emit(value)
+    return value
+
+def _session(context, payload):
+    _emit(_session_context(context))
 
 def _note_path(context, payload):
     from note_writer import _resolve_note_path
@@ -1215,7 +1218,9 @@ def _evidence(context, payload):
             or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,199}', value)
             or '..' in value for value in ids)):
         raise ValueError('also_session_ids must contain explicit full native session IDs.')
-    _emit(gather_session_evidence(str(context.vault_path), context.config.get('sessions_folder', 'claude-sessions'), context.config.get('insights_folder', 'claude-insights'), context.native_session_id, context.project_name, also_session_ids=ids))
+    bundle = gather_session_evidence(str(context.vault_path), context.config.get('sessions_folder', 'claude-sessions'), context.config.get('insights_folder', 'claude-insights'), context.native_session_id, context.project_name, also_session_ids=ids)
+    bundle['_ctx'] = _session_context(context)
+    _emit(bundle)
 
 
 def _retro_gate(context, payload):

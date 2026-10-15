@@ -181,3 +181,58 @@ def store_artifact(context, operation_id, name, content, *, semantic=None):
     """Publish under persistent OS ownership; never take over a live holder."""
     with _operation_lock(context, operation_id):
         return _store_artifact_locked(context, operation_id, name, content, semantic=semantic)
+
+
+def _source_revision(context, name):
+    """Hash a bounded regular source in the selected vault without following links."""
+    path = Path(name)
+    if not path.is_absolute():
+        path = context.vault_path / path
+    _no_symlinks(path)
+    if str(path) != str(path.resolve()) or context.vault_path.resolve() not in path.resolve().parents:
+        raise ValueError('Prepared source escapes selected vault')
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0))
+    with os.fdopen(descriptor, 'rb') as stream:
+        before = os.fstat(stream.fileno())
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError('Prepared source must be a regular note')
+        raw = stream.read(1_000_001)
+        after = path.stat()
+        _no_symlinks(path)
+        if len(raw) > 1_000_000 or (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
+            raise ValueError('Prepared source changed while reading or exceeds the note limit')
+    return hashlib.sha256(raw).hexdigest()
+
+
+def bind_semantic(context, operation_id, semantic):
+    """Bind the first typed identity after checked source reads; never rebind it."""
+    if not isinstance(semantic, dict) or not isinstance(semantic.get('sources'), dict):
+        raise ValueError('Invalid operation semantic identity')
+    with _operation_lock(context, operation_id):
+        manifest_path, manifest = _manifest(context, operation_id)
+        previous = manifest['semantic']
+        if previous is not None and previous != semantic:
+            raise ValueError('Operation inputs changed')
+        files = manifest.get('files')
+        if not isinstance(files, dict) or (previous is None and set(files) - {'source-manifest.json'}):
+            raise ValueError('Unexpected artifacts before semantic binding')
+        for name, expected in files.items():
+            raw = _read_private(_artifact(context, operation_id, name))
+            if hashlib.sha256(raw).hexdigest() != expected:
+                raise ValueError('Operation artifact content changed')
+            if name == 'source-manifest.json':
+                prepared = json.loads(raw)
+                identity = {'host': context.host, 'session_key': context.session_key,
+                            'vault': str(context.vault_path), 'project': str(context.canonical_project_root),
+                            'operation_id': operation_id}
+                if not isinstance(prepared, dict) or any(prepared.get(k) != v for k, v in identity.items()) or not isinstance(prepared.get('sources'), dict):
+                    raise ValueError('Source manifest belongs to another native operation')
+                for path, revision in prepared['sources'].items():
+                    if not isinstance(path, str) or _source_revision(context, path) != revision:
+                        raise ValueError('Prepared source revision changed')
+        for path, revision in semantic['sources'].items():
+            if not isinstance(path, str) or _source_revision(context, path) != revision:
+                raise ValueError('Operation source revision changed')
+        if previous is None:
+            manifest['semantic'] = semantic
+            _write_private(manifest_path, json.dumps(manifest, sort_keys=True).encode(), context)

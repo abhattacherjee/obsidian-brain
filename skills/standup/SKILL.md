@@ -356,12 +356,24 @@ On success this prints `OK: <absolute path>` and the file is now at mode `0o600`
 
 Move all upgraded files from `UNSUMMARIZED` into the working set alongside `SUMMARIZED`. Track the count of upgraded notes as `UPGRADED_COUNT`.
 
-Before analyzing open items, call `cascade-collect` with the prepared
-`operation_id` for every project with open items, one collection call per project,
+Before collecting cascade sources, retain the primary prepared ID as
+`STANDUP_OPERATION_ID`. If `IS_DEEP` is true, call the same installed `prepare`
+operation again with `{}` and retain its distinct ID and directory as
+`CASCADE_OPERATION_ID` and `CASCADE_OPERATION_DIR`. Otherwise set
+`CASCADE_OPERATION_ID = STANDUP_OPERATION_ID`. Do this before the first
+`cascade-collect`; never move or rebind an existing manifest.
+
+Call `cascade-collect` with `CASCADE_OPERATION_ID` for every project with open items, one collection call per project,
 including an explicitly selected project whose collection is empty. An uncollected
 project cannot be cascaded. Its immutable source revisions govern
-all later `cascade` calls, whose payload includes `checked_texts`, the same
-`project`, and the operation ID. Identical text in another project is not confirmed. Preserve missing/stale sources as pending.
+all later `cascade` calls in Steps 14b and 19, whose payload includes
+`checked_texts`, the same `project`, and `CASCADE_OPERATION_ID`. Keep deep
+analysis, presentation, classifications and reviewed edits on the fresh
+`DEEP_OPERATION_ID` prepared in Step 15. The first typed artifact on that operation must be
+the deep pipeline with its `deep-v1` source identity. The pipeline explicitly
+binds that identity after checking the registered source reads and their
+unchanged revisions; it never replaces an existing typed identity. Cascade artifacts belong
+only to the separate cascade operation in deep mode. Identical text in another project is not confirmed. Preserve missing/stale sources as pending.
 
 ### Step 7 — Read and distill note content
 
@@ -587,7 +599,7 @@ Request for `cascade` (substitute the values as data):
 
 ```json
 {
-  "operation_id": "<prepared id>",
+  "operation_id": "<CASCADE_OPERATION_ID>",
   "project": "<project>",
   "checked_texts": [
     "<confirmed item text>"
@@ -638,13 +650,30 @@ Create 5 native progress tasks (all in one message):
 
 Then set task #1 to `in_progress` via Native progress update. **Do NOT proceed to Step 15 until all 5 tasks exist.**
 
-**Step 15 — Collect data and gather evidence.** First check for a fresh cache (avoids re-running the full pipeline if `/standup deep` or `/emerge` was run recently with the same data):
+**Step 15 — Collect data and gather evidence.** Prepare a fresh deep-analysis
+operation with the installed `prepare` operation and `{}`. Retain its ID and
+directory as `DEEP_OPERATION_ID` and `DEEP_OPERATION_DIR`. Do this after the
+ordinary mode's reviewed writes and cascade calls finish, even if they made
+no changes. Keep the original `CASCADE_OPERATION_ID` for Step 19.
+
+Call `note-read` for every current selected source under `DEEP_OPERATION_ID`
+before running the pipeline. Use those returned current revisions for deep
+analysis. If a read or later source check refuses a changed source, stop and
+report it as pending; never replace a protected revision or rebind the old
+operation. Earlier ordinary reads are not the deep operation's source snapshot.
+Use `DEEP_OPERATION_ID` and its returned artifact paths for all subsequent
+`deep-pipeline`, `deep-present`, `artifact-store`, `deep-checkoffs`, `deep-edit`
+and deep-mode `note-read` calls. Step 19's `cascade` calls alone keep
+`CASCADE_OPERATION_ID`. Each shell call supplies its retained explicit ID;
+do not depend on variables persisting between shells.
+
+Run the pipeline for this prepared snapshot. Repeated calls within this operation may reuse verified analysis; they cannot reuse artifacts from an earlier `/standup deep` or `/emerge` operation.
 
 Request for `deep-pipeline` (substitute the values as data):
 
 ```json
 {
-  "operation_id": "<prepared id>",
+  "operation_id": "<DEEP_OPERATION_ID>",
   "stdin": {"basenames": ["<selected note basename>"], "projects": ["<selected project>"]}
 }
 ```
@@ -670,7 +699,7 @@ Request for `deep-present` (substitute the values as data):
 
 ```json
 {
-  "operation_id": "<prepared id>",
+  "operation_id": "<DEEP_OPERATION_ID>",
   "pipeline_path": "<registered pipeline.json>",
   "classifications_path": "<registered classifications.json>"
 }
@@ -709,7 +738,7 @@ Request for `deep-edit` (substitute the values as data):
 ```json
 {
   "stdin": [["<vault-relative note>", "<exact original text>", "<reviewed replacement text>"]],
-  "operation_id": "<same prepared id>"
+  "operation_id": "<DEEP_OPERATION_ID>"
 }
 ```
 
@@ -719,15 +748,11 @@ python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_C
 
 Mark task #4 complete, task #5 in_progress.
 
-**Step 19 — Cascade checkoffs + cleanup.** For each project with newly checked items, run `batch_cascade_checkoff()` (same as Step 14b) in parallel.
+**Step 19 — Cascade checkoffs + cleanup.** For each project with newly checked items, call the installed `cascade` operation with the retained `CASCADE_OPERATION_ID` (same as Step 14b) in parallel. Do not pass `DEEP_OPERATION_ID`.
 
-**Always clean up temp files** (even if user skipped actions — prevents stale cache from giving the same recommendations on next run):
+Keep private artifacts in the prepared operation directory for revision checks. Never reuse another operation's artifacts.
 
-```bash
-echo "Private operation artifacts remain scoped to this operation."
-```
-
-This invalidates the 15-min cache so the next `/standup deep` run gets fresh data reflecting any changes made.
+Each new `/standup deep` invocation uses a fresh prepared operation. Reuse within an operation requires unchanged sources and git HEAD.
 
 Mark task #5 complete.
 
@@ -747,14 +772,17 @@ Failed or cancelled AI leaves the operation pending and preserves the note.
 
 ## Fixed request shapes
 
-Pass these objects through the installed launcher for the named operation. Keep
-one operation ID across source reads, analysis and reviewed publication.
+Pass these objects through the installed launcher for the named operation.
+Keep each phase's ID across its source reads, analysis and reviewed publication:
+`STANDUP_OPERATION_ID` for ordinary work, `DEEP_OPERATION_ID` for deep analysis,
+and `CASCADE_OPERATION_ID` for cascade collection and checkoffs. Do not mix
+their manifests or artifact paths.
 
 Request for `note-read`:
 
 ```json
 {
-  "operation_id": "<prepared id>",
+  "operation_id": "<STANDUP_OPERATION_ID for ordinary work; DEEP_OPERATION_ID for deep work>",
   "path": "<vault-relative note.md>"
 }
 ```
@@ -763,7 +791,7 @@ Request for `note-apply`:
 
 ```json
 {
-  "operation_id": "<same prepared id>",
+  "operation_id": "<STANDUP_OPERATION_ID for ordinary work; DEEP_OPERATION_ID for deep work>",
   "path": "<same vault-relative note.md>",
   "expected_revision": "<note-read SHA256>",
   "content": "<complete reviewed note>"
@@ -774,7 +802,7 @@ Request for `cascade-collect`:
 
 ```json
 {
-  "operation_id": "<prepared id>",
+  "operation_id": "<CASCADE_OPERATION_ID>",
   "project": "<selected project>"
 }
 ```
@@ -783,7 +811,7 @@ Request for `artifact-store`:
 
 ```json
 {
-  "operation_id": "<prepared id>",
+  "operation_id": "<DEEP_OPERATION_ID>",
   "name": "deep-classifications.json",
   "content": "<reviewed helper output as data>"
 }

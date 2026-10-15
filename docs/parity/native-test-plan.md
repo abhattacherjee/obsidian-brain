@@ -395,7 +395,7 @@ save a handoff and continue independent cases rather than waiting silently.
 | `compress` | Save the synthetic learned retry/expiry facts. | Curated insight retains meaning and source identity; classification/save policy followed. |
 | `recall` | Retrieve the project's decision and snapshot from a fresh/resumed session. | Relevant facts cite real fixture notes; snapshots resolve to their parent; no foreign session link. |
 | `standup` | Summarize synthetic completed and open work. | Completed/open distinction is accurate; manual unchecked sentinel remains open. |
-| `retro` | Analyze pre/post-compaction synthetic work. | Evidence includes parent and snapshot, claims reflect observed work, and classification-before-save runs. |
+| `retro` | Analyze pre/post-compaction synthetic work. | Evidence includes parent and snapshot, claims reflect observed work, and classification runs after publication and before the saved confirmation. |
 | `check-items` | Triage duplicate and completed synthetic checkboxes. | Approved fixture updates occur once; manual sentinel is never checked off; concurrent edit survives/refuses safely. |
 | `consolidate` | Cluster overlapping fixture notes into named database themes; exercise theme split and merge by ID. | Theme membership and source tracking survive; original note files remain intact; no unrelated note is removed. |
 | `emerge` | Find the retry pattern in seeded themes. | Analysis grounded in selected sources; selected native backend performs synthesis; saved artifact has correct provenance. |
@@ -486,7 +486,7 @@ than the fixed backend. Account for these distinct paths too:
 | vault-import | Native helper summaries for explicitly selected historical session fixtures |
 | check-items | Semantic grouping, evidence gathering, classification, reviewed application |
 | consolidate | Native theme naming and analysis-driven theme merge/split |
-| retro | Main-session retrospective with snapshots and classification-before-save |
+| retro | Main-session retrospective with snapshots; classify after publication and before the saved confirmation |
 | compress / decide / error-log | Main-session synthesis with correct source provenance and reviewed publication |
 | link | Main-session link selection followed by revision-bound publication |
 | vault-ask | Main-session cited answer synthesis and eligible reviewed wiki filing |

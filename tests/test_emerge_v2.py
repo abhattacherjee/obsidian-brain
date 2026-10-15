@@ -326,7 +326,7 @@ def test_run_emerge_themes_sparse(emerge_db, capsys):
     assert not os.path.exists(emerge_cli._themes_json_path())
 
 
-def test_run_emerge_themes_ok(emerge_db, capsys):
+def test_run_emerge_themes_ok(emerge_db, tmp_vault, capsys):
     conn = vault_index._connect(emerge_db)
     # Two windowed themes, each with a recent member.
     _mk(conn, 1, "alpha", [], updated_date=_recent(2))
@@ -343,6 +343,10 @@ def test_run_emerge_themes_ok(emerge_db, capsys):
     # Pre-condition: activation starts at the seeded 0.0.
     assert conn.execute("SELECT MAX(activation) FROM themes").fetchone()[0] == 0.0
     conn.close()
+
+    # Corpus revisions must refer to real selected-vault notes, not DB-only fixtures.
+    for name, content in [('m1.md', 'body m1.md'), ('m2.md', 'body m2.md'), ('free.md', 'free body')]:
+        (tmp_vault / name).write_text(content)
 
     emerge_cli.run_emerge_themes(30, operation_id='e' * 32)
 

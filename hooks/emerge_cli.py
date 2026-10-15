@@ -146,6 +146,8 @@ def run_emerge_themes(days: int = 30, *, operation_id=None) -> None:
     semantic = {'algorithm': 'emerge-v1', 'days': days,
                 'corpus_sha256': hashlib.sha256(json.dumps(corpus, sort_keys=True).encode()).hexdigest(),
                 'sources': _corpus_revisions(vault, corpus)}
+    from operation_state import bind_semantic
+    bind_semantic(context, identity, semantic)
     out = store_artifact(context, identity, 'emerge-themes.json', json.dumps(corpus, indent=2), semantic=semantic)
     print(json.dumps({'operation_id': identity, 'operation_dir': str(directory),
                       'themes_path': str(out), 'analysis_path': str(directory / 'emerge-analysis.md')}))

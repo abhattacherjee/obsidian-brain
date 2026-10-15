@@ -111,6 +111,11 @@ def _allowed(file, function, node):
         return (name == '_publish_private_json' and len(node.args) == 2
                 and ast.unparse(node.args[0]) == 'output_path'
                 and ast.unparse(node.args[1]) in {'result.data', 'ordered'})
+    if file == 'hooks/operation_state.py' and function == 'bind_semantic':
+        return (name == '_write_private' and not node.keywords and len(node.args) == 3
+                and ast.unparse(node.args[0]) == 'manifest_path'
+                and ast.unparse(node.args[1]) == 'json.dumps(manifest, sort_keys=True).encode()'
+                and ast.unparse(node.args[2]) == 'context')
     if file == 'hooks/operation_state.py' and function == '_store_artifact_locked':
         return (name == '_write_private' and len(node.args) == 3
                 and ast.unparse(node.args[0]) in {'path', 'manifest_path'}
@@ -519,3 +524,20 @@ def test_ai_receipt_exception_is_scoped_and_cannot_publish_vault_content():
     ]
     assert all(_violations(mutant, 'hooks/ai_backend.py') for mutant in forbidden)
     assert _violations(source, 'hooks/unreviewed_writer.py')
+
+
+def test_first_semantic_binding_has_only_exact_private_manifest_write():
+    root = Path(__file__).resolve().parents[1]
+    tree = ast.parse((root / 'hooks/operation_state.py').read_text())
+    source = next(ast.unparse(node) for node in tree.body
+                  if isinstance(node, ast.FunctionDef) and node.name == 'bind_semantic')
+    assert 'with _operation_lock(context, operation_id):' in source
+    assert any(isinstance(node, ast.Assign) and ast.unparse(node.value) == '_manifest(context, operation_id)'
+               and isinstance(node.targets[0], ast.Tuple)
+               and [item.id for item in node.targets[0].elts] == ['manifest_path', 'manifest']
+               for node in ast.walk(ast.parse(source)))
+    assert not _violations(source, 'hooks/operation_state.py')
+    assert _violations(source.replace('_write_private(manifest_path,', '_write_private(note_path,'),
+                       'hooks/operation_state.py')
+    assert _violations(source + '\n    Path(note_path).write_text("bypass")\n',
+                       'hooks/operation_state.py')
