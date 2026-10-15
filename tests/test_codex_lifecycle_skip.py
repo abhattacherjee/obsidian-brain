@@ -60,7 +60,7 @@ def test_lifecycle_host_guard(selected_host_context, tmp_path, script, event, fo
             '--vault', str(context.vault_path), '--config', str(context.config_path),
             '--resource-root', str(context.resource_root), '--index', str(context.index_path),
             '--state', str(context.state_path), '--transcript', str(source), script]
-    if not foreign_source and event == 'session_start':
+    if not foreign_source:
         command.insert(-1, '--recover-deferred')
     state_before = owned_state(context)
     result = invoke_hook(context, command, source, env)
@@ -133,3 +133,74 @@ def test_expired_start_retains_owned_input_then_next_stop_publishes(selected_hos
     assert 'Capture the first synthetic fact.' in notes[0].read_text()
     assert 'Keep all synthetic facts.' in notes[0].read_text()
     assert context.transcript_path.read_bytes() == before
+
+
+def test_early_transcript_deadline_replays_precompact_fixture(selected_host_context):
+    context = selected_host_context
+    before = context.transcript_path.read_bytes()
+    command = [sys.executable, str(ROOT / 'tests/native_hook_test_driver.py'),
+        '--host', context.host, '--client', context.client, '--session-id', context.native_session_id,
+        '--cwd', str(context.worktree), '--vault', str(context.vault_path), '--config', str(context.config_path),
+        '--resource-root', str(context.resource_root), '--index', str(context.index_path),
+        '--state', str(context.state_path), '--transcript', str(context.transcript_path),
+        '--expire-first-transcript', '--recover-deferred', 'obsidian_context_snapshot.py']
+    result = invoke_hook(context, command, context.transcript_path, dict(os.environ))
+    assert result.returncode == 0, result.stderr
+    proof = json.loads(next(line.split(':', 1)[1] for line in result.stderr.splitlines()
+                            if line.startswith('NATIVE_CONTEXT_PROOF:')))
+    first, last = proof['capture_results']
+    assert first['status'] == 'pending' and first['event'] == 'pre_compact'
+    assert set(first['warnings']) == {'Transcript deadline reached before reading',
+                                      'Native transcript identity is unverified'}
+    assert proof['initial_mutation_count'] == 0 and proof['recovery_attempted']
+    assert proof['replay_scope'] == 'unit-fixture-event-replay-not-native-L3'
+    assert last['event'] == 'pre_compact' and last['status'] == 'complete'
+    assert last['applied_revision'] and proof['mutation_contexts']
+    snapshots = list(context.vault_path.rglob('*snapshot*.md'))
+    parents = [p for p in context.vault_path.rglob('*.md') if p not in snapshots]
+    assert len(snapshots) == len(parents) == 1
+    text = snapshots[0].read_text()
+    assert 'source_session: "' + context.native_session_id + '"' in text
+    assert 'parent_session: "[[' + parents[0].stem + ']]"' in text
+    assert 'Keep all synthetic facts.' in text
+    assert context.transcript_path.read_bytes() == before
+
+
+@pytest.mark.parametrize('change', ['source', 'config', 'context', 'input-loss', 'unsupported', 'unverified-only'])
+def test_fixture_replay_refuses_changed_or_unqualified_input(selected_host_context, change):
+    from native_hook_test_driver import fixture_replay_baseline, qualify_fixture_replay
+    context = selected_host_context
+    baseline = fixture_replay_baseline(context)
+    pending = {'status': 'pending', 'pending_sources': 1, 'loss_of_input': False,
+               'applied_revision': None, 'warnings': ['Transcript deadline reached before reading',
+                    'Native transcript identity is unverified'], 'context': dict(baseline['context']),
+               'source_revision': hashlib.sha256(baseline['source'][0]).hexdigest()}
+    if change == 'source':
+        context.transcript_path.write_bytes(context.transcript_path.read_bytes() + b'\n')
+    elif change == 'config':
+        context.config_path.write_bytes(context.config_path.read_bytes() + b'\n')
+    elif change == 'context':
+        pending['context']['native_session_id'] = 'another-full-session'
+    elif change == 'input-loss':
+        pending['loss_of_input'] = True
+    elif change == 'unsupported':
+        pending['warnings'].append('Unknown substantive transcript record')
+    else:
+        pending['warnings'] = ['Native transcript identity is unverified']
+    with pytest.raises(AssertionError):
+        qualify_fixture_replay(context, pending, baseline)
+    assert not list(context.vault_path.rglob('*.md'))
+
+
+@pytest.mark.parametrize('damage', ['wrong-id', 'malformed'])
+def test_fixture_replay_requires_actual_complete_native_identity(selected_host_context, damage):
+    from native_hook_test_driver import fixture_replay_baseline
+    context = selected_host_context
+    if damage == 'wrong-id':
+        text = context.transcript_path.read_text().replace(context.native_session_id, 'another-full-session')
+        context.transcript_path.write_text(text)
+    else:
+        context.transcript_path.write_text(context.transcript_path.read_text() + '{unfinished')
+    with pytest.raises(AssertionError):
+        fixture_replay_baseline(context)
+    assert not list(context.vault_path.rglob('*.md'))
