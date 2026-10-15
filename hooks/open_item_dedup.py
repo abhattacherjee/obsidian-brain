@@ -1840,6 +1840,24 @@ def build_deep_presentation(
 
     # --- Build markdown ---
     sections: list[str] = []
+    gaps = pipeline.get('evidence_gaps', {})
+    all_gapped = bool(gaps.get('all_projects_gapped', False))
+    without_repo = sorted(set(gaps.get('projects_without_repo', [])))
+    evidence = pipeline.get('evidence', {})
+    pending_projects = {project for project in without_repo if not evidence.get(project)}
+    has_gaps = all_gapped or bool(without_repo)
+    if has_gaps:
+        sections.append('## Pending Evidence\n')
+        if all_gapped:
+            sections.append('Analysis is incomplete: no selected project produced evidence. Open-item completion remains unknown.\n')
+        for project in without_repo:
+            if project in pending_projects or all_gapped:
+                sections.append(f'- **{project}**: pending — no local repository or completion evidence is available.')
+            else:
+                sections.append(f'- **{project}**: local repository evidence is unavailable; note evidence alone cannot verify completion.')
+        if all_gapped and not without_repo:
+            sections.append('- Selected projects remain pending; evidence is unavailable.')
+        sections.append('')
 
     # Open Item Consolidation
     items_data = pipeline.get("items", {})
@@ -1856,12 +1874,15 @@ def build_deep_presentation(
         by_class: dict[str, list[dict]] = {}
         for item in classified_items:
             cls = item.get("classification", "UNKNOWN").upper()
+            if all_gapped or item.get('project') in pending_projects:
+                cls = 'PENDING'
             by_class.setdefault(cls, []).append(item)
 
         class_counts = {k: len(v) for k, v in by_class.items()}
         count_parts = ", ".join(f"**{v}** {k.lower()}" for k, v in sorted(class_counts.items()))
+        label = 'review status' if all_gapped or pending_projects else 'classified'
         sections.append(f"## Open Item Consolidation\n\n"
-                        f"**{total_raw}** raw items classified: {count_parts}.\n")
+                        f"**{total_raw}** raw items {label}: {count_parts}.\n")
 
         # Render each classification group in priority order
         class_order = _DEEP_CLASS_ORDER
@@ -1945,7 +1966,9 @@ def build_deep_presentation(
         actions.append("- [ ] Review orphaned notes for linking opportunities")
     if merge_suggestions:
         actions.append("- [ ] Consider merging similar insight notes")
-    if not actions:
+    if has_gaps:
+        actions.append('- [ ] Resolve the evidence gaps and rerun analysis; completion remains unverified for the pending projects.')
+    elif not actions:
         actions.append("- No actions needed — vault is well-connected!")
     sections.extend(actions)
 

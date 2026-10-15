@@ -1143,55 +1143,55 @@
     {
       "source": "hooks/open_item_dedup.py",
       "expression": "subprocess.run(['git', 'log', '--oneline', '-40'], cwd=repo_path, capture_output=True, text=True, timeout=10)",
-      "source_sha256": "850c553ec3ecddedc35f53e36d8589a9edba3163d7f20d74820bd2a1d3d737a3",
+      "source_sha256": "d66f656252f123f3b869b2fe2cca0c6217a79470ef77472b6956bdb32e596daa",
       "scope": "support",
       "reason": "Bounded or disposable-repository Git metadata/setup. The enclosing native operation keeps its separate host contract."
     },
     {
       "source": "hooks/open_item_dedup.py",
       "expression": "subprocess.run(['git', 'tag', '--list', '--sort=-creatordate'], cwd=repo_path, capture_output=True, text=True, timeout=10)",
-      "source_sha256": "850c553ec3ecddedc35f53e36d8589a9edba3163d7f20d74820bd2a1d3d737a3",
+      "source_sha256": "d66f656252f123f3b869b2fe2cca0c6217a79470ef77472b6956bdb32e596daa",
       "scope": "support",
       "reason": "Bounded or disposable-repository Git metadata/setup. The enclosing native operation keeps its separate host contract."
     },
     {
       "source": "hooks/open_item_dedup.py",
       "expression": "subprocess.run(['git', 'log', '--name-only', '--pretty=format:', '-40'], cwd=repo_path, capture_output=True, text=True, timeout=10)",
-      "source_sha256": "850c553ec3ecddedc35f53e36d8589a9edba3163d7f20d74820bd2a1d3d737a3",
+      "source_sha256": "d66f656252f123f3b869b2fe2cca0c6217a79470ef77472b6956bdb32e596daa",
       "scope": "support",
       "reason": "Bounded or disposable-repository Git metadata/setup. The enclosing native operation keeps its separate host contract."
     },
     {
       "source": "hooks/open_item_dedup.py",
       "expression": "subprocess.run(['gh', 'release', 'list', '--limit', '5'], cwd=repo_path, capture_output=True, text=True, timeout=10)",
-      "source_sha256": "850c553ec3ecddedc35f53e36d8589a9edba3163d7f20d74820bd2a1d3d737a3",
+      "source_sha256": "d66f656252f123f3b869b2fe2cca0c6217a79470ef77472b6956bdb32e596daa",
       "scope": "support",
       "reason": "Read-only release, PR, or issue metadata for the explicit repository. No native session or model is selected here."
     },
     {
       "source": "hooks/open_item_dedup.py",
       "expression": "subprocess.run(['gh', 'pr', 'list', '--state', 'merged', '--limit', '20', '--json', 'number,title,mergedAt,url'], cwd=repo_path, capture_output=True, text=True, timeout=10)",
-      "source_sha256": "850c553ec3ecddedc35f53e36d8589a9edba3163d7f20d74820bd2a1d3d737a3",
+      "source_sha256": "d66f656252f123f3b869b2fe2cca0c6217a79470ef77472b6956bdb32e596daa",
       "scope": "support",
       "reason": "Read-only release, PR, or issue metadata for the explicit repository. No native session or model is selected here."
     },
     {
       "source": "hooks/open_item_dedup.py",
       "expression": "subprocess.run(['gh', 'issue', 'list', '--state', 'closed', '--limit', '20', '--json', 'number,title,closedAt,body,url'], cwd=repo_path, capture_output=True, text=True, timeout=10)",
-      "source_sha256": "850c553ec3ecddedc35f53e36d8589a9edba3163d7f20d74820bd2a1d3d737a3",
+      "source_sha256": "d66f656252f123f3b869b2fe2cca0c6217a79470ef77472b6956bdb32e596daa",
       "scope": "support",
       "reason": "Read-only release, PR, or issue metadata for the explicit repository. No native session or model is selected here."
     },
     {
       "source": "hooks/open_item_dedup.py",
       "expression": "subprocess.run(['python3', cli_path, 'semantic_merge', str(out_path)], input=in_path.read_text(), capture_output=True, text=True, timeout=_outer_subagent_timeout())",
-      "source_sha256": "850c553ec3ecddedc35f53e36d8589a9edba3163d7f20d74820bd2a1d3d737a3",
+      "source_sha256": "d66f656252f123f3b869b2fe2cca0c6217a79470ef77472b6956bdb32e596daa",
       "capability": "ai.native_selection"
     },
     {
       "source": "hooks/open_item_dedup.py",
       "expression": "subprocess.run(['python3', cli_path, 'classifier', str(out_path)], input=in_path.read_text(), capture_output=True, text=True, timeout=_outer_subagent_timeout())",
-      "source_sha256": "850c553ec3ecddedc35f53e36d8589a9edba3163d7f20d74820bd2a1d3d737a3",
+      "source_sha256": "d66f656252f123f3b869b2fe2cca0c6217a79470ef77472b6956bdb32e596daa",
       "capability": "ai.native_selection"
     },
     {
@@ -1996,7 +1996,7 @@
     {
       "source": "tests/test_standup_deep.py",
       "expression": "original_run(cmd, **kwargs)",
-      "source_sha256": "f33223f67331d8c11667a3f3b1475c5a4899d8645b4629c0b008e49e9a6a6f34",
+      "source_sha256": "86dc6bb03885a9047061975278a9ee3002bc94271a385ceb5ac448c7e3ba004f",
       "scope": "support",
       "reason": "Paired standup test intercepts git-log and gh failures, forwarding remaining fixture repository commands. The real native pipeline remains actor-scoped."
     },

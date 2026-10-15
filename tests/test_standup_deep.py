@@ -1129,3 +1129,53 @@ class TestDeepClassOrder:
 from selected_legacy_vault import selected_host_context  # noqa: E402,F401
 
 pytestmark = pytest.mark.usefixtures("selected_host_context")
+
+
+@pytest.mark.parametrize('mode', ['all-gapped', 'partial-gapped', 'analyzed-empty'])
+def test_presentation_distinguishes_evidence_gaps_from_empty_analysis(tmp_vault, mode):
+    all_gapped = mode == 'all-gapped'
+    partial = mode == 'partial-gapped'
+    pipeline = {
+        'items': {'total_raw': 5 if all_gapped else 2 if partial else 0, 'groups': []},
+        'evidence': {'verified-project': {'git_log': ['verified commit']}} if not all_gapped else {},
+        'evidence_gaps': {
+            'projects_scanned': 2 if partial else 1,
+            'projects_with_evidence': 0 if all_gapped else 1,
+            'projects_without_repo': ['unknown-project'] if all_gapped or partial else [],
+            'all_projects_gapped': all_gapped,
+        },
+        'link_suggestions': [], 'merge_suggestions': [],
+    }
+    classifications = []
+    if partial:
+        pipeline['link_suggestions'] = [{'note_a': 'verified-a', 'note_b': 'verified-b', 'shared_keywords': ['SQLite']}]
+        classifications = [
+            {'classification': 'DONE', 'canonical': 'Verified completed task',
+             'project': 'verified-project', 'evidence': 'verified commit', 'instances': []},
+            {'classification': 'DONE', 'canonical': 'Unverified task',
+             'project': 'unknown-project', 'evidence': '', 'instances': []},
+        ]
+    pipeline_path = tmp_vault / 'pipeline-gaps.json'
+    classification_path = tmp_vault / 'classifications-gaps.json'
+    pipeline_path.write_text(json.dumps(pipeline))
+    classification_path.write_text(json.dumps(classifications))
+    result = open_item_dedup.build_deep_presentation(
+        str(pipeline_path), str(classification_path), '[]', str(tmp_vault),
+        'claude-sessions', 'claude-insights')
+    if all_gapped or partial:
+        assert '## Pending Evidence' in result
+        assert '**unknown-project**: pending' in result
+        assert 'completion remains unverified' in result
+        assert 'well-connected' not in result and 'No actions needed' not in result
+    else:
+        assert 'Pending Evidence' not in result
+        assert 'No actions needed — vault is well-connected!' in result
+    if all_gapped:
+        assert 'no selected project produced evidence' in result
+        assert '**5** raw items' in result
+    if partial:
+        assert '### Done (1)' in result
+        assert 'Verified completed task' in result and 'verified commit' in result
+        assert '### Pending (1)' in result and 'Unverified task' in result
+        assert '[[verified-a]] ↔ [[verified-b]]' in result
+        assert '- [ ] Add suggested wikilinks' in result
