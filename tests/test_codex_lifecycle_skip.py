@@ -1,4 +1,5 @@
 """Explicit native lifecycle selection resists inherited markers and foreign roots."""
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -9,6 +10,23 @@ import pytest
 from test_snapshot_e2e import selected_host_context
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def owned_state(context):
+    # Scope the no-write claim to plugin/native state. Apple Python can create
+    # unrelated stdlib bytecode in HOME/Library/Caches before the hook runs.
+    roots = (context.native_home, context.state_path, context.index_path.parent,
+             context.user_home / '.local/state/obsidian-brain', context.vault_path, context.config_path)
+    return {str(path): hashlib.sha256(path.read_bytes()).hexdigest()
+            for root in roots for path in ((root,) if root.is_file() else root.rglob('*'))
+            if path.is_file()}
+
+
+def invoke_hook(context, command, source, env):
+    return subprocess.run(command, input=json.dumps({
+        'session_id': context.native_session_id, 'cwd': str(context.worktree),
+        'transcript_path': str(source), 'trigger': 'manual'}),
+        text=True, capture_output=True, env=env, cwd=context.worktree, timeout=5)
 
 
 @pytest.mark.parametrize('script,event', [
@@ -42,14 +60,15 @@ def test_lifecycle_host_guard(selected_host_context, tmp_path, script, event, fo
             '--vault', str(context.vault_path), '--config', str(context.config_path),
             '--resource-root', str(context.resource_root), '--index', str(context.index_path),
             '--state', str(context.state_path), '--transcript', str(source), script]
-    result = subprocess.run(command, input=json.dumps({
-        'session_id': context.native_session_id, 'cwd': str(context.worktree),
-        'transcript_path': str(source), 'trigger': 'manual'}),
-        text=True, capture_output=True, env=env, cwd=context.worktree, timeout=5)
+    if not foreign_source and event == 'session_start':
+        command.insert(-1, '--recover-deferred')
+    state_before = owned_state(context)
+    result = invoke_hook(context, command, source, env)
     assert result.returncode == 0, result.stderr
     notes = list(context.vault_path.rglob('*.md'))
     if foreign_source:
         assert notes == []
+        assert owned_state(context) == state_before
         assert result.stdout == ''
         assert json.loads(result.stderr)['code'] == 'transcript_outside_host'
     else:
@@ -57,8 +76,48 @@ def test_lifecycle_host_guard(selected_host_context, tmp_path, script, event, fo
                                 if line.startswith('NATIVE_CONTEXT_PROOF:')))
         assert proof['host'] == context.host
         assert proof['native_session_id'] == context.native_session_id
-        assert proof['mutation_contexts']
+        assert proof['mutation_contexts'], result.stderr
         assert len(notes) == (2 if event == 'pre_compact' else 1)
         assert all('foreign-session' not in path.read_text() and 'foreign-thread' not in path.read_text()
                    for path in notes)
     assert source.read_bytes() == context.transcript_path.read_bytes()
+
+
+@pytest.mark.parametrize('recover', [False, True])
+def test_expired_start_retains_owned_input_then_next_stop_publishes(selected_host_context, recover):
+    context = selected_host_context
+    before = context.transcript_path.read_bytes()
+    command = [sys.executable, str(ROOT / 'tests' / 'native_hook_test_driver.py'),
+        '--host', context.host, '--client', context.client, '--session-id', context.native_session_id,
+        '--cwd', str(context.worktree), '--vault', str(context.vault_path), '--config', str(context.config_path),
+        '--resource-root', str(context.resource_root), '--index', str(context.index_path),
+        '--state', str(context.state_path), '--transcript', str(context.transcript_path),
+        '--expire-first-capture', 'obsidian_session_hint.py']
+    if recover:
+        command.insert(-1, '--recover-deferred')
+    result = invoke_hook(context, command, context.transcript_path, dict(os.environ))
+    assert result.returncode == 0, result.stderr
+    proof = json.loads(next(line.split(':', 1)[1] for line in result.stderr.splitlines()
+                            if line.startswith('NATIVE_CONTEXT_PROOF:')))
+    assert proof['initial_mutation_count'] == 0 and proof['recovery_attempted'] is recover
+    assert proof['source_path'] == str(context.transcript_path)
+    if not recover:
+        assert proof['capture_results'][0]['status'] == 'pending'
+        assert proof['capture_results'][0]['warnings'] == ['Capture deadline reached']
+        assert proof['capture_results'][0]['context']['native_session_id'] == context.native_session_id
+        assert proof['mutation_contexts'] == []
+        assert list(context.vault_path.rglob('*.md')) == []
+        assert context.transcript_path.read_bytes() == before
+        return
+    first, last = proof['capture_results']
+    assert first['status'] == 'pending' and first['warnings'] == ['Capture deadline reached']
+    assert last['event'] == 'stop' and last['status'] == 'complete' and last['applied_revision']
+    assert first['context'] == last['context'] == proof['mutation_contexts'][0]
+    assert first['context']['native_session_id'] == context.native_session_id
+    assert first['context']['host'] == context.host and first['context']['client'] == context.client
+    assert first['source_revision'] == last['source_revision'] == proof['source_revision']
+    notes = list(context.vault_path.rglob('*.md'))
+    assert len(notes) == 1
+    assert 'Capture the first synthetic fact.' in notes[0].read_text()
+    assert 'Keep all synthetic facts.' in notes[0].read_text()
+    assert context.transcript_path.read_bytes() == before

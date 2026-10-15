@@ -1256,7 +1256,7 @@
       "source": "tests/test_codex_lifecycle_skip.py",
       "expression": "subprocess.run(command, input=json.dumps({'session_id': context.native_session_id, 'cwd': str(context.worktree), 'transcript_path': str(source), 'trigger': 'manual'}), text=True, capture_output=True, env=env, cwd=context.worktree, timeout=5)",
       "capability": "capture.normalization",
-      "source_sha256": "2baf007f3d5e69329e50e7ebdd46deb9d4e8e2f55a75fe3c4353f15212f9b323"
+      "source_sha256": "8556362ce66d03e0a3b918b006d448798896fd945a241b1e5464a20b1ae3cf8d"
     },
     {
       "source": "tests/test_dev_skill_install.py",
