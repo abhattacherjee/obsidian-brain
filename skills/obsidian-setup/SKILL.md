@@ -210,6 +210,27 @@ test -f "$VAULT_PATH/claude-dashboards/<filename>" && echo "EXISTS" || echo "MIS
 If EXISTS and `MODE=upgrade`, skip this file — preserve user customizations.
 Otherwise (MISSING, or `MODE=fresh`, or `MODE=reconfigure`), publish the approved dashboard through `note-create`; bind any existing destination before a conditional replacement through `note-apply`.
 
+For a new dashboard, send this JSON request to the installed launcher's
+`note-create` operation:
+
+```json
+{
+  "operation_id": "<actual operation_id returned by prepare>",
+  "folder": "claude-dashboards",
+  "filename": "sessions-overview.md",
+  "content": "<complete reviewed dashboard Markdown>"
+}
+```
+
+Use the selected config's `dashboards_folder` as `folder`, relative to the vault
+(`claude-dashboards` by default). `filename` must be a bare `.md` name, not a path.
+Both fields are required; a full or relative destination `path` does not replace
+them. Substitute actual values and JSON-encode the reviewed body; never send
+the placeholder strings literally. Check that the combined destination is still
+absent, then show the complete request for approval before publication. Repeat
+with each approved dashboard's filename and body. Preserve existing files in
+upgrade mode.
+
 **Dashboard files to install:**
 
 **File: `$VAULT_PATH/claude-dashboards/sessions-overview.md`**
