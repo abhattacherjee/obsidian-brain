@@ -73,7 +73,7 @@ def copy_runtime(source, cache):
     try:
         if cache.exists():
             _copy_tree(cache, stage)
-        for relative in ('hooks', 'skills', '.claude-plugin', '.codex-plugin', '.codex',
+        for relative in ('hooks', 'skills', 'templates', 'dashboards', '.claude-plugin', '.codex-plugin', '.codex',
                          'scripts/vault_doctor_checks', 'scripts/dev-test'):
             origin = source / relative
             if origin.is_dir():

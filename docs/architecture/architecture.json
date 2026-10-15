@@ -1305,7 +1305,7 @@
             "scripts/dev-test/loaded_resource_root.py",
             "scripts/dev-test/validate-host-contracts.py"
           ],
-          "purpose": "Validates loaded roots and complete runtime packages before atomic cache publication. Codex backups and temporary packages stay outside plugins in owned, private recovery storage on the cache filesystem. Exact-byte rollback preserves permissions; legacy backups remain restorable. Version synchronization includes architecture HTML embedded metadata. Installed metadata proof does not certify current-client binding."
+          "purpose": "Validates loaded roots and complete runtime packages before atomic cache publication. Both host installers retain bundled templates and dashboards alongside hooks, skills and required runtime scripts; repository docs and tests stay outside the runtime package. Codex backups and temporary packages stay outside plugins in owned, private recovery storage on the cache filesystem. Exact-byte rollback preserves permissions; legacy backups remain restorable. Version synchronization includes architecture HTML embedded metadata. Installed metadata proof does not certify current-client binding."
         },
         {
           "id": "runtime-gates-tools",

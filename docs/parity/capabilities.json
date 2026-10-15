@@ -2093,7 +2093,7 @@
     {
       "source": "tests/test_readonly_dev_install.py",
       "expression": "subprocess.run(['bash', str(source / 'scripts/test-dev-skill.sh'), 'restore', '--host', selected_host_context.host, '--source', str(source), '--cache-path', str(cache)], env=metadata_environment(home), stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)",
-      "source_sha256": "e98f9fc524f7da5227ba418ba879ea283795c47faa6ee34d33e85ccf9e31fcb9",
+      "source_sha256": "e3e08407fc3454a2f5c186d5f3de3a61bae0bd86a31e35fbb7c5b1e4f17e130f",
       "scope": "support",
       "reason": "Runs only the copied restore script against a disposable private home and read-only partial cache, with metadata-only native inventory. Checks exact backup restoration and unchanged source permissions. No installed native client, AI, live configuration or vault runs; the enclosing paired test retains its host context."
     },

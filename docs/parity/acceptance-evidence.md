@@ -116,13 +116,15 @@ provenance. Pending capability records cannot certify a release.
 ## Native CLI progress, 2026-10-15
 
 These are partial test results, not acceptance certification. All seven issue
-criteria remain unchecked. The tested source commit is
+criteria remain unchecked. The native CLI results below use source commit
 `2ed4b3502b15ffb7c35e1c825a14f57f1f956eec`.
 
-- Normal commit preflight passed: 9,797 tests, 91.48% coverage. The separate
-  Python 3.9 focused run passed 176 tests. Published CI run `38758588224` passed
-  in 514 seconds, unchanged from its predecessor. Further shard changes still
-  require full preflight and a measured CI run.
+- Normal preflight on `1de35c85c29fc6bf60f6e3071e5a7c4ba91ca167` passed
+  9,808 tests with 91.48% coverage. The earlier Python 3.9 focused run passed
+  176 tests. CI run `38765148573` passed in 352 seconds, versus 514 seconds for
+  `38758588224`: 162 seconds saved, a 31.5% reduction. Both measurements cover
+  workflow creation through the last completed job. Host conformance run
+  `38765148000` also passed; its feature-branch native acceptance job was skipped.
 - The installed Codex CLI read a historical source larger than the old 4 MiB
   batch limit: 4,229,273 bytes and 563 normalized records. Two native helpers
   produced reviewed summaries. Normal publication succeeded for both selected
@@ -130,8 +132,20 @@ criteria remain unchecked. The tested source commit is
   skipped without duplicate notes. Independent checks verified the published
   bodies, source hashes, configuration and destination sentinel.
 - A real resume recorded `SYNTHETIC_IMPORT_GROWTH_272_2ED4B35` and exited with
-  wrapper status 0. Importing that growth and preserving concurrent manual edits
-  have not yet passed.
+  wrapper status 0. Normal import then updated the existing summary from the
+  grown source while preserving both manual markers, including one added after
+  the read. Both replays skipped without duplicate notes. Independent checks
+  verified the exact reviewed summary, complete manual tail and six physical
+  files. The parent exited normally with wrapper status 0 and process births
+  confirmed gone.
+- Positive independent process samples recorded registered SessionStart, Stop
+  and SessionEnd arguments with `--client codex-cli`, `--require-cli-launcher`
+  and direct native parentage. These samples do not prove the complete native
+  dispatch-to-exit deadline or the absence of other calls.
+- Native `dev-test` remains open. Its first successful install preserved the
+  backup but omitted bundled templates and dashboards. Acceptance requires
+  another installed-package run after the packaging repair, followed by restore
+  and fresh-session checks.
 
 Local receipts are under the private campaign directory
 `/Users/abhishek/.local/state/obsidian-272-parity/20261015`. Filenames below are
@@ -144,6 +158,11 @@ relative to that directory. They are progress receipts, not a release bundle.
 | `native-import-final-subset.json` | `74f49d458140deae7aaf8dceb77ebff58a25552888c72b2339641396c9eabeb5` |
 | `owned-import-helper-dispatch-metadata.json` | `2dde4205b8d4ca7b5df820c042ca054faf5c48ead2a52c81050b3d2aa9e3e3d7` |
 | `close-2ed4b350-1792079057998907000.json` | `95d8f1c3fe61a1b55b5831d795cebd84f8ae71f80cab2964136534fed1bdcd5e` |
+| `native-import-grown-final-subset.json` | `e4832f271cadc817cc9bc99836fcf91046ce7be3777e143a84e5b48d8b914220` |
+| `independent-native-import-growth.json` | `619e38bb3f844176b9f2e7b289bc94fb60cc29b5430babca9e45b3d08050909e` |
+| `independent-growth-hook-arguments.json` | `341d204e4d28b1b928233bc18ac2d2ed9c71442a13cc51a7837e76d1dbcfdbcd` |
+| `close-2ed4b350-1792079603578003000.json` | `a7429d139dcab5171ff7308b9b295189ed7b4764661afa625700519eb33691f0` |
+| `ci-1de35c8-measured-comparison.json` | `331fdfff8a7c6f8b096297c247fa9b8a2baca4504183b32b07ae607ca98f44e0` |
 
 The import subset contains selected bounded sidecars only. One raw output
 exceeded the normal collection limit and remains untouched in the VM. This

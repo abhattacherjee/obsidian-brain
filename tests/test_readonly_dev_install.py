@@ -41,14 +41,25 @@ def readonly(root):
 
 
 def test_readonly_source_install_and_readonly_partial_restore(tmp_path, selected_host_context):
+    import shutil
     source = _stage_repo(tmp_path)
+    for folder in ('templates', 'dashboards'):
+        shutil.copytree(ROOT / folder, source / folder)
+    expected_assets = {str(path.relative_to(source)): path.read_bytes()
+                       for folder in ('templates', 'dashboards')
+                       for path in (source / folder).rglob('*') if path.is_file()}
     home = _stage_cache(tmp_path)
     cache = home / native_folder() / 'plugins/cache/claude-code-skills/obsidian-brain/2.3.0'
+    for folder in ('templates', 'dashboards'):
+        target = cache / folder
+        target.mkdir()
+        (target / 'released-only.md').write_text('Keep released asset bytes.\n')
     original = inventory(cache)
     readonly(source)
     source_before = inventory(source)
     result = _run_install(tmp_path, home)
     assert result.returncode == 0, result.stderr
+    assert {name: (cache / name).read_bytes() for name in expected_assets} == expected_assets
     from tests.native_install_test_helpers import backup_path
     backup = backup_path(home, cache)
     assert inventory(backup) == original
@@ -124,3 +135,22 @@ def test_publish_failure_restores_original_tree(tmp_path, monkeypatch):
     assert inventory(cache) == before
     assert not list(tmp_path.glob('.runtime-stage-*'))
     assert not list(tmp_path.glob('.runtime-previous-*'))
+
+
+def test_fresh_runtime_copy_retains_bundled_assets_only(tmp_path, selected_host_context):
+    import shutil
+    source = _stage_repo(tmp_path)
+    for folder in ('templates', 'dashboards'):
+        shutil.copytree(ROOT / folder, source / folder)
+    (source / 'docs').mkdir()
+    (source / 'docs/private.md').write_text('Not a runtime resource.')
+    cache = tmp_path / 'empty runtime cache'
+    assert not cache.exists()
+    package.copy_runtime(source, cache)
+    for folder in ('templates', 'dashboards'):
+        expected = {path.relative_to(source / folder): path.read_bytes()
+                    for path in (source / folder).rglob('*') if path.is_file()}
+        actual = {path.relative_to(cache / folder): path.read_bytes()
+                  for path in (cache / folder).rglob('*') if path.is_file()}
+        assert actual == expected and actual
+    assert not (cache / 'docs').exists() and not (cache / 'tests').exists()
