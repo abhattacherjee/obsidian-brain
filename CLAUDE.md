@@ -43,8 +43,12 @@ python3 hooks/brain_cli.py --host "$OB_HOST" --client "$OB_CLIENT" --resource-ro
    it explicitly as `--client`; missing, invalid, or conflicting values skip
    capture before reading the payload. CLI launchers use
    `OB_CLIENT=codex-cli codex --no-daemon`. Registered capture requires that
-   isolated CLI in actual process ancestry and refuses shared-server ancestors,
-   unreadable ancestry, and Desktop dispatch. Ancestry never chooses a client.
+   isolated CLI in actual process ancestry. Desktop is opt-in: a root observer
+   must first attest a newly launched, pinned, signed Desktop and its private
+   stdio app-server under forced OS remote-control denial. Each hook rechecks
+   that proof. Missing proof, shared servers and unreadable ancestry skip capture.
+   Ancestry never chooses a client. See the Desktop setup in
+   `docs/parity/runtime-contracts.md`; native Desktop acceptance remains pending.
    An independent hook ancestry/argument observation is still required for
    acceptance; the declaration alone does not prove current-event binding.
 2. **Skills** use the loaded `skills/*/SKILL.md`, explicit runtime context, and

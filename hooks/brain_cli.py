@@ -35,7 +35,7 @@ def read_payload(raw):
     return value
 
 
-def main(argv=None, stdin=None, stdout=None, stderr=None, started_at=None):
+def main(argv=None, stdin=None, stdout=None, stderr=None, started_at=None, entry_monotonic_ns=None):
     started_at = time.monotonic() if started_at is None else started_at
     stdout = stdout if stdout is not None else sys.stdout
     stderr = stderr if stderr is not None else sys.stderr
@@ -55,6 +55,8 @@ def main(argv=None, stdin=None, stdout=None, stderr=None, started_at=None):
              "cwd": "cwd", "transcript": "transcript_path"}
     overrides = {target: getattr(args, source) for source, target in names.items()
                  if getattr(args, source) is not None}
+    context = None
+    timing_outcome = 'error'
     try:
         if stdin is None:
             stdin = sys.stdin
@@ -88,6 +90,7 @@ def main(argv=None, stdin=None, stdout=None, stderr=None, started_at=None):
             output = dispatch(context, args.event, payload, started_at)
             if output is not None:
                 stdout.write(json.dumps(output) + "\n")
+            timing_outcome = 'completed'
             return 0
         if args.command in {"capture", "recover"}:
             from capture import CaptureEvent, capture_checkpoint, recover_registered
@@ -117,6 +120,15 @@ def main(argv=None, stdin=None, stdout=None, stderr=None, started_at=None):
     except RuntimeContextError as exc:
         stderr.write(json.dumps({"code": exc.code, "message": str(exc)}) + "\n")
         return 0 if args.command == "hook" else 2
+    finally:
+        if args.command == 'hook' and context is not None and entry_monotonic_ns is not None:
+            complete_ns = time.monotonic_ns()
+            try:
+                from native_lifecycle import record_wrapper_timing
+                record_wrapper_timing(context, args.event, timing_outcome, entry_monotonic_ns, complete_ns)
+            except Exception:
+                # Diagnostics cannot change hook output, deadlines or pending work.
+                pass
 
 
 if __name__ == "__main__":

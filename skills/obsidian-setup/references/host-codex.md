@@ -28,6 +28,13 @@ The invoking runtime must explicitly supply the current client. If it does not,
 stop with "Current native client binding is unavailable". Do not default Desktop
 to CLI or infer the frontend from a transcript header or environment markers.
 
+Registered Desktop hooks additionally require the verified local stdio setup in
+`docs/parity/runtime-contracts.md` from the matching source checkout. The operator
+must install the reviewed app-only profile, run the protected observer, and launch
+Desktop afresh with its declaration. A declaration, a trusted hook listing, or an
+old attestation alone is insufficient. Do not restart the app or install policy
+from a skill. Missing proof stays pending; do not substitute a CLI invocation.
+
 Context, metadata and local operations use the ordinary workspace sandbox.
 Native AI may also need SQLite writes under the selected private `CODEX_HOME`
 and network access to the declared provider API. The user must first authorize

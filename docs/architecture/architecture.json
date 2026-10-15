@@ -213,9 +213,10 @@
           "files": [
             "hooks/hooks.json",
             "hooks/codex-hooks.json",
-            "hooks/native_entry.py"
+            "hooks/native_entry.py",
+            "hooks/desktop_binding.py"
           ],
-          "purpose": "Claude hooks/hooks.json and Codex hooks/codex-hooks.json select native_entry.py for SessionStart, Stop, PreCompact and SessionEnd. Claude binds claude-code explicitly. Codex passes the pre-launch declaration and requires verified CLI ancestry with --no-daemon; shared-server, Desktop, missing or conflicting identity skips before runtime access. Native delivery still requires acceptance evidence."
+          "purpose": "Claude hooks/hooks.json and Codex hooks/codex-hooks.json select native_entry.py for lifecycle events. Codex current-launcher verification keeps isolated CLI ancestry or requires pinned signed Desktop/stdin-out socketpairs plus a root-observed prebirth forced-OS remote-control denial. The finite root observer hashes assets once; each hook checks live identity, policy and stable file metadata. Missing proof skips before payload access. Native Desktop delivery remains acceptance-pending."
         }
       ]
     },
@@ -492,7 +493,7 @@
             "hooks/native_lifecycle.py",
             "hooks/brain_cli.py"
           ],
-          "purpose": "Shared bounded Start/resume, Stop, PreCompact and End handlers capture before legacy retro gates, retain pending input, and recover bounded registered sources. Claude and Codex descriptors enter native_entry. Each bound SessionEnd handler appends one private outcome log entry; bootstrap failures without a verified context report only to stderr. Fixtures prove shared behavior, not actual Desktop dispatch."
+          "purpose": "Shared bounded Start/resume, Stop, PreCompact and End handlers capture before legacy retro gates, retain pending input, and recover bounded registered sources. Claude and Codex descriptors enter native_entry. Each bound SessionEnd handler appends one private outcome log entry; optional wrapper timing writes exclusive payload-free 0600 metadata to that session’s guarded logs after dispatch, with no unbound or default logging; bootstrap failures without a verified context report only to stderr. Fixtures prove shared behavior, not actual Desktop dispatch."
         },
         {
           "id": "native-ai-backend",

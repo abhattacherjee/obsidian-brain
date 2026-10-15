@@ -481,11 +481,13 @@
       "CODEX_SANDBOX_NETWORK_DISABLED",
       "CODEX_THREAD_ID"
     ],
-    "hooks/native_lifecycle.py": [
-      "OBSIDIAN_BRAIN_NESTED_AI"
-    ],
     "hooks/native_entry.py": [
-      "OB_CLIENT"
+      "OB_CLIENT",
+      "OB_NATIVE_DIAGNOSTIC_TIMING"
+    ],
+    "hooks/native_lifecycle.py": [
+      "OBSIDIAN_BRAIN_NESTED_AI",
+      "OB_NATIVE_DIAGNOSTIC_TIMING"
     ],
     "hooks/obsidian_context_snapshot.py": [
       "OBSIDIAN_BRAIN_NESTED_AI"

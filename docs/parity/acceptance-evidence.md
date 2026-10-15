@@ -163,6 +163,23 @@ relative to that directory. They are progress receipts, not a release bundle.
 | `independent-growth-hook-arguments.json` | `341d204e4d28b1b928233bc18ac2d2ed9c71442a13cc51a7837e76d1dbcfdbcd` |
 | `close-2ed4b350-1792079603578003000.json` | `a7429d139dcab5171ff7308b9b295189ed7b4764661afa625700519eb33691f0` |
 | `ci-1de35c8-measured-comparison.json` | `331fdfff8a7c6f8b096297c247fa9b8a2baca4504183b32b07ae607ca98f44e0` |
+| `preflight-runtime-assets-final.log` | `f5067c6a91c8820f781e739d35cfdba923d49a9e2d19968e312702242bf65a3a` |
+| `ci-863e56c-measured-comparison.json` | `0a04097e599e0a10566c51a5d7ebd77e14ffec4f50472ecd4e7fd287a0832570` |
+| `conformance-38769398945-run.json` | `d8064477c51beee6bc374ba66ca3877a022f6102c99b3f278af77cf6926a8819` |
+| `conformance-38769398945-jobs.json` | `b7f2c32580c1f1ce44b7994e920c06e36f0643fdb19c8a5206854157ce6a0bf7` |
+| `install-863e56ca-1792082867456768000.json` | `c2260196312d625929a30fed0920cd75645ddd5c6f4c06043fd01ab9255a8013` |
+| `native-evidence-1792083772077081000/metadata.json` | `08e9f59286756fca728c0a7f23ed908c7d8540622f3f96e1b1ef96d3cc90d4cf` |
+| `native-evidence-1792083772077081000/423f92a1484d-dev-test-install-863-review.json` | `f911b88fc4850584cb092b23a0e3360a75731d6070f347557f8f6a4487a87a38` |
+| `native-evidence-1792084077819434000/metadata.json` | `69e6170f2bcd9e889b4c0c78b876d65c1316911a40e529a37f9ddabd9e9e83fd` |
+| `native-evidence-1792084077819434000/d74c703f7a11-dev-active-new-session-review.json` | `a670c850b152e16dbf68cf885ff054486b495e576c3631b5da592dc9e2319bcc` |
+| `native-evidence-1792084157261750000/metadata.json` | `ff0b5c53af508a2c4da505b284578201e9221758341ea05f46ed89ad2b91e680` |
+| `native-evidence-1792084157261750000/488089576e8c-dev-restored-review.json` | `8e929f641abc08b9dfb55c28075aeeafd90d49bb23476b5a73490f92135aad75` |
+| `native-evidence-1792084460261181000/metadata.json` | `bfd9655adf9a0686aaab1ea19ac0fdc70c40cfa91167880d9365cb479dfaaf47` |
+| `independent-final-dev-cycle-863.json` | `96676241eddfd3094c00553ae6b8136351f4b04eebd5a5f6e16fdeddafb61547` |
+| `close-863e56ca-1792083378908029000.json` | `28704f62f498d0e5e52d720819afef92c7fddeca72036594a2cc3b2fa84eab71` |
+| `close-863e56ca-1792083793894011000.json` | `edf8934c36b2d1c31df27bb3c816059ab0faac174729ea4fd8149ae409bf6927` |
+| `close-863e56ca-1792084166892055000.json` | `4539579332bdb31939889c6b6abbd25ed6144d5c1e54f8ee64c6cdae324a801a` |
+| `close-863e56ca-1792084538900795000.json` | `acde16c61dfd8e104c96d34673beb9513a9b4021544627552b09c3a074952beb` |
 
 The import subset contains selected bounded sidecars only. One raw output
 exceeded the normal collection limit and remains untouched in the VM. This
@@ -171,3 +188,53 @@ It does not qualify the full 19-skill plan, lifecycle and cache checks, native
 Desktop dispatch, dashboard checks or Claude regression testing. Desktop
 binding remains unimplemented and unverified; Claude testing remains paused
 until the Codex plan passes.
+
+### Later checkpoint on 2026-10-15: fixed native dev-test cycle
+
+The earlier packaging failure above is retained. The completed cycle below uses
+`863e56ca8ffd2196c0836cd8a52940d292b057a9`, tree
+`45d97184ee869245f3183e77a93f8db55f5096af`; it does not transfer all earlier
+native results to this source.
+
+- Normal preflight passed 9,810 tests out of 9,843 collected, with 3 skipped
+  and 30 expected failures, at 91.48% combined coverage. The parallel phase
+  passed 9,554 tests in 637.16 seconds; the separate serial phase passed all
+  256 timing cases in 102.78 seconds.
+- [CI run 38769399058](https://github.com/abhattacherjee/obsidian-brain/actions/runs/38769399058)
+  passed in 341 seconds, measured from workflow creation to the last completed
+  job. The same measure was 514 seconds for baseline run `38758588224`:
+  173 seconds saved, a 33.6576% reduction. This measures workflow wall time,
+  not a controlled CPU benchmark.
+  [Host conformance run 38769398945](https://github.com/abhattacherjee/obsidian-brain/actions/runs/38769398945)
+  passed; native acceptance was skipped.
+- The normal native plugin manager installed all 477 canonical source files.
+  Its retained install receipt binds installed-verification SHA256
+  `542ddf99e739ed2a376ba23445e694dffd87a6c78fa5a5b7e822808c50b1f172`.
+  Actual native `dev-test install` then exited zero, preserved all 498 original
+  cache files and installed exactly 162 runtime files, including all 14 bundled
+  template/dashboard entries. The curated runtime intentionally excludes
+  repository documentation and tests.
+- A new native session loaded that curated runtime and returned
+  `dev_active: true`; all 649 recorded readiness checks passed. Normal
+  `dev-test restore` exited zero. A further new native session loaded the
+  restored full 477-file source and returned `dev_active: false`, with status
+  exit zero and protected files unchanged.
+- Independent final filesystem checks matched every original cache entry:
+  560 entries, 498 files, no missing or changed entries, and no added entries.
+  All 21 existing generated bytecode files and the three generated files in
+  the source export passed header and reviewed-source code checks. Recovery
+  backup and configuration record were absent. The selected config, native
+  config and synthetic sentinel retained their exact hashes and mode `0600`.
+- The first strict inventory attempt and its normal restore remain recorded:
+  one added generated bytecode file caused that attempt to stop, with no
+  original entry missing or changed. It was not relabeled as a successful
+  inventory. All four dev-cycle clients later exited normally with wrapper
+  status zero, their observed process births gone and observers closed.
+
+These results qualify this scoped native CLI dev-test cycle only. The D8
+model-pinned classifier-cache test is at readiness, with no cache PASS yet.
+All seven issue acceptance criteria remain unchecked. The full 19-skill plan,
+remaining lifecycle/cache checks, complete native end-to-end deadline,
+Desktop acceptance, dashboard checks and Claude regression testing remain
+pending. Desktop implementation work is underway; it is not certified.
+Claude testing remains paused until the Codex plan passes.

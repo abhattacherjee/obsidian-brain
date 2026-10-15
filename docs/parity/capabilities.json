@@ -1094,21 +1094,21 @@
     {
       "source": "tests/test_native_entry_binding.py",
       "expression": "subprocess.run(['/usr/bin/codesign', '--force', '--sign', '-', str(executable)], stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10)",
-      "source_sha256": "275a7b4b43f6fad7cf087182df388b0175dea3d467aa7facbecbf89774d262e4",
+      "source_sha256": "aee4e8e19d2051a8f4e7bd3b48a897ea7aabaaaaf6220b1f7210367b99ca1c32",
       "scope": "structural",
       "reason": "Private copied-Python argv controls only: macOS ad-hoc signs the disposable fixture executable, then Python launches that fixture to inspect actual kernel argv boundaries. No native client, model, credentials, installed binaries or live stores are used. This is synthetic launcher validation, not native acceptance."
     },
     {
       "source": "tests/test_native_entry_binding.py",
       "expression": "subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10)",
-      "source_sha256": "275a7b4b43f6fad7cf087182df388b0175dea3d467aa7facbecbf89774d262e4",
+      "source_sha256": "aee4e8e19d2051a8f4e7bd3b48a897ea7aabaaaaf6220b1f7210367b99ca1c32",
       "scope": "structural",
       "reason": "Private copied-Python argv controls only: macOS ad-hoc signs the disposable fixture executable, then Python launches that fixture to inspect actual kernel argv boundaries. No native client, model, credentials, installed binaries or live stores are used. This is synthetic launcher validation, not native acceptance."
     },
     {
       "source": "tests/test_native_entry_binding.py",
       "expression": "subprocess.run(command, shell=True, env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=5)",
-      "source_sha256": "275a7b4b43f6fad7cf087182df388b0175dea3d467aa7facbecbf89774d262e4",
+      "source_sha256": "aee4e8e19d2051a8f4e7bd3b48a897ea7aabaaaaf6220b1f7210367b99ca1c32",
       "scope": "structural",
       "reason": "Disposable installed-entry recorder checks the four Codex descriptor shell expansions, including missing and invalid pre-launch declarations and paths with spaces. It launches no native client, model, hook runtime or live store; this check does not certify native dispatch."
     },
@@ -1411,13 +1411,13 @@
     {
       "source": "tests/test_native_lifecycle_integration.py",
       "expression": "subprocess.run(command, input=json.dumps({'session_id': native_id, 'cwd': str(context.worktree), 'transcript_path': str(source)}), text=True, capture_output=True, timeout=5)",
-      "source_sha256": "7e331a8a165a6f05d6df1faf8dea8cf86aca75112bf34c241cd9858413dffa42",
+      "source_sha256": "a1b90d55d256f0a436b47e94162d5b2eccea583558f7a534f51a3c0c4258cd24",
       "capability": "capture.normalization"
     },
     {
       "source": "tests/test_native_lifecycle_integration.py",
       "expression": "subprocess.run([sys.executable, str(wrapper), '--host', 'codex'], stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=5)",
-      "source_sha256": "7e331a8a165a6f05d6df1faf8dea8cf86aca75112bf34c241cd9858413dffa42",
+      "source_sha256": "a1b90d55d256f0a436b47e94162d5b2eccea583558f7a534f51a3c0c4258cd24",
       "scope": "structural",
       "reason": "Codex wrapper without verified current-client binding skips before runtime/capture and retains no source. This is a negative control, not successful lifecycle evidence."
     },
@@ -2102,6 +2102,13 @@
       "expression": "subprocess.run(command, env=metadata_environment(home), stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)",
       "source_sha256": "dc448eb9f80610de28faaa46bba6fec4d9bc1b232dd54534d77b022bce8a3291",
       "capability": "installation.rollback"
+    },
+    {
+      "source": "hooks/desktop_binding.py",
+      "expression": "subprocess.run(['/usr/bin/python3', '-I', '-c', source], env={'PATH': '/usr/bin:/bin', 'HOME': account.pw_dir}, preexec_fn=drop_privileges, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=2)",
+      "source_sha256": "ac3c75a29e03879cd4ddca42c72ce60c62c66f709fc085eaa5045a5a58b8531f",
+      "scope": "structural",
+      "reason": "Root-staged foreground Desktop observer only: fixed OS Python runs the reviewed CFPreferences reader after dropping to the console UID, with isolated imports, a minimal noncredential environment, closed stdin and a two-second deadline. Reads only the exact forced remote-control policy; no native client, model, auth, transcript, provider, or vault operation."
     }
   ]
 }

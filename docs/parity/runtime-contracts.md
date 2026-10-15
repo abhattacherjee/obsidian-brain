@@ -32,6 +32,126 @@ that a desktop conversation dispatched a hook. An earlier CLI observation was
 `0.155.1`; the CLI changed during this session. The committed fixtures were
 recorded again against the current binary.
 
+## Optional native wrapper timing
+
+`OB_NATIVE_DIAGNOSTIC_TIMING=1` opts registered hooks into payload-free timing.
+It does not select identity or change lifecycle decisions. After context binding,
+`brain_cli` writes one exclusive `0600` `hook-timing-<PID>-<entry_ns>.json` under
+that session's guarded `logs` directory outside the vault. No path is accepted
+from the environment. Records contain only schema, event, wrapper outcome, PID,
+entry/completion monotonic nanoseconds and elapsed nanoseconds (at most 4 KiB).
+An unbound hook writes nothing. Missing/failed diagnostics leave pending capture
+and normal output unchanged; missing records cannot qualify a timing check.
+The completion timestamp precedes diagnostic writing. Independent process entry
+and exit tracing must also bound the write and exit overhead. These measurements
+do not claim a cold OS page cache.
+
+## Verified local Desktop setup
+
+This is an opt-in binding implementation, not native Desktop acceptance evidence.
+It supports Desktop `26.1007.71326` build `20398` and its bundled
+`0.162.0-alpha.17.2` code only. An update refuses until its pins are reviewed.
+The installed executable matches every byte before `LC_CODE_SIGNATURE` in the
+official `rust-v0.162.0-alpha.17.2` release; its bundle signing data differs.
+
+The registered entry uses `--require-current-launcher`. CLI keeps its existing
+`--no-daemon` ancestry check. Desktop requires the nearest native owner to be
+the pinned app-server directly under the signed Desktop process, reciprocal
+unshared anonymous stdio socketpairs, stable PID/birth identities, unchanged
+attested app/ASAR/server files, and genuine OS-forced remote-control denial.
+A nearer CLI, proxy, daemon, listener, missing field or changed proof refuses
+before reading the hook payload. Per-hook checks do not hash the large assets.
+
+The system `requirements.toml` alone is insufficient: this client's enterprise
+and forced macOS layers can override its scalar. A manually installed
+`com.apple.ManagedClient.preferences` profile can force the highest layer
+without enrolling the Mac in MDM. The generated profile changes only
+`com.openai.codex:requirements_toml_base64` to the base64 encoding of
+`allow_remote_control = false` plus a newline. This disables device remote
+control for Codex clients on this Mac. It does not disable outbound SSH projects;
+those use separate remote app-servers and do not qualify as local Desktop.
+Do not replace an existing managed requirements policy with this one-key profile.
+An existing policy needs a separate reviewed merge; the verifier otherwise refuses.
+
+Apple documents manual installation and removal in System Settings → General →
+Device Management. No enrollment payload is generated. Review the exact profile
+before installation. No helper installs/removes policy, launches/restarts Desktop,
+signals a process, or drives the app UI. Existing computer-use restrictions remain.
+
+Generate the reviewable artifact in an owned directory with mode `0700`:
+
+```bash
+python3 /absolute/loaded/hooks/desktop_binding.py --profile-output /absolute/private/desktop.mobileconfig
+```
+
+After the operator installs it, the foreground observer must first see the
+forced value through Apple's API in both root and console-user contexts. Only
+then may the operator close and relaunch Desktop normally. Take care if Desktop
+is hosting the active task: run the observer from a separate terminal and preserve
+the task first. Declare `OB_CLIENT=codex-desktop` before the actual new app starts;
+an already-running app cannot acquire a new declaration through an `open` handoff.
+The observer accepts only a new signed Desktop and new direct stdio child born
+after its policy observation. It has no target-PID or positive-claim input.
+
+Run only reviewed, root-staged observer bytes. The following bootstrap refuses a
+changed source before executing it. Replace both literals from the reviewed
+candidate; never compute the expected hash from an unreviewed file at launch:
+
+```bash
+sudo /usr/bin/python3 -I -c '
+import hashlib, os, stat
+source = "/absolute/loaded/hooks/desktop_binding.py"
+expected = "<REVIEWED_64_HEX_SHA256>"
+assert len(expected) == 64 and all(c in "0123456789abcdef" for c in expected)
+fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW)
+before = os.fstat(fd)
+assert stat.S_ISREG(before.st_mode) and before.st_nlink == 1 and before.st_size <= 100000
+with os.fdopen(fd, "rb") as stream:
+    code = stream.read(100001)
+    after = os.fstat(stream.fileno())
+assert (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) == (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+assert hashlib.sha256(code).hexdigest() == expected
+for parent in ("/private", "/private/var", "/private/var/root"):
+    info = os.lstat(parent)
+    assert stat.S_ISDIR(info.st_mode) and info.st_uid == 0 and not info.st_mode & 0o022
+stage = "/private/var/root/obsidian-brain-desktop-" + expected
+os.mkdir(stage, 0o700)
+path = stage + "/observer.py"
+fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o500)
+with os.fdopen(fd, "wb") as stream:
+    stream.write(code)
+    stream.flush()
+    os.fsync(stream.fileno())
+os.execve("/usr/bin/python3", ["/usr/bin/python3", "-I", path, "--watch", "180"], {"PATH": "/usr/bin:/bin", "HOME": "/var/root"})
+' < /dev/null
+```
+
+The observer stops within its explicit watch window (maximum 600 seconds).
+It validates signed resources and hashes the pinned files once. Its root-owned
+read-only receipt lives in the console user's private `0700`
+`~/Library/Application Support/obsidian-brain-desktop/` directory. It records
+only policy/code hashes, file identities, PID/birth and socket metadata. A hook
+checks the actual nearest owner, signatures, endpoints, current forced value,
+boot identity and file metadata again. User-written receipts cannot qualify.
+Receipt removal or policy removal restores refusal; no fallback retains input.
+
+The [pinned server](https://github.com/openai/codex/blob/rust-v0.162.0-alpha.17.2/codex-rs/app-server/src/lib.rs) snapshots `RemoteControlStartConfig.policy` at startup. Its
+remote-control session keeps that plain immutable value, including replacement
+auth sessions, and [every enable request checks it](https://github.com/openai/codex/blob/rust-v0.162.0-alpha.17.2/codex-rs/app-server-transport/src/transport/remote_control/mod.rs). Removing and reinstalling the
+same forced profile cannot enable remote ingress in a server born with
+`DisabledByRequirements`. This claim depends on the exact pinned server bytes;
+an app/server update requires a new source review and pins. Per-hook OS checks
+still refuse when the forced value is missing or changed.
+
+Actual registered Desktop lifecycle, same-thread frontend switching, concurrent
+CLI/Desktop isolation and end-to-end latency still need operator-run evidence.
+The observer's metadata does not replace those checks.
+
+Sources: [Apple managed preferences](https://developer.apple.com/documentation/devicemanagement/managedpreferences),
+[Apple manual profile installation](https://support.apple.com/guide/mac-help/mh35561/mac),
+[pinned Codex requirements composition](https://github.com/openai/codex/blob/rust-v0.162.0-alpha.17.2/codex-rs/config/src/loader/managed_requirements.rs),
+[pinned transport selection](https://github.com/openai/codex/blob/rust-v0.162.0-alpha.17.2/codex-rs/app-server/src/lib.rs).
+
 ## Discovery and installation
 
 In the initial historical probe, both binaries accepted a local marketplace and installed version `3.8.0` in

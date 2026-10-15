@@ -13,6 +13,34 @@ EVENTS = {"session_start", "resume", "stop", "pre_compact", "session_end", "reco
 STDIN_CAP_CHARS = 1000000
 
 
+def record_wrapper_timing(context, event, outcome, entry_ns, complete_ns):
+    """Write optional payload-free timing only in this bound session's logs."""
+    if (os.environ.get('OB_NATIVE_DIAGNOSTIC_TIMING') != '1' or event not in EVENTS
+            or outcome not in {'completed', 'error'} or type(entry_ns) is not int
+            or type(complete_ns) is not int or not 0 < entry_ns <= complete_ns):
+        return
+    from session_auxiliary_state import directory
+    root = directory(context, 'logs')
+    path = root / f'hook-timing-{os.getpid()}-{entry_ns}.json'
+    payload = json.dumps({'schema': 1, 'event': event, 'outcome': outcome, 'pid': os.getpid(),
+                          'entry_monotonic_ns': entry_ns, 'main_complete_ns': complete_ns,
+                          'elapsed_ns': complete_ns - entry_ns}, sort_keys=True).encode()
+    if len(payload) > 4096:
+        return
+    temporary = root / f'.hook-timing-{os.getpid()}-{entry_ns}.tmp'
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        with os.fdopen(descriptor, 'wb', closefd=False) as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(descriptor)
+        # Hard-link publication is atomic and refuses an existing final name.
+        os.link(temporary, path, follow_symlinks=False)
+    finally:
+        os.close(descriptor)
+        temporary.unlink()
+
+
 def _warn(stage, error):
     print(f"[obsidian-brain] {stage} failed: {error}", file=sys.stderr)
 

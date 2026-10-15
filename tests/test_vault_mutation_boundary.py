@@ -105,6 +105,29 @@ def _writes(node, readonly_names=()):
 
 def _allowed(file, function, node):
     name = ast.unparse(node.func)
+    if file == 'hooks/native_lifecycle.py' and function == 'record_wrapper_timing':
+        return ast.unparse(node) in {
+            'os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 384)',
+            'os.link(temporary, path, follow_symlinks=False)', 'temporary.unlink()',
+            "os.fdopen(descriptor, 'wb', closefd=False)", 'stream.write(payload)',
+        }
+    if file == 'hooks/desktop_binding.py':
+        # Root observation writes only its fixed private attestation. The
+        # unprivileged CLI can exclusively create a reviewed profile artifact.
+        approved = {
+            '_write_receipt': {
+                'os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 256, dir_fd=directory)',
+                "os.fdopen(descriptor, 'wb', closefd=False)", 'stream.write(raw)',
+                'os.replace(name, path.name, src_dir_fd=directory, dst_dir_fd=directory)',
+                'os.unlink(name, dir_fd=directory)',
+            },
+            'main': {
+                'os.open(args.profile_output, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 384)',
+                "os.fdopen(descriptor, 'wb')",
+                'stream.write(plistlib.dumps(profile_payload(), sort_keys=True))',
+            },
+        }
+        return ast.unparse(node) in approved.get(function, set())
     if file == 'hooks/note_transactions.py':
         return True
     if file == 'hooks/check_items_cli.py' and function in {'run_semantic_merge', 'run_classifier'}:
@@ -526,6 +549,21 @@ def test_ai_receipt_exception_is_scoped_and_cannot_publish_vault_content():
     assert _violations(source, 'hooks/unreviewed_writer.py')
 
 
+def test_desktop_attestation_exception_cannot_publish_vault_content():
+    root = Path(__file__).resolve().parents[1]
+    tree = ast.parse((root / 'hooks/desktop_binding.py').read_text())
+    functions = {node.name: ast.unparse(node) for node in tree.body if isinstance(node, ast.FunctionDef)}
+    for name in ('_write_receipt', 'main'):
+        source = functions[name]
+        assert not _violations(source, 'hooks/desktop_binding.py')
+        assert _violations(source + '\n    Path(vault_note).write_text("bypass")\n', 'hooks/desktop_binding.py')
+        assert _violations(source, 'hooks/unreviewed_writer.py')
+    assert _violations(functions['_write_receipt'].replace('stream.write(raw)', 'stream.write(note_body)'),
+                       'hooks/desktop_binding.py')
+    assert _violations(functions['_write_receipt'].replace('os.replace(name, path.name,', 'os.replace(name, vault_note,'),
+                       'hooks/desktop_binding.py')
+
+
 def test_first_semantic_binding_has_only_exact_private_manifest_write():
     root = Path(__file__).resolve().parents[1]
     tree = ast.parse((root / 'hooks/operation_state.py').read_text())
@@ -541,3 +579,18 @@ def test_first_semantic_binding_has_only_exact_private_manifest_write():
                        'hooks/operation_state.py')
     assert _violations(source + '\n    Path(note_path).write_text("bypass")\n',
                        'hooks/operation_state.py')
+
+
+def test_wrapper_timing_writer_has_only_bound_private_sink():
+    root = Path(__file__).resolve().parents[1]
+    tree = ast.parse((root / 'hooks/native_lifecycle.py').read_text())
+    function = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                    and node.name == 'record_wrapper_timing')
+    source = ast.unparse(function)
+    assert "root = directory(context, 'logs')" in source
+    assert 'OB_NATIVE_DIAGNOSTIC_TIMING' in source
+    assert not _violations(source, 'hooks/native_lifecycle.py')
+    assert _violations(source + '\n    Path(vault_note).write_text("bypass")\n',
+                       'hooks/native_lifecycle.py')
+    assert _violations(source.replace('stream.write(payload)', 'stream.write(note_body)'),
+                       'hooks/native_lifecycle.py')

@@ -2,13 +2,15 @@
 """Run an explicitly bound native hook from its installed resource tree."""
 from __future__ import annotations
 
+import time
+
+STARTED_AT = time.monotonic()
+ENTRY_MONOTONIC_NS = time.monotonic_ns()
+
 import argparse
 import os
 from pathlib import Path
 import sys
-import time
-
-STARTED_AT = time.monotonic()
 RESOURCE_ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -131,6 +133,19 @@ def isolated_cli_ancestor():
     return False
 
 
+def isolated_desktop_ancestor():
+    """Load OS-specific proof code only for an explicit Desktop invocation."""
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "brain_desktop_binding", RESOURCE_ROOT / "hooks" / "desktop_binding.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module.verified_desktop_ancestor()
+    except (ImportError, OSError, ValueError):
+        return False
+
+
 def run(argv=None, *, started_at=None):
     arguments = list(sys.argv[1:] if argv is None else argv)
     if any(value == "--resource-root" or value.startswith("--resource-root=")
@@ -142,6 +157,7 @@ def run(argv=None, *, started_at=None):
     selection.add_argument("--host")
     selection.add_argument("--client")
     selection.add_argument("--require-cli-launcher", action="store_true")
+    selection.add_argument("--require-current-launcher", action="store_true")
     try:
         selected, _ = selection.parse_known_args(arguments)
     except SystemExit:
@@ -164,6 +180,18 @@ def run(argv=None, *, started_at=None):
         print("[obsidian-brain] native client declaration conflicts with the selected client; "
               "capture was skipped; no source was retained.", file=sys.stderr)
         return 0
+    if selected.require_cli_launcher and selected.require_current_launcher:
+        print("[obsidian-brain] conflicting launcher contracts; capture was skipped; no source was retained.",
+              file=sys.stderr)
+        return 0
+    if selected.require_current_launcher:
+        verified = (selected.host == "codex" and (
+            isolated_cli_ancestor() if selected.client == "codex-cli" else isolated_desktop_ancestor()))
+        if not verified:
+            print("[obsidian-brain] current native launcher proof is unavailable; capture was skipped; "
+                  "no source was retained.", file=sys.stderr)
+            return 0
+        arguments.remove("--require-current-launcher")
     if selected.require_cli_launcher:
         if selected.host != "codex" or selected.client != "codex-cli" or not isolated_cli_ancestor():
             print("[obsidian-brain] isolated Codex CLI launcher is unavailable; capture was skipped; "
@@ -174,8 +202,10 @@ def run(argv=None, *, started_at=None):
     sys.path.insert(0, str(RESOURCE_ROOT / "hooks"))
     try:
         from brain_cli import main
+        timing = ({'entry_monotonic_ns': ENTRY_MONOTONIC_NS}
+                  if os.environ.get('OB_NATIVE_DIAGNOSTIC_TIMING') == '1' else {})
         main(["--resource-root", str(RESOURCE_ROOT), *arguments, "hook"],
-             started_at=STARTED_AT if started_at is None else started_at)
+             started_at=STARTED_AT if started_at is None else started_at, **timing)
     except (Exception, SystemExit):
         print("[obsidian-brain] native lifecycle failed; capture was skipped; no source was retained.", file=sys.stderr)
     return 0

@@ -647,3 +647,93 @@ def test_native_start_summary_has_content_or_explicit_pending(context, capture_c
     assert text.endswith(expected)
     assert 'Private decision' not in text
     assert '<!--' not in text
+
+
+@pytest.mark.parametrize('enabled', [None, '0', '1'])
+def test_wrapper_timing_is_optional_private_and_keeps_deadline(context, capture_calls, monkeypatch, enabled):
+    import io
+    import os
+    import brain_cli
+    import session_auxiliary_state
+    if enabled is None:
+        monkeypatch.delenv('OB_NATIVE_DIAGNOSTIC_TIMING', raising=False)
+    else:
+        monkeypatch.setenv('OB_NATIVE_DIAGNOSTIC_TIMING', enabled)
+    monkeypatch.setattr(brain_cli, 'resolve_runtime_context', lambda *a, **k: context)
+    start = time.monotonic()
+    entry = time.monotonic_ns()
+    output = io.StringIO()
+    assert brain_cli.main(['--host', context.host, '--client', context.client,
+                           '--event', 'session_end', 'hook'], stdin=io.StringIO('{}'),
+                          stdout=output, started_at=start, entry_monotonic_ns=entry) == 0
+    assert output.getvalue() == ''
+    assert capture_calls == [('capture', 'session_end', None, start + 2.5)]
+    logs = session_auxiliary_state.directory(context, 'logs')
+    records = list(logs.glob('hook-timing-*.json'))
+    assert len(records) == (1 if enabled == '1' else 0)
+    if records:
+        record = json.loads(records[0].read_text())
+        assert set(record) == {'schema', 'event', 'outcome', 'pid', 'entry_monotonic_ns',
+                               'main_complete_ns', 'elapsed_ns'}
+        assert record['entry_monotonic_ns'] == entry
+        assert record['main_complete_ns'] >= entry
+        assert record['elapsed_ns'] == record['main_complete_ns'] - entry
+        assert record['pid'] == os.getpid()
+        assert record['event'] == 'session_end' and record['outcome'] == 'completed'
+        assert records[0].stat().st_mode & 0o777 == 0o600
+        assert logs.stat().st_mode & 0o777 == 0o700
+
+
+def test_timing_refused_context_writes_nothing(context, monkeypatch):
+    import io
+    import brain_cli
+    import session_auxiliary_state
+    from runtime_context import RuntimeContextError
+    monkeypatch.setenv('OB_NATIVE_DIAGNOSTIC_TIMING', '1')
+    def refuse(*a, **k):
+        raise RuntimeContextError('session_missing', 'No bound identity')
+    monkeypatch.setattr(brain_cli, 'resolve_runtime_context', refuse)
+    monkeypatch.setattr(session_auxiliary_state, 'directory', lambda *a: pytest.fail('Unbound state write'))
+    assert brain_cli.main(['--host', context.host, '--client', context.client, '--event', 'stop', 'hook'],
+                          stdin=io.StringIO('{}'), stderr=io.StringIO(),
+                          entry_monotonic_ns=time.monotonic_ns()) == 0
+
+
+def test_timing_failure_cannot_change_hook_output(context, monkeypatch):
+    import io
+    import brain_cli
+    import native_lifecycle
+    import session_auxiliary_state
+    monkeypatch.setenv('OB_NATIVE_DIAGNOSTIC_TIMING', '1')
+    monkeypatch.setattr(brain_cli, 'resolve_runtime_context', lambda *a, **k: context)
+    monkeypatch.setattr(native_lifecycle, 'dispatch', lambda *a: {'decision': 'block', 'reason': 'pending'})
+    def disk_full(*a):
+        raise OSError('disk full')
+    monkeypatch.setattr(session_auxiliary_state, 'directory', disk_full)
+    output = io.StringIO()
+    assert brain_cli.main(['--host', context.host, '--client', context.client, '--event', 'stop', 'hook'],
+                          stdin=io.StringIO('{}'), stdout=output,
+                          entry_monotonic_ns=time.monotonic_ns()) == 0
+    assert json.loads(output.getvalue()) == {'decision': 'block', 'reason': 'pending'}
+
+
+def test_timing_publication_is_exclusive_and_refuses_logs_symlink(context, tmp_path, monkeypatch):
+    import native_lifecycle
+    import session_auxiliary_state
+    monkeypatch.setenv('OB_NATIVE_DIAGNOSTIC_TIMING', '1')
+    native_lifecycle.record_wrapper_timing(context, 'stop', 'completed', 10, 20)
+    logs = session_auxiliary_state.directory(context, 'logs')
+    record = next(logs.glob('hook-timing-*.json'))
+    before = record.read_bytes()
+    with pytest.raises(FileExistsError):
+        native_lifecycle.record_wrapper_timing(context, 'stop', 'error', 10, 30)
+    assert record.read_bytes() == before
+    assert not list(logs.glob('*.tmp'))
+    record.unlink()
+    logs.rmdir()
+    outside = tmp_path / 'outside-logs'
+    outside.mkdir()
+    logs.symlink_to(outside, target_is_directory=True)
+    with pytest.raises((ValueError, OSError)):
+        native_lifecycle.record_wrapper_timing(context, 'stop', 'completed', 40, 50)
+    assert not list(outside.iterdir())
