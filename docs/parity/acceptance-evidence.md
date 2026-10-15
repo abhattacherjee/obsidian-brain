@@ -238,20 +238,27 @@ remaining lifecycle/cache checks, complete native end-to-end deadline,
 Desktop acceptance, dashboard checks and Claude regression testing remain
 pending. Desktop implementation work is underway; it is not certified.
 
-L.4 remains unqualified. Source review of the official CLI
-`0.159.0-alpha.12.1` and Desktop-bundled CLI `0.162.0-alpha.17.2` shows
-`SessionStart` with `source: clear` identifies the replacement session; it
-carries no outgoing session ID or clear-transition witness. `SessionEnd`
-provides only `reason: other`. See the exact
+L.4 remains unqualified. The implemented fallback freezes the verified outgoing
+Codex SessionEnd source under `snapshot_on_clear`, including ordinary ends.
+The trigger is truthfully `session_end` unless the host supplies an explicit
+clear reason. A versioned end intent commits atomically with retained facts and
+cursor.
+Recovery validates and publishes the canonical parent and frozen checkpoint
+before ingesting resumed facts, then clears the exact marker after success.
+Disabled clear starts warn without guessing an outgoing source. Claude end
+behavior is unchanged. Native enabled/disabled clear reproduction is **NOT RUN**.
+
+Source review of the official CLI `0.159.0-alpha.12.1` and Desktop-bundled CLI
+`0.162.0-alpha.17.2` still shows that `SessionStart` with `source: clear`
+identifies only the replacement session, while SessionEnd supplies `reason: other`.
+See the exact
 [0.159 hook contract](https://github.com/openai/codex/blob/rust-v0.159.0-alpha.12.1/codex-rs/hooks/src/schema.rs#L499-L523),
 [0.162 hook contract](https://github.com/openai/codex/blob/rust-v0.162.0-alpha.17.2/codex-rs/hooks/src/schema.rs#L799-L801)
 and [replacement sequence](https://github.com/openai/codex/blob/rust-v0.162.0-alpha.17.2/codex-rs/tui/src/app/session_lifecycle.rs#L1010-L1035).
-A thread registry cannot prove the foreground thread: resuming B without a turn
-can leave its hook queued before clear creates C. Neither a guessed newest
-source nor a fabricated clear payload is acceptable. This is source-contract
-proof only; an actual native clear reproduction is **NOT RUN**. The unsubmitted
+The fallback does not infer the foreground thread or a clear transition from a
+thread registry, newest source or fabricated payload. The unsubmitted
 `H/upstream-codex-clear-witness-proposal.md` (SHA256
 `c18440300fe46b1f5449510e7074fab3f14d87df65f43697b8a0da831ba9e394`)
-proposes an upstream witness; it is not a fix, submission or compact equivalent.
+remains a separate upstream proposal, not an implemented or submitted witness.
 
 Claude testing remains paused until the Codex plan passes.

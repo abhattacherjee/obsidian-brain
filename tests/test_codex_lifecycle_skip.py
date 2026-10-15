@@ -77,7 +77,19 @@ def test_lifecycle_host_guard(selected_host_context, tmp_path, script, event, fo
         assert proof['host'] == context.host
         assert proof['native_session_id'] == context.native_session_id
         assert proof['mutation_contexts'], result.stderr
-        assert len(notes) == (2 if event == 'pre_compact' else 1)
+        snapshots = [path for path in notes if '-snapshot-' in path.name]
+        parents = [path for path in notes if path not in snapshots]
+        expects_snapshot = event == 'pre_compact' or (context.host == 'codex' and event == 'session_end')
+        assert len(parents) == 1
+        assert len(snapshots) == int(expects_snapshot)
+        if context.host == 'codex' and event == 'session_end':
+            snapshot = snapshots[0].read_text()
+            assert 'trigger: "session_end"' in snapshot
+            assert 'trigger: "clear"' not in snapshot
+            assert 'source_session: "' + context.native_session_id + '"' in snapshot
+            assert 'agent_session_id: "' + context.native_session_id + '"' in snapshot
+            assert 'parent_session: "[[' + parents[0].stem + ']]"' in snapshot
+            assert 'Capture the first synthetic fact.' in snapshot
         assert all('foreign-session' not in path.read_text() and 'foreign-thread' not in path.read_text()
                    for path in notes)
     assert source.read_bytes() == context.transcript_path.read_bytes()

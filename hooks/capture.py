@@ -11,7 +11,7 @@ from session_lookup import SessionLookupPending
 
 from note_transactions import (
     LockBusy, NoteMutation, apply_mutations, connect_coordination, ownership_lock,
-    read_revision,
+    read_revision, defer_mutation,
 )
 
 
@@ -525,10 +525,7 @@ def _snapshot_created_at():
     return datetime.now(timezone.utc).isoformat()
 
 
-def _snapshot(context, note, first_date, body, trigger, deadline):
-    if time.monotonic() >= deadline:
-        return CaptureResult("pending", pending_sources=1,
-                             warnings=("Snapshot deadline reached",))
+def _snapshot_mutation(context, note, first_date, body, trigger, connection):
     normalized = body if body.endswith("\n") else body + "\n"
     revision = hashlib.sha256(normalized.encode()).hexdigest()
     identity = hashlib.sha256((context.session_key + "\0" + revision + "\0" + trigger).encode()).hexdigest()
@@ -539,12 +536,9 @@ def _snapshot(context, note, first_date, body, trigger, deadline):
     path = folder / (first_date + "-" + filename_project + "-" + context.host + "-snapshot-" + identity + ".md")
     from note_transactions import _contained
     _contained(context, path)
-    with ownership_lock(context), contextlib.closing(connect_coordination(context)) as connection:
-        _schema(connection)
-        row = connection.execute("SELECT created_at FROM native_snapshots WHERE identity=?", (identity,)).fetchone()
-        created_at = row[0] if row else _snapshot_created_at()
-        connection.execute("INSERT OR IGNORE INTO native_snapshots VALUES (?,?)", (identity, created_at))
-        connection.commit()
+    row = connection.execute("SELECT created_at FROM native_snapshots WHERE identity=?", (identity,)).fetchone()
+    created_at = row[0] if row else _snapshot_created_at()
+    connection.execute("INSERT OR IGNORE INTO native_snapshots VALUES (?,?)", (identity, created_at))
     metadata = {"type": "claude-snapshot", "date": first_date, "created_at": created_at,
                 "status": "auto-logged", "project": project,
                 "session_id": context.native_session_id,
@@ -557,10 +551,139 @@ def _snapshot(context, note, first_date, body, trigger, deadline):
     from note_transactions import _render
     document = _render("", {"metadata": json.dumps(metadata), "capture": body})
     # Snapshots have one publication identity and are never amended in place.
-    result = apply_mutations(context, [NoteMutation(path, None, {"document": document},
-                                                   "snapshot-" + identity)])
+    return NoteMutation(path, None, {"document": document}, "snapshot-" + identity)
+
+
+def _snapshot(context, note, first_date, body, trigger, deadline, *, defer_only=False):
+    if not defer_only and time.monotonic() >= deadline:
+        return CaptureResult("pending", pending_sources=1, warnings=("Snapshot deadline reached",))
+    with ownership_lock(context), contextlib.closing(connect_coordination(context)) as connection:
+        _schema(connection)
+        mutation = _snapshot_mutation(context, note, first_date, body, trigger, connection)
+        connection.commit()
+    result = defer_mutation(context, mutation) if defer_only else apply_mutations(context, [mutation])
     return CaptureResult("complete" if result.status in {"applied", "unchanged"} else result.status,
                          result.revision, warnings=result.warnings)
+
+
+def _capture_metadata(context, note, first_date, state, completeness, duration):
+    metadata = {"agent_provider": context.host, "agent_session_id": context.native_session_id,
+                "capture_state": state, "capture_completeness": completeness,
+                "duration_minutes": duration / 60, "git_branch": _git_branch(context)}
+    if not note.exists():
+        project = context.project_name
+        metadata.update({"type": "claude-session", "date": first_date, "status": "auto-logged",
+                         "project": project, "project_path": str(context.canonical_project_root),
+                         "git_branch": _git_branch(context), "duration_minutes": duration / 60,
+                         "session_id": context.native_session_id,
+                         "tags": ["claude/session", "claude/project/" + project, "claude/auto"]})
+    return metadata
+
+
+_END_INTENT = "_capture_end_snapshot"
+
+
+def _end_snapshot_intent(context, connection, note, first_date, events, batch, completeness, duration, trigger):
+    """Freeze the end boundary in the same transaction as its retained facts."""
+    from note_transactions import _pending_payload_bound
+    metadata = _capture_metadata(context, note, first_date, "ended", completeness, duration)
+    status = _partial_status(batch) if completeness == "partial" else ""
+    body = _native_body(events) + ("\n\n" + status if status else "")
+    mutation = _snapshot_mutation(context, note, first_date, body, trigger, connection)
+    snapshot = {"path": str(mutation.path), "expected": None, "mode": None,
+                "operation": mutation.operation_id, "changes": dict(mutation.managed_changes)}
+    _pending_payload_bound(json.dumps(snapshot, sort_keys=True, ensure_ascii=False))
+    intent = {"version": 1, "parent": str(note), "metadata": metadata,
+              "event_order": [identity for identity, _ in events], "offset": batch.consumed_offset,
+              "tag": hashlib.sha256(json.dumps([batch.source_generation, metadata, events, status],
+                                               sort_keys=True).encode()).hexdigest(),
+              "capture_status": status, "snapshot": snapshot}
+    intent["digest"] = hashlib.sha256(json.dumps(intent, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+    if len(json.dumps(intent, ensure_ascii=False).encode()) > 8 * 1024 * 1024:
+        raise ValueError("End snapshot intent exceeds its 8 MiB bound")
+    return intent
+
+
+def _finish_end_snapshot(context, connection, scope, intent, deadline):
+    """Finish the frozen parent and snapshot before consuming resumed facts."""
+    from note_transactions import _contained, _metadata_lines, _regions
+    fields = {"version", "parent", "metadata", "event_order", "offset", "tag", "capture_status", "snapshot", "digest"}
+    if (not isinstance(intent, dict) or set(intent) != fields
+            or type(intent.get("version")) is not int or intent["version"] != 1
+            or not isinstance(intent.get("metadata"), dict)
+            or len(json.dumps(intent, ensure_ascii=False).encode()) > 8 * 1024 * 1024
+            or intent.get("digest") != hashlib.sha256(json.dumps(
+                {key: value for key, value in intent.items() if key != "digest"},
+                sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+            or intent.get("metadata", {}).get("agent_provider") != context.host
+            or intent.get("metadata", {}).get("agent_session_id") != context.native_session_id
+            or intent.get("metadata", {}).get("capture_state") != "ended"):
+        return CaptureResult("conflict", warnings=("The retained end snapshot identity is invalid",))
+    row = connection.execute("SELECT cursor,note FROM source_sessions WHERE scope=?", (scope,)).fetchone()
+    parent = _contained(context, Path(intent["parent"]))
+    if not row or row[1] != str(parent):
+        return CaptureResult("conflict", warnings=("The retained end snapshot parent changed",))
+    if time.monotonic() >= deadline:
+        return CaptureResult("pending", pending_sources=1, warnings=("End snapshot deadline reached",))
+    facts = dict(connection.execute("SELECT event,text FROM capture_events WHERE scope=? "
+                                   "AND source='native' AND generation='stable'", (scope,)))
+    order = intent["event_order"]
+    if (not isinstance(order, list) or not all(isinstance(identity, str) for identity in order)
+            or len(order) != len(set(order)) or any(identity not in facts for identity in order)):
+        return CaptureResult("conflict", warnings=("The retained end snapshot facts changed",))
+    events = [(identity, facts[identity]) for identity in order]
+    item = intent["snapshot"]
+    if (not isinstance(item, dict) or set(item) != {"path", "expected", "mode", "operation", "changes"}
+            or item["expected"] is not None or item["mode"] is not None
+            or not isinstance(item["changes"], dict) or set(item["changes"]) != {"document"}
+            or not isinstance(item["changes"]["document"], str)
+            or type(intent["offset"]) is not int or intent["offset"] < 0
+            or not isinstance(intent["capture_status"], str)):
+        return CaptureResult("conflict", warnings=("The retained end snapshot payload is invalid",))
+    body = _native_body(events) + ("\n\n" + intent["capture_status"] if intent["capture_status"] else "")
+    revision = hashlib.sha256((body if body.endswith("\n") else body + "\n").encode()).hexdigest()
+    try:
+        document = item["changes"]["document"]
+        header = _metadata_lines(document)
+        value = lambda key: json.loads(header[key].split(":", 1)[1].strip())
+        trigger = value("trigger")
+        identity = hashlib.sha256((context.session_key + "\0" + revision + "\0" + trigger).encode()).hexdigest()
+        valid = (trigger in {"clear", "session_end"} and item["operation"] == "snapshot-" + identity
+            and _regions(document).get("capture") == revision and value("source_revision") == revision
+            and value("agent_provider") == context.host and value("source_session") == context.native_session_id
+            and value("agent_session_id") == context.native_session_id
+            and value("parent_session") == "[[" + parent.stem + "]]"
+            and Path(item["path"]).name.endswith("-snapshot-" + identity + ".md"))
+    except (KeyError, ValueError, TypeError):
+        valid = False
+    if not valid:
+        return CaptureResult("conflict", warnings=("The retained end snapshot body or source is invalid",))
+    result = publish_events(context, "native", "stable", intent["offset"], events, parent,
+                            metadata=intent["metadata"], checkpoint_tag=intent["tag"], native_order=True,
+                            capture_status=intent["capture_status"])
+    if result.status != "complete":
+        return result
+    # Never publish a snapshot before its canonical parent has been published.
+    if time.monotonic() >= deadline or not parent.is_file():
+        return replace(result, status="pending", pending_sources=1, warnings=("End snapshot deadline reached",))
+    item = intent["snapshot"]
+    mutation = NoteMutation(_contained(context, Path(item["path"])), item["expected"],
+                            item["changes"], item["operation"], item["mode"])
+    queued = defer_mutation(context, mutation)
+    if queued.status != "pending":
+        return CaptureResult(queued.status, queued.revision, pending_sources=1, warnings=queued.warnings)
+    if time.monotonic() >= deadline:
+        return CaptureResult("pending", pending_sources=1, warnings=("End snapshot deadline reached",))
+    written = apply_mutations(context, [mutation])
+    if written.status not in {"applied", "unchanged"}:
+        return CaptureResult(written.status, written.revision, pending_sources=1, warnings=written.warnings)
+    current = json.loads(connection.execute("SELECT cursor FROM source_sessions WHERE scope=?", (scope,)).fetchone()[0])
+    if current.get("parser_state", {}).get(_END_INTENT) != intent:
+        return CaptureResult("conflict", warnings=("The retained end snapshot changed during publication",))
+    del current["parser_state"][_END_INTENT]
+    connection.execute("UPDATE source_sessions SET cursor=? WHERE scope=?", (json.dumps(current), scope))
+    connection.commit()
+    return CaptureResult("complete", written.revision)
 
 
 def capture_checkpoint(context, event, deadline):
@@ -582,6 +705,13 @@ def capture_checkpoint(context, event, deadline):
                 scope = _scope(context)
                 row = connection.execute("SELECT * FROM source_sessions WHERE scope=?", (scope,)).fetchone()
                 cursor = SourceCursor(**json.loads(row[2])) if row else SourceCursor()
+                if context.host == "codex" and _END_INTENT in cursor.parser_state:
+                    finished = _finish_end_snapshot(context, connection, scope,
+                                                    cursor.parser_state[_END_INTENT], deadline)
+                    if finished.status != "complete":
+                        return finished
+                    row = connection.execute("SELECT * FROM source_sessions WHERE scope=?", (scope,)).fetchone()
+                    cursor = SourceCursor(**json.loads(row[2]))
                 try:
                     source_version = _source_version(context.transcript_path)
                 except (OSError, ValueError, TypeError):
@@ -723,9 +853,18 @@ def capture_checkpoint(context, event, deadline):
                     if identity is not None and not _matches_identity(context, identity):
                         connection.rollback()
                         return CaptureResult("conflict", warnings=("The selected note belongs to another native session",))
+                end_intent = None
+                parser_state = {**batch.parser_state, "_capture_loss": source_loss}
+                if (context.host == "codex" and event.kind == "session_end"
+                        and context.config.get("snapshot_on_clear", True)
+                        and selected_note is not None and messages
+                        and (retained_note or messages >= threshold and not too_short)):
+                    end_intent = _end_snapshot_intent(context, connection, selected_note, first_date, events,
+                        batch, completeness, duration, "clear" if event.trigger == "clear" else "session_end")
+                    parser_state[_END_INTENT] = end_intent
                 next_cursor = SourceCursor(batch.source_generation or cursor.generation,
                     batch.consumed_offset, batch.source_identity or cursor.source_identity,
-                    batch.anchor_digest, {**batch.parser_state, "_capture_loss": source_loss}, cursor.historical,
+                    batch.anchor_digest, parser_state, cursor.historical,
                     batch.source_size, batch.source_complete)
                 connection.execute("INSERT INTO source_sessions VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(scope) DO UPDATE SET "
                                    "descriptor=excluded.descriptor,cursor=excluded.cursor,note=excluded.note,"
@@ -749,32 +888,23 @@ def capture_checkpoint(context, event, deadline):
                 if time.monotonic() >= deadline:
                     return CaptureResult("pending", pending_sources=1, loss_of_input=batch.loss_of_input,
                                          warnings=batch.warnings + ("Facts retained; publication deadline reached",))
-                metadata = {"agent_provider": context.host, "agent_session_id": context.native_session_id,
-                            "capture_state": state, "capture_completeness": completeness,
-                            "duration_minutes": duration / 60, "git_branch": _git_branch(context)}
-                if not selected_note.exists():
-                    project = context.project_name
-                    metadata.update({"type": "claude-session", "date": first_date,
-                                      "status": "auto-logged",
-                                     "project": project,
-                                     "project_path": str(context.canonical_project_root),
-                                     "git_branch": _git_branch(context),
-                                     "duration_minutes": duration / 60,
-                                     "session_id": context.native_session_id,
-                                     "tags": ["claude/session", "claude/project/" + project, "claude/auto"]})
-                status_line = _partial_status(batch) if completeness == "partial" else ""
-                body = _native_body(events)
-                if status_line:
-                    body += "\n\n" + status_line
-                tag = hashlib.sha256(json.dumps([batch.source_generation, metadata, events, status_line],
-                                                sort_keys=True).encode()).hexdigest()
-                result = publish_events(context, "native", "stable", batch.consumed_offset, events,
-                                        selected_note, metadata=metadata, checkpoint_tag=tag, native_order=True, capture_status=status_line)
-                snapshot_trigger = (("pre_compact:" + event.trigger) if event.trigger else "pre_compact") if event.kind == "pre_compact" else event.trigger
-                snapshot_enabled = (event.kind == "pre_compact" and context.config.get("snapshot_on_compact", True)
-                                    or snapshot_trigger == "clear" and context.config.get("snapshot_on_clear", True))
-                if result.status == "complete" and snapshot_enabled:
-                    result = _snapshot(context, selected_note, first_date, body, snapshot_trigger, deadline)
+                if end_intent is not None:
+                    result = _finish_end_snapshot(context, connection, scope, end_intent, deadline)
+                else:
+                    metadata = _capture_metadata(context, selected_note, first_date, state, completeness, duration)
+                    status_line = _partial_status(batch) if completeness == "partial" else ""
+                    body = _native_body(events)
+                    if status_line:
+                        body += "\n\n" + status_line
+                    tag = hashlib.sha256(json.dumps([batch.source_generation, metadata, events, status_line],
+                                                    sort_keys=True).encode()).hexdigest()
+                    result = publish_events(context, "native", "stable", batch.consumed_offset, events,
+                                            selected_note, metadata=metadata, checkpoint_tag=tag, native_order=True, capture_status=status_line)
+                    snapshot_trigger = (("pre_compact:" + event.trigger) if event.trigger else "pre_compact") if event.kind == "pre_compact" else event.trigger
+                    snapshot_enabled = (event.kind == "pre_compact" and context.config.get("snapshot_on_compact", True)
+                                        or snapshot_trigger == "clear" and context.config.get("snapshot_on_clear", True))
+                    if result.status == "complete" and snapshot_enabled:
+                        result = _snapshot(context, selected_note, first_date, body, snapshot_trigger, deadline)
                 if result.status == "complete" and state == "ended":
                     _retire_source(connection, scope, context, batch, completeness, source_version)
                 pending_input = batch.status != "ok" and result.status == "complete"

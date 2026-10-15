@@ -260,7 +260,19 @@ batch without scanning the full vault. Start/resume recovers before capture;
 Stop captures before the retro gate; PreCompact captures and writes an immutable
 snapshot in the legacy sessions folder by default, with explicit compact/clear
 triggers and snapshot toggles; explicit SessionEnd flushes and marks the session
-ended. `task_complete`
+ended. With `snapshot_on_clear` enabled, every verified Codex SessionEnd also
+freezes an immutable checkpoint of that event's own session and source, including
+ordinary ends. Its trigger is `session_end`; an explicit clear reason keeps
+`clear`. This does not infer which thread the frontend cleared. The checkpoint
+may arrive after the new session starts. Its versioned end intent and exact
+document commit atomically with retained facts and cursor. Recovery validates the frozen identity and body before reading
+resumed facts, publishes the canonical parent through existing revision checks,
+then uses the private mutation journal to publish the checkpoint. The retained
+marker is cleared only after success; later toggle changes do not discard an
+already committed end intent. Claude end behavior is unchanged.
+With that setting disabled, Codex SessionStart with source `clear` warns that no
+old-session checkpoint is enabled; it never guesses or reads an outgoing source.
+`task_complete`
 ends a turn; `turn_aborted` marks interruption. Completeness is a separate field.
 
 `capture_revision` is SHA256 of the normalized managed capture region.

@@ -858,7 +858,7 @@ def _clear_pending(context, operation_id):
         path.unlink()
 
 
-def _recover_pending_directory(context, directory, max_operations=8, deadline=None):
+def _recover_pending_directory(context, directory, max_operations=8, deadline=None, *, snapshots_only=False):
     """Replay bounded, private intents with their original CAS and operation IDs."""
     if isinstance(max_operations, bool) or not isinstance(max_operations, int) or max_operations < 1:
         raise ValueError("Recovery needs a positive operation bound")
@@ -917,6 +917,9 @@ def _recover_pending_directory(context, directory, max_operations=8, deadline=No
                     raise ValueError("Pending intent exceeds the recovery size bound")
                 value = json.loads(raw)
                 items = value if isinstance(value, list) else [value]
+                if snapshots_only and any(not isinstance(item, dict) or not isinstance(item.get("operation"), str)
+                        or not re.fullmatch(r"snapshot-[0-9a-f]{64}", item["operation"]) for item in items):
+                    continue
                 results = []
                 token = _recovery_pending_intent.set((
                     context, Path(entry.path), raw,
@@ -982,7 +985,7 @@ def _recover_pending_directory(context, directory, max_operations=8, deadline=No
     return WriteResult("pending" if remaining else "unchanged", warnings=tuple(warnings[:8])), max(completed, attempted)
 
 
-def recover_pending_mutations(context, max_operations=8, deadline=None):
+def recover_pending_mutations(context, max_operations=8, deadline=None, *, snapshots_only=False):
     """Recover registered same-vault actors fairly with original operation IDs."""
     if type(max_operations) is not int or max_operations < 1:
         raise ValueError('Recovery needs a positive operation bound')
@@ -1015,7 +1018,8 @@ def recover_pending_mutations(context, max_operations=8, deadline=None):
             pending = True
             break
         last = name
-        result, count = _recover_pending_directory(actor,directory,max_operations-used,deadline)
+        result, count = _recover_pending_directory(actor,directory,max_operations-used,deadline,
+                                                   snapshots_only=snapshots_only)
         used += count
         pending = pending or result.status == 'pending'
         warnings.extend(result.warnings)
@@ -1310,6 +1314,30 @@ def delete_note(context, path, expected_revision, operation_id) -> WriteResult:
         return WriteResult("conflict", warnings=(str(exc),))
     except (OSError, sqlite3.Error) as exc:
         return WriteResult("pending", warnings=(str(exc),))
+
+
+def defer_mutation(context, mutation: NoteMutation) -> WriteResult:
+    """Retain one immutable mutation for the normal bounded recovery path."""
+    path = _contained(context, mutation.path)
+    if not mutation.operation_id or not mutation.managed_changes:
+        raise ValueError("A mutation needs content and an operation ID")
+    if mutation.file_mode not in {None, 0o600, 0o644}:
+        raise ValueError("Unsupported note permissions")
+    payload = json.dumps({"path": str(path), "expected": mutation.expected_revision,
+                          "changes": dict(mutation.managed_changes),
+                          "mode": mutation.file_mode, "operation": mutation.operation_id},
+                         sort_keys=True, ensure_ascii=False)
+    key = _digest(context.session_key + "\0" + str(context.canonical_project_root) +
+                  "\0" + mutation.operation_id)
+    with ownership_lock(context):
+        directory = _private_dir(session_state_path(context) / "pending")
+        pending = directory / (_digest(key) + ".json")
+        if pending.exists() or pending.is_symlink():
+            if _read_private_state(pending, MAX_PENDING_BYTES) != payload.encode("utf-8"):
+                return WriteResult("conflict", pending_path=pending,
+                                   warnings=("The deferred operation already has another immutable payload",))
+        pending = _pending(context, key, payload)
+    return WriteResult("pending", pending_path=pending)
 
 
 def apply_mutations(context, mutations: Sequence[NoteMutation]) -> WriteResult:

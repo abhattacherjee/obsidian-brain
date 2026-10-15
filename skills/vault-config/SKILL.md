@@ -120,6 +120,13 @@ takes precedence over a conflicting legacy alias; reads do not rewrite config.
 
 For any key not present in the config, show its default value: `wiki_folder` defaults to `claude-wiki`, `log_raw_messages` defaults to `true`, `min_messages` defaults to `3`, `min_duration_minutes` defaults to `2`, `snapshot_on_compact` defaults to `true`, `snapshot_on_clear` defaults to `true`.
 
+For Codex, `snapshot_on_clear` also controls immutable checkpoints on ordinary
+SessionEnd events. Their trigger is `session_end`; only an explicit clear reason
+uses `clear`. The host supplies the outgoing session on SessionEnd, so its
+checkpoint may arrive after the new clear session starts. Disabling this setting
+makes the new clear SessionStart warn without guessing an outgoing session.
+Claude behavior is unchanged.
+
 When rendering rows 8 or 9, if the value is `False`, append this warning inline on the same row:
 
 > ⚠ Disables pre-clear/compact checkpoint. Recommended: True.

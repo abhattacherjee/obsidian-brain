@@ -160,6 +160,31 @@ def _dual_install_env(home: Path) -> dict:
     return env
 
 
+def _assert_native_lifecycle_notes(context, event, facts):
+    notes = list(context.vault_path.rglob('*.md'))
+    snapshots = [path for path in notes if '-snapshot-' in path.name]
+    parents = [path for path in notes if path not in snapshots]
+    assert len(parents) == 1
+    expects_snapshot = event == 'pre_compact' or (context.host == 'codex' and event == 'session_end')
+    assert len(snapshots) == int(expects_snapshot)
+    parent = parents[0]
+    for path in notes:
+        content = path.read_text()
+        assert obsidian_utils.parse_frontmatter_field(content, 'agent_provider') == context.host
+        assert obsidian_utils.parse_frontmatter_field(content, 'agent_session_id') == context.native_session_id
+        for fact in facts:
+            assert content.count(fact) == 1
+    if context.host == 'codex' and event == 'session_end':
+        content = snapshots[0].read_text()
+        assert obsidian_utils.parse_frontmatter_field(content, 'trigger') == 'session_end'
+        assert obsidian_utils.parse_frontmatter_field(content, 'source_session') == context.native_session_id
+        assert obsidian_utils.parse_frontmatter_field(content, 'parent_session') == '[[' + parent.stem + ']]'
+        revision = obsidian_utils.parse_frontmatter_field(content, 'source_revision')
+        assert revision == obsidian_utils.parse_frontmatter_field(content, 'capture_revision')
+        assert len(revision) == 64 and all(char in '0123456789abcdef' for char in revision)
+    return parent, notes
+
+
 def test_two_concurrent_sessionend_fires_dedup_to_one_claim(selected_host_context):
     """Two native child writers retain one session and one copy of each fact."""
     context = selected_host_context
@@ -210,9 +235,9 @@ def test_two_concurrent_sessionend_fires_dedup_to_one_claim(selected_host_contex
             assert all(actor[field] == proof[field] for actor in proof['mutation_contexts'])
         proofs.append(proof)
     assert any(proof['mutation_contexts'] for proof in proofs)
-    notes = list(context.vault_path.rglob('*.md'))
-    assert len(notes) == 1
-    content = notes[0].read_text()
+    parent, notes = _assert_native_lifecycle_notes(context, 'session_end',
+        ('First concurrent native fact.', 'Second concurrent native fact.'))
+    content = parent.read_text()
     assert obsidian_utils.parse_frontmatter_field(content, 'agent_provider') == context.host
     assert obsidian_utils.parse_frontmatter_field(content, 'agent_session_id') == context.native_session_id
     for text in ('First concurrent native fact.', 'Second concurrent native fact.'):
@@ -400,7 +425,7 @@ def test_native_loser_never_publishes_without_ownership(selected_host_context,na
             release.set()
         active.result(timeout=1)
     assert checkpoint(selected_host_context,'session_end').status=='complete'
-    assert len(list(selected_host_context.vault_path.rglob('*.md')))==1
+    _assert_native_lifecycle_notes(selected_host_context, 'session_end', ('First native fact.',))
 
 
 def _native_failed_writer_retry(context,module,event,monkeypatch,capsys):
@@ -419,8 +444,7 @@ def _native_failed_writer_retry(context,module,event,monkeypatch,capsys):
     monkeypatch.setattr(capture,'apply_mutations',original)
     module._run(payload={'trigger':'manual'})
     assert capsys.readouterr().err==''
-    paths=list(context.vault_path.rglob('*.md'))
-    assert len(paths)==(2 if event=='pre_compact' else 1)
+    _, paths = _assert_native_lifecycle_notes(context, event, ('First native fact.',))
     assert all('First native fact.' in path.read_text() for path in paths)
     before={path:path.read_bytes() for path in paths}
     module._run(payload={'trigger':'manual'})

@@ -68,19 +68,26 @@ def test_snapshot_e2e_pipeline(selected_host_context, monkeypatch, skill):
     child('session_end')
     snapshots = list(context.vault_path.rglob('*snapshot*.md'))
     sessions = [path for path in context.vault_path.rglob('*.md') if path not in snapshots]
-    assert len(snapshots) == len(sessions) == 1
-    snapshot, session = snapshots[0], sessions[0]
-    for path in (snapshot, session):
+    assert len(sessions) == 1
+    assert len(snapshots) == (2 if context.host == 'codex' else 1)
+    session = sessions[0]
+    expected_triggers = {'pre_compact:manual', 'session_end'} if context.host == 'codex' else {'pre_compact:manual'}
+    assert {obsidian_utils.parse_frontmatter_field(path.read_text(), 'trigger')
+            for path in snapshots} == expected_triggers
+    all_notes = snapshots + sessions
+    for path in all_notes:
         content = path.read_text()
         assert obsidian_utils.parse_frontmatter_field(content, 'agent_provider') == context.host
         assert obsidian_utils.parse_frontmatter_field(content, 'agent_session_id') == context.native_session_id
         assert obsidian_utils.parse_frontmatter_field(content, 'project') == context.canonical_project_root.name
         assert 'Keep all synthetic facts.' in content
         assert 'foreign-inherited' not in content
-    assert obsidian_utils.parse_frontmatter_field(snapshot.read_text(), 'parent_session') == '[[' + session.stem + ']]'
+    for snapshot in snapshots:
+        assert obsidian_utils.parse_frontmatter_field(snapshot.read_text(), 'parent_session') == '[[' + session.stem + ']]'
+        assert obsidian_utils.parse_frontmatter_field(snapshot.read_text(), 'source_session') == context.native_session_id
     queue = json.loads(obsidian_utils.find_unsummarized_notes(str(context.vault_path), 'claude-sessions',
                                                  context.canonical_project_root.name))
-    assert set(queue['unsummarized']) == {str(snapshot), str(session)}
+    assert set(queue['unsummarized']) == {str(path) for path in all_notes}
     seen = []
     summary = ('## Summary\nNative pipeline summary.\n\n## Key Decisions\n- Kept facts.\n\n'
                '## Changes Made\n- Synthetic test.\n\n## Errors Encountered\nNone.\n\n'
@@ -100,14 +107,14 @@ def test_snapshot_e2e_pipeline(selected_host_context, monkeypatch, skill):
     }, stdout, stderr)
     assert result == 0, stderr.getvalue()
     upgrades = json.loads(stdout.getvalue())
-    assert {row['path'] for row in upgrades} == {str(snapshot), str(session)}
+    assert {row['path'] for row in upgrades} == {str(path) for path in all_notes}
     assert all(row['status'].startswith('Upgraded ') for row in upgrades), upgrades
-    for path in (snapshot, session):
+    for path in all_notes:
         fields = path.read_text()
         assert obsidian_utils.parse_frontmatter_field(fields, 'status') == 'summarized'
         assert obsidian_utils.parse_frontmatter_field(fields, 'summary_revision') == obsidian_utils.parse_frontmatter_field(fields, 'capture_revision')
         assert 'Keep all synthetic facts.' in fields
-    assert seen == ['snapshot_summary', 'session_summaries']
+    assert seen == ['snapshot_summary'] * len(snapshots) + ['session_summaries']
     brief = obsidian_utils.build_context_brief(str(context.vault_path), 'claude-sessions',
                         'claude-insights', context.canonical_project_root.name)
     assert 'Native pipeline summary.' in brief

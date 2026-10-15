@@ -252,6 +252,7 @@
       "cwd",
       "sessionId",
       "session_id",
+      "source",
       "transcript_path",
       "turn_id"
     ],
@@ -360,7 +361,8 @@
     ],
     "hooks/native_lifecycle.py": [
       "auto_log_enabled",
-      "sessions_folder"
+      "sessions_folder",
+      "snapshot_on_clear"
     ],
     "hooks/obsidian_context_snapshot.py": [
       "sessions_folder",

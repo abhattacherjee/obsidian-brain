@@ -65,7 +65,8 @@
         "note_transactions.record_read",
         "note_transactions.record_raw_read",
         "note_transactions.context_for_vault",
-        "note_writer._atomic_rewrite"
+        "note_writer._atomic_rewrite",
+        "note_transactions.defer_mutation"
       ],
       "hosts": {
         "claude": {
@@ -1256,7 +1257,7 @@
       "source": "tests/test_codex_lifecycle_skip.py",
       "expression": "subprocess.run(command, input=json.dumps({'session_id': context.native_session_id, 'cwd': str(context.worktree), 'transcript_path': str(source), 'trigger': 'manual'}), text=True, capture_output=True, env=env, cwd=context.worktree, timeout=5)",
       "capability": "capture.normalization",
-      "source_sha256": "8556362ce66d03e0a3b918b006d448798896fd945a241b1e5464a20b1ae3cf8d"
+      "source_sha256": "df7437fa3a2c5730cd55bd466f14acda001e35ec63764a58fa269463d574a08b"
     },
     {
       "source": "tests/test_dev_skill_install.py",
@@ -1285,7 +1286,7 @@
     {
       "source": "tests/test_hook_dedup_guard.py",
       "expression": "subprocess.run(command, input=payload, capture_output=True, text=True, cwd=context.worktree, env=dict(os.environ, CLAUDE_CODE_SESSION_ID='foreign-inherited-id', CODEX_THREAD_ID='foreign-inherited-thread'), timeout=10)",
-      "source_sha256": "864590a5736829b58e39fb0a657783d3730cc5f9eda075282e79044461009811",
+      "source_sha256": "3ad1d07cd10aa898e9fe20d918e94bb5676515e56367224e26a436eca73b9291",
       "capability": "capture.normalization"
     },
     {
@@ -1411,13 +1412,13 @@
     {
       "source": "tests/test_native_lifecycle_integration.py",
       "expression": "subprocess.run(command, input=json.dumps({'session_id': native_id, 'cwd': str(context.worktree), 'transcript_path': str(source)}), text=True, capture_output=True, timeout=5)",
-      "source_sha256": "a1b90d55d256f0a436b47e94162d5b2eccea583558f7a534f51a3c0c4258cd24",
+      "source_sha256": "4f0b9f190935bed8a0be5d52a8ac276478a3661dd11c31408392e5b0733e420a",
       "capability": "capture.normalization"
     },
     {
       "source": "tests/test_native_lifecycle_integration.py",
       "expression": "subprocess.run([sys.executable, str(wrapper), '--host', 'codex'], stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=5)",
-      "source_sha256": "a1b90d55d256f0a436b47e94162d5b2eccea583558f7a534f51a3c0c4258cd24",
+      "source_sha256": "4f0b9f190935bed8a0be5d52a8ac276478a3661dd11c31408392e5b0733e420a",
       "scope": "structural",
       "reason": "Codex wrapper without verified current-client binding skips before runtime/capture and retains no source. This is a negative control, not successful lifecycle evidence."
     },
@@ -1623,7 +1624,7 @@
       "source": "tests/test_session_end_telemetry.py",
       "expression": "subprocess.run(command, input=raw, capture_output=True, text=True, cwd=context.worktree, env=dict(os.environ, CLAUDE_CODE_SESSION_ID='foreign-id', CODEX_THREAD_ID='foreign-thread'), timeout=5)",
       "capability": "capture.normalization",
-      "source_sha256": "9224914ed45b48bf4442772bdf03abb530c067a42b3026b4c56d82c041041fae"
+      "source_sha256": "fcc8a6ce07850d568500d5fdc4f2b550f177099d54c85540b4d223130298b5bb"
     },
     {
       "source": "tests/test_session_hint_bootstrap.py",
@@ -1641,7 +1642,7 @@
       "source": "tests/test_snapshot_e2e.py",
       "expression": "subprocess.run(command, input=json.dumps({'session_id': context.native_session_id, 'cwd': str(context.worktree), 'transcript_path': str(context.transcript_path), 'trigger': 'manual'}), env=dict(os.environ, CLAUDE_CODE_SESSION_ID='foreign-inherited-id', CODEX_THREAD_ID='foreign-inherited-thread'), cwd=context.worktree, capture_output=True, text=True, timeout=10)",
       "capability": "capture.normalization",
-      "source_sha256": "68e558a376bed2bfecbd67272df0b42610163c97feb7e0b9c20c999a7246e694"
+      "source_sha256": "998969f2c6cc4dadd45d79ceb55816a7f1128f690c68a6d16952ad26c2e43491"
     },
     {
       "source": "tests/test_vault_doctor_audit_historic_repairs.py",

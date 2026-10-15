@@ -34,11 +34,25 @@ def test_native_reaper_publishes_retained_source_once(selected_host_context, mon
     monkeypatch.setattr(capture, '_fault', lambda point: None)
     with using_runtime_context(actor):
         first = reap_registered_sessions(actor, deadline=time.monotonic() + 2)
+        first_bytes = {path: path.read_bytes() for path in actor.vault_path.rglob('*.md')}
         second = reap_registered_sessions(actor, deadline=time.monotonic() + 2)
+        assert {path: path.read_bytes() for path in actor.vault_path.rglob('*.md')} == first_bytes
     assert first.status == second.status == 'complete'
     notes = list(actor.vault_path.rglob('*.md'))
-    assert len(notes) == 1
-    text = notes[0].read_text()
+    snapshots = [path for path in notes if '-snapshot-' in path.name]
+    parents = [path for path in notes if path not in snapshots]
+    assert len(parents) == 1
+    assert len(snapshots) == int(actor.host == 'codex')
+    if snapshots:
+        snapshot = snapshots[0].read_text()
+        assert 'trigger: "session_end"' in snapshot
+        assert 'trigger: "clear"' not in snapshot
+        assert 'source_session: "' + actor.native_session_id + '"' in snapshot
+        assert 'agent_session_id: "' + actor.native_session_id + '"' in snapshot
+        assert 'agent_provider: "codex"' in snapshot
+        assert 'parent_session: "[[' + parents[0].stem + ']]"' in snapshot
+        assert snapshot.count('Recover this native fact once.') == 1
+    text = parents[0].read_text()
     assert text.count('Recover this native fact once.') == 1
     assert actor.native_session_id in text
     assert 'agent_provider: ' + actor.host in text or 'agent_provider: "' + actor.host + '"' in text

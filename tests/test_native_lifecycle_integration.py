@@ -183,8 +183,14 @@ def test_explicit_native_cli_replays_real_fixture_in_disposable_vault(selected_h
                             text=True, capture_output=True, timeout=5)
     assert result.returncode == 0, result.stderr
     assert not result.stdout
-    notes = list(context.vault_path.rglob("*.md"))
+    all_notes = list(context.vault_path.rglob("*.md"))
+    snapshots = [path for path in all_notes if "-snapshot-" in path.name]
+    notes = [path for path in all_notes if path not in snapshots]
     assert len(notes) == 1, result.stderr
+    assert len(snapshots) == (1 if context.host == "codex" else 0)
+    if snapshots:
+        assert 'trigger: "session_end"' in snapshots[0].read_text()
+        assert 'source_session: "' + native_id + '"' in snapshots[0].read_text()
     text = notes[0].read_text()
     assert 'agent_provider: "' + context.host + '"' in text
     assert 'capture_state: "ended"' in text
@@ -351,7 +357,10 @@ def test_native_clear_reason_is_forwarded_as_explicit_snapshot_trigger(context, 
     dispatch(context, "session_end", {"reason": "clear"}, time.monotonic())
     assert seen[0]["trigger"] == "clear"
     dispatch(context, "session_end", {"reason": "other"}, time.monotonic())
-    assert "trigger" not in seen[1]
+    if context.host == "codex":
+        assert seen[1]["trigger"] == "session_end"
+    else:
+        assert "trigger" not in seen[1]
 
 
 def test_native_reaper_reports_unavailable_without_crashing(context, monkeypatch):
@@ -737,3 +746,236 @@ def test_timing_publication_is_exclusive_and_refuses_logs_symlink(context, tmp_p
     with pytest.raises((ValueError, OSError)):
         native_lifecycle.record_wrapper_timing(context, 'stop', 'completed', 40, 50)
     assert not list(outside.iterdir())
+
+
+def _end_snapshot_case(context, monkeypatch, enabled=True):
+    from dataclasses import replace
+    import transcripts
+    selected = replace(context, config=MappingProxyType(dict(context.config,
+        min_messages=1, min_duration_minutes=0, snapshot_on_clear=enabled)))
+    def read(ctx, cursor, deadline):
+        records = (transcripts.SourceRecord('old-fact', 'user', 'OLD SESSION FACT', 1),) if ctx.native_session_id == selected.native_session_id else ()
+        return transcripts.TranscriptBatch('ok', records, 'one', 100,
+            metadata={'native_session_id':ctx.native_session_id},source_identity='one',
+            source_complete=True,source_size=100)
+    monkeypatch.setattr(transcripts,'read_records',read)
+    return selected
+
+
+def test_end_other_freezes_only_actual_old_source_and_keeps_parent_edits(context, monkeypatch):
+    from dataclasses import replace
+    import native_lifecycle
+    selected=_end_snapshot_case(context,monkeypatch)
+    native_lifecycle.dispatch(selected,'stop',{},time.monotonic())
+    parent=next(selected.vault_path.rglob('*.md'))
+    parent.write_text(parent.read_text()+'\n## Summary\nMANUAL SUMMARY\n\nMANUAL SENTINEL\n')
+    native_lifecycle.dispatch(selected,'session_end',{'reason':'other'},time.monotonic())
+    snapshots=list(selected.vault_path.rglob('*snapshot*.md'))
+    assert len(snapshots)==(1 if selected.host=='codex' else 0)
+    if snapshots:
+        content=snapshots[0].read_text()
+        assert 'trigger: "session_end"' in content and 'trigger: "clear"' not in content
+        assert 'source_session: "'+selected.native_session_id+'"' in content
+        assert 'parent_session: "[['+parent.stem+']]"' in content
+        assert 'OLD SESSION FACT' in content
+        original=snapshots[0].read_bytes()
+        native_lifecycle.dispatch(selected,'session_end',{'reason':'other'},time.monotonic())
+        assert snapshots[0].read_bytes()==original
+        assert len(list(selected.vault_path.rglob('*snapshot*.md')))==1
+    newer=replace(selected,native_session_id='00000000-0000-4000-8000-00000000000c')
+    native_lifecycle.dispatch(newer,'session_start',{'source':'clear'},time.monotonic())
+    assert 'MANUAL SUMMARY' in parent.read_text() and 'MANUAL SENTINEL' in parent.read_text()
+    assert all('source_session: "'+newer.native_session_id+'"' not in p.read_text() for p in snapshots)
+
+
+def test_disabled_clear_warns_without_checkpoint_or_old_source_assignment(context,monkeypatch,capsys):
+    from dataclasses import replace
+    import native_lifecycle
+    selected=_end_snapshot_case(context,monkeypatch,enabled=False)
+    native_lifecycle.dispatch(selected,'session_end',{'reason':'other'},time.monotonic())
+    newer=replace(selected,native_session_id='00000000-0000-4000-8000-00000000000c')
+    output=native_lifecycle.dispatch(newer,'session_start',{'source':'clear'},time.monotonic())
+    assert not list(selected.vault_path.rglob('*snapshot*.md'))
+    if selected.host=='codex':
+        assert 'snapshot_on_clear is disabled' in output['hookSpecificOutput']['additionalContext']
+        assert selected.native_session_id not in output['hookSpecificOutput']['additionalContext']
+    else:
+        assert not output or 'snapshot_on_clear is disabled' not in str(output)
+
+
+@pytest.mark.parametrize("prior_canonical_stop", [True, False])
+def test_end_snapshot_budget_retains_frozen_intent_for_normal_recovery(context,monkeypatch,prior_canonical_stop):
+    import capture,native_lifecycle,note_transactions,transcripts
+    selected=_end_snapshot_case(context,monkeypatch)
+    if prior_canonical_stop:
+        native_lifecycle.dispatch(selected,'stop',{},time.monotonic())
+    else:
+        assert not list(selected.vault_path.rglob('*.md'))
+    clock=[100.0]
+    monkeypatch.setattr(time,'monotonic',lambda:clock[0])
+    def expire(point):
+        if point=='after_source_retention':clock[0]=103.0
+    monkeypatch.setattr(capture,'_fault',expire)
+    native_lifecycle.dispatch(selected,'session_end',{'reason':'other'},100.0)
+    assert not list(selected.vault_path.rglob('*snapshot*.md'))
+    if not prior_canonical_stop:
+        assert not list(selected.vault_path.rglob('*.md'))
+    pending=note_transactions.pending_mutation_inventory(selected)
+    assert pending['pending_mutations']==0
+    with note_transactions.connect_coordination(selected) as conn:
+        retained=json.loads(conn.execute('SELECT cursor FROM source_sessions WHERE scope=?',
+                                        (selected.session_key,)).fetchone()[0])
+    if selected.host=='codex':
+        intent=retained['parser_state']['_capture_end_snapshot']
+        assert 'OLD SESSION FACT' in intent['snapshot']['changes']['document']
+        assert intent['metadata']['capture_state']=='ended'
+    else:
+        assert '_capture_end_snapshot' not in retained['parser_state']
+    monkeypatch.setattr(capture,'_fault',lambda point:None)
+    real_apply=capture.apply_mutations
+    def parent_before_snapshot(ctx,mutations):
+        if any(item.operation_id.startswith('snapshot-') for item in mutations):
+            with note_transactions.connect_coordination(ctx) as conn:
+                parent=conn.execute('SELECT note FROM source_sessions WHERE scope=?',
+                                    (ctx.session_key,)).fetchone()[0]
+            assert Path(parent).is_file(), 'Snapshot must not publish before its canonical parent'
+        return real_apply(ctx,mutations)
+    monkeypatch.setattr(capture,'apply_mutations',parent_before_snapshot)
+    def later(ctx,cursor,deadline):
+        return transcripts.TranscriptBatch('ok',(transcripts.SourceRecord('later','user','LATER RESUMED FACT',101),),
+            'one',200,metadata={'native_session_id':ctx.native_session_id},source_identity='one',source_complete=True,source_size=200)
+    monkeypatch.setattr(transcripts,'read_records',later)
+    native_lifecycle.dispatch(selected,'session_start',{'source':'resume'},103.0)
+    snapshots=list(selected.vault_path.rglob('*snapshot*.md'))
+    assert len(snapshots)==(1 if selected.host=='codex' else 0)
+    if snapshots:
+        assert 'OLD SESSION FACT' in snapshots[0].read_text()
+        assert 'LATER RESUMED FACT' not in snapshots[0].read_text()
+        assert 'trigger: "session_end"' in snapshots[0].read_text()
+        assert note_transactions.pending_mutation_inventory(selected)['pending_mutations']==0
+    parents=[path for path in selected.vault_path.rglob('*.md') if path not in snapshots]
+    assert len(parents)==1
+    assert parents[0].read_text().count('OLD SESSION FACT')==1
+    assert parents[0].read_text().count('LATER RESUMED FACT')==1
+    assert 'agent_session_id: "'+selected.native_session_id+'"' in parents[0].read_text()
+    if snapshots:
+        assert 'parent_session: "[['+parents[0].stem+']]"' in snapshots[0].read_text()
+        assert 'source_session: "'+selected.native_session_id+'"' in snapshots[0].read_text()
+
+
+def test_end_snapshot_refuses_wrong_source_identity_before_journaling(context,monkeypatch):
+    import capture,native_lifecycle,note_transactions,transcripts
+    selected=_end_snapshot_case(context,monkeypatch)
+    monkeypatch.setattr(transcripts,'read_records',lambda *args:transcripts.TranscriptBatch(
+        'ok',(transcripts.SourceRecord('wrong','user','WRONG SOURCE',1),),'one',100,
+        metadata={'native_session_id':'another-native-session'},source_identity='one',source_complete=True,source_size=100))
+    native_lifecycle.dispatch(selected,'session_end',{'reason':'other'},time.monotonic())
+    assert not list(selected.vault_path.rglob('*.md'))
+    assert note_transactions.pending_mutation_inventory(selected)['pending_mutations']==0
+
+
+def test_end_checkpoint_preserves_manual_snapshot_edits_on_replay(context,monkeypatch):
+    import native_lifecycle,note_transactions
+    selected=_end_snapshot_case(context,monkeypatch)
+    native_lifecycle.dispatch(selected,'session_end',{'reason':'other'},time.monotonic())
+    snapshots=list(selected.vault_path.rglob('*snapshot*.md'))
+    if selected.host=='claude':
+        assert not snapshots
+        return
+    snapshot=snapshots[0]
+    snapshot.write_text(snapshot.read_text()+'\nMANUAL SNAPSHOT EDIT\n')
+    original=snapshot.read_bytes()
+    native_lifecycle.dispatch(selected,'session_end',{'reason':'other'},time.monotonic())
+    assert snapshot.read_bytes()==original
+    assert len(list(selected.vault_path.rglob('*snapshot*.md')))==1
+    assert note_transactions.pending_mutation_inventory(selected)['pending_mutations']==0
+
+
+def test_end_below_message_threshold_never_publishes_snapshot(context,monkeypatch):
+    from dataclasses import replace
+    import native_lifecycle,note_transactions
+    selected=_end_snapshot_case(context,monkeypatch)
+    selected=replace(selected,config=MappingProxyType(dict(selected.config,min_messages=3)))
+    native_lifecycle.dispatch(selected,'session_end',{'reason':'other'},time.monotonic())
+    assert not list(selected.vault_path.rglob('*.md'))
+    assert note_transactions.pending_mutation_inventory(selected)['pending_mutations']==0
+
+
+def test_end_snapshot_recovery_does_not_apply_unrelated_pending_mutations(context,monkeypatch):
+    import native_lifecycle,note_transactions
+    selected=_end_snapshot_case(context,monkeypatch)
+    path=selected.vault_path/'unrelated-curated.md'
+    note_transactions.defer_mutation(selected,note_transactions.NoteMutation(
+        path,None,{'document':'UNRELATED CURATED INTENT\n'},'curated-not-a-snapshot'))
+    native_lifecycle.dispatch(selected,'session_start',{},time.monotonic())
+    assert not path.exists()
+    assert note_transactions.pending_mutation_inventory(selected)['pending_mutations']==1
+
+
+def test_deferred_end_snapshot_operation_cannot_replace_frozen_payload(context):
+    import note_transactions
+    path=context.vault_path/'immutable-pending-snapshot.md'
+    operation='snapshot-'+('a'*64)
+    first=note_transactions.defer_mutation(context,note_transactions.NoteMutation(
+        path,None,{'document':'FROZEN END FACT\n'},operation))
+    original=first.pending_path.read_bytes()
+    changed=note_transactions.defer_mutation(context,note_transactions.NoteMutation(
+        path,None,{'document':'DIFFERENT LATER FACT\n'},operation))
+    assert changed.status=='conflict'
+    assert first.pending_path.read_bytes()==original
+    assert not path.exists()
+
+
+def test_end_commit_before_journal_crash_preserves_boundary_on_resume(context,monkeypatch):
+    from dataclasses import replace
+    import capture,native_lifecycle,note_transactions
+    source=context.native_home/('sessions' if context.host=='codex' else 'projects')/'own-crash-window.jsonl'
+    source.parent.mkdir(parents=True,exist_ok=True)
+    selected=replace(context,transcript_path=source,config=MappingProxyType(dict(context.config,
+        min_messages=1,min_duration_minutes=0,snapshot_on_clear=True)))
+    sid=selected.native_session_id
+    if selected.host=='codex':
+        rows=[{'type':'session_meta','ordinal':0,'payload':{'id':sid,'session_id':sid,'cwd':str(selected.worktree)}},
+              {'type':'event_msg','ordinal':1,'payload':{'type':'task_started','turn_id':'old-turn','started_at':1,'collaboration_mode_kind':'default','model_context_window':None}},
+              {'type':'response_item','ordinal':2,'payload':{'type':'message','id':'old-message','role':'user','content':[{'type':'input_text','text':'END BEFORE JOURNAL CRASH'}],'internal_chat_message_metadata_passthrough':{'turn_id':'old-turn'}}},
+              {'type':'event_msg','ordinal':3,'payload':{'type':'task_complete','turn_id':'old-turn'}}]
+        later=[{'type':'event_msg','ordinal':4,'payload':{'type':'task_started','turn_id':'later-turn','started_at':2,'collaboration_mode_kind':'default','model_context_window':None}},
+               {'type':'response_item','ordinal':5,'payload':{'type':'message','id':'later-message','role':'user','content':[{'type':'input_text','text':'RESUMED AFTER JOURNAL CRASH'}],'internal_chat_message_metadata_passthrough':{'turn_id':'later-turn'}}},
+               {'type':'event_msg','ordinal':6,'payload':{'type':'task_complete','turn_id':'later-turn'}}]
+    else:
+        rows=[{'type':'user','sessionId':sid,'uuid':'old-message','message':{'role':'user','content':'END BEFORE JOURNAL CRASH'}}]
+        later=[{'type':'user','sessionId':sid,'uuid':'later-message','message':{'role':'user','content':'RESUMED AFTER JOURNAL CRASH'}}]
+    source.write_text(''.join(json.dumps(row)+'\n' for row in rows))
+    real_defer=capture.defer_mutation
+    def crash_before_write(*args,**kwargs):
+        raise OSError('synthetic crash before first snapshot journal write')
+    monkeypatch.setattr(capture,'defer_mutation',crash_before_write)
+    native_lifecycle.dispatch(selected,'session_end',{'reason':'other'},time.monotonic())
+    with note_transactions.connect_coordination(selected) as conn:
+        assert conn.execute('SELECT state FROM source_sessions WHERE scope=?',(selected.session_key,)).fetchone()[0]=='ended'
+        assert 'END BEFORE JOURNAL CRASH' in conn.execute('SELECT text FROM capture_events WHERE scope=?',(selected.session_key,)).fetchone()[0]
+    assert note_transactions.pending_mutation_inventory(selected)['pending_mutations']==0
+    if selected.host=='codex':
+        with note_transactions.connect_coordination(selected) as conn:
+            cursor=json.loads(conn.execute('SELECT cursor FROM source_sessions WHERE scope=?',
+                                           (selected.session_key,)).fetchone()[0])
+        frozen=cursor['parser_state']['_capture_end_snapshot']
+        assert 'END BEFORE JOURNAL CRASH' in frozen['snapshot']['changes']['document']
+        assert 'RESUMED AFTER JOURNAL CRASH' not in frozen['snapshot']['changes']['document']
+    monkeypatch.setattr(capture,'defer_mutation',real_defer)
+    # An end decision already committed while enabled survives later setting changes.
+    selected=replace(selected,config=MappingProxyType(dict(selected.config,snapshot_on_clear=False)))
+    with source.open('a') as stream:
+        stream.write(''.join(json.dumps(row)+'\n' for row in later))
+    native_lifecycle.dispatch(selected,'session_start',{'source':'resume'},time.monotonic())
+    snapshots=list(selected.vault_path.rglob('*snapshot*.md'))
+    assert len(snapshots)==(1 if selected.host=='codex' else 0)
+    parents=[p for p in selected.vault_path.rglob('*.md') if p not in snapshots]
+    assert len(parents)==1
+    assert 'END BEFORE JOURNAL CRASH' in parents[0].read_text()
+    assert 'RESUMED AFTER JOURNAL CRASH' in parents[0].read_text()
+    if snapshots:
+        text=snapshots[0].read_text()
+        assert 'END BEFORE JOURNAL CRASH' in text and 'RESUMED AFTER JOURNAL CRASH' not in text
+        assert 'source_session: "'+sid+'"' in text
+        assert 'parent_session: "[['+parents[0].stem+']]"' in text

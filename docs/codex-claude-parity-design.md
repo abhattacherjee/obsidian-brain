@@ -121,7 +121,7 @@ Validate transcript paths against the selected adapter's allowed locations, reso
 | Session start/resume | Establish identity, perform bounded pending-work recovery, and inject project context across both hosts. |
 | Completed turn (`Stop`) | Capture new visible activity and update the same session note; then evaluate the existing blocking retro classification gate. |
 | Before compaction | Persist new activity and an immutable snapshot linked to the parent session note. |
-| Session end | Flush remaining activity and mark the observed session end. Do not call an AI backend. |
+| Session end | Flush remaining activity and mark the observed session end. Codex also retains an immutable `session_end` checkpoint when `snapshot_on_clear` is enabled. This includes ordinary ends: the host does not identify the outgoing clear separately. An explicit clear reason retains the `clear` trigger. Claude end behavior stays unchanged. Do not call an AI backend. |
 | Abrupt termination | Recover from the last committed cursor and remaining source records at the next supported recovery opportunity. |
 
 States are `active`, `ended`, and `interrupted`; capture completeness is a separate `complete` or `partial` field. An ended session can resume and become active again. A crash-recovered note without a trustworthy end event stays interrupted, not falsely finalized.

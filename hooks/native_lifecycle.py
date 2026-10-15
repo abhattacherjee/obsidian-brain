@@ -241,10 +241,18 @@ def dispatch(context, event, payload, started_at):
                 pending_sources = max(pending_sources, recovered.pending_sources)
                 if recovered.status != "complete" or recovered.pending_sources or recovered.loss_of_input:
                     _report_capture_result("recovery", recovered)
+                if context.host == "codex":
+                    from note_transactions import recover_pending_mutations
+                    pending = recover_pending_mutations(context, max_operations=8, deadline=deadline, snapshots_only=True)
+                    warnings.extend(pending.warnings[:32])
+                    pending_sources = max(pending_sources, int(pending.status == "pending"))
             if capture_enabled and event != "recover":
                 options = {"kind": event, "turn_id": turn_id}
-                if event == "session_end" and payload.get("reason") == "clear":
-                    options["trigger"] = "clear"
+                if event == "session_end":
+                    if payload.get("reason") == "clear":
+                        options["trigger"] = "clear"
+                    elif context.host == "codex":
+                        options["trigger"] = "session_end"
                 if event == "pre_compact" and payload.get("trigger") in {"auto", "manual"}:
                     options["trigger"] = payload["trigger"]
                 result = capture_checkpoint(context, CaptureEvent(**options), deadline)
@@ -282,6 +290,10 @@ def dispatch(context, event, payload, started_at):
         if event in {"session_start", "resume"}:
             output = _context_hint(context, deadline)
             diagnostic = _unsupported_hint(warnings, pending_sources)
+            if (context.host == "codex" and payload.get("source") == "clear"
+                    and context.config.get("snapshot_on_clear", True) is False):
+                warning = "snapshot_on_clear is disabled; native clear has no old-session checkpoint."
+                diagnostic = "\n".join(part for part in (diagnostic, warning) if part)
             if diagnostic:
                 existing = output["hookSpecificOutput"]["additionalContext"] if output else ""
                 return {"hookSpecificOutput": {"hookEventName": "SessionStart",

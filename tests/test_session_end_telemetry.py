@@ -406,6 +406,28 @@ def test_native_sessionend_threshold_retains_facts_without_publication(selected_
                                   (context.session_key,)).fetchone()[0]==4
 
 
+def _assert_native_end_notes(context, *, precompact=False):
+    import obsidian_utils
+    paths = list(context.vault_path.rglob('*.md'))
+    snapshots = [path for path in paths if '-snapshot-' in path.name]
+    parents = [path for path in paths if path not in snapshots]
+    assert len(parents) == 1
+    triggers = {'pre_compact:manual'} if precompact else set()
+    if context.host == 'codex':
+        triggers.add('session_end')
+    assert len(snapshots) == len(triggers)
+    assert {obsidian_utils.parse_frontmatter_field(path.read_text(), 'trigger')
+            for path in snapshots} == triggers
+    for path in snapshots:
+        text = path.read_text()
+        assert obsidian_utils.parse_frontmatter_field(text, 'agent_provider') == context.host
+        assert obsidian_utils.parse_frontmatter_field(text, 'agent_session_id') == context.native_session_id
+        assert obsidian_utils.parse_frontmatter_field(text, 'source_session') == context.native_session_id
+        assert obsidian_utils.parse_frontmatter_field(text, 'parent_session') == '[[' + parents[0].stem + ']]'
+        assert text.count('Keep all synthetic facts.') == 1
+    return parents[0]
+
+
 def test_native_sessionend_write_failure_keeps_input_for_retry(selected_host_context):
     context=selected_host_context
     folder=context.vault_path/'claude-sessions';folder.mkdir()
@@ -417,7 +439,7 @@ def test_native_sessionend_write_failure_keeps_input_for_retry(selected_host_con
     finally:
         folder.chmod(0o700)
     _native_session_child(context)
-    assert len(list(context.vault_path.rglob('*.md')))==1
+    _assert_native_end_notes(context)
 
 
 def test_native_sessionend_updates_snapshot_parent_even_after_threshold_change(selected_host_context):
@@ -425,9 +447,7 @@ def test_native_sessionend_updates_snapshot_parent_even_after_threshold_change(s
     _native_session_child(context,script='obsidian_context_snapshot.py')
     _native_config(context,min_messages=99)
     _native_session_child(context)
-    paths=list(context.vault_path.rglob('*.md'))
-    assert len(paths)==2
-    parent=next(p for p in paths if 'snapshot' not in p.name)
+    parent = _assert_native_end_notes(context, precompact=True)
     import obsidian_utils
     assert obsidian_utils.parse_frontmatter_field(parent.read_text(),'capture_state')=='ended'
 
@@ -436,7 +456,7 @@ def test_native_sessionend_success_records_selected_origin_and_retained_facts(se
     context=selected_host_context
     _,proof=_native_session_child(context)
     assert proof['mutation_contexts']
-    [note]=list(context.vault_path.rglob('*.md'))
+    note = _assert_native_end_notes(context)
     import obsidian_utils
     fields=note.read_text()
     assert obsidian_utils.parse_frontmatter_field(fields,'agent_provider')==context.host
