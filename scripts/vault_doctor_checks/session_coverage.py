@@ -196,6 +196,9 @@ def _load_thresholds(home: Path) -> tuple[int, float, bool]:
         )
         return (min_messages, min_duration, auto_log)
 
+    from runtime_context import normalize_capture_config
+    cfg = normalize_capture_config(cfg)
+
     # Coerce each key independently — one bad key must not discard the rest.
     try:
         min_messages = int(cfg.get("min_messages", 3))

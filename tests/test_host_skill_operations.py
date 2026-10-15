@@ -561,3 +561,160 @@ def test_deep_edit_preserves_manual_change_after_pre_ai_read(context):
     status, output, errors = invoke(context, 'standup', 'deep-edit', payload, success=False)
     assert status == 1 and 'source revision changed' in errors
     assert 'Applied 0/1 edits' in output and target.read_bytes() == manual
+
+
+@pytest.mark.parametrize('settings', [
+    {'min_turns': 4},
+    {'min_turns': 4, 'min_messages': 4},
+    {'min_messages': 4},
+])
+def test_message_threshold_setting_controls_real_capture(context, monkeypatch, settings):
+    """The public setting must affect publication, not just round-trip JSON."""
+    import time
+    import capture
+    import transcripts
+    revision = json.loads(invoke(context, 'vault-config', 'config-read')[1])['expected_revision']
+    invoke(context, 'vault-config', 'configure', {'expected_revision': revision, 'settings': settings})
+    persisted = json.loads(context.config_path.read_text())
+    actor = replace(context, config=MappingProxyType(persisted))
+    records = [transcripts.SourceRecord('threshold-' + str(i), 'user', 'Synthetic threshold fact ' + str(i), i * 100,
+               timestamp='2026-10-15T00:' + minute + ':' + second + 'Z')
+               for i, (minute, second) in enumerate([('00', '00'), ('01', '00'), ('02', '00')])]
+    def read(selected, cursor, deadline):
+        return transcripts.TranscriptBatch('ok', tuple(records), 'threshold-generation', len(records) * 100,
+            metadata={'native_session_id': actor.native_session_id}, source_identity='threshold-source',
+            source_complete=True, source_size=len(records) * 100)
+    monkeypatch.setattr(transcripts, 'read_records', read)
+    first = capture.capture_checkpoint(actor, capture.CaptureEvent('stop'), time.monotonic() + 3)
+    assert first.status == 'complete' and first.applied_revision is None
+    assert not list(actor.vault_path.rglob('*.md'))
+    records.append(transcripts.SourceRecord('threshold-3', 'user', 'Synthetic threshold fact 3', 300,
+                                            timestamp='2026-10-15T00:02:01Z'))
+    final = capture.capture_checkpoint(actor, capture.CaptureEvent('stop'), time.monotonic() + 3)
+    assert final.status == 'complete' and final.applied_revision
+    notes = list(actor.vault_path.rglob('*.md'))
+    assert len(notes) == 1
+    assert all(notes[0].read_text().count('Synthetic threshold fact ' + str(i)) == 1 for i in range(4))
+    assert persisted['min_messages'] == 4 and 'min_turns' not in persisted
+
+
+@pytest.mark.parametrize('settings', [
+    {'min_turns': True}, {'min_turns': False}, {'min_turns': 0}, {'min_turns': -1},
+    {'min_turns': '4'}, {'min_turns': 4.0}, {'min_turns': 4, 'min_messages': 3},
+    {'min_turns': 1, 'min_messages': True}, {'min_turns': 4, 'min_messages': 4.0},
+])
+def test_deprecated_threshold_invalid_requests_preserve_config(context, settings):
+    original = context.config_path.read_bytes()
+    revision = json.loads(invoke(context, 'vault-config', 'config-read')[1])['expected_revision']
+    status, _, error = invoke(context, 'vault-config', 'configure',
+        {'expected_revision': revision, 'settings': settings}, success=False)
+    assert status == 1 and error
+    assert context.config_path.read_bytes() == original
+
+
+def test_deprecated_threshold_stale_revision_preserves_config(context):
+    revision = json.loads(invoke(context, 'vault-config', 'config-read')[1])['expected_revision']
+    invoke(context, 'vault-config', 'configure', {'expected_revision': revision, 'settings': {'min_turns': 4}})
+    published = context.config_path.read_bytes()
+    status, _, error = invoke(context, 'vault-config', 'configure',
+        {'expected_revision': revision, 'settings': {'min_turns': 5}}, success=False)
+    assert status == 1 and 'Configuration changed' in error
+    assert context.config_path.read_bytes() == published
+
+
+@pytest.mark.parametrize('stored,expected,warning', [
+    ({'min_turns': 4}, 4, False),
+    ({'min_messages': 3, 'min_turns': 4}, 3, True),
+    ({'min_messages': 4, 'min_turns': 4}, 4, False),
+])
+def test_legacy_threshold_reads_before_defaults_without_rewriting(context, monkeypatch, capsys, stored, expected, warning):
+    import obsidian_utils
+    from runtime_context import resolve_runtime_context, using_runtime_context
+    config = {k: v for k, v in context.config.items() if k not in {'min_messages', 'min_turns'}}
+    config.update(stored)
+    context.config_path.write_text(json.dumps(config, indent=4) + '\n')
+    original = context.config_path.read_bytes()
+    selected = resolve_runtime_context(context.host, context.client, {},
+        {'session_id': context.native_session_id, 'cwd': str(context.worktree),
+         'config_path': str(context.config_path), 'index_path': str(context.index_path),
+         'state_path': str(context.state_path), 'resource_root': str(context.resource_root)})
+    assert selected.config['min_messages'] == expected
+    assert obsidian_utils.load_config(context=selected)['min_messages'] == expected
+    assert json.loads(invoke(selected, 'vault-config', 'config')[1])['min_messages'] == expected
+    # Exercise the separate legacy Claude disk loader with an explicitly selected
+    # private file and an in-memory cache sink; no native or personal fallback.
+    monkeypatch.setattr(obsidian_utils, '_CONFIG_PATH', context.config_path)
+    monkeypatch.setattr(obsidian_utils, '_get_session_id_fast', lambda: 'synthetic-threshold-config')
+    monkeypatch.setattr(obsidian_utils, 'cache_get', lambda *args: None)
+    monkeypatch.setattr(obsidian_utils, 'cache_set', lambda *args: None)
+    with using_runtime_context(None):
+        assert obsidian_utils.load_config(fresh=True)['min_messages'] == expected
+    assert context.config_path.read_bytes() == original
+    messages = capsys.readouterr().err
+    assert ('min_turns' in messages) is warning
+
+
+def test_unrelated_config_write_keeps_legacy_alias_until_explicit_threshold_change(context):
+    raw = {**context.config, 'min_messages': 3, 'min_turns': 4}
+    context.config_path.write_text(json.dumps(raw))
+    revision = json.loads(invoke(context, 'vault-config', 'config-read')[1])['expected_revision']
+    invoke(context, 'vault-config', 'configure', {'expected_revision': revision, 'settings': {'snapshot_on_compact': True}})
+    unchanged_alias = json.loads(context.config_path.read_text())
+    assert unchanged_alias['min_messages'] == 3 and unchanged_alias['min_turns'] == 4
+    revision = json.loads(invoke(context, 'vault-config', 'config-read')[1])['expected_revision']
+    invoke(context, 'vault-config', 'configure', {'expected_revision': revision, 'settings': {'min_messages': 5}})
+    canonical = json.loads(context.config_path.read_text())
+    assert canonical['min_messages'] == 5 and 'min_turns' not in canonical
+
+
+@pytest.mark.parametrize('stored,expected', [({'min_turns': 4}, 4), ({'min_messages': 3, 'min_turns': 4}, 3)])
+def test_legacy_doctor_coverage_uses_effective_threshold(context, monkeypatch, stored, expected):
+    from runtime_adapters.claude import legacy_config_path
+    monkeypatch.syspath_prepend(str(ROOT / 'scripts'))
+    from vault_doctor_checks.session_coverage import _load_thresholds
+    path = legacy_config_path(context.user_home)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    original = (json.dumps(dict(stored, min_duration_minutes=2, auto_log_enabled=True)) + '\n').encode()
+    path.write_bytes(original)
+    path.chmod(0o600)
+    assert _load_thresholds(context.user_home) == (expected, 2.0, True)
+    assert path.read_bytes() == original
+
+
+@pytest.mark.parametrize('stored,expected', [({'min_turns': 4}, 4), ({'min_messages': 3, 'min_turns': 4}, 3)])
+def test_legacy_alias_cache_rereads_raw_config_before_defaults(context, monkeypatch, stored, expected):
+    import obsidian_utils
+    from runtime_context import using_runtime_context
+    raw = (json.dumps(dict(stored, vault_path=str(context.vault_path))) + '\n').encode()
+    context.config_path.write_bytes(raw)
+    monkeypatch.setattr(obsidian_utils, '_CONFIG_PATH', context.config_path)
+    monkeypatch.setattr(obsidian_utils, '_get_session_id_fast', lambda: 'old-threshold-cache')
+    old_cache = dict(obsidian_utils._DEFAULTS, min_turns=4)
+    def old_cached_value(session_id, key):
+        return obsidian_utils._defaults_signature() if key == 'config_defaults_sig' else old_cache
+    monkeypatch.setattr(obsidian_utils, 'cache_get', old_cached_value)
+    monkeypatch.setattr(obsidian_utils, 'cache_set', lambda *args: None)
+    with using_runtime_context(None):
+        loaded = obsidian_utils.load_config()
+    assert loaded['min_messages'] == expected
+    assert context.config_path.read_bytes() == raw
+    import time
+    import capture
+    import transcripts
+    actor = replace(context, config=MappingProxyType(loaded))
+    records = [transcripts.SourceRecord('cache-' + str(i), 'user', 'Cached threshold fact ' + str(i), i * 100,
+               timestamp='2026-10-15T00:0' + str(i) + ':00Z') for i in range(3)]
+    monkeypatch.setattr(transcripts, 'read_records', lambda selected, cursor, deadline:
+        transcripts.TranscriptBatch('ok', tuple(records), 'cache-generation', len(records) * 100,
+            metadata={'native_session_id': actor.native_session_id}, source_identity='cache-source',
+            source_complete=True, source_size=len(records) * 100))
+    first = capture.capture_checkpoint(actor, capture.CaptureEvent('stop'), time.monotonic() + 3)
+    assert first.status == 'complete' and bool(first.applied_revision) == (expected == 3)
+    if expected == 4:
+        assert not list(actor.vault_path.rglob('*.md'))
+    records.append(transcripts.SourceRecord('cache-3', 'user', 'Cached threshold fact 3', 300,
+                                            timestamp='2026-10-15T00:02:01Z'))
+    final = capture.capture_checkpoint(actor, capture.CaptureEvent('stop'), time.monotonic() + 3)
+    assert final.status == 'complete' and final.applied_revision
+    assert len(list(actor.vault_path.rglob('*.md'))) == 1
+    assert context.config_path.read_bytes() == raw

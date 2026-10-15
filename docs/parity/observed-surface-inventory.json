@@ -404,6 +404,8 @@
     ],
     "hooks/runtime_context.py": [
       "index_path",
+      "min_messages",
+      "min_turns",
       "vault_path"
     ],
     "hooks/session_lookup.py": [

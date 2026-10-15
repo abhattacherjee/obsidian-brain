@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Shared runtime context, revision-checked vault writes, host-native AI adapters, Codex plugin packaging, and paired Claude Code/Codex tests (#272). Native current-client binding and installed Codex Desktop lifecycle acceptance remain pending; this does not certify full parity.
 
 ### Changed
+- Capture and configuration now use `min_messages` consistently. The legacy `min_turns` alias is read before defaults; configuration writes use the canonical key and reject conflicting thresholds.
 - The first `/check-items` run after upgrading re-classifies; the old global cache is no longer read. It remains unchanged because it has no verifiable vault/provider/project ownership. The new scoped cache reuses matching results across sessions.
 - Native hooks now enter `native_entry.py`; Codex capture is skipped without retaining a source until current frontend binding is verified. This does not certify CLI/Desktop parity.
 - Desktop binding can opt into a pinned signed local stdio transport under OS-forced remote-control denial and a root-observed prelaunch receipt. Missing or changed proof refuses capture; native Desktop lifecycle acceptance remains pending. Registered hooks can also opt into payload-free private wrapper timing; default capture behavior stays unchanged.

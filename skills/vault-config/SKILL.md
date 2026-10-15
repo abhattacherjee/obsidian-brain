@@ -105,7 +105,7 @@ Obsidian Brain Configuration
 3. insights_folder        <value>
 4. wiki_folder            <value>      <- wiki pages from /vault-ask (#383; empty = off)
 5. log_raw_messages       <value>      <- controls raw conversation logging
-6. min_turns              <value>      <- minimum turns to log a session
+6. min_messages              <value>      <- minimum turns to log a session
 7. min_duration_minutes   <value>      <- minimum duration to log
 8. snapshot_on_compact    <value>      <- checkpoint note on /compact
 9. snapshot_on_clear      <value>      <- checkpoint note on /clear
@@ -113,7 +113,12 @@ Obsidian Brain Configuration
 Enter a number to change, or 'done' to exit.
 ```
 
-For any key not present in the config, show its default value: `wiki_folder` defaults to `claude-wiki`, `log_raw_messages` defaults to `true`, `min_turns` defaults to `3`, `min_duration_minutes` defaults to `2`, `snapshot_on_compact` defaults to `true`, `snapshot_on_clear` defaults to `true`.
+`min_messages` counts visible user messages, not assistant/tool turns. The old
+`min_turns` input is deprecated: it maps to `min_messages`. Reject a request
+that supplies unequal values for both keys. A stored `min_messages` value
+takes precedence over a conflicting legacy alias; reads do not rewrite config.
+
+For any key not present in the config, show its default value: `wiki_folder` defaults to `claude-wiki`, `log_raw_messages` defaults to `true`, `min_messages` defaults to `3`, `min_duration_minutes` defaults to `2`, `snapshot_on_compact` defaults to `true`, `snapshot_on_clear` defaults to `true`.
 
 When rendering rows 8 or 9, if the value is `False`, append this warning inline on the same row:
 
@@ -136,7 +141,7 @@ Wait for user input.
 
   Only toggle after explicit confirmation.
 - **String settings** (`vault_path`, `sessions_folder`, `insights_folder`, `wiki_folder`): Show current value, ask for new value.
-- **Number settings** (`min_turns`, `min_duration_minutes`): Show current value, ask for new value. Validate it's a positive integer.
+- **Number settings** (`min_messages`, `min_duration_minutes`): Show current value, ask for new value. Validate it's a positive integer.
 
 ### Step 5 — Write updated config
 

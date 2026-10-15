@@ -14,6 +14,38 @@ from typing import Mapping, Optional
 _ACTIVE_CONTEXT = ContextVar("obsidian_brain_runtime_context", default=None)
 
 
+def normalize_capture_config(config, *, for_write=False):
+    """Read the old threshold alias before defaults; write only the canonical key."""
+    value = dict(config)
+    if "min_turns" not in value:
+        return value
+    alias = value["min_turns"]
+    valid = isinstance(alias, int) and not isinstance(alias, bool) and alias > 0
+    if for_write:
+        if not valid:
+            raise ValueError("min_turns must be a positive integer.")
+        if "min_messages" in value:
+            canonical = value["min_messages"]
+            if not isinstance(canonical, int) or isinstance(canonical, bool) or canonical <= 0:
+                raise ValueError("min_messages must be a positive integer.")
+            if canonical != alias:
+                raise ValueError("min_turns conflicts with min_messages; use only min_messages.")
+        value["min_messages"] = alias
+        del value["min_turns"]
+    elif "min_messages" in value:
+        if not valid or alias != value["min_messages"]:
+            import sys
+            print("[obsidian-brain] deprecated min_turns ignored; min_messages takes precedence.",
+                  file=sys.stderr)
+    elif valid:
+        value["min_messages"] = alias
+    else:
+        import sys
+        print("[obsidian-brain] invalid deprecated min_turns ignored; using the message default.",
+              file=sys.stderr)
+    return value
+
+
 def current_runtime_context():
     """Return a context supplied by a native entry point, without host detection."""
     return _ACTIVE_CONTEXT.get()
@@ -73,6 +105,9 @@ class RuntimeContext:
     coordination_root: Optional[Path] = None
 
     def __post_init__(self):
+        if "min_turns" in self.config:
+            object.__setattr__(self, "config", MappingProxyType(copy.deepcopy(
+                normalize_capture_config(self.config))))
         if self.user_home is None:
             object.__setattr__(self, 'user_home', Path.home().resolve())
         if self.coordination_root is None:

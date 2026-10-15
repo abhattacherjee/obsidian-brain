@@ -1122,21 +1122,21 @@
     {
       "source": "hooks/obsidian_utils.py",
       "expression": "subprocess.run(['git', 'rev-parse', '--git-common-dir'], capture_output=True, text=True, timeout=5, cwd=cwd or None)",
-      "source_sha256": "3192e748048ede1032d8ac082e39264fc5e57b5e8afe3d12331ed205b3f43b79",
+      "source_sha256": "feffd8f9457a036cd44a4f0d17466cbc2085b1c654f703c8ab4909731c5d32b8",
       "scope": "support",
       "reason": "Bounded or disposable-repository Git metadata/setup. The enclosing native operation keeps its separate host contract."
     },
     {
       "source": "hooks/obsidian_utils.py",
       "expression": "subprocess.run(['find', str(projects_dir), '-name', target, '-type', 'f', '-print', '-quit'], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=5)",
-      "source_sha256": "3192e748048ede1032d8ac082e39264fc5e57b5e8afe3d12331ed205b3f43b79",
+      "source_sha256": "feffd8f9457a036cd44a4f0d17466cbc2085b1c654f703c8ab4909731c5d32b8",
       "scope": "support",
       "reason": "Legacy Claude transcript location compatibility. Bound native contexts return only their selected transcript before this call."
     },
     {
       "source": "hooks/obsidian_utils.py",
       "expression": "subprocess.run(['git', 'rev-parse', '--abbrev-ref', 'HEAD'], capture_output=True, text=True, timeout=5, cwd=cwd or None)",
-      "source_sha256": "3192e748048ede1032d8ac082e39264fc5e57b5e8afe3d12331ed205b3f43b79",
+      "source_sha256": "feffd8f9457a036cd44a4f0d17466cbc2085b1c654f703c8ab4909731c5d32b8",
       "scope": "support",
       "reason": "Bounded or disposable-repository Git metadata/setup. The enclosing native operation keeps its separate host contract."
     },
@@ -1197,14 +1197,14 @@
     {
       "source": "hooks/skill_procedures.py",
       "expression": "subprocess.run(['git', '-C', repo_path, 'rev-parse', 'HEAD'], capture_output=True, text=True, timeout=10)",
-      "source_sha256": "9c60cb57ceb8c94bd7c3a0a6a772cebc0809f0c60bd27f038494eb19b763f98a",
+      "source_sha256": "5cfbd9e693338387ec33cb4454f474ae8d3ffb6dbc4bae079a603dfef0de34f4",
       "scope": "support",
       "reason": "Bounded or disposable-repository Git metadata/setup. The enclosing native operation keeps its separate host contract."
     },
     {
       "source": "hooks/skill_procedures.py",
       "expression": "subprocess.run(command, env=environment, stdin=subprocess.DEVNULL, timeout=120)",
-      "source_sha256": "9c60cb57ceb8c94bd7c3a0a6a772cebc0809f0c60bd27f038494eb19b763f98a",
+      "source_sha256": "5cfbd9e693338387ec33cb4454f474ae8d3ffb6dbc4bae079a603dfef0de34f4",
       "capability": "installation.fresh_upgrade"
     },
     {
@@ -1223,7 +1223,7 @@
     {
       "source": "scripts/vault_doctor_checks/session_coverage.py",
       "expression": "subprocess.run(cmd, capture_output=True, text=True, timeout=120)",
-      "source_sha256": "500cf6bbd61cf3dbb53f186b29bd969deec357b0c89fb4a36d23d9231983639e",
+      "source_sha256": "30a1d905218e73939a9eb0edc9885a7c43e7a446008daa2d381e0e48633d7f17",
       "capability": "doctor.session_coverage"
     },
     {

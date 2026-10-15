@@ -2379,12 +2379,12 @@ def load_config(fresh: bool = False, context=None) -> dict:
     ``config`` without touching ``config_defaults_sig``. So a cached dict
     must also carry every current default key.
     """
-    from runtime_context import current_runtime_context
+    from runtime_context import current_runtime_context, normalize_capture_config
     context = context or current_runtime_context()
     if context:
         import copy as _copy
         config = _copy.deepcopy(_DEFAULTS)
-        config.update(_copy.deepcopy(dict(context.config)))
+        config.update(_copy.deepcopy(normalize_capture_config(context.config)))
         config["vault_path"] = str(context.vault_path)
         config["index_path"] = str(context.index_path)
         return config
@@ -2393,10 +2393,10 @@ def load_config(fresh: bool = False, context=None) -> dict:
     cached = None
     if not fresh and cache_get(sid, "config_defaults_sig") == sig:
         cached = cache_get(sid, "config")
-        if not (isinstance(cached, dict) and _DEFAULTS.keys() <= cached.keys()):
+        if not (isinstance(cached, dict) and _DEFAULTS.keys() <= cached.keys()) or "min_turns" in cached:
             cached = None
     if cached is not None:
-        return cached
+        return normalize_capture_config(cached)
 
     # dict(_DEFAULTS) is a shallow copy — any list/dict values in _DEFAULTS
     # would be shared across calls, so an in-place mutation on
@@ -2408,7 +2408,7 @@ def load_config(fresh: bool = False, context=None) -> dict:
         with open(_CONFIG_PATH, "r", encoding="utf-8") as fh:
             user_cfg = json.load(fh)
         if isinstance(user_cfg, dict):
-            config.update(user_cfg)
+            config.update(normalize_capture_config(user_cfg))
     except FileNotFoundError:
         print(
             f"[obsidian-brain] config not found at {_CONFIG_PATH}, using defaults",

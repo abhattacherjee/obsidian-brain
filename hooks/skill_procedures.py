@@ -938,6 +938,8 @@ def _configure(context, payload):
     allowed = {'vault_path', 'sessions_folder', 'insights_folder', 'dashboards_folder', 'check_items_folder', 'wiki_folder', 'index_path', 'min_messages', 'min_turns', 'min_duration_minutes', 'summary_model', 'auto_log_enabled', 'log_raw_messages', 'snapshot_on_compact', 'snapshot_on_clear', 'summary_timeout', 'summary_batch_size', 'summary_pipeline', 'classifier_model', 'codex_ai_model', 'codex_summary_model', 'optional_deps_prompted', 'optional_deps_declined'}
     if set(settings) - allowed:
         raise ValueError('Unknown configuration setting.')
+    from runtime_context import normalize_capture_config
+    settings = normalize_capture_config(settings, for_write=True)
     for key in ('auto_log_enabled', 'log_raw_messages', 'snapshot_on_compact', 'snapshot_on_clear', 'optional_deps_prompted'):
         if key in settings and (not isinstance(settings[key], bool)):
             raise ValueError(key + ' must be true or false.')
@@ -961,6 +963,8 @@ def _configure(context, payload):
         if len(raw) > 1000000 or hashlib.sha256(raw).hexdigest() != expected:
             raise ValueError('Configuration changed after it was read; reload it before saving.')
         config = json.loads(raw) if raw else {}
+        if 'min_messages' in settings:
+            config.pop('min_turns', None)
         config.update(settings)
         if Path(config.get('vault_path', '')).resolve() != context.vault_path.resolve():
             raise ValueError('Select the new vault explicitly before updating its configuration.')
