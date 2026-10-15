@@ -218,3 +218,58 @@ def test_import_destination_read_refuses_unsafe_bytes_without_mutation(context, 
         assert note.read_bytes() == before
     else:
         assert note.is_dir()
+
+
+def test_bounded_import_reads_all_batches_and_reimports_idempotently(context, monkeypatch):
+    import transcripts
+    facts = ['Batch fact ' + str(number) + ' ' + ('x' * 80) for number in range(9)]
+    source = prepare_source(context, facts)
+    monkeypatch.setattr(transcripts, 'MAX_BATCH_BYTES', max(map(len, source.read_bytes().splitlines(keepends=True))) * 2)
+    original = transcripts.read_records
+    batches = []
+    def observe(*args):
+        batch = original(*args)
+        batches.append(batch)
+        return batch
+    monkeypatch.setattr(transcripts, 'read_records', observe)
+    before = source.read_bytes()
+    payload, ready = read_source(context, source)
+    assert len(batches) >= 2 and any(batch.status == 'partial' for batch in batches)
+    assert [record['text'] for record in ready['records']] == facts
+    assert ready['source_revision'] == hashlib.sha256(before).hexdigest()
+    code, _, errors = publish(context, payload, 'All nine batch facts summarized')
+    assert code == 0, errors
+    note = context.vault_path / context.config['sessions_folder'] / 'initial.md'
+    note_before = note.read_bytes()
+    _, skipped = read_source(context, source)
+    assert skipped['status'] == 'skipped'
+    assert note.read_bytes() == note_before and source.read_bytes() == before
+
+
+@pytest.mark.parametrize('failure', ['deadline', 'unfinished', 'unknown', 'mixed', 'suffixed', 'loss', 'no-progress'])
+def test_import_does_not_continue_unsafe_partial_batches(context, monkeypatch, failure):
+    from dataclasses import replace
+    import transcripts
+    source = prepare_source(context, ['First fact', 'Final fact'])
+    original = transcripts.read_records
+    calls = []
+    def unsafe(origin, cursor, deadline):
+        calls.append(cursor)
+        batch = original(origin, cursor, deadline)
+        warnings = {'deadline': ('Transcript deadline reached',),
+                    'unfinished': ('Incomplete final transcript line retained',),
+                    'unknown': ('Unknown transcript record',),
+                    'mixed': ('Transcript batch limit reached', 'Transcript deadline reached'),
+                    'suffixed': ('Transcript batch limit reached extra',)}.get(
+                        failure, ('Transcript batch limit reached',))
+        return replace(batch, status='partial', warnings=warnings, source_complete=False,
+                       loss_of_input=failure == 'loss',
+                       consumed_offset=cursor.offset if failure == 'no-progress' else batch.consumed_offset)
+    monkeypatch.setattr(transcripts, 'read_records', unsafe)
+    operation = successful(context, 'prepare', {})['operation_id']
+    before = source.read_bytes()
+    code, _, errors = invoke(context, 'import-read', {'operation_id': operation,
+        'source_host': context.host, 'source_session_id': 'grown-origin', 'source_path': str(source)})
+    assert code != 0 and 'pending' in errors
+    assert len(calls) == 1 and not list(context.vault_path.rglob('*.md'))
+    assert source.read_bytes() == before

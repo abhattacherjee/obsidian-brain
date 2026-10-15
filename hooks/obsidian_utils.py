@@ -4752,8 +4752,9 @@ _SECRET_PATTERNS = [
     # A header alone is not enough: private key material can span many lines.
     (re.compile(r'-----BEGIN ((?:[A-Z0-9]+ )*PRIVATE KEY)-----[\s\S]*?(?:-----END \1-----|\Z)'),
      '[REDACTED:private-key]'),
-    # Preserve connection details while removing URI userinfo passwords.
-    (re.compile(r'([A-Za-z][A-Za-z0-9+.-]*://[^/\s:@]+:)[^/\s]+@'), r'\1[REDACTED]@'),
+    # Match once per scheme token, rather than retrying at every letter.
+    # Keep any leading digits/punctuation that the old search skipped.
+    (re.compile(r'(?<![A-Za-z0-9+.-])([0-9+.-]*[A-Za-z][A-Za-z0-9+.-]*://[^/\s:@]+:)[^/\s]+@'), r'\1[REDACTED]@'),
     (re.compile(r'(?i)("(?:password|passwd|secret|token|api[_-]?key|client[_-]?secret)"\s*:\s*)"(?:\\.|[^"\\])*"'),
      r'\1"[REDACTED]"'),
     (re.compile(r"(?i)('(?:password|passwd|secret|token|api[_-]?key|client[_-]?secret)'\s*:\s*)'(?:\\.|[^'\\])*'"),

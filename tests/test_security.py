@@ -142,6 +142,40 @@ class TestFindTranscriptContainment:
 class TestSecretScrubbing:
     """H2: scrub_secrets redacts common secret patterns."""
 
+    @pytest.mark.parametrize('text,expected', [
+        ('https://user:synthetic-pass@example.invalid/path',
+         'https://user:[REDACTED]@example.invalid/path'),
+        ('123https://u:p@host', '123https://u:[REDACTED]@host'),
+        ('.+12h://u:p@host', '.+12h://u:[REDACTED]@host'),
+        ('x+y.z-1://u:p:q@host', 'x+y.z-1://u:[REDACTED]@host'),
+        ('éhttps://u:p@host', 'éhttps://u:[REDACTED]@host'),
+        ('https://u:p@host\nhttp://v:q@other',
+         'https://u:[REDACTED]@host\nhttp://v:[REDACTED]@other'),
+        ('123://u:p@host', '123://u:p@host'),
+        ('://u:p@host', '://u:p@host'),
+        ('https://user@host/path', 'https://user@host/path'),
+    ])
+    def test_uri_redaction_keeps_scheme_prefixes_and_surrounding_text(self, text, expected):
+        from obsidian_utils import scrub_secrets
+        assert scrub_secrets(text) == expected
+
+    def test_long_plain_token_does_not_stall_uri_redaction(self):
+        # A long non-URI token followed by a real URI must still be scrubbed.
+        # Bound the child so a quadratic regression cannot hang the suite.
+        program = '''
+import sys
+sys.path.insert(0, sys.argv[1])
+from obsidian_utils import scrub_secrets
+prefix = "x" * 150000
+assert scrub_secrets(prefix) == prefix
+assert scrub_secrets(prefix + " https://u:synthetic-pass@host/path") == prefix + " https://u:[REDACTED]@host/path"
+'''
+        result = subprocess.run(
+            [sys.executable, '-c', program, str(Path(__file__).resolve().parents[1] / 'hooks')],
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=5,
+        )
+        assert result.returncode == 0, result.stderr
+
     def test_scrub_github_token(self):
         from obsidian_utils import scrub_secrets
         text = "my token is ghp_abc123def456ghi789jkl012mno345pqr678stu9"

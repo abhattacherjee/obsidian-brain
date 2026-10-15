@@ -1541,7 +1541,10 @@ def _import_read(context, payload):
     metadata = {}
     while time.monotonic() < deadline:
         batch = read_records(origin, cursor, deadline)
-        if batch.status not in {'ok', 'empty'} or batch.loss_of_input:
+        bounded_continuation = (batch.status == 'partial'
+            and batch.warnings == ('Transcript batch limit reached',)
+            and batch.consumed_offset > cursor.offset)
+        if (batch.status not in {'ok', 'empty'} and not bounded_continuation) or batch.loss_of_input:
             raise ValueError('Historical source is incomplete; operation remains pending: ' + ', '.join(batch.warnings))
         records.extend(asdict(record) for record in batch.records)
         metadata.update(batch.metadata)
