@@ -749,7 +749,7 @@
           "files": [
             "hooks/consolidate_cli.py"
           ],
-          "purpose": "Thin CLI backing /consolidate: gathers unassigned (or all, with --full) note vectors, clusters per-project, names through the invoking native AI backend, persists themes + theme_members; stats/split/merge."
+          "purpose": "Thin CLI backing /consolidate: retries pending theme names in place, gathers unassigned (or all, with --full) note vectors, clusters per-project, names through the invoking native AI backend, and persists themes + theme_members. Failed naming keeps deterministic fallback themes and a theme_naming_pending request. Retry checks theme and member revisions before updating names. Also provides stats/split/merge."
         },
         {
           "id": "clustering",
@@ -1159,7 +1159,7 @@
           "files": [
             "hooks/vault_index.py"
           ],
-          "purpose": "The vault index DB (WAL, 0600, ~33 MB). Tables: notes, notes_fts (contentless FTS5), access_log, themes, theme_members, term_df. Derived and fully rebuildable from the vault. Coordination journals and capture cursors live outside this rebuildable index.",
+          "purpose": "The vault index DB (WAL, 0600, ~33 MB). Tables: notes, notes_fts (contentless FTS5), access_log, themes, theme_members, term_df, and lazily created theme_naming_pending. Pending naming survives ordinary reindexing and is retried by /consolidate without replacing memberships. Derived and fully rebuildable from the vault; an explicit index reset also resets themes. Coordination journals and capture cursors live outside this rebuildable index.",
           "overrideEnv": "OBSIDIAN_BRAIN_DB"
         },
         {
@@ -1786,7 +1786,7 @@
     {
       "id": "theme-seeding",
       "name": "/consolidate theme seeding",
-      "description": "Batch-cluster unassigned notes into named themes: partition by project, cluster per-project, name through the invoking native AI backend, persist themes + theme_members.",
+      "description": "Retry pending theme naming with revision checks, then cluster unassigned notes per project and name through the invoking native AI backend. Persist themes + theme_members and retain failed naming requests for ordinary retry.",
       "steps": [
         {
           "from": "sk-consolidate",
@@ -2737,7 +2737,7 @@
   "testing": {
     "unitSuite": {
       "tool": "pytest",
-      "fileCount": 198,
+      "fileCount": 199,
       "duration": "fast (stdlib, no network)",
       "environments": {
         "python": "3.12",

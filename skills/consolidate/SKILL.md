@@ -101,8 +101,19 @@ python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_C
 ```
 
 Report the `UNASSIGNED=` (or `SCANNED=` for `--full`), `CREATED=`, and
-`THEMES_TOTAL=` lines. If `CREATED=0`, tell the user no clusters of 3+ similar
-notes were found (themes need at least 3 notes above the similarity threshold).
+`THEMES_TOTAL=` lines, plus `RENAMED=` and `NAMING_PENDING_COUNT=` when present.
+An ordinary run retries pending theme names before clustering new notes; a
+successful retry preserves theme IDs and memberships. If naming is unavailable,
+deterministic fallback themes remain usable but naming stays pending. Report
+the failure and pending count; do not call fallback naming successful. Retry
+the ordinary command after resolving the cause; do not use `--full` as a retry.
+If `CREATED=0`, distinguish completed naming retries from pending names and
+the absence of new clusters of 3+ similar notes.
+
+If native Codex cannot initialize its selected home inside the current sandbox,
+request permission for the exact reviewed operation through the client's normal
+approval flow. Do not change providers, model policy or sandbox settings to
+silence the failure. Preserve the failed request and receipts.
 
 ### Step 3 — Stats
 
@@ -117,7 +128,8 @@ Request for `theme-stats` (substitute the values as data):
 python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'theme-stats' < "$REQUEST_PATH"
 ```
 
-Present `THEMES=`, `MEMBERS=`, `UNASSIGNED=`, the `LARGEST` rows, and any `NUDGE`.
+Present `THEMES=`, `MEMBERS=`, `UNASSIGNED=`, `NAMING_PENDING_COUNT=`, the
+`LARGEST` rows, and any `NUDGE`.
 
 ### Step 4 — Split
 
@@ -133,7 +145,9 @@ Request for `theme-split` (substitute the values as data):
 python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'theme-split' < "$REQUEST_PATH"
 ```
 
-Report `SPLIT` or `NO_SPLIT`.
+Report `SPLIT` or `NO_SPLIT` and `NAMING_PENDING_COUNT=` when present.
+Failed split naming retains pending work on the new subthemes; an ordinary
+consolidation run retries their names without splitting them again.
 
 ### Step 5 — Merge
 

@@ -12,6 +12,7 @@ to satisfy the #192 guard.
 from __future__ import annotations
 
 import sqlite3
+import json
 import sys
 from datetime import datetime, timezone
 
@@ -38,6 +39,78 @@ def _partition_by_project(rows):
     return buckets
 
 
+def _ensure_pending_names(conn):
+    conn.execute("CREATE TABLE IF NOT EXISTS theme_naming_pending "
+                 "(theme_id INTEGER PRIMARY KEY, reason TEXT NOT NULL)")
+    conn.execute("DELETE FROM theme_naming_pending WHERE theme_id NOT IN (SELECT id FROM themes)")
+    conn.commit()
+
+
+def _naming_revision(conn, theme_id):
+    row = conn.execute("SELECT id, name, summary, centroid, note_count, project, updated_date "
+                       "FROM themes WHERE id = ?", (theme_id,)).fetchone()
+    members = conn.execute("SELECT m.note_path, n.tfidf_vector FROM theme_members m "
+                           "LEFT JOIN notes n ON n.path = m.note_path "
+                           "WHERE m.theme_id = ? ORDER BY m.note_path", (theme_id,)).fetchall()
+    return (tuple(row) if row else None, tuple(tuple(member) for member in members))
+
+
+def _report_pending_names(db):
+    conn = _connect(db)
+    try:
+        exists = conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                              "AND name = 'theme_naming_pending'").fetchone()
+        count = conn.execute("SELECT COUNT(*) FROM theme_naming_pending p JOIN themes t "
+                             "ON t.id = p.theme_id").fetchone()[0] if exists else 0
+    finally:
+        conn.close()
+    print(f"NAMING_PENDING_COUNT={count}")
+
+
+def _retry_pending_names(db, model):
+    renamed = 0
+    conn = _connect(db)
+    try:
+        _ensure_pending_names(conn)
+        ids = [row[0] for row in conn.execute("SELECT theme_id FROM theme_naming_pending ORDER BY theme_id")]
+        snapshots = [_naming_revision(conn, theme_id) for theme_id in ids]
+    finally:
+        conn.close()
+    buckets = {}
+    for revision in snapshots:
+        row, members = revision
+        if row is not None:
+            buckets.setdefault(row[5], []).append(revision)
+    for project, revisions in buckets.items():
+        payload = [{"top_terms": [term for term, _ in sorted(json.loads(row[3] or "{}").items(),
+                                                               key=lambda item: -item[1])[:10]],
+                    "sample_titles": [member[0] for member in members[:5]]}
+                   for row, members in revisions]
+        names, reason = generate_theme_names(payload, model=model)
+        if reason is not None or not names or len(names) != len(revisions):
+            print(f"NAMING_PENDING={reason or 'count_mismatch'} project={project}", file=sys.stderr)
+            continue
+        conn = _connect(db)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            for revision, named in zip(revisions, names):
+                theme_id = revision[0][0]
+                if _naming_revision(conn, theme_id) != revision:
+                    print(f"NAMING_CONFLICT theme={theme_id}", file=sys.stderr)
+                    continue
+                # A concurrent successful retry must not be overwritten.
+                if not conn.execute("SELECT 1 FROM theme_naming_pending WHERE theme_id = ?", (theme_id,)).fetchone():
+                    continue
+                conn.execute("UPDATE themes SET name = ?, summary = ?, updated_date = ? WHERE id = ?",
+                             (named["name"], named["summary"], _now_iso(), theme_id))
+                conn.execute("DELETE FROM theme_naming_pending WHERE theme_id = ?", (theme_id,))
+                renamed += 1
+            conn.commit()
+        finally:
+            conn.close()
+    return renamed
+
+
 def run_consolidate(full: bool = False) -> None:
     config = load_config()
     if not config.get("vault_path"):
@@ -48,6 +121,10 @@ def run_consolidate(full: bool = False) -> None:
     min_size = int(config.get("consolidate_min_cluster_size", 3))
 
     try:
+        # Keep deterministic fallback themes usable, while retaining their naming work.
+        if not full:
+            renamed = _retry_pending_names(db, config.get("summary_model", "haiku"))
+            print(f"RENAMED={renamed}")
         # --- Step 1: read source rows BEFORE any write ---
         # For --full, use all vectorized notes (wipe is deferred until after planning).
         # For incremental, only unassigned notes.
@@ -84,17 +161,23 @@ def run_consolidate(full: bool = False) -> None:
                 else:
                     name, summary = _fallback_name(cen)
                 members = [(p, vec_by_path[p]) for p in cl]
-                plan.append((proj, name, summary, cen, members))
+                plan.append((proj, name, summary, cen, members,
+                             (reason or "count_mismatch") if not names else None))
 
         # --- Step 3: ONE transaction — wipe (if full) then create all themes ---
         conn = _connect(db)
         try:
+            _ensure_pending_names(conn)
             conn.execute("BEGIN IMMEDIATE")
             if full:
+                conn.execute("DELETE FROM theme_naming_pending")
                 conn.execute("DELETE FROM theme_members")
                 conn.execute("DELETE FROM themes")
-            for proj, name, summary, cen, members in plan:
-                themes.create_theme(conn, name, summary, cen, members, proj, now)
+            for proj, name, summary, cen, members, pending_reason in plan:
+                theme_id = themes.create_theme(conn, name, summary, cen, members, proj, now)
+                if pending_reason:
+                    conn.execute("INSERT INTO theme_naming_pending (theme_id, reason) VALUES (?, ?)",
+                                 (theme_id, pending_reason))
             themes.recompute_activation(conn, now)
             conn.commit()
         finally:
@@ -107,6 +190,7 @@ def run_consolidate(full: bool = False) -> None:
         finally:
             conn.close()
         print(f"CREATED={created} THEMES_TOTAL={total}")
+        _report_pending_names(db)
 
     except (sqlite3.Error, RuntimeError, ValueError, TypeError) as exc:
         print(f"ERROR {exc}", file=sys.stderr)
@@ -121,6 +205,7 @@ def run_stats() -> None:
         print(f"THEMES={st['themes']}")
         print(f"MEMBERS={st['members']}")
         print(f"UNASSIGNED={st['unassigned']}")
+        _report_pending_names(db)
         for t in st["largest"]:
             print(f"LARGEST id={t['id']} count={t['note_count']} name={t['name']}")
         nudge = int(config.get("consolidate_unassigned_threshold", 50))
@@ -199,17 +284,23 @@ def run_split(theme_id: int) -> int:
         now = _now_iso()
         conn = _connect(db)
         try:
+            _ensure_pending_names(conn)
             conn.execute("BEGIN IMMEDIATE")
+            conn.execute("DELETE FROM theme_naming_pending WHERE theme_id = ?", (theme_id,))
             conn.execute("DELETE FROM theme_members WHERE theme_id = ?", (theme_id,))
             conn.execute("DELETE FROM themes WHERE id = ?", (theme_id,))
             for i, cl in enumerate(subclusters):
                 cen = centroids[i]
                 name, summary = (names[i]["name"], names[i]["summary"]) if names else _fallback_name(cen)
-                themes.create_theme(conn, name, summary, cen, [(p, vec_by_path[p]) for p in cl], project, now)
+                new_id = themes.create_theme(conn, name, summary, cen, [(p, vec_by_path[p]) for p in cl], project, now)
+                if not names:
+                    conn.execute("INSERT INTO theme_naming_pending (theme_id, reason) VALUES (?, ?)",
+                                 (new_id, reason or "count_mismatch"))
             conn.commit()
         finally:
             conn.close()
         print(f"SPLIT theme={theme_id} into={len(subclusters)}")
+        _report_pending_names(db)
         return 0
 
     except (sqlite3.Error, RuntimeError, ValueError, TypeError) as exc:
