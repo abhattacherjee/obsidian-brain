@@ -4446,8 +4446,19 @@ def _execute_summary_ai(prompt, operation, model, timeout, input_revision="", ex
     if operation == "theme_names":
         output = json.dumps(output)
     elif operation == "session_summaries":
-        output = "\n\n".join("===== SUMMARY %d =====\n%s" % (index, text)
-                              for index, text in sorted(output.items()))
+        blocks = []
+        header = re.compile(r"^=====\s*SUMMARY\s+(\d+)\s*=====\s*$", re.MULTILINE)
+        for index, text in sorted(output.items()):
+            text = text.strip()
+            match = header.match(text)
+            if match is not None and int(match.group(1)) == index:
+                text = text[match.end():].lstrip("\r\n")
+            # Structured indexes own the boundaries, not delimiters in model text.
+            if header.search(text):
+                return SimpleNamespace(returncode=1, stdout="", stderr="invalid_output",
+                                       failure_reason="missing_section")
+            blocks.append("===== SUMMARY %d =====\n%s" % (index, text))
+        output = "\n\n".join(blocks)
     return SimpleNamespace(returncode=0, stdout=output, stderr="", model=result.model, failure_reason=None)
 
 

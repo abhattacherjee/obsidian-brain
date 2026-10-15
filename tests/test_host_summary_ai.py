@@ -119,3 +119,55 @@ def test_timeout_clears_previous_model_and_retains_native_host(context, monkeypa
         assert obsidian_utils._SUMMARY_NATIVE_MODEL.get() is None
     assert failure.value.cmd == [context.host]
     assert failure.value.timeout == 7
+
+
+@pytest.mark.parametrize("wrapped", [False, True])
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_structured_batch_headers_preserve_each_note_sections(context, monkeypatch, wrapped, newline):
+    sections = [newline.join(["## Summary", "First fact.", ""]),
+                newline.join(["## Summary", "Second fact.", ""])]
+    output = {"summaries": [{"index": index, "text":
+              ("===== SUMMARY %d =====" % index + newline if wrapped else "") + text}
+              for index, text in enumerate(sections, 1)]}
+    def execute(ctx, operation, request):
+        assert operation == "session_summaries"
+        data = ai_backend.validate_ai_output(operation, output, request.options)
+        return ai_backend.AIResult("ok", data, request.input_revision,
+                                   backend=context.host, model="observed-model")
+    monkeypatch.setattr(ai_backend, "execute_ai", execute)
+    import open_item_dedup
+    monkeypatch.setattr(open_item_dedup, "collect_open_items", lambda *a, **k: [])
+    monkeypatch.setattr(obsidian_utils, "_summary_recovery_enabled", lambda: False)
+    prepared = [{"user_msgs": ["Synthetic fact"], "assistant_msgs": ["Recorded"],
+                 "metadata": {}, "input_capture_revision": "a" * 64} for _ in sections]
+    with using_runtime_context(context):
+        rendered = obsidian_utils._execute_summary_ai("Batch", "session_summaries", "haiku", 10,
+                                                     expected_count=2)
+        parsed = obsidian_utils.generate_summaries_batch(prepared, vault_path=str(context.vault_path))
+    assert rendered.stdout.count("===== SUMMARY 1 =====") == 1
+    assert rendered.stdout.count("===== SUMMARY 2 =====") == 1
+    assert parsed == [(text.strip(), None) for text in sections]
+
+
+@pytest.mark.parametrize("indexes", [[1, 1], [1, 3]])
+def test_structured_batch_still_rejects_duplicate_or_out_of_range_indexes(indexes):
+    output = {"summaries": [{"index": index, "text": "## Summary\nFact."} for index in indexes]}
+    with pytest.raises(ValueError):
+        ai_backend.validate_ai_output("session_summaries", output, {"expected_count": 2})
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+@pytest.mark.parametrize("lines", [
+    ["===== SUMMARY 2 =====", "## Summary", "Wrong target."],
+    ["## Summary", "First fact.", "===== SUMMARY 2 =====", "## Summary", "Wrong target."],
+    ["===== SUMMARY 1 =====", "===== SUMMARY 1 =====", "## Summary", "Repeated boundary."],
+])
+def test_structured_batch_foreign_header_cannot_move_summary_between_notes(context, monkeypatch, newline, lines):
+    monkeypatch.setattr(ai_backend, "execute_ai", lambda *a: ai_backend.AIResult(
+        "ok", {1: newline.join(lines)}, backend=context.host))
+    with using_runtime_context(context):
+        result = obsidian_utils._execute_summary_ai("Batch", "session_summaries", "haiku", 10,
+                                                   expected_count=2)
+    assert result.returncode == 1
+    assert result.stdout == ""
+    assert result.failure_reason == "missing_section"
