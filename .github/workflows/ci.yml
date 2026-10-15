@@ -56,7 +56,7 @@ jobs:
             exit 1
           fi
 
-  # Whole test files stay together so both invoking hosts remain paired.
+  # Ordinary files and security classes keep both invoking hosts paired.
   coverage-shards:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
@@ -64,7 +64,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [0, 1, 2, 3, 4, 5]
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
@@ -76,7 +76,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/shard-data"
-          python scripts/ci-checks/test_shards.py list --count 6 --index "${{ matrix.shard }}" --manifest "$RUNNER_TEMP/shard-data/manifest.json" > "$RUNNER_TEMP/shard-files"
+          python scripts/ci-checks/test_shards.py list --count 8 --index "${{ matrix.shard }}" --manifest "$RUNNER_TEMP/shard-data/manifest.json" > "$RUNNER_TEMP/shard-files"
           mapfile -t TEST_FILES < "$RUNNER_TEMP/shard-files"
           PYTHONUNBUFFERED=1 PYTHONPATH=hooks:tests pytest -p parity_collection_plugin --parity-matrix docs/parity/capabilities.json "${TEST_FILES[@]}" -n 4 --deselect=tests/test_security.py::TestDecisionTimeIsBounded:: --deselect=tests/test_security.py::TestPatternDecisionTimeIsBounded:: -o addopts=--tb=short -q --basetemp="$RUNNER_TEMP/pytest-coverage" --cov=hooks --cov-report= --cov-fail-under=0 -o junit_family=xunit1 --junitxml="$RUNNER_TEMP/shard-data/parallel.xml" --durations=30
           cp .coverage "$RUNNER_TEMP/shard-data/.coverage"
@@ -145,7 +145,7 @@ jobs:
           name: coverage-timing
           path: ${{ runner.temp }}/timing-artifact
       - name: Require complete partition and combined 90% coverage
-        run: python scripts/ci-checks/test_shards.py coverage --count 6 --prefix coverage-shard --artifacts "$RUNNER_TEMP/coverage-artifacts" --timing-artifact "$RUNNER_TEMP/timing-artifact"
+        run: python scripts/ci-checks/test_shards.py coverage --count 8 --prefix coverage-shard --artifacts "$RUNNER_TEMP/coverage-artifacts" --timing-artifact "$RUNNER_TEMP/timing-artifact"
 
   # Python 3.9 remains a full test gate without a second coverage measurement.
   py39-shards:
@@ -155,7 +155,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [0, 1, 2, 3]
+        shard: [0, 1, 2, 3, 4, 5]
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
@@ -167,7 +167,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/shard-data"
-          python scripts/ci-checks/test_shards.py list --count 4 --index "${{ matrix.shard }}" --manifest "$RUNNER_TEMP/shard-data/manifest.json" > "$RUNNER_TEMP/shard-files"
+          python scripts/ci-checks/test_shards.py list --count 6 --index "${{ matrix.shard }}" --manifest "$RUNNER_TEMP/shard-data/manifest.json" > "$RUNNER_TEMP/shard-files"
           mapfile -t TEST_FILES < "$RUNNER_TEMP/shard-files"
           PYTHONUNBUFFERED=1 PYTHONPATH=hooks:tests pytest -p parity_collection_plugin --parity-matrix docs/parity/capabilities.json "${TEST_FILES[@]}" -n 4 --deselect=tests/test_security.py::TestDecisionTimeIsBounded:: --deselect=tests/test_security.py::TestPatternDecisionTimeIsBounded:: -o addopts=--tb=short -q --basetemp="$RUNNER_TEMP/pytest-py39" -o junit_family=xunit1 --junitxml="$RUNNER_TEMP/shard-data/parallel.xml" --durations=30
           if [[ "${{ matrix.shard }}" == 0 ]]; then
@@ -202,7 +202,7 @@ jobs:
           path: ${{ runner.temp }}/py39-artifacts
           merge-multiple: false
       - name: Require complete Python 3.9 partition
-        run: python scripts/ci-checks/test_shards.py validate --count 4 --prefix py39-shard --artifacts "$RUNNER_TEMP/py39-artifacts"
+        run: python scripts/ci-checks/test_shards.py validate --count 6 --prefix py39-shard --artifacts "$RUNNER_TEMP/py39-artifacts"
 
   # ── DB-pollution guard — blocks bare ensure_index() in tests (GH #46) ─
   no-default-db-check:

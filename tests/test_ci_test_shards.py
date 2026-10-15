@@ -31,7 +31,7 @@ def _check_workflow_timing_owner(tmp_path, job, block):
     import sys
 
     root = Path(__file__).resolve().parents[1]
-    count, owner = (6, None) if job == 'coverage-shards' else (4, 0)
+    count, owner = (8, None) if job == 'coverage-shards' else (6, 0)
     binaries = tmp_path / 'bin'
     binaries.mkdir()
     driver = binaries / 'driver'
@@ -214,7 +214,7 @@ pathlib.Path('combined-argv.json').write_text(json.dumps(sys.argv[1:]))
                             stdin=subprocess.DEVNULL, capture_output=True, timeout=10)
     assert result.returncode == 0
     args = json.loads((tmp_path / 'combined-argv.json').read_text())
-    assert args == ['scripts/ci-checks/test_shards.py', 'coverage', '--count', '6',
+    assert args == ['scripts/ci-checks/test_shards.py', 'coverage', '--count', '8',
                     '--prefix', 'coverage-shard', '--artifacts',
                     str(tmp_path / 'coverage-artifacts'), '--timing-artifact',
                     str(tmp_path / 'timing-artifact')]
@@ -618,3 +618,93 @@ def test_new_preflight_invalidates_previous_token_before_checks(tmp_path, interr
                             text=True, timeout=20)
     assert result.returncode == status
     assert not token.exists(), 'A previous approval survived the new run starting'
+
+
+def _measured_weights(root, files=None, selectors=None):
+    directory = root / 'scripts/ci-checks'
+    directory.mkdir(parents=True, exist_ok=True)
+    payload = {'schema': 1, 'source_commit': 'a' * 40, 'source_run': 123,
+               'units': 'seconds', 'fallback_seconds_per_byte': 0.01,
+               'files': files or {}, 'security_selectors': selectors or {}}
+    (directory / 'test-runtime-weights.json').write_text(json.dumps(payload))
+    return directory / 'test-runtime-weights.json'
+
+
+def test_security_classes_use_two_reserved_shards_and_runtime_weights(corpus):
+    root, _ = corpus
+    (root / 'tests/test_security.py').write_text('''
+class TestSlow:
+    def test_one(self): pass
+class TestMedium:
+    def test_two(self): pass
+def test_small(): pass
+''')
+    _measured_weights(root, {'tests/test_native.py': 1, 'tests/legacy_test.py': 10,
+                            'tests/test_reader.py': 8, 'tests/test_writer.py': 2},
+                      {'tests/test_security.py::TestSlow': 10,
+                       'tests/test_security.py::TestMedium': 6,
+                       'tests/test_security.py::test_small': 3})
+    groups = shards.partitions(root, 4)
+    assert groups == [['tests/test_security.py::TestSlow'],
+                      ['tests/test_security.py::TestMedium', 'tests/test_security.py::test_small'],
+                      ['tests/legacy_test.py', 'tests/test_native.py'],
+                      ['tests/test_reader.py', 'tests/test_writer.py']]
+    assert shards.partitions(root, 4) == groups
+
+
+def test_unknown_file_uses_positive_seconds_per_byte_fallback(corpus):
+    root, _ = corpus
+    _measured_weights(root, {'tests/test_native.py': 0.1})
+    assert shards.partitions(root, 2) == [
+        ['tests/legacy_test.py', 'tests/test_native.py'],
+        ['tests/test_reader.py', 'tests/test_writer.py']]
+
+
+@pytest.mark.parametrize('damage', ['nan', 'negative', 'zero-fallback', 'unknown-units',
+                                  'wrong-schema', 'unsafe-path', 'boolean', 'extra-field'])
+def test_malformed_committed_weights_fail_closed(corpus, damage):
+    root, _ = corpus
+    path = _measured_weights(root)
+    data = json.loads(path.read_text())
+    if damage == 'nan': data['files'] = {'tests/test_native.py': float('nan')}
+    elif damage == 'negative': data['security_selectors'] = {'tests/test_security.py::TestSlow': -1}
+    elif damage == 'zero-fallback': data['fallback_seconds_per_byte'] = 0
+    elif damage == 'unknown-units': data['units'] = 'bytes'
+    elif damage == 'wrong-schema': data['schema'] = 2
+    elif damage == 'unsafe-path': data['files'] = {'../outside.py': 1}
+    elif damage == 'boolean': data['files'] = {'tests/test_native.py': True}
+    else: data['ignored'] = 1
+    path.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match='weight'):
+        shards.partitions(root, 2)
+
+
+def test_security_selector_union_matches_independent_real_pytest_collection(tmp_path):
+    import os
+    import subprocess
+    import sys
+    root = Path(__file__).resolve().parents[1]
+    result = subprocess.run([sys.executable, '-m', 'pytest', 'tests/test_security.py',
+                             '--collect-only', '-q', '-o', 'addopts='], cwd=root,
+                            env=dict(os.environ), stdin=subprocess.DEVNULL,
+                            capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stdout + result.stderr
+    nodes = [line for line in result.stdout.splitlines() if line.startswith('tests/test_security.py::')]
+    assert nodes and len(nodes) == len(set(nodes))
+    selectors = [selector for group in shards.partitions(root, 8) for selector in group
+                 if selector.startswith('tests/test_security.py::')]
+    assert selectors, 'Security must be split into actual class/function selectors'
+    for node in nodes:
+        assert sum(node == selector or node.startswith(selector + '::')
+                   or node.startswith(selector + '[') for selector in selectors) == 1, node
+    assert all(any(node == selector or node.startswith(selector + '::')
+                   or node.startswith(selector + '[') for node in nodes) for selector in selectors)
+    timing = [node for node in nodes if any('::' + name + '::' in node for name in
+              ('TestDecisionTimeIsBounded', 'TestPatternDecisionTimeIsBounded'))]
+    assert len(timing) == 256
+    ordinary = [selector for group in shards.partitions(root, 8) for selector in group
+                if not selector.startswith('tests/test_security.py::')]
+    expected = sorted(path.relative_to(root).as_posix() for path in (root / 'tests').rglob('*.py')
+                      if (path.name.startswith('test_') or path.name.endswith('_test.py'))
+                      and path.name != 'test_security.py')
+    assert sorted(ordinary) == expected

@@ -1,9 +1,53 @@
 """Partition full test files and require complete artifacts before coverage."""
 import argparse
+import ast
+import math
 import json
 import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
+
+
+def _runtime_weights(root):
+    path = root / 'scripts/ci-checks/test-runtime-weights.json'
+    if not path.exists():
+        return {}, {}, 1.0
+    try:
+        value = json.loads(path.read_text())
+        expected = {'schema', 'source_commit', 'source_run', 'units',
+                    'fallback_seconds_per_byte', 'files', 'security_selectors'}
+        if (not isinstance(value, dict) or set(value) != expected
+                or type(value['schema']) is not int or value['schema'] != 1
+                or not isinstance(value['source_commit'], str)
+                or not re.fullmatch(r'[a-f0-9]{40}', value['source_commit'])
+                or type(value['source_run']) is not int or value['source_run'] <= 0
+                or value['units'] != 'seconds'):
+            raise ValueError('Invalid runtime weight metadata')
+        def seconds(number, positive=False):
+            return (type(number) in (int, float) and math.isfinite(number)
+                    and (number > 0 if positive else number >= 0))
+        if not seconds(value['fallback_seconds_per_byte'], positive=True):
+            raise ValueError('Invalid runtime weight fallback')
+        for field in ('files', 'security_selectors'):
+            entries = value[field]
+            if not isinstance(entries, dict):
+                raise ValueError('Invalid runtime weight entries')
+            for name, duration in entries.items():
+                pattern = (r'tests/(?:[A-Za-z0-9_-]+/)*[A-Za-z0-9_-]+\.py' if field == 'files'
+                           else r'tests/test_security\.py::[A-Za-z_][A-Za-z0-9_]*')
+                if not isinstance(name, str) or not re.fullmatch(pattern, name) or not seconds(duration):
+                    raise ValueError('Invalid runtime weight path or duration')
+        return value['files'], value['security_selectors'], value['fallback_seconds_per_byte']
+    except (OSError, TypeError, json.JSONDecodeError) as exc:
+        raise ValueError('Cannot read runtime weights') from exc
+
+
+def _security_selectors(path):
+    tree = ast.parse(path.read_text())
+    return sorted('tests/test_security.py::' + node.name for node in tree.body
+                  if (isinstance(node, ast.ClassDef) and node.name.startswith('Test'))
+                  or (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                      and node.name.startswith('test_')))
 
 
 def partitions(root, count):
@@ -13,20 +57,31 @@ def partitions(root, count):
                    if path.name.startswith('test_') or path.name.endswith('_test.py'))
     if len(files) < count:
         raise ValueError('Every shard must contain tests')
-    groups, sizes = [[] for _ in range(count)], [0] * count
-    # The measured Linux serial coverage run spends 24 minutes in this file.
-    # Give it one shard; balance the remaining whole files across the others.
+    for path in files:
+        if '\n' in str(path) or '\r' in str(path) or path.is_symlink():
+            raise ValueError('Test paths must be regular files without newlines')
+    weights, security_weights, fallback = _runtime_weights(root)
+    groups, sizes = [[] for _ in range(count)], [0.0] * count
     security = root / 'tests/test_security.py'
     isolate_security = count > 1 and security in files
-    available = range(1 if isolate_security else 0, count)
-    for path in sorted(files, key=lambda p: (-p.stat().st_size, str(p))):
-        index = (0 if isolate_security and path == security else
-                 min(available, key=lambda i: (sizes[i], i)))
-        name = path.relative_to(root).as_posix()
-        if '\n' in name or '\r' in name or path.is_symlink():
-            raise ValueError('Test paths must be regular files without newlines')
-        groups[index].append(name)
-        sizes[index] += path.stat().st_size
+    selectors = _security_selectors(security) if isolate_security and count >= 3 else []
+    reserved = 2 if len(selectors) >= 2 else (1 if isolate_security else 0)
+    if reserved == 2:
+        default = security.stat().st_size * fallback / len(selectors)
+        for selector in sorted(selectors, key=lambda name: (-security_weights.get(name, default), name)):
+            index = min(range(2), key=lambda i: (sizes[i], i))
+            groups[index].append(selector)
+            sizes[index] += security_weights.get(selector, default)
+    elif reserved:
+        groups[0].append('tests/test_security.py')
+    available = range(reserved, count)
+    ordinary = [path for path in files if not (isolate_security and path == security)]
+    def weight(path):
+        return weights.get(path.relative_to(root).as_posix(), path.stat().st_size * fallback)
+    for path in sorted(ordinary, key=lambda path: (-weight(path), str(path))):
+        index = min(available, key=lambda i: (sizes[i], i))
+        groups[index].append(path.relative_to(root).as_posix())
+        sizes[index] += weight(path)
     if any(not group for group in groups):
         raise ValueError('Every shard must contain tests')
     return [sorted(group) for group in groups]

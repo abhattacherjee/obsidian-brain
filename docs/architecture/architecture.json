@@ -1247,9 +1247,11 @@
           "name": "CI workflow",
           "kind": "ops",
           "files": [
-            ".github/workflows/ci.yml"
+            ".github/workflows/ci.yml",
+            "scripts/ci-checks/test_shards.py",
+            "scripts/ci-checks/test-runtime-weights.json"
           ],
-          "purpose": "Adaptive cost-optimized CI: secret-scan, changelog-check (PRs to main), python-tests (3.12, cov>=90), python-tests-py39 (whole suite on 3.9, the macOS system python3; no coverage gate, #371), no-default-db AST guard, security-tests, and an advisory detect-release-merge check."
+          "purpose": "PR CI runs eight coverage shards and six Python 3.9 shards with four pytest workers each. Two shards split security by whole class/function; ordinary modules stay whole, keeping both hosts paired. Versioned runtime weights from actual JUnit reports balance only selection order and load; new tests use a positive seconds-per-byte fallback. An independent pytest collector checks every security case is selected exactly once. Exact partition manifests, all shard job results, the dedicated 256-case serial timing report and combined coverage >=90% remain required. Also runs secret scanning, changelog checks for main PRs, DB isolation and security checks."
         },
         {
           "id": "ops-no-default-db",

@@ -112,3 +112,43 @@ claiming native certification. The ship gate still requires native proof for
 this parity PR. Before a release bundle can pass, each required capability in
 `capabilities.json` must name its verified client version range and fixture
 provenance. Pending capability records cannot certify a release.
+
+## Native CLI progress, 2026-10-15
+
+These are partial test results, not acceptance certification. All seven issue
+criteria remain unchecked. The tested source commit is
+`2ed4b3502b15ffb7c35e1c825a14f57f1f956eec`.
+
+- Normal commit preflight passed: 9,797 tests, 91.48% coverage. The separate
+  Python 3.9 focused run passed 176 tests. Published CI run `38758588224` passed
+  in 514 seconds, unchanged from its predecessor. Further shard changes still
+  require full preflight and a measured CI run.
+- The installed Codex CLI read a historical source larger than the old 4 MiB
+  batch limit: 4,229,273 bytes and 563 normalized records. Two native helpers
+  produced reviewed summaries. Normal publication succeeded for both selected
+  sources; a deliberate filename collision was refused; unchanged imports were
+  skipped without duplicate notes. Independent checks verified the published
+  bodies, source hashes, configuration and destination sentinel.
+- A real resume recorded `SYNTHETIC_IMPORT_GROWTH_272_2ED4B35` and exited with
+  wrapper status 0. Importing that growth and preserving concurrent manual edits
+  have not yet passed.
+
+Local receipts are under the private campaign directory
+`/Users/abhishek/.local/state/obsidian-272-parity/20261015`. Filenames below are
+relative to that directory. They are progress receipts, not a release bundle.
+
+| Receipt | SHA256 |
+| --- | --- |
+| `preflight-uri-scrub-final.log` | `e87fefdd89477f2904fd75e89393c09179ccb8bf3159f1c11e1fd2b60f82c912` |
+| `independent-native-import-publication.json` | `327f82461e6dff3aed023ad3d3ad5598f23282c1a13913513c2548913a6499b4` |
+| `native-import-final-subset.json` | `74f49d458140deae7aaf8dceb77ebff58a25552888c72b2339641396c9eabeb5` |
+| `owned-import-helper-dispatch-metadata.json` | `2dde4205b8d4ca7b5df820c042ca054faf5c48ead2a52c81050b3d2aa9e3e3d7` |
+| `close-2ed4b350-1792079057998907000.json` | `95d8f1c3fe61a1b55b5831d795cebd84f8ae71f80cab2964136534fed1bdcd5e` |
+
+The import subset contains selected bounded sidecars only. One raw output
+exceeded the normal collection limit and remains untouched in the VM. This
+subset does not prove complete trace coverage or the absence of other calls.
+It does not qualify the full 19-skill plan, lifecycle and cache checks, native
+Desktop dispatch, dashboard checks or Claude regression testing. Desktop
+binding remains unimplemented and unverified; Claude testing remains paused
+until the Codex plan passes.
