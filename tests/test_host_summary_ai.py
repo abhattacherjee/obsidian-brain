@@ -171,3 +171,68 @@ def test_structured_batch_foreign_header_cannot_move_summary_between_notes(conte
     assert result.returncode == 1
     assert result.stdout == ""
     assert result.failure_reason == "missing_section"
+
+
+@pytest.mark.parametrize("route,cap", [("snapshot", 8000), ("single", 12000), ("batch", 12000)])
+@pytest.mark.parametrize("retained", [True, False], ids=["native-capture", "legacy-raw"])
+@pytest.mark.parametrize("padding", [14900, 0], ids=["over-budget", "within-budget"])
+def test_summary_prompt_keeps_completed_native_tail_without_changing_legacy_sampling(
+        context, monkeypatch, route, cap, retained, padding):
+    """Prefix clipping must not turn a completed retained capture into pending work."""
+    from note_transactions import NoteMutation, apply_mutations, read_revision
+    import re
+
+    capture = "EARLY_PENDING|" + "x" * padding + "MIDDLE_ONLY|" + "y" * padding + "FINAL_COMPLETED"
+    note = context.vault_path / "summary-input.md"
+    kind = "claude-snapshot" if route == "snapshot" else "claude-session"
+    note.write_text("---\ntype: " + kind + "\nsession_id: synthetic-sampling-id\n"
+                    "status: auto-logged\nproject: project\n---\nUser prose must stay outside AI input.\n")
+    if retained:
+        apply_mutations(context, [NoteMutation(note, read_revision(context, note),
+                         {"capture": capture}, "seed-native-sampling")])
+    else:
+        with note.open("a") as stream:
+            stream.write("\n## Conversation (raw)\n**User:** " + capture + "\n")
+    monkeypatch.setattr(obsidian_utils, "find_transcript_jsonl", lambda *a: None)
+    prompts = []
+
+    def execute(ctx, operation, request):
+        prompts.append(request.input)
+        text = "## Summary\nThe work completed.\n"
+        data = {1: text} if operation == "session_summaries" else text
+        return ai_backend.AIResult("ok", data, request.input_revision,
+                                   backend=context.host, model="observed-model")
+
+    monkeypatch.setattr(ai_backend, "execute_ai", execute)
+    with using_runtime_context(context):
+        prep = obsidian_utils._prepare_note_for_summary(
+            str(note), str(context.vault_path), "sessions", "project")
+        assert prep["ok"]
+        if route == "snapshot":
+            result, reason = obsidian_utils.generate_snapshot_summary(
+                prep["user_msgs"], prep["assistant_msgs"], prep["metadata"])
+            assert result and reason is None
+            pattern = r"USER MESSAGES:\n(.*?)\n\n---\n\nASSISTANT MESSAGES:"
+        elif route == "single":
+            result, reason = obsidian_utils.generate_summary(
+                prep["user_msgs"], prep["assistant_msgs"], prep["metadata"])
+            assert result and reason is None
+            pattern = r"TRANSCRIPT \(user and assistant messages\):\n(.*?)\n\n---\n\n"
+        else:
+            result = obsidian_utils.generate_summaries_batch(
+                [prep], vault_path=str(context.vault_path), sessions_folder="sessions", project="project")
+            assert result[0][0] and result[0][1] is None
+            pattern = r"SESSION TRANSCRIPT:\n(.*?)\n\n---\n\n"
+    assert len(prompts) == 1
+    sample = re.search(pattern, prompts[0], re.DOTALL).group(1)
+    assert len(sample) <= cap
+    assert "User prose must stay outside AI input." not in prompts[0]
+    if retained and len(capture) > cap:
+        assert "FINAL_COMPLETED" in sample
+        assert "omitted" in sample.lower()
+        assert "MIDDLE_ONLY" not in sample
+        assert ("EARLY_PENDING" in sample) == (route != "snapshot")
+    elif retained:
+        assert sample == capture + "\n"
+    else:
+        assert sample == capture[:cap]

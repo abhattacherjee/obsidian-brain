@@ -4462,6 +4462,19 @@ def _execute_summary_ai(prompt, operation, model, timeout, input_revision="", ex
     return SimpleNamespace(returncode=0, stdout=output, stderr="", model=result.model, failure_reason=None)
 
 
+def _sample_retained_capture(text: str, limit: int, *, tail_only: bool = False) -> str:
+    """Keep final native facts within the existing prompt character budget."""
+    if len(text) <= limit:
+        return text
+    if tail_only:
+        marker = "[... earlier retained native capture omitted; tail follows ...]\n"
+        return marker + text[-(limit - len(marker)):]
+    marker = "\n[... middle of retained native capture omitted ...]\n"
+    available = limit - len(marker)
+    head = available // 2
+    return text[:head] + marker + text[-(available - head):]
+
+
 def generate_snapshot_summary(
     user_msgs: list[str],
     assistant_msgs: list[str],
@@ -4488,6 +4501,8 @@ def generate_snapshot_summary(
     sampled_asst = assistant_msgs[-10:] if len(assistant_msgs) > 10 else assistant_msgs
     user_sample = "\n---\n".join(sampled_user)[:8000]
     asst_sample = "\n---\n".join(sampled_asst)[:8000]
+    if metadata.get("retained_native_capture") is True:
+        user_sample = _sample_retained_capture("\n---\n".join(user_msgs), 8000, tail_only=True)
     transcript = f"USER MESSAGES:\n{user_sample}\n\n---\n\nASSISTANT MESSAGES:\n{asst_sample}"
 
     prompt = SNAPSHOT_SUMMARY_PROMPT.format(transcript=transcript)
@@ -4632,6 +4647,8 @@ def generate_summary(
 
     user_sample = "\n---\n".join(sampled_user)[:12000]
     assistant_sample = "\n---\n".join(sampled_asst)[:12000]
+    if metadata.get("retained_native_capture") is True:
+        user_sample = _sample_retained_capture("\n---\n".join(user_msgs), 12000)
 
     preamble = metadata.get("snapshot_preamble", "")
     cohesion_hint = ""
@@ -6860,6 +6877,8 @@ def _prepare_note_for_summary(
 
     # Build metadata for generate_summary
     metadata: dict = {"project": project, "vault_path": vault_path, "sessions_folder": sessions_folder}
+    if retained_capture is not None:
+        metadata["retained_native_capture"] = True
     for line in raw_lines[:20]:
         stripped = line.strip()
         if stripped.startswith('git_branch:'):
@@ -7089,7 +7108,7 @@ def generate_summaries_batch(
     except Exception as exc:  # noqa: BLE001
         print(f"[obsidian-brain] open item collection failed (non-fatal): {exc}", file=sys.stderr)
 
-    def _sample_msgs(user_msgs: list[str], assistant_msgs: list[str]) -> tuple[str, str]:
+    def _sample_msgs(user_msgs: list[str], assistant_msgs: list[str], metadata: dict) -> tuple[str, str]:
         if len(user_msgs) > 20:
             sampled_user: list[str] = (
                 user_msgs[:10] + ["[... middle messages omitted ...]"] + user_msgs[-10:]
@@ -7102,7 +7121,10 @@ def generate_summaries_batch(
             )
         else:
             sampled_asst = assistant_msgs
-        return "\n---\n".join(sampled_user)[:12000], "\n---\n".join(sampled_asst)[:12000]
+        user_sample = "\n---\n".join(sampled_user)[:12000]
+        if metadata.get("retained_native_capture") is True:
+            user_sample = _sample_retained_capture("\n---\n".join(user_msgs), 12000)
+        return user_sample, "\n---\n".join(sampled_asst)[:12000]
 
     prompt_parts: list[str] = [
         f"You are a technical summarizer. You will be given {n} session transcript(s) below.\n"
@@ -7116,7 +7138,7 @@ def generate_summaries_batch(
     ]
 
     for k, prep in enumerate(prepared_notes, start=1):
-        user_sample, asst_sample = _sample_msgs(prep["user_msgs"], prep["assistant_msgs"])
+        user_sample, asst_sample = _sample_msgs(prep["user_msgs"], prep["assistant_msgs"], prep["metadata"])
         meta = prep["metadata"]
         preamble = meta.get("snapshot_preamble", "")
         files_str = ", ".join(meta.get("files_touched", [])[:15]) or "none detected"

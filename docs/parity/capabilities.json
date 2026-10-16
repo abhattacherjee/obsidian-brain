@@ -1123,21 +1123,21 @@
     {
       "source": "hooks/obsidian_utils.py",
       "expression": "subprocess.run(['git', 'rev-parse', '--git-common-dir'], capture_output=True, text=True, timeout=5, cwd=cwd or None)",
-      "source_sha256": "13e9444d10b8f5f92dde3179a6863e2ae311669a3e836dd2f71de4dd29649b38",
+      "source_sha256": "e973d00f8895a590fe9c503b0f01fa67f8be0c6d0e57612dd0503b95bb00e3a9",
       "scope": "support",
       "reason": "Bounded or disposable-repository Git metadata/setup. The enclosing native operation keeps its separate host contract."
     },
     {
       "source": "hooks/obsidian_utils.py",
       "expression": "subprocess.run(['find', str(projects_dir), '-name', target, '-type', 'f', '-print', '-quit'], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=5)",
-      "source_sha256": "13e9444d10b8f5f92dde3179a6863e2ae311669a3e836dd2f71de4dd29649b38",
+      "source_sha256": "e973d00f8895a590fe9c503b0f01fa67f8be0c6d0e57612dd0503b95bb00e3a9",
       "scope": "support",
       "reason": "Legacy Claude transcript location compatibility. Bound native contexts return only their selected transcript before this call."
     },
     {
       "source": "hooks/obsidian_utils.py",
       "expression": "subprocess.run(['git', 'rev-parse', '--abbrev-ref', 'HEAD'], capture_output=True, text=True, timeout=5, cwd=cwd or None)",
-      "source_sha256": "13e9444d10b8f5f92dde3179a6863e2ae311669a3e836dd2f71de4dd29649b38",
+      "source_sha256": "e973d00f8895a590fe9c503b0f01fa67f8be0c6d0e57612dd0503b95bb00e3a9",
       "scope": "support",
       "reason": "Bounded or disposable-repository Git metadata/setup. The enclosing native operation keeps its separate host contract."
     },
