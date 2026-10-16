@@ -3,20 +3,20 @@ Report writer for /check-items.
 
 Path: <vault>/<check_items_folder>/check-items-<scope>-<YYYY-MM-DD>.md
 where `check_items_folder` is read from
-`~/.claude/obsidian-brain-config.json` (default: `claude-check-items`).
+the selected runtime configuration (default: `claude-check-items`).
 The folder is configurable so users can keep /check-items notes
 separate from Dataview dashboards.
 
 Always written, even on --dry-run or user cancel.
 Idempotent — overwritten on next run with same scope/date.
 
-Atomic temp+rename pattern.
+Publishes atomically only while the source revision is current.
 """
 from __future__ import annotations
 
 import os
 import re
-import tempfile
+import uuid
 from pathlib import Path
 
 
@@ -300,6 +300,10 @@ def write_check_items_dashboard(
     if not target.is_relative_to(vault_root):
         raise ValueError(f"refusing to write outside vault root: {target}")
 
+    from note_transactions import NoteMutation, apply_mutations, context_for_vault, read_revision
+    context = context_for_vault(vault_root)
+    expected_revision = read_revision(context, target)
+
     # Use safe_scope (computed above for the filename) throughout the note body
     # and frontmatter so that crafted scope values cannot inject YAML fields or
     # markdown headings with newlines/colons.
@@ -311,16 +315,10 @@ def write_check_items_dashboard(
                        classifications, applied, cascaded, merges, skipped=skipped,
                        evidence_gaps=evidence_gaps))
 
-    tmp = tempfile.NamedTemporaryFile(
-        mode="w", delete=False, dir=str(target_dir),
-        suffix=".tmp", encoding="utf-8"
-    )
-    try:
-        tmp.write(content)
-        tmp.flush()
-        os.fsync(tmp.fileno())
-    finally:
-        tmp.close()
-    os.replace(tmp.name, str(target))
-    os.chmod(str(target), 0o600)
+    result = apply_mutations(context, [NoteMutation(
+        target, expected_revision, {"document": content}, uuid.uuid4().hex,
+        file_mode=0o600,
+    )])
+    if result.status not in {"applied", "unchanged"}:
+        raise OSError(f"dashboard publication {result.status}: {target}")
     return str(target)

@@ -27,47 +27,57 @@ def cfg(tmp_path, monkeypatch):
 def test_cache_written_by_older_code_is_not_trusted(cfg):
     # The literal repro: old code cached "config" with no signature key, and
     # its dict lacked the wiki_folder default added in 3.8.0.
-    stale = {k: v for k, v in obsidian_utils._DEFAULTS.items() if k != "wiki_folder"}
-    stale["vault_path"] = "/vault"
-    obsidian_utils.cache_set(SID, "config", stale)
-    assert obsidian_utils.load_config().get("wiki_folder") == "claude-wiki"
+    with using_runtime_context(None):
+        stale = {k: v for k, v in obsidian_utils._DEFAULTS.items() if k != "wiki_folder"}
+        stale["vault_path"] = "/vault"
+        obsidian_utils.cache_set(SID, "config", stale)
+        assert obsidian_utils.load_config().get("wiki_folder") == "claude-wiki"
 
 
 def test_defaults_change_mid_session_is_picked_up(cfg, monkeypatch):
-    assert "new_default_409" not in obsidian_utils.load_config()
-    monkeypatch.setitem(obsidian_utils._DEFAULTS, "new_default_409", "x")
-    assert obsidian_utils.load_config()["new_default_409"] == "x"
+    with using_runtime_context(None):
+        assert "new_default_409" not in obsidian_utils.load_config()
+        monkeypatch.setitem(obsidian_utils._DEFAULTS, "new_default_409", "x")
+        assert obsidian_utils.load_config()["new_default_409"] == "x"
 
 
 def test_cache_still_used_while_defaults_are_unchanged(cfg):
-    assert obsidian_utils.load_config()["vault_path"] == "/vault"
-    cfg.write_text(json.dumps({"vault_path": "/elsewhere"}))
-    # Same session, same defaults: the cached view wins, as before.
-    assert obsidian_utils.load_config()["vault_path"] == "/vault"
-    assert obsidian_utils.load_config(fresh=True)["vault_path"] == "/elsewhere"
+    with using_runtime_context(None):
+        assert obsidian_utils.load_config()["vault_path"] == "/vault"
+        cfg.write_text(json.dumps({"vault_path": "/elsewhere"}))
+        # Same session, same defaults: the cached view wins, as before.
+        assert obsidian_utils.load_config()["vault_path"] == "/vault"
+        assert obsidian_utils.load_config(fresh=True)["vault_path"] == "/elsewhere"
 
 
 def test_invalidating_config_key_still_forces_a_reread(cfg):
-    obsidian_utils.load_config()
-    cfg.write_text(json.dumps({"vault_path": "/elsewhere"}))
-    obsidian_utils.cache_invalidate(SID, "config")
-    assert obsidian_utils.load_config()["vault_path"] == "/elsewhere"
+    with using_runtime_context(None):
+        obsidian_utils.load_config()
+        cfg.write_text(json.dumps({"vault_path": "/elsewhere"}))
+        obsidian_utils.cache_invalidate(SID, "config")
+        assert obsidian_utils.load_config()["vault_path"] == "/elsewhere"
 
 
 def test_signature_is_not_a_config_key(cfg):
     # The signature lives beside the config in the cache, never inside it,
     # so /vault-config never shows it as a setting.
-    assert "config_defaults_sig" not in obsidian_utils.load_config()
-    assert "config_defaults_sig" not in obsidian_utils.load_config()
+    with using_runtime_context(None):
+        assert "config_defaults_sig" not in obsidian_utils.load_config()
+        assert "config_defaults_sig" not in obsidian_utils.load_config()
 
 
 def test_old_code_rewriting_config_under_a_new_signature_is_not_trusted(cfg):
     # Review finding on PR #411. Old hooks keep running the pre-update install
     # for the whole session; an old load_config re-caches "config" without
     # touching "config_defaults_sig", so the signature alone would bless it.
-    assert obsidian_utils.load_config()["wiki_folder"] == "claude-wiki"  # 1
-    obsidian_utils.cache_invalidate(SID, "config")                       # 2
-    old = {k: v for k, v in obsidian_utils._DEFAULTS.items() if k != "wiki_folder"}
-    old["vault_path"] = "/vault"
-    obsidian_utils.cache_set(SID, "config", old)                         # 3
-    assert obsidian_utils.load_config().get("wiki_folder") == "claude-wiki"  # 4
+    with using_runtime_context(None):
+        assert obsidian_utils.load_config()["wiki_folder"] == "claude-wiki"  # 1
+        obsidian_utils.cache_invalidate(SID, "config")                       # 2
+        old = {k: v for k, v in obsidian_utils._DEFAULTS.items() if k != "wiki_folder"}
+        old["vault_path"] = "/vault"
+        obsidian_utils.cache_set(SID, "config", old)                         # 3
+        assert obsidian_utils.load_config().get("wiki_folder") == "claude-wiki"  # 4
+
+from runtime_context import using_runtime_context
+from selected_legacy_vault import selected_host_context
+pytestmark = pytest.mark.usefixtures("selected_host_context")

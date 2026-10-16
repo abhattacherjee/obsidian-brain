@@ -1,5 +1,6 @@
 """Tests for deep_analysis_pipeline() and build_deep_presentation()."""
 
+from tests.native_pipeline_test_adapter import private_pipeline_output, run_native_pipeline
 import json
 import os
 from datetime import date
@@ -14,6 +15,14 @@ import vault_index
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def tmp_vault(selected_host_context):
+    vault = selected_host_context.vault_path
+    for folder in ("claude-sessions", "claude-insights"):
+        (vault / folder).mkdir()
+    return vault
 
 
 def _write_note(path, frontmatter: dict, body: str = ""):
@@ -70,7 +79,7 @@ class TestDeepAnalysisPipeline:
             open_items=["Fix the login handler"],
         )
 
-        output_path = str(tmp_vault / "pipeline_out.json")
+        output_path = str(private_pipeline_output(tmp_vault, "pipeline_out.json"))
         basenames = [f.name for f in sessions_dir.iterdir() if f.suffix == ".md"]
 
         db_path = str(tmp_vault / "test.db")
@@ -79,7 +88,7 @@ class TestDeepAnalysisPipeline:
         )
 
         with patch.object(open_item_dedup, "_resolve_project_paths", return_value={}):
-            result = open_item_dedup.deep_analysis_pipeline(
+            result = run_native_pipeline(
                 basenames=basenames,
                 projects_json='["proj"]',
                 output_path=output_path,
@@ -110,7 +119,7 @@ class TestDeepAnalysisPipeline:
             open_items=["Fix login handler in src/auth.py for PR #99"],
         )
 
-        output_path = str(tmp_vault / "pipeline_out.json")
+        output_path = str(private_pipeline_output(tmp_vault, "pipeline_out.json"))
         basenames = [f.name for f in sessions_dir.iterdir() if f.suffix == ".md"]
 
         db_path = str(tmp_vault / "test.db")
@@ -119,7 +128,7 @@ class TestDeepAnalysisPipeline:
         )
 
         with patch.object(open_item_dedup, "_resolve_project_paths", return_value={}):
-            result = open_item_dedup.deep_analysis_pipeline(
+            result = run_native_pipeline(
                 basenames=basenames,
                 projects_json='["proj"]',
                 output_path=output_path,
@@ -141,7 +150,7 @@ class TestDeepAnalysisPipeline:
             body="## Summary\nNothing to do.\n",
         )
 
-        output_path = str(tmp_vault / "pipeline_out.json")
+        output_path = str(private_pipeline_output(tmp_vault, "pipeline_out.json"))
         basenames = [f.name for f in sessions_dir.iterdir() if f.suffix == ".md"]
 
         db_path = str(tmp_vault / "test.db")
@@ -150,7 +159,7 @@ class TestDeepAnalysisPipeline:
         )
 
         with patch.object(open_item_dedup, "_resolve_project_paths", return_value={}):
-            result = open_item_dedup.deep_analysis_pipeline(
+            result = run_native_pipeline(
                 basenames=basenames,
                 projects_json='["proj"]',
                 output_path=output_path,
@@ -179,7 +188,7 @@ class TestDeepAnalysisPipeline:
             body="## Summary\nAlso worked on frobulator widget.\n",
         )
 
-        output_path = str(tmp_vault / "pipeline_out.json")
+        output_path = str(private_pipeline_output(tmp_vault, "pipeline_out.json"))
         basenames = [f.name for f in sessions_dir.iterdir() if f.suffix == ".md"]
 
         db_path = str(tmp_vault / "test.db")
@@ -188,7 +197,7 @@ class TestDeepAnalysisPipeline:
         )
 
         with patch.object(open_item_dedup, "_resolve_project_paths", return_value={}):
-            result = open_item_dedup.deep_analysis_pipeline(
+            result = run_native_pipeline(
                 basenames=basenames,
                 projects_json='["proj"]',
                 output_path=output_path,
@@ -327,6 +336,7 @@ class TestResolveProjectPaths:
         repo = scan_dir / "my-project"
         repo.mkdir()
         (repo / ".git").mkdir()
+        (repo / ".git" / "HEAD").write_text("ref: refs/heads/unborn\n")
         non_repo = scan_dir / "plain-dir"
         non_repo.mkdir()
 
@@ -362,7 +372,7 @@ class TestPipelineEvidence:
         (fake_repo / ".git").mkdir()
         (fake_repo / "CHANGELOG.md").write_text("# Changelog\n## v1.0.0\n- Initial\n")
 
-        output_path = str(tmp_vault / "pipeline_out.json")
+        output_path = str(private_pipeline_output(tmp_vault, "pipeline_out.json"))
         basenames = [f.name for f in sessions_dir.iterdir() if f.suffix == ".md"]
 
         db_path = str(tmp_vault / "test.db")
@@ -375,7 +385,7 @@ class TestPipelineEvidence:
             open_item_dedup, "_resolve_project_paths",
             return_value={"myproj": str(fake_repo)},
         ):
-            result = open_item_dedup.deep_analysis_pipeline(
+            result = run_native_pipeline(
                 basenames=basenames,
                 projects_json='["myproj"]',
                 output_path=output_path,
@@ -480,7 +490,7 @@ class TestPipelineMultiProject:
             open_items=["Test beta integration"],
         )
 
-        output_path = str(tmp_vault / "pipeline_out.json")
+        output_path = str(private_pipeline_output(tmp_vault, "pipeline_out.json"))
         basenames = [f.name for f in sessions_dir.iterdir() if f.suffix == ".md"]
 
         db_path = str(tmp_vault / "test.db")
@@ -490,7 +500,7 @@ class TestPipelineMultiProject:
         )
 
         with patch.object(open_item_dedup, "_resolve_project_paths", return_value={}):
-            result = open_item_dedup.deep_analysis_pipeline(
+            result = run_native_pipeline(
                 basenames=basenames,
                 projects_json='["alpha", "beta"]',
                 output_path=output_path,
@@ -519,7 +529,7 @@ class TestPipelineErrorHandling:
             open_items=["Some item"],
         )
 
-        output_path = str(tmp_vault / "pipeline_out.json")
+        output_path = str(private_pipeline_output(tmp_vault, "pipeline_out.json"))
         basenames = [f.name for f in sessions_dir.iterdir() if f.suffix == ".md"]
 
         db_path = str(tmp_vault / "test.db")
@@ -528,7 +538,7 @@ class TestPipelineErrorHandling:
         )
 
         with patch.object(open_item_dedup, "_resolve_project_paths", return_value={}):
-            result = open_item_dedup.deep_analysis_pipeline(
+            result = run_native_pipeline(
                 basenames=basenames,
                 projects_json="{not valid json",
                 output_path=output_path,
@@ -545,10 +555,10 @@ class TestPipelineErrorHandling:
         with patch.object(
             vault_index, "ensure_index", side_effect=RuntimeError("index broken")
         ):
-            result = open_item_dedup.deep_analysis_pipeline(
+            result = run_native_pipeline(
                 basenames=["note.md"],
                 projects_json="[]",
-                output_path=str(tmp_vault / "out.json"),
+                output_path=str(private_pipeline_output(tmp_vault, "out.json")),
                 vault_path=str(tmp_vault),
                 sessions_folder="claude-sessions",
                 insights_folder="claude-insights",
@@ -754,7 +764,7 @@ class TestSubprocessStderrLogging:
         fake_repo.mkdir(parents=True)
         (fake_repo / ".git").mkdir()
 
-        output_path = str(tmp_vault / "pipeline_out.json")
+        output_path = str(private_pipeline_output(tmp_vault, "pipeline_out.json"))
         basenames = [f.name for f in sessions_dir.iterdir() if f.suffix == ".md"]
 
         db_path = str(tmp_vault / "test.db")
@@ -775,7 +785,7 @@ class TestSubprocessStderrLogging:
 
         with patch.object(open_item_dedup, "_resolve_project_paths", return_value={"proj": str(fake_repo)}):
             with patch("subprocess.run", side_effect=mock_run):
-                result = open_item_dedup.deep_analysis_pipeline(
+                result = run_native_pipeline(
                     basenames=basenames,
                     projects_json='["proj"]',
                     output_path=output_path,
@@ -804,7 +814,7 @@ class TestTempFilePermissions:
             open_items=["Item"],
         )
 
-        output_path = str(tmp_vault / "pipeline_out.json")
+        output_path = str(private_pipeline_output(tmp_vault, "pipeline_out.json"))
         basenames = [f.name for f in sessions_dir.iterdir() if f.suffix == ".md"]
 
         db_path = str(tmp_vault / "test.db")
@@ -813,7 +823,7 @@ class TestTempFilePermissions:
         )
 
         with patch.object(open_item_dedup, "_resolve_project_paths", return_value={}):
-            result = open_item_dedup.deep_analysis_pipeline(
+            result = run_native_pipeline(
                 basenames=basenames,
                 projects_json='["proj"]',
                 output_path=output_path,
@@ -847,9 +857,9 @@ class TestFtsScopingPerProject:
 
         db_path = str(tmp_vault / "test.db")
         vault_index.ensure_index(str(tmp_vault), ["claude-sessions", "claude-insights"], db_path=db_path)
-        output = tmp_vault / "deep.json"
+        output = private_pipeline_output(tmp_vault, "deep.json")
         with patch.object(open_item_dedup, '_resolve_project_paths', return_value={}):
-            open_item_dedup.deep_analysis_pipeline(
+            run_native_pipeline(
                 [f"{_today()}-proj-a-0001", f"{_today()}-proj-b-0001"],
                 '["proj-a", "proj-b"]',
                 str(output),
@@ -880,10 +890,13 @@ class TestPipelineDirCreation:
         db_path = str(tmp_vault / "test.db")
         vault_index.ensure_index(str(tmp_vault), ["claude-sessions", "claude-insights"], db_path=db_path)
 
-        # Output to a non-existent subdirectory
-        output = tmp_vault / "nonexistent" / "subdir" / "deep.json"
+        # Remove the prepared job to exercise directory creation at publication.
+        output = private_pipeline_output(tmp_vault, "deep.json")
+        import shutil
+        shutil.rmtree(output.parent)
+        assert not output.parent.exists()
         with patch.object(open_item_dedup, '_resolve_project_paths', return_value={}):
-            status = open_item_dedup.deep_analysis_pipeline(
+            status = run_native_pipeline(
                 [bn], '["p"]', str(output),
                 str(tmp_vault), "claude-sessions", "claude-insights",
                 db_path=db_path)
@@ -907,9 +920,9 @@ class TestRepresentativeKey:
         db_path = str(tmp_vault / "test.db")
         vault_index.ensure_index(str(tmp_vault), ["claude-sessions", "claude-insights"], db_path=db_path)
 
-        output = tmp_vault / "deep.json"
+        output = private_pipeline_output(tmp_vault, "deep.json")
         with patch.object(open_item_dedup, '_resolve_project_paths', return_value={}):
-            open_item_dedup.deep_analysis_pipeline(
+            run_native_pipeline(
                 [bn], '["p"]', str(output),
                 str(tmp_vault), "claude-sessions", "claude-insights",
                 db_path=db_path)
@@ -937,9 +950,9 @@ class TestEncodingCorruption:
 
         db_path = str(tmp_vault / "test.db")
         vault_index.ensure_index(str(tmp_vault), ["claude-sessions", "claude-insights"], db_path=db_path)
-        output = tmp_vault / "deep.json"
+        output = private_pipeline_output(tmp_vault, "deep.json")
         with patch.object(open_item_dedup, '_resolve_project_paths', return_value={}):
-            status = open_item_dedup.deep_analysis_pipeline(
+            status = run_native_pipeline(
                 [bn], '["p"]', str(output),
                 str(tmp_vault), "claude-sessions", "claude-insights",
                 db_path=db_path)
@@ -1112,3 +1125,57 @@ class TestDeepClassOrder:
 
         assert "Unrecognized label item" in result
         assert "still surfaced" in result
+
+from selected_legacy_vault import selected_host_context  # noqa: E402,F401
+
+pytestmark = pytest.mark.usefixtures("selected_host_context")
+
+
+@pytest.mark.parametrize('mode', ['all-gapped', 'partial-gapped', 'analyzed-empty'])
+def test_presentation_distinguishes_evidence_gaps_from_empty_analysis(tmp_vault, mode):
+    all_gapped = mode == 'all-gapped'
+    partial = mode == 'partial-gapped'
+    pipeline = {
+        'items': {'total_raw': 5 if all_gapped else 2 if partial else 0, 'groups': []},
+        'evidence': {'verified-project': {'git_log': ['verified commit']}} if not all_gapped else {},
+        'evidence_gaps': {
+            'projects_scanned': 2 if partial else 1,
+            'projects_with_evidence': 0 if all_gapped else 1,
+            'projects_without_repo': ['unknown-project'] if all_gapped or partial else [],
+            'all_projects_gapped': all_gapped,
+        },
+        'link_suggestions': [], 'merge_suggestions': [],
+    }
+    classifications = []
+    if partial:
+        pipeline['link_suggestions'] = [{'note_a': 'verified-a', 'note_b': 'verified-b', 'shared_keywords': ['SQLite']}]
+        classifications = [
+            {'classification': 'DONE', 'canonical': 'Verified completed task',
+             'project': 'verified-project', 'evidence': 'verified commit', 'instances': []},
+            {'classification': 'DONE', 'canonical': 'Unverified task',
+             'project': 'unknown-project', 'evidence': '', 'instances': []},
+        ]
+    pipeline_path = tmp_vault / 'pipeline-gaps.json'
+    classification_path = tmp_vault / 'classifications-gaps.json'
+    pipeline_path.write_text(json.dumps(pipeline))
+    classification_path.write_text(json.dumps(classifications))
+    result = open_item_dedup.build_deep_presentation(
+        str(pipeline_path), str(classification_path), '[]', str(tmp_vault),
+        'claude-sessions', 'claude-insights')
+    if all_gapped or partial:
+        assert '## Pending Evidence' in result
+        assert '**unknown-project**: pending' in result
+        assert 'completion remains unverified' in result
+        assert 'well-connected' not in result and 'No actions needed' not in result
+    else:
+        assert 'Pending Evidence' not in result
+        assert 'No actions needed — vault is well-connected!' in result
+    if all_gapped:
+        assert 'no selected project produced evidence' in result
+        assert '**5** raw items' in result
+    if partial:
+        assert '### Done (1)' in result
+        assert 'Verified completed task' in result and 'verified commit' in result
+        assert '### Pending (1)' in result and 'Unverified task' in result
+        assert '[[verified-a]] ↔ [[verified-b]]' in result
+        assert '- [ ] Add suggested wikilinks' in result

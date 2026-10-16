@@ -9,6 +9,19 @@ import sqlite3
 from hooks.obsidian_utils import find_unsummarized_notes, upgrade_unsummarized_note, _augment_session_input_with_snapshots, _note_has_inbound_links, _parse_note_tags
 
 
+import pytest
+from dataclasses import replace
+from runtime_context import using_runtime_context
+
+@pytest.fixture(autouse=True)
+def selected_host_context(host, selected_host_context, tmp_path):
+    vault = tmp_path / "v"
+    selected = replace(selected_host_context, vault_path=vault,
+                       config=dict(selected_host_context.config, vault_path=str(vault)))
+    with using_runtime_context(selected):
+        yield selected
+
+
 def _fixture(sess_dir: Path, name: str, type_: str, status: str, session_id: str, body: str = ""):
     p = sess_dir / name
     p.write_text(
@@ -27,7 +40,7 @@ def _fixture_no_type(sess_dir: Path, name: str, status: str, session_id: str):
     )
 
 
-def test_find_unsummarized_picks_up_snapshots(tmp_path):
+def test_find_unsummarized_picks_up_snapshots(selected_host_context, tmp_path):
     vault = tmp_path / "v"
     sess = vault / "claude-sessions"
     sess.mkdir(parents=True)
@@ -41,7 +54,7 @@ def test_find_unsummarized_picks_up_snapshots(tmp_path):
     assert any(n == "2026-04-18-demo-aaaa.md" for n in names)
 
 
-def test_find_unsummarized_skips_summarized_snapshots(tmp_path):
+def test_find_unsummarized_skips_summarized_snapshots(selected_host_context, tmp_path):
     vault = tmp_path / "v"
     sess = vault / "claude-sessions"
     sess.mkdir(parents=True)
@@ -51,7 +64,7 @@ def test_find_unsummarized_skips_summarized_snapshots(tmp_path):
     assert result["unsummarized"] == []
 
 
-def test_find_unsummarized_orders_snapshots_before_parent(tmp_path):
+def test_find_unsummarized_orders_snapshots_before_parent(selected_host_context, tmp_path):
     vault = tmp_path / "v"
     sess = vault / "claude-sessions"
     sess.mkdir(parents=True)
@@ -66,7 +79,7 @@ def test_find_unsummarized_orders_snapshots_before_parent(tmp_path):
     assert names.index("2026-04-18-demo-cccc-snapshot-120000.md") < names.index("2026-04-18-demo-cccc.md")
 
 
-def test_find_unsummarized_rejects_non_session_non_snapshot_types(tmp_path):
+def test_find_unsummarized_rejects_non_session_non_snapshot_types(selected_host_context, tmp_path):
     vault = tmp_path / "v"
     sess = vault / "claude-sessions"
     sess.mkdir(parents=True)
@@ -79,7 +92,7 @@ def test_find_unsummarized_rejects_non_session_non_snapshot_types(tmp_path):
     assert "2026-04-18-demo-dddd-insight.md" not in names
 
 
-def test_find_unsummarized_keeps_legacy_notes_without_type_field(tmp_path):
+def test_find_unsummarized_keeps_legacy_notes_without_type_field(selected_host_context, tmp_path):
     vault = tmp_path / "v"
     sess = vault / "claude-sessions"
     sess.mkdir(parents=True)
@@ -118,7 +131,7 @@ def test_augment_defaults_missing_trigger_to_auto(tmp_path):
     assert "trigger=compact" not in out
 
 
-def test_find_unsummarized_orders_snapshot_before_parent_with_quoted_type(tmp_path):
+def test_find_unsummarized_orders_snapshot_before_parent_with_quoted_type(selected_host_context, tmp_path):
     """Regression for Copilot PR #43 round 2 finding: `_bias_key` reads the
     `type:` frontmatter value without stripping quotes. A snapshot that uses
     valid YAML quoting (`type: "claude-snapshot"`) previously sorted AFTER
@@ -155,7 +168,7 @@ def test_find_unsummarized_orders_snapshot_before_parent_with_quoted_type(tmp_pa
     assert names.index(snap_single.name) < names.index(parent.name)
 
 
-def test_snapshot_routes_through_snapshot_prompt(tmp_path):
+def test_snapshot_routes_through_snapshot_prompt(selected_host_context, tmp_path):
     vault = tmp_path / "v"
     sess = vault / "claude-sessions"
     sess.mkdir(parents=True)
@@ -192,7 +205,7 @@ def test_snapshot_routes_through_snapshot_prompt(tmp_path):
     assert "## Key context that may be lost (summary)" in snap_path.read_text(encoding="utf-8")
 
 
-def test_session_routes_through_session_prompt(tmp_path):
+def test_session_routes_through_session_prompt(selected_host_context, tmp_path):
     vault = tmp_path / "v"
     sess = vault / "claude-sessions"
     sess.mkdir(parents=True)
@@ -301,7 +314,7 @@ def test_augment_omits_current_tail_banner_when_transcript_empty(tmp_path):
     assert "CURRENT TAIL" not in result
 
 
-def test_find_unsummarized_keeps_notes_with_empty_type_field(tmp_path):
+def test_find_unsummarized_keeps_notes_with_empty_type_field(selected_host_context, tmp_path):
     """Issue #94 site D — empty `type:` was previously cross-newline-captured
     into a non-allowlisted value and silently skipped. After the fix, empty
     `type:` returns None from the helper and is treated as legacy (kept).
@@ -355,7 +368,7 @@ def _aged_fixture(sess_dir: Path, name: str, mtime_offset_days: float,
 class TestAgedNoteDeferral:
     """Tests for the aged-note deferral heuristic added in #168."""
 
-    def test_fresh_and_linked_aged_summarized_unlinked_aged_skipped(self, tmp_path):
+    def test_fresh_and_linked_aged_summarized_unlinked_aged_skipped(self, selected_host_context, tmp_path):
         """A (fresh) and C (aged, has inbound link) appear in unsummarized;
         B (aged, no link) is deferred to skipped_aged."""
         vault = tmp_path / "v"
@@ -384,7 +397,7 @@ class TestAgedNoteDeferral:
         assert note_b.name in skipped_names, "aged-unlinked note B must be in skipped_aged"
         assert note_b.name not in unsummarized_names, "note B must NOT appear in unsummarized"
 
-    def test_include_aged_bypasses_deferral(self, tmp_path):
+    def test_include_aged_bypasses_deferral(self, selected_host_context, tmp_path):
         """With include_aged=True, all notes appear in unsummarized regardless of age."""
         vault = tmp_path / "v"
         sess = vault / "claude-sessions"
@@ -405,7 +418,7 @@ class TestAgedNoteDeferral:
         assert note_b.name in unsummarized_names, "B must be in unsummarized when include_aged=True"
         assert result["skipped_aged"] == [], "skipped_aged must be empty when include_aged=True"
 
-    def test_pinned_aged_note_not_deferred(self, tmp_path):
+    def test_pinned_aged_note_not_deferred(self, selected_host_context, tmp_path):
         """An aged note with a pin tag is never deferred, even without inbound links."""
         vault = tmp_path / "v"
         sess = vault / "claude-sessions"
@@ -429,7 +442,7 @@ class TestAgedNoteDeferral:
         assert note_pinned.name in unsummarized_names, "pinned note must be in unsummarized"
         assert note_pinned.name not in skipped_names, "pinned note must NOT be in skipped_aged"
 
-    def test_max_age_days_override(self, tmp_path):
+    def test_max_age_days_override(self, selected_host_context, tmp_path):
         """aged_threshold_days param overrides the default threshold."""
         vault = tmp_path / "v"
         sess = vault / "claude-sessions"
@@ -467,7 +480,7 @@ class TestAgedNoteDeferral:
         result = _note_has_inbound_links("nonexistent-stem", db_path=missing_db)
         assert result is True, "must return True (conservative) when index DB is missing"
 
-    def test_pinned_aged_note_block_list_tags_not_deferred(self, tmp_path):
+    def test_pinned_aged_note_block_list_tags_not_deferred(self, selected_host_context, tmp_path):
         """Aged note with pin tag in YAML block-list form is NOT deferred (#168 Fix 1).
 
         obsidian_session_log.py writes tags as a YAML block-list. Without Fix 1,
@@ -510,7 +523,7 @@ class TestAgedNoteDeferral:
         assert note_pinned.name not in skipped_names, \
             "block-list-pinned note must NOT be in skipped_aged"
 
-    def test_threshold_boundary_not_deferred(self, tmp_path):
+    def test_threshold_boundary_not_deferred(self, selected_host_context, tmp_path):
         """A note aged ONE SECOND LESS than the threshold is NOT deferred.
 
         The deferral check is strict ``>``; a note that is (threshold - 1s) old
@@ -541,7 +554,7 @@ class TestAgedNoteDeferral:
             "note aged (threshold - 1s) must NOT be deferred (strict > check)"
         assert result["skipped_aged"] == [], "skipped_aged must be empty for under-threshold note"
 
-    def test_skipped_aged_empty_for_all_fresh_default(self, tmp_path):
+    def test_skipped_aged_empty_for_all_fresh_default(self, selected_host_context, tmp_path):
         """All-fresh notes always appear in unsummarized; skipped_aged is empty.
 
         Anchors the happy-path contract: with freshly-written notes the age gate

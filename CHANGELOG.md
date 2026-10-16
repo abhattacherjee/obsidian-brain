@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Shared runtime context, revision-checked vault writes, host-native AI adapters, Codex plugin packaging, and paired Claude Code/Codex tests (#272). Native current-client binding and installed Codex Desktop lifecycle acceptance remain pending; this does not certify full parity.
+
+### Changed
+- Codex SessionEnd now retains an immutable checkpoint under `snapshot_on_clear`, including ordinary ends. The end intent commits atomically with retained facts and cursor. Recovery publishes the parent and frozen checkpoint before reading resumed facts. Disabled clear starts warn without guessing an outgoing session. Claude end behavior is unchanged. Native clear acceptance remains pending.
+- Capture and configuration now use `min_messages` consistently. The legacy `min_turns` alias is read before defaults; configuration writes use the canonical key and reject conflicting thresholds.
+- The first `/check-items` run after upgrading re-classifies; the old global cache is no longer read. It remains unchanged because it has no verifiable vault/provider/project ownership. The new scoped cache reuses matching results across sessions.
+- Native hooks now enter `native_entry.py`; Codex capture is skipped without retaining a source until current frontend binding is verified. This does not certify CLI/Desktop parity.
+- Desktop binding can opt into a pinned signed local stdio transport under OS-forced remote-control denial and a root-observed prelaunch receipt. Missing or changed proof refuses capture; native Desktop lifecycle acceptance remains pending. Registered hooks can also opt into payload-free private wrapper timing; default capture behavior stays unchanged.
+- Config follows the selected native home. New indexes use the XDG data home; private runtime state is versioned. Vault coordination moves to the frozen account home's `.local/state/obsidian-brain/vaults/` only after matching-vault verification.
+- Native notes retain provider/full-session provenance, capture revisions and partial completeness. Telemetry moves to per-session logs with lowercase outcomes. Summary analysis uses the invoking host's bounded native backend without cross-host fallback.
+- Transcript reads cap each row at 1 MiB and each forward batch at 4 MiB. Opaque verification/draining stops at 256 MiB or 256 chunks under the same deadline; oversized rows are drained without loading their bodies and labelled generically while verified later rows may publish partial capture; larger sources remain pending. Recoverable mutation intents cap UTF8 content plus metadata at 4 MiB and reject oversized whole-note writes with a controlled reason.
+- Native `duration_minutes` records elapsed fractional minutes rather than the legacy one-decimal rounding.
+- Native session names are `<date>-<project>-<provider>-<hash16>.md`; immutable snapshots are `<date>-<project>-<provider>-snapshot-<64hex>.md` with capture-region bodies and parent links. Partial notes display safe unresolved record-type labels. Proven fork ownership excludes inherited parent facts; ambiguous ownership stays partial.
+- Codex SessionEnd grants a three-second wrapper timeout. `codex_ai_model` and `codex_summary_model` select invoking-native analysis without Claude fallback. Coordination honors frozen `XDG_STATE_HOME`, account `.local/state`, or `/var/tmp/obsidian-brain-state-<UID>` when needed outside the vault.
+
 ## [3.8.1] - 2026-10-05
 
 ### Fixed

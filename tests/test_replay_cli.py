@@ -57,24 +57,35 @@ def isolated_home(tmp_path, monkeypatch):
     return tmp_path
 
 
-def _run_cli(*args: str, env_extra: dict[str, str] | None = None) -> subprocess.CompletedProcess:
+def _run_legacy_claude_replay(*args: str, env_extra: dict[str, str] | None = None) -> subprocess.CompletedProcess:
     env = {**os.environ, **(env_extra or {})}
-    return subprocess.run(
-        [sys.executable, str(_REPLAY_SCRIPT), *args],
-        capture_output=True, text=True, env=env, cwd=str(_REPO_ROOT),
-    )
+    # These are Claude troubleshooting-format tests. Keep publication suppressed;
+    # actual native capture and recovery are tested with both invoking hosts.
+    command = [sys.executable, str(_REPLAY_SCRIPT), *args]
+    if "--dry-run" not in args:
+        command.append("--dry-run")
+    vault = Path(env_extra["HOME"]) / "vault" if env_extra and "HOME" in env_extra else None
+    before = {str(path): path.read_bytes() for path in vault.rglob("*.md")} if vault else {}
+    result = subprocess.run(command, stdin=subprocess.DEVNULL,
+                            capture_output=True, text=True, env=env,
+                            cwd=str(_REPO_ROOT), timeout=20)
+    if vault:
+        assert {str(path): path.read_bytes() for path in vault.rglob("*.md")} == before
+    return result
 
 
 # -------------------- TestReplayCliArgparse --------------------
 
 class TestReplayCliArgparse:
+    @pytest.mark.host_only("claude", reason="claude-record-format", capability="claude_native_format")
     def test_missing_jsonl(self):
-        result = _run_cli("--cwd", "/fake")
+        result = _run_legacy_claude_replay("--cwd", "/fake")
         assert result.returncode == 2
         assert "--jsonl" in result.stderr
 
+    @pytest.mark.host_only("claude", reason="claude-record-format", capability="claude_native_format")
     def test_invalid_mode(self):
-        result = _run_cli(
+        result = _run_legacy_claude_replay(
             "--jsonl", str(_FIXTURES / "d63cc484-3min-14msg.jsonl"),
             "--cwd", "/fake",
             "--mode", "bogus",
@@ -82,14 +93,16 @@ class TestReplayCliArgparse:
         assert result.returncode == 2
         assert "invalid choice" in result.stderr.lower() or "bogus" in result.stderr
 
+    @pytest.mark.host_only("claude", reason="claude-record-format", capability="claude_native_format")
     def test_help_renders(self):
-        result = _run_cli("--help")
+        result = _run_legacy_claude_replay("--help")
         assert result.returncode == 0
         assert "--jsonl" in result.stdout
         assert "--mode" in result.stdout
 
+    @pytest.mark.host_only("claude", reason="claude-record-format", capability="claude_native_format")
     def test_dry_run_does_not_touch_disk(self, isolated_home):
-        result = _run_cli(
+        result = _run_legacy_claude_replay(
             "--jsonl", str(_FIXTURES / "d63cc484-3min-14msg.jsonl"),
             "--cwd", "/Users/abhishek/dev/claude_workspace/obsidian-brain",
             "--dry-run",
@@ -103,9 +116,10 @@ class TestReplayCliArgparse:
         sessions_dir = isolated_home / "vault" / "sessions"
         assert not list(sessions_dir.glob("*.md"))
 
+    @pytest.mark.host_only("claude", reason="claude-record-format", capability="claude_native_format")
     def test_jsonl_path_does_not_exist(self, isolated_home, tmp_path):
         """Guard at _run_sessionend line ~174: --jsonl provided but file missing."""
-        result = _run_cli(
+        result = _run_legacy_claude_replay(
             "--jsonl", str(tmp_path / "nonexistent.jsonl"),
             "--cwd", "/Users/abhishek/dev/claude_workspace/obsidian-brain",
             env_extra={"HOME": str(isolated_home), "_REAL_VAULT_GUARD": "1"},
@@ -149,6 +163,7 @@ class TestReplayCliCaptureAlgorithm:
         lines = [json.loads(l) for l in out.read_text().splitlines() if l.strip()]
         assert len(lines) < 61, f"expected halved output (<61 records), got {len(lines)}"
 
+    @pytest.mark.host_only("claude", reason="claude-record-format", capability="claude_native_format")
     def test_no_log_line_emitted_sentinel(self, isolated_home):
         """If _run() returns without writing to the hook log, CLI emits the sentinel.
 
@@ -167,7 +182,7 @@ class TestReplayCliCaptureAlgorithm:
         cfg["auto_log_enabled"] = False
         config_path.write_text(json.dumps(cfg))
 
-        result = _run_cli(
+        result = _run_legacy_claude_replay(
             "--jsonl", str(_FIXTURES / "d63cc484-3min-14msg.jsonl"),
             "--cwd", "/Users/abhishek/dev/claude_workspace/obsidian-brain",
             "--json",
@@ -181,6 +196,7 @@ class TestReplayCliCaptureAlgorithm:
             f"got {out['outcome']!r}. If this is NO_LOG_LINE_EMITTED, #123 regressed."
         )
 
+    @pytest.mark.host_only("claude", reason="claude-record-format", capability="claude_native_format")
     def test_dry_run_intercepts_write_vault_note_call(self, isolated_home, tmp_path):
         """Behavioral test for --dry-run: synthesize a fixture that passes thresholds,
         assert vault_writes is non-empty AND no .md file lands on disk.
@@ -211,7 +227,7 @@ class TestReplayCliCaptureAlgorithm:
             }))
         fixture.write_text("\n".join(records) + "\n")
 
-        result = _run_cli(
+        result = _run_legacy_claude_replay(
             "--jsonl", str(fixture),
             "--cwd", "/Users/abhishek/dev/claude_workspace/obsidian-brain",
             "--dry-run",
@@ -266,6 +282,7 @@ class TestReplayCliSessionEnd:
     guard; #125 will revisit if its F1 fix changes how fixtures behave.
     """
 
+    @pytest.mark.host_only("claude", reason="claude-record-format", capability="claude_native_format")
     @pytest.mark.parametrize("fixture,expected_msgs", [
         ("d63cc484-3min-14msg.jsonl", "1"),
         ("6fa4f267-2min-5msg.jsonl", "0"),
@@ -274,7 +291,7 @@ class TestReplayCliSessionEnd:
     def test_sessionend_fixture_skipped_below_threshold(
         self, isolated_home, fixture, expected_msgs
     ):
-        result = _run_cli(
+        result = _run_legacy_claude_replay(
             "--jsonl", str(_FIXTURES / fixture),
             "--cwd", "/Users/abhishek/dev/claude_workspace/obsidian-brain",
             "--json",
@@ -313,13 +330,14 @@ class TestReplayCliReaper:
     Verifies exit 0, JSON output, and correct outcome field per fixture.
     """
 
+    @pytest.mark.host_only("claude", reason="claude-record-format", capability="claude_native_format")
     @pytest.mark.parametrize("fixture_name,expected_event", REAPER_FIXTURES)
     def test_replay_cli_reaper_mode(self, isolated_home, fixture_name, expected_event):
         """Drive replay-sessionend.py in reaper mode against each fixture."""
         fixture = _FIXTURES / fixture_name
         assert fixture.exists()
 
-        result = _run_cli(
+        result = _run_legacy_claude_replay(
             "--jsonl", str(fixture),
             "--cwd", "/Users/abhishek/dev/claude_workspace/obsidian-brain",
             "--mode", "reaper",
@@ -368,6 +386,7 @@ class TestReaperSessionsFolderDefault:
     matching obsidian_utils._DEFAULTS['sessions_folder'], not the old wrong 'sessions'.
     """
 
+    @pytest.mark.host_only("claude", reason="claude-record-format", capability="claude_native_format")
     def test_reaper_sessions_folder_default_is_claude_sessions(self, isolated_home):
         """Config without sessions_folder key: reaper must use 'claude-sessions' as default.
 
@@ -389,7 +408,7 @@ class TestReaperSessionsFolderDefault:
 
         fixture = _FIXTURES / "d2cc7e46-long-617min-full.jsonl"
 
-        result = _run_cli(
+        result = _run_legacy_claude_replay(
             "--jsonl", str(fixture),
             "--cwd", "/Users/abhishek/dev/claude_workspace/obsidian-brain",
             "--mode", "reaper",

@@ -5,11 +5,73 @@ metadata:
   version: 1.7.0
 ---
 
+## Native runtime and installed resources
+
+Use the absolute path of this loaded `SKILL.md` as `OB_SKILL_PATH`. Read the
+reference for the invoking host when this skill has paired host references.
+Set `OB_HOST`, `OB_SESSION_ID`, and `OB_CWD` from that native invocation.
+Claude has one frontend: use the fixed host client `claude-code`. Reject an
+inherited `OB_CLIENT` that differs, including an empty declaration.
+For Codex, read the operator-declared, inherited `OB_CLIENT`; never choose or
+export it yourself. It must be `codex-cli` or `codex-desktop`; if missing or
+invalid, stop with "Current native client binding is unavailable". Never label a Desktop
+invocation as a CLI invocation or infer the frontend from transcript creation
+metadata or inherited environment markers. Use the selected host's own session ID. Keep curated note taxonomy
+separate from `agent_provider` and `agent_session_id` provenance.
+
+```bash
+case "$OB_HOST" in
+  claude)
+    if [ "${OB_CLIENT+x}" = x ] && [ "$OB_CLIENT" != claude-code ]; then
+      printf '%s\n' 'Current native client binding is unavailable: conflicting Claude declaration.' >&2
+      exit 1
+    fi
+    OB_CLIENT=claude-code
+    ;;
+  codex)
+    case "${OB_CLIENT:-}" in
+      codex-cli|codex-desktop) ;;
+      *) printf '%s\n' 'Current native client binding is unavailable; stop without choosing a frontend.' >&2; exit 1 ;;
+    esac
+    ;;
+  *) printf '%s\n' 'Current native client binding is unavailable: unknown host.' >&2; exit 1 ;;
+esac
+OB_SKILL_PATH='<absolute path of this loaded SKILL.md>'
+OB_RESOURCE_ROOT=$(python3 -c 'import pathlib,sys; p=pathlib.Path(sys.argv[1]); assert p.is_absolute(); p=p.resolve(); assert p.name == "SKILL.md" and p.parent.parent.name == "skills"; print(p.parents[2])' "$OB_SKILL_PATH")
+python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" context < /dev/null
+```
+
+Use the returned `config_path`, `vault_path`, `index_path`, and `state_path`.
+Create the operation with this fixed literal request:
+
+```bash
+printf '{}' | python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'prepare'
+```
+
+Call `prepare` to create a private operation under native state. Retain its
+`operation_id` and `operation_dir`. Register approved helper output names with `artifact-store`;
+inputs are read through the immutable artifact manifest. Do not discover resources from the current directory or another plugin
+cache. Each shell invocation supplies the same explicit values; a previous
+shell's variables are not assumed to persist.
+
+Each data operation uses the installed launcher with a JSON request on stdin:
+
+```bash
+python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation '<fixed operation>' < "$REQUEST_PATH"
+```
+
+Map config JSON `vault_path`, `sessions_folder`, and `insights_folder` to the
+procedure variables `VAULT_PATH`/`VAULT`, `SESSIONS_FOLDER`/`SESS`, and
+`INSIGHTS_FOLDER`/`INS`. Use the canonical project returned in config JSON (and native `session` when available),
+not the basename of an unrelated shell working directory.
+
+Before drafting an edit or summary, call `note-read` and retain its exact `expected_revision`. Use `note-apply` with that revision for the reviewed edit. A conflict preserves the current note; show the pending result and do not count it as saved. Use only the operations documented for this skill. Their writes bind the source revisions before analysis and preserve manual edits on conflict. Content is JSON data, never shell code. Read `references/host-claude.md` or `references/host-codex.md` when present. Codex has no native memory-file API; shared vault retrieval and wiki filing continue without borrowing another host's memory.
+
 # Recall — Load Project Context from Obsidian Vault
 
 Searches the Obsidian vault for session notes and insights matching the current project, upgrades any unsummarized notes with AI summaries, and presents a concise context brief.
 
-**Tools needed:** Bash, Grep, Read, Write
+**Tools needed:** native shell, native content search, native file reading, trusted publication
 
 ## Procedure
 
@@ -19,43 +81,17 @@ Follow these steps exactly. Do not skip steps or reorder them.
 
 Run a single call that loads config and derives the project name (saves one parent round):
 
-```bash
-cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-python3 -c '
-import sys, os
-import glob, json, os, re, sys
-def _ob_hooks():
-    try:
-        for _m in json.load(open(os.path.expanduser("~/.claude/plugins/known_marketplaces.json"))).values():
-            _s = _m.get("source") if isinstance(_m, dict) else None
-            if not (isinstance(_s, dict) and _s.get("source") == "directory"):
-                continue
-            _i = _m.get("installLocation") if isinstance(_m, dict) else None
-            if not (isinstance(_i, str) and os.path.isabs(_i)):
-                continue
-            _h = os.path.join(_i, "hooks")
-            if os.path.isfile(os.path.join(_h, "obsidian_utils.py")):
-                return _h
-    except Exception:
-        pass
-    _c = [_d for _d in glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")) if re.fullmatch("[0-9]+([.][0-9]+)*", _d.split("/")[-2])]
-    return max(_c, key=lambda _p: ([int(_n) for _n in _p.split("/")[-2].split(".")], _p), default="hooks")
-sys.path.insert(0, _ob_hooks())
-from obsidian_utils import load_config
-c = load_config()
-if not c.get("vault_path"):
-    print("ERROR: vault_path not configured", file=sys.stderr)
-    sys.exit(1)
-project = os.path.basename(os.getcwd()).lower().replace(" ", "-")
-print("VAULT=" + c["vault_path"])
-print("SESS=" + c.get("sessions_folder", "claude-sessions"))
-print("INS=" + c.get("insights_folder", "claude-insights"))
-print("PROJECT=" + project)
-print("PIPELINE=" + c.get("summary_pipeline", "auto"))
-'
+Request for `config` (substitute the values as data):
+
+```json
+{}
 ```
 
-Parse each output line as KEY=VALUE, splitting on the first `=`. Also capture PIPELINE (defaults to "auto").
+```bash
+python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'config' < "$REQUEST_PATH"
+```
+
+Parse the single JSON object. Read its named fields; do not split output on `=`.
 
 If the user passed a project name argument (e.g. `/recall my-project`), override `PROJECT` with that value.
 
@@ -65,59 +101,55 @@ If the output is empty or errors, tell the user:
 
 Stop here if config is missing.
 
+### Step 1b — Recover retained native facts
+
+Before finding or summarizing notes, run the shared recovery command. Use the invoking host: Claude uses its fixed `claude-code` client. Codex uses the operator-declared inherited `codex-cli` or `codex-desktop`; never choose or export a Codex client yourself. Use the installed skill's adjacent `hooks` resource path. Pass the authoritative native session ID with `--session-id` when the native tool environment does not supply it. Do not derive identity or client from an old transcript.
+
+```bash
+python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" recover < /dev/null
+```
+
+Recovery processes at most eight registered sources within one second. It can retain facts from an active session; it does not finalize that session. Read the JSON `status`, `pending_sources`, `loss_of_input`, and `warnings`. When recovery remains pending or unavailable, say so and continue reading the notes already saved. If `loss_of_input` is true, report lost source input even when `status` is `complete`. Do not claim complete recovery from a partial result. Recovery uses no AI; summaries remain a separate step.
+
 **Create the task manifest** for the full `/recall` flow:
 
 ```
-TaskCreate: subject="Find unsummarized notes", activeForm="Searching for unsummarized notes"
-TaskCreate: subject="Summarize unsummarized notes", activeForm="Summarizing notes"
-TaskCreate: subject="Present read-only context brief", activeForm="Building and presenting context brief"
+Native progress task: subject="Find unsummarized notes", activeForm="Searching for unsummarized notes"
+Native progress task: subject="Summarize unsummarized notes", activeForm="Summarizing notes"
+Native progress task: subject="Present read-only context brief", activeForm="Building and presenting context brief"
 ```
 
-Track the returned task IDs — you will update them as each step completes. Immediately set task #1 to `in_progress` via TaskUpdate.
+Track the returned task IDs — you will update them as each step completes. Immediately set task #1 to `in_progress` via Native progress update.
 
 ### Step 2 — Summarize unsummarized notes (deferred summarization, truncation-aware)
 
 > ⚠️ **THIS STEP IS MANDATORY. DO NOT SKIP IT.**
 >
-> If Grep finds any file matching both `status: auto-logged` AND `project: $PROJECT`, you **must** produce an upgraded summary for every such file before proceeding to Step 3. "Skipping to save context" or "the other session covers it" is a bug, not an optimization — the user ran `/recall` specifically to get current-session context, and stale unsummarized notes are exactly what they asked you to fix.
+> If pattern search finds any file matching both `status: auto-logged` AND `project: $PROJECT`, you **must** produce an upgraded summary for every such file before proceeding to Step 3. "Skipping to save context" or "the other session covers it" is a bug, not an optimization — the user ran `/recall` specifically to get current-session context, and stale unsummarized notes are exactly what they asked you to fix.
 >
 > **Visibility requirement:** Before Step 3, emit a one-line status: `Step 2: processing N unsummarized note(s) for $PROJECT` (or `Step 2: no unsummarized notes for $PROJECT` if the intersection is empty). This makes the decision auditable in the tool trace.
 
-Find unsummarized notes for this project in a single Python call (replaces multiple Grep rounds):
+Find unsummarized notes for this project in a single Python call (replaces multiple pattern search rounds):
+
+Request for `unsummarized` (substitute the values as data):
+
+```json
+{
+  "project": "<canonical project>",
+  "include_aged": false
+}
+```
 
 ```bash
-cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-python3 -c '
-import sys, os
-import glob, json, os, re, sys
-def _ob_hooks():
-    try:
-        for _m in json.load(open(os.path.expanduser("~/.claude/plugins/known_marketplaces.json"))).values():
-            _s = _m.get("source") if isinstance(_m, dict) else None
-            if not (isinstance(_s, dict) and _s.get("source") == "directory"):
-                continue
-            _i = _m.get("installLocation") if isinstance(_m, dict) else None
-            if not (isinstance(_i, str) and os.path.isabs(_i)):
-                continue
-            _h = os.path.join(_i, "hooks")
-            if os.path.isfile(os.path.join(_h, "obsidian_utils.py")):
-                return _h
-    except Exception:
-        pass
-    _c = [_d for _d in glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")) if re.fullmatch("[0-9]+([.][0-9]+)*", _d.split("/")[-2])]
-    return max(_c, key=lambda _p: ([int(_n) for _n in _p.split("/")[-2].split(".")], _p), default="hooks")
-sys.path.insert(0, _ob_hooks())
-from obsidian_utils import find_unsummarized_notes
-print(find_unsummarized_notes(sys.argv[1], sys.argv[2], sys.argv[3]))
-' "$VAULT_PATH" "$SESSIONS_FOLDER" "$PROJECT"
+python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'unsummarized' < "$REQUEST_PATH"
 ```
 
 **Optional flags (#168 aged-note deferral):**
-- If the user passed `--include-aged`, call with `include_aged=True` to include aged-out deferred notes:
+- If the user passed `--include-aged`, set JSON `include_aged` to `true` to include aged-out deferred notes:
   ```python
   find_unsummarized_notes(vault, sessions_folder, project, include_aged=True)
   ```
-- If the user passed `--max-age-days N`, call with `aged_threshold_days=N` to override the config threshold:
+- If the user passed `--max-age-days N`, set JSON `aged_threshold_days` to the positive integer `N` to override the config threshold:
   ```python
   find_unsummarized_notes(vault, sessions_folder, project, aged_threshold_days=N)
   ```
@@ -125,6 +157,8 @@ print(find_unsummarized_notes(sys.argv[1], sys.argv[2], sys.argv[3]))
 Parse the JSON output: `{"unsummarized": ["/path/to/note1.md", ...], "auto_fixed": N, "skipped_aged": [...]}`.
 
 The function handles project filtering, defense-in-depth (skips notes with real `## Summary` but stale `auto-logged` status, auto-fixes them), and returns only genuinely unsummarized note paths.
+
+This list includes `type: claude-snapshot` notes. Keep those paths in Phase 1: `upgrade-batch` sends each unsummarized snapshot through `snapshot_summary` on the invoking host. With the default batching, snapshots finish before session upgrades. Session notes use `session_summary` or `session_summaries`. Snapshot summaries preserve the raw checkpoint; native capture hooks never run AI.
 
 If `auto_fixed > 0`, report: `Auto-fixed N note(s) with stale status.`
 
@@ -138,65 +172,37 @@ Update task #1 to completed. Update task #2 subject to `Summarize N unsummarized
 
 Update task #2 subject to `No unsummarized notes found` and set to `completed`. Skip to Step 3.
 
-#### Path B: N>=1 (parallel Haiku pipelines with sub-agent fallback)
+#### Path B: N>=1 (parallel native pipelines with sub-agent fallback)
 
-> **Config escape hatch (#84):** If `PIPELINE=subagent`, SKIP Phase 1 (the `upgrade_batch` Haiku `claude -p` pipeline) entirely and treat ALL N notes as the Phase 2 fallback list — route every note directly to the sub-agent path in Phase 2. This is for machines where `claude -p` cold-start latency exceeds the timeout budget (the Haiku pipeline would waste ~2-4 min/note on doomed timeouts). When `PIPELINE=auto` (default), proceed with Phase 1 as written below.
+> Run the bound native backend first. The config response has no `PIPELINE` field. Claude startup details are in [the Claude reference](references/host-claude.md).
 
 **Task management threshold:** If N <= 5, create a sub-task per note. If N > 5, skip per-note sub-tasks — use a single progress update on task #2 instead. This saves ~15-20s of parent round-trip overhead at large N.
 
-##### Phase 1 — Parallel Haiku upgrades (single batch call)
+##### Phase 1 — Parallel native upgrades (single batch call)
 
-If N <= 5, create a sub-task for each note (subject `"Upgrade: <basename>"`, activeForm `"Upgrading <basename> via Haiku"`).
+If N <= 5, create a sub-task for each note (subject `"Upgrade: <basename>"`, activeForm `"Upgrading <basename> via the native backend"`).
 
-**Single Bash tool call** — `upgrade_batch()` fans out N Haiku invocations in parallel inside one Python process via `concurrent.futures.ThreadPoolExecutor`. This sidesteps the Claude Code harness's serialization of parallel Bash tool calls for subprocess-blocking work:
+**Single native shell call** — `upgrade_batch()` uses the invoking host’s bound AI backend and bounded batch concurrency.
 
-```bash
-cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-printf '%s' "$UNSUMMARIZED_PATHS_JSON" | python3 -c '
-import sys, os, json
-from collections import Counter
-import glob, json, os, re, sys
-def _ob_hooks():
-    try:
-        for _m in json.load(open(os.path.expanduser("~/.claude/plugins/known_marketplaces.json"))).values():
-            _s = _m.get("source") if isinstance(_m, dict) else None
-            if not (isinstance(_s, dict) and _s.get("source") == "directory"):
-                continue
-            _i = _m.get("installLocation") if isinstance(_m, dict) else None
-            if not (isinstance(_i, str) and os.path.isabs(_i)):
-                continue
-            _h = os.path.join(_i, "hooks")
-            if os.path.isfile(os.path.join(_h, "obsidian_utils.py")):
-                return _h
-    except Exception:
-        pass
-    _c = [_d for _d in glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")) if re.fullmatch("[0-9]+([.][0-9]+)*", _d.split("/")[-2])]
-    return max(_c, key=lambda _p: ([int(_n) for _n in _p.split("/")[-2].split(".")], _p), default="hooks")
-sys.path.insert(0, _ob_hooks())
-from obsidian_utils import upgrade_batch
-import time
-paths = json.loads(sys.stdin.read())
-_t0 = time.monotonic()
-try:
-    results = upgrade_batch(paths, sys.argv[1], sys.argv[2], sys.argv[3])
-    # results is list[dict] with keys: path, status, elapsed_s, model_used, fallback_reason
-    wall_s = round(time.monotonic() - _t0, 1)
-    model_counts = Counter()
-    for r in results:
-        tag = r["model_used"] or "fallback"
-        model_counts[tag] += 1
-    DASH = chr(45)
-    breakdown = " / ".join(f"{n} {m.split(DASH)[0]}" for m, n in model_counts.most_common())
-    print(json.dumps(results))
-    print(f"[obsidian-brain] Step 2: upgraded {len(results)} note(s) in {wall_s}s wall ({breakdown})", file=sys.stderr)
-except Exception as exc:
-    print(json.dumps({"error": f"{type(exc).__name__}: {exc}", "results": []}))
-    print(f"[obsidian-brain] upgrade_batch failed: {exc}", file=sys.stderr)
-    sys.exit(1)
-' "$VAULT_PATH" "$SESSIONS_FOLDER" "$PROJECT"
+Resolve any vault-relative note paths from metadata against the returned
+`vault_path` before this request; keep already-absolute paths unchanged.
+
+Request for `upgrade-batch` (substitute the values as data):
+
+```json
+{
+  "paths": [
+    "<eligible absolute source note paths>"
+  ],
+  "project": "<canonical project>"
+}
 ```
 
-Parse the returned JSON. If the top-level object contains an `"error"` key, `upgrade_batch` itself failed — treat all notes as failed and fall back to the Phase 2 sub-agent path for each. Otherwise, parse the array normally. Each result dict has: `path`, `status`, `elapsed_s`, `model_used` (`haiku-4.5` on success, `None` on failure; `sonnet-4.6` / `opus-*` reserved for Phase 3 #165), `fallback_reason` (`haiku_timeout` | `empty_output` | `haiku_subprocess_error` | `None`). Note: `upgrade_batch` now groups session notes into batches (default 3 per spawn, config key `summary_batch_size`; set to 1 to disable) and summarizes each group in a single `claude -p` spawn to amortize CLI startup cost (#166). Per-note parse failures (`missing_section`) and whole-spawn failures fall through to the per-note solo path automatically before any result reaches Phase 2. For each entry:
+```bash
+python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'upgrade-batch' < "$REQUEST_PATH"
+```
+
+Parse the returned JSON. A top-level `"error"` sends every note to Phase 2. Otherwise each result includes `path`, `status`, `elapsed_s`, the actual `model_used` when reported, and `fallback_reason`. The backend may batch session notes (`summary_batch_size`, default 3; use 1 to disable). Per-note or whole-batch failures remain pending and enter Phase 2. Never claim a configured alias was the actual model.
 - `status` starts with `Upgraded ` → mark as succeeded
 - anything else (including `Failed: ...`, empty, or unexpected prefix) → add to the Phase 2 fallback list
 
@@ -205,76 +211,55 @@ The stderr line emits a per-model breakdown visible in the tool trace (e.g. `Ste
 If N <= 5: update each sub-task accordingly (succeeded or `Failed: <basename>`).
 If N > 5: update task #2 subject to `Upgrade N notes: M succeeded, F pending fallback`.
 
-> **Why a single Bash call, not N parallel calls?** The Claude Code harness serializes parallel Bash tool calls through a limited shell pool when each subprocess blocks on I/O (e.g., `claude -p --model haiku` taking 5-30s). Dispatching 10 Bash calls in one message still executes them one at a time — wall time ≈ Σ per-call. Pushing fan-out into a single Python process with `ThreadPoolExecutor` gives true concurrency (the GIL releases during subprocess waits), so wall time ≈ max per-call. See `claude-insights/2026-04-21-recall-parallel-bash-dispatch-runs-sequentially-fbee-error.md` and GH #69.
+Use one trusted batch call so the selected native backend controls bounded concurrency.
 
 ##### Phase 2 — Sub-agent fallback (only for failed notes)
 
 If no failures, skip this phase entirely.
 
-For each failed note, spawn a sub-agent. If multiple notes failed, spawn all sub-agents in a **single message turn**:
+For each failed note, run `note-read` to bind its exact current revision before analysis. Then use a native analysis helper; if unavailable, perform the same analysis inline. If multiple notes failed, spawn all sub-agents in a **single message turn**:
 
 ```
-Agent({
+Native analysis helper({
   description: "Summarize session note <basename>",
-  prompt: "Read the session note at <NOTE_PATH>. Produce a structured summary with these exact markdown sections:\n\n## Summary\n1-3 sentence overview of what was accomplished.\n\n## Key Decisions\n- Bullet list of important technical decisions. Write \"None noted.\" if none.\n\n## Changes Made\n- Bullet list of files modified/created with brief description. Write \"None noted.\" if none.\n\n## Errors Encountered\n- Bullet list of errors and how resolved. Write \"None.\" if none.\n\n## Open Questions / Next Steps\n- [ ] Checkbox list of unresolved items. Write \"None.\" if none.\n\nWrite the summary to ~/.claude/obsidian-brain/summary-<basename>.md using the Write tool. After the summary sections, add a final line:\nIMPORTANCE: N\nwhere N is 1-10. 1-3: trivial (config, interrupted). 4-6: standard work. 7-8: key decisions or error resolutions. 9-10: major releases or security audits.\n\nReturn ONLY the single line: WRITTEN:~/.claude/obsidian-brain/summary-<basename>.md"
+  prompt: "Read the session note at <NOTE_PATH>. Produce a structured summary with these exact markdown sections:\n\n## Summary\n1-3 sentence overview of what was accomplished.\n\n## Key Decisions\n- Bullet list of important technical decisions. Write \"None noted.\" if none.\n\n## Changes Made\n- Bullet list of files modified/created with brief description. Write \"None noted.\" if none.\n\n## Errors Encountered\n- Bullet list of errors and how resolved. Write \"None.\" if none.\n\n## Open Questions / Next Steps\n- [ ] Checkbox list of unresolved items. Write \"None.\" if none.\n\nReturn the summary text to the parent; do not publish vault or scratch files. After the summary sections, add a final line:\nIMPORTANCE: N\nwhere N is 1-10. 1-3: trivial (config, interrupted). 4-6: standard work. 7-8: key decisions or error resolutions. 9-10: major releases or security audits.\n\nReturn the complete summary text and IMPORTANCE line."
 })
 ```
 
 When sub-agents return, for each:
 
-1. If the sub-agent returned `WRITTEN:<path>`, extract the path after `WRITTEN:` and replace the leading `~` with `$HOME` to get an absolute path. Store this as `SUMMARY_TEMP_PATH`. Verify the file exists: `test -f "$SUMMARY_TEMP_PATH" && echo "EXISTS" || echo "MISSING"`.
-2. If EXISTS, apply it via Python:
+1. Require complete returned summary text with the requested sections. Keep the SHA256 from `note-read`; do not read again to rebind it after analysis.
+2. Apply the returned text through the trusted launcher:
+
+   Request for `summary-apply` (substitute the values as data):
+
+   ```json
+   {
+     "operation_id": "<prepared id>",
+     "path": "<source note>",
+     "expected_revision": "<pre-model SHA256>",
+     "summary": "<generated summary>"
+   }
+   ```
 
    ```bash
-   cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-   python3 -c '
-   import sys, os
-   import glob, json, os, re, sys
-   def _ob_hooks():
-       try:
-           for _m in json.load(open(os.path.expanduser("~/.claude/plugins/known_marketplaces.json"))).values():
-               _s = _m.get("source") if isinstance(_m, dict) else None
-               if not (isinstance(_s, dict) and _s.get("source") == "directory"):
-                   continue
-               _i = _m.get("installLocation") if isinstance(_m, dict) else None
-               if not (isinstance(_i, str) and os.path.isabs(_i)):
-                   continue
-               _h = os.path.join(_i, "hooks")
-               if os.path.isfile(os.path.join(_h, "obsidian_utils.py")):
-                   return _h
-       except Exception:
-           pass
-       _c = [_d for _d in glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")) if re.fullmatch("[0-9]+([.][0-9]+)*", _d.split("/")[-2])]
-       return max(_c, key=lambda _p: ([int(_n) for _n in _p.split("/")[-2].split(".")], _p), default="hooks")
-   sys.path.insert(0, _ob_hooks())
-   from obsidian_utils import upgrade_note_with_summary
-   with open(os.path.expanduser(sys.argv[6]), "r") as f:
-       summary = f.read()
-   status = upgrade_note_with_summary(sys.argv[1], summary, sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5])
-   print(status)
-   ' "$NOTE_PATH" "$VAULT_PATH" "$SESSIONS_FOLDER" "$PROJECT" "sub-agent" "$SUMMARY_TEMP_PATH"
+   python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'summary-apply' < "$REQUEST_PATH"
    ```
 
    If the write-back status starts with `Failed:`, count this note as permanently failed — do NOT count it as upgraded. If N <= 5, update the per-note sub-task to `Permanently failed: <basename>`.
 
    If the write-back succeeds, and N <= 5, update the per-note sub-task to `Fallback succeeded: <basename>`.
 
-3. If MISSING or sub-agent didn't return `WRITTEN:` → note stays unsummarized for next `/recall`. If N <= 5, update the per-note sub-task to `Permanently failed: <basename>`.
+3. Missing or invalid summary output leaves the note pending for the next `/recall`. Report the failure. Helpers return text, so no temporary-file cleanup is needed.
 
-**Always** clean up temp files from Phase 2 after all write-backs complete, regardless of outcome. Use the actual `SUMMARY_TEMP_PATH` values collected from each sub-agent's `WRITTEN:` response (not placeholder names):
-
-```bash
-rm -f "$SUMMARY_TEMP_PATH_1" "$SUMMARY_TEMP_PATH_2" ...
-```
-
-If N > 5: update task #2 subject to reflect final Phase 2 results (e.g. `Upgrade N notes: M Haiku + F fallback succeeded, K failed`).
+If N > 5: update task #2 subject to reflect final Phase 2 results (e.g. `Upgrade N notes: M native + F fallback succeeded, K failed`).
 
 ##### Completion
 
 Mark task #2 as completed. Report results:
-- How many upgraded via Haiku pipeline (Phase 1 successes)
+- How many upgraded via the native backend pipeline (Phase 1 successes)
 - How many upgraded via sub-agent fallback (Phase 2 write-back successes)
-- How many permanently failed (notes where both Phase 1 Haiku AND Phase 2 sub-agent fallback failed or were skipped — these stay unsummarized for next `/recall`)
+- How many permanently failed (notes where both Phase 1 native backend AND Phase 2 sub-agent fallback failed or were skipped — these stay unsummarized for next `/recall`)
 
 For failed notes: "Note `<basename>` could not be summarized. It will be retried on the next `/recall`."
 
@@ -284,33 +269,16 @@ Update task #3 to `in_progress`.
 
 Run a single Python call that reads all session and insight files and composes the brief — no sub-agent needed:
 
+Request for `brief` (substitute the values as data):
+
+```json
+{
+  "project": "<canonical project>"
+}
+```
+
 ```bash
-cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-python3 -c '
-import sys, os
-import glob, json, os, re, sys
-def _ob_hooks():
-    try:
-        for _m in json.load(open(os.path.expanduser("~/.claude/plugins/known_marketplaces.json"))).values():
-            _s = _m.get("source") if isinstance(_m, dict) else None
-            if not (isinstance(_s, dict) and _s.get("source") == "directory"):
-                continue
-            _i = _m.get("installLocation") if isinstance(_m, dict) else None
-            if not (isinstance(_i, str) and os.path.isabs(_i)):
-                continue
-            _h = os.path.join(_i, "hooks")
-            if os.path.isfile(os.path.join(_h, "obsidian_utils.py")):
-                return _h
-    except Exception:
-        pass
-    _c = [_d for _d in glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")) if re.fullmatch("[0-9]+([.][0-9]+)*", _d.split("/")[-2])]
-    return max(_c, key=lambda _p: ([int(_n) for _n in _p.split("/")[-2].split(".")], _p), default="hooks")
-sys.path.insert(0, _ob_hooks())
-from obsidian_utils import build_context_brief, check_hook_status
-hs = check_hook_status()
-status_line = ("[OK] " if hs["ok"] else "[WARN] ") + hs["message"]
-print(build_context_brief(sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], hook_status_line=status_line))
-' "$VAULT_PATH" "$SESSIONS_FOLDER" "$INSIGHTS_FOLDER" "$PROJECT"
+python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'brief' < "$REQUEST_PATH"
 ```
 
 The first line of the emitted `CONTEXT_BRIEF` is always the hook-status line. If it starts with `[OK]`, omit it from the displayed output — the user doesn't need to see "session logging active" every time. If it starts with `[WARN]`, display it verbatim so the user knows to take action (e.g., run `/obsidian-setup`).
@@ -339,32 +307,16 @@ If unsummarized notes were upgraded in Step 2, also mention:
 
 Surface the project's top recurring themes (ranked by stored activation, kept fresh by `/consolidate` and `/emerge`). This is a fast, read-only DB read — `$PROJECT` is the value already derived in Step 1.
 
+Request for `recurring-themes` (substitute the values as data):
+
+```json
+{
+  "project": "<canonical project>"
+}
+```
+
 ```bash
-cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-python3 -c '
-import sys, os
-import glob, json, os, re, sys
-def _ob_hooks():
-    try:
-        for _m in json.load(open(os.path.expanduser("~/.claude/plugins/known_marketplaces.json"))).values():
-            _s = _m.get("source") if isinstance(_m, dict) else None
-            if not (isinstance(_s, dict) and _s.get("source") == "directory"):
-                continue
-            _i = _m.get("installLocation") if isinstance(_m, dict) else None
-            if not (isinstance(_i, str) and os.path.isabs(_i)):
-                continue
-            _h = os.path.join(_i, "hooks")
-            if os.path.isfile(os.path.join(_h, "obsidian_utils.py")):
-                return _h
-    except Exception:
-        pass
-    _c = [_d for _d in glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")) if re.fullmatch("[0-9]+([.][0-9]+)*", _d.split("/")[-2])]
-    return max(_c, key=lambda _p: ([int(_n) for _n in _p.split("/")[-2].split(".")], _p), default="hooks")
-sys.path.insert(0, _ob_hooks())
-from obsidian_utils import recurring_themes_section
-from vault_index import _default_db_path
-print(recurring_themes_section(_default_db_path(), sys.argv[1] if len(sys.argv) > 1 else None))
-' "$PROJECT"
+python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'recurring-themes' < "$REQUEST_PATH"
 ```
 
 If the output is non-empty, append it verbatim to the brief (between the context brief and the open-items footer). If it is empty, print nothing — there are no themes yet.
@@ -398,3 +350,33 @@ Mark task #3 (the renamed final task) as `completed` and end.
 - **Very large vault (50+ sessions):** Only grep, never glob the entire folder. Limit reads to the most recent 5 sessions + all insights.
 - **Config exists but vault path is invalid:** Warn the user and suggest running `/obsidian-setup` again.
 - **Open items exist:** Do not attempt to check them off. Append the footer nudge pointing to `/check-items` instead.
+
+A native session summary is stale when `capture_revision` differs from
+`summary_revision`, or no `summary_revision` exists. Label it stale explicitly.
+Use unchanged raw capture facts as evidence; do not present its old summary as fresh.
+Failed or cancelled AI leaves the operation pending and preserves the note.
+
+## Fixed request shapes
+
+Pass these objects through the installed launcher for the named operation. Keep
+one operation ID across source reads, analysis and reviewed publication.
+
+Request for `note-read`:
+
+```json
+{
+  "operation_id": "<prepared id>",
+  "path": "<vault-relative note.md>"
+}
+```
+
+Request for `note-apply`:
+
+```json
+{
+  "operation_id": "<same prepared id>",
+  "path": "<same vault-relative note.md>",
+  "expected_revision": "<note-read SHA256>",
+  "content": "<complete reviewed note>"
+}
+```

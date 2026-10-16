@@ -1,3 +1,8 @@
+import pytest
+from selected_legacy_vault import selected_host_context
+
+pytestmark = pytest.mark.usefixtures("selected_host_context")
+
 from pathlib import Path
 
 from hooks.obsidian_utils import build_context_brief, fetch_snapshot_summaries
@@ -13,7 +18,7 @@ def _fixture(path, type_, sid, date, project="demo", extras="", body="body"):
 
 
 def test_build_context_brief_filters_snapshots_from_top_level(tmp_path):
-    vault = tmp_path / "v"
+    vault = tmp_path
     sess = vault / "claude-sessions"
     ins = vault / "claude-insights"
     sess.mkdir(parents=True); ins.mkdir()
@@ -45,7 +50,7 @@ def test_fetch_snapshot_summaries_returns_ordered_items(tmp_path):
 
 
 def test_build_context_brief_emits_snapshot_count_in_load_manifest(tmp_path):
-    vault = tmp_path / "v"
+    vault = tmp_path
     sess = vault / "claude-sessions"
     ins = vault / "claude-insights"
     sess.mkdir(parents=True); ins.mkdir()
@@ -85,7 +90,7 @@ def test_fetch_snapshot_summaries_missing_trigger_defaults_to_auto(tmp_path):
 
 
 def test_build_context_brief_no_snapshot_artifacts_when_session_has_none(tmp_path):
-    vault = tmp_path / "v"
+    vault = tmp_path
     sess = vault / "claude-sessions"
     ins = vault / "claude-insights"
     sess.mkdir(parents=True); ins.mkdir()

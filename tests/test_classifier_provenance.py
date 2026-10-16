@@ -19,6 +19,8 @@ from __future__ import annotations
 import json
 
 import open_item_dedup as oid
+import check_items_cli
+from check_items_test_helpers import native_ai_context
 
 # Exact production strings — do not paraphrase. Test 1 exists to prove this
 # shape genuinely reaches HIGH before the guard is applied, so test 2's cap
@@ -115,9 +117,7 @@ def test_classify_groups_heuristic_stamps_source():
 # ---------------------------------------------------------------------------
 
 def test_agent_results_stamped_agent_or_prefilter(monkeypatch):
-    def fake_cli_run(cmd, *args, **kwargs):
-        out_path = next((c for c in cmd if isinstance(c, str)
-                         and c.endswith(".json") and "out" in c), None)
+    def fake_cli_run(stdin_json, out_path):
         if out_path:
             with open(out_path, "w") as f:
                 json.dump([
@@ -139,9 +139,9 @@ def test_agent_results_stamped_agent_or_prefilter(monkeypatch):
                         "prefiltered": True,
                     },
                 ], f)
-        return _fake_completed(returncode=0)
+        return 0
 
-    monkeypatch.setattr(oid.subprocess, "run", fake_cli_run)
+    monkeypatch.setattr(check_items_cli, "run_classifier", fake_cli_run)
 
     merged_groups = [
         {"group_id": "g1", "project": "p", "representative": "ship",
@@ -166,9 +166,7 @@ def test_agent_payload_cannot_self_declare_classifier_source(monkeypatch):
     unconditionally and overwrite any value the payload already carries —
     this test would fail under the old `r.setdefault(...)` form, since
     setdefault leaves a pre-existing key untouched."""
-    def fake_cli_run(cmd, *args, **kwargs):
-        out_path = next((c for c in cmd if isinstance(c, str)
-                         and c.endswith(".json") and "out" in c), None)
+    def fake_cli_run(stdin_json, out_path):
         if out_path:
             with open(out_path, "w") as f:
                 json.dump([{
@@ -182,9 +180,9 @@ def test_agent_payload_cannot_self_declare_classifier_source(monkeypatch):
                     # Self-declared by the payload — must be overridden.
                     "classifier_source": "agent",
                 }], f)
-        return _fake_completed(returncode=0)
+        return 0
 
-    monkeypatch.setattr(oid.subprocess, "run", fake_cli_run)
+    monkeypatch.setattr(check_items_cli, "run_classifier", fake_cli_run)
 
     merged_groups = [
         {"group_id": "g1", "project": "p", "representative": "prefiltered",

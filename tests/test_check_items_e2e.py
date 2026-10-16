@@ -2,9 +2,8 @@
 
 Exercises the full pipeline from raw item collection through grouping,
 classification, and dashboard write using a 6-fixture-note vault under
-tests/fixtures/check_items_e2e/. Sub-agent stages (semantic merge and
-classifier) are mocked via unittest.mock.patch to keep the test
-deterministic and offline.
+tests/fixtures/check_items_e2e/. Native classifier transport is mocked. Collection, validation, and
+transactional dashboard publication run against a disposable selected vault.
 
 Spec ref: § Testing test 11 line 657.
 
@@ -26,6 +25,7 @@ import json
 import os
 import sys
 import time
+import shutil
 
 import pytest
 from unittest.mock import patch, MagicMock
@@ -127,7 +127,7 @@ def _infer_project(item_text, fpath, raw_items):
 # End-to-end integration test
 # ---------------------------------------------------------------------------
 
-def test_check_items_e2e_fixture_vault(tmp_path):
+def test_check_items_e2e_fixture_vault(tmp_path, host, selected_host_context, monkeypatch, request):
     """Full pipeline: collect → group → classify → dashboard write.
 
     Fixture vault: 6 session notes across 3 projects, ~21 raw items total.
@@ -150,11 +150,19 @@ def test_check_items_e2e_fixture_vault(tmp_path):
 
     Spec § Testing test 11 line 657.
     """
+    from runtime_context import using_runtime_context, current_runtime_context
+    from ai_backend import AIResult
+    vault = selected_host_context.vault_path
+    shutil.copytree(_FIXTURE_VAULT, vault, dirs_exist_ok=True)
+    binding = using_runtime_context(selected_host_context)
+    binding.__enter__()
+    # Release the binding even if an assertion fails.
+    request.addfinalizer(lambda: binding.__exit__(None, None, None))
     # Step 1: Collect raw items from all 3 projects using real signatures
     raw_items: list[tuple[str, int, str]] = []
     for project in _PROJECTS:
         items = oid.collect_open_items(
-            vault_path=_FIXTURE_VAULT,
+            vault_path=str(vault),
             sessions_folder=_SESSIONS_FOLDER,
             project=project,
             max_sessions=50,
@@ -171,8 +179,7 @@ def test_check_items_e2e_fixture_vault(tmp_path):
     assert len(all_groups) > 0, "grouping produced no groups"
 
     # Step 3: Build mock classifier output — one DONE, one NEEDS-ACTION, rest ACTIVE.
-    # The classifier sub-agent is exercised via classify_groups_with_agent, whose
-    # subprocess.run is intercepted so no real claude invocation happens.
+    # The classifier transport returns deterministic records for every input ID.
     done_gid = all_groups[0]["group_id"]
     na_gid = all_groups[1]["group_id"] if len(all_groups) > 1 else all_groups[0]["group_id"]
 
@@ -209,52 +216,24 @@ def test_check_items_e2e_fixture_vault(tmp_path):
                 })
         return out
 
-    # Intercept the classifier sub-agent subprocess call and write the mock output
-    def _mock_subprocess_run(cmd, *args, **kwargs):
-        # Locate the output path argument (check_items_cli passes it as last arg to classifier)
-        out_path = None
-        if isinstance(cmd, list):
-            for c in cmd:
-                if isinstance(c, str) and c.endswith(".json") and (
-                    "classify" in c or "out" in c
-                ):
-                    out_path = c
-                    break
-        mock_out = _make_classifier_output()
-        if out_path:
-            try:
-                with open(out_path, "w", encoding="utf-8") as f:
-                    json.dump(mock_out, f)
-            except OSError:
-                pass
-        return _fake_subprocess_completed(
-            stdout=json.dumps(mock_out), returncode=0
-        )
-
-    # Step 4: Run the classifier stage with mocked subprocess
-    evidence = {}  # no real evidence needed for the mock
-    with patch.object(oid.subprocess, "run", side_effect=_mock_subprocess_run):
-        classifications = oid.classify_groups_with_agent(all_groups, evidence)
-
-    # If the agent mock path didn't match (file path heuristic miss), fall back to
-    # heuristic so the test still exercises the tier assertions.
-    if not classifications:
-        classifications = oid.classify_groups_heuristic(all_groups, evidence)
-        # Inject at least one DONE and one NEEDS-ACTION if heuristic produced none
-        if not any(c["classification"] == "DONE" for c in classifications):
-            classifications[0] = dict(classifications[0],
-                                       classification="DONE",
-                                       confidence="HIGH",
-                                       evidence_citation="PR #68 merged 7fa1662")
-        if not any(c["classification"] == "NEEDS-ACTION" for c in classifications):
-            if len(classifications) > 1:
-                classifications[1] = dict(
-                    classifications[1],
-                    classification="NEEDS-ACTION",
-                    confidence="HIGH",
-                    evidence_citation="Story 11.12 shipped",
-                    action_required='gh issue close 534',
-                )
+    # Mock only the native AI boundary. Collection, fixed classifier dispatch,
+    # validation, and transactional dashboard publication remain real.
+    import ai_backend
+    import check_items_prefilter
+    seen_contexts = []
+    def classify(context, operation, request):
+        assert context is selected_host_context is current_runtime_context()
+        assert context.host == host and operation == "classify_items"
+        seen_contexts.append(context)
+        records = [row for row in _make_classifier_output()
+                   if row['group_id'] in request.options['expected_ids']]
+        return AIResult('ok', records, request.input_revision, '', host,
+                        'synthetic-native-model')
+    monkeypatch.setattr(ai_backend, 'execute_ai', classify)
+    monkeypatch.setattr(check_items_prefilter, 'is_prefilter_enabled', lambda: False)
+    classifications = oid.classify_groups_with_agent(all_groups, {})
+    assert seen_contexts and oid.get_last_classifier_mode() == 'ok'
+    assert {row['group_id'] for row in classifications} == {g['group_id'] for g in all_groups}
 
     # Assertion 2-4: tier distribution
     kinds = {"DONE": 0, "NEEDS-ACTION": 0, "ACTIVE": 0, "STALE": 0}
@@ -274,8 +253,8 @@ def test_check_items_e2e_fixture_vault(tmp_path):
     )
 
     # Step 5: Write dashboard report
-    vault_with_dashboard = tmp_path / "vault"
-    (vault_with_dashboard / "claude-dashboards").mkdir(parents=True)
+    vault_with_dashboard = vault
+    (vault_with_dashboard / "claude-dashboards").mkdir(parents=True, exist_ok=True)
 
     dashboard_path = write_check_items_dashboard(
         vault_path=str(vault_with_dashboard),

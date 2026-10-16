@@ -2,7 +2,7 @@
 ``source_session_note`` disagree about which session produced them (#330).
 
 Background: ``get_session_context()`` used to resolve the current session
-by scanning ``~/.claude/projects/<project>/*.jsonl`` for the newest-mtime
+by scanning ``the selected native projects root/<project>/*.jsonl`` for the newest-mtime
 transcript, which is not a stable key when two sessions in the same repo
 are both live. A retro or insight note calls ``get_session_context()``
 more than once while it is being written (once for ``source_session``,
@@ -91,7 +91,7 @@ def _read_note_metadata_uncached(path: Path) -> dict | None:
     session cache (#354 review items 2/3).
 
     ``read_note_metadata()`` does a ``cache_get``/``cache_set`` round-trip
-    against ``~/.claude/obsidian-brain/cache-<sid>.json`` on EVERY call, and
+    against ``the selected session cache`` on EVERY call, and
     with ``DEFAULT_WINDOW_DAYS = 9999`` this check's own scan is unbounded —
     on a 2472-note vault that balloons the cache file to 1.32 MB, and every
     later ``load_config()``, ``get_session_context()`` and

@@ -114,3 +114,164 @@ def all_checks() -> list:
         if not flag:
             result.append(m)
     return result
+
+
+# Doctor repairs share the same publication boundary as native hook writers.
+import contextlib
+import functools
+from pathlib import Path
+from uuid import uuid4
+
+from scripts.doctor_repair_state import REPAIRS as _REPAIRS, INVOCATION as _INVOCATION
+
+
+def vault_scan(function):
+    """Keep the selected vault with every issue, including custom nested folders."""
+    @functools.wraps(function)
+    def scanned(*args, **kwargs):
+        vault = args[0] if args else kwargs["vault_path"]
+        import hashlib
+        before = {}
+        for path in Path(vault).rglob("*.md"):
+            try:
+                if path.is_symlink() or any(parent.is_symlink() for parent in path.parents):
+                    continue
+                path.resolve().relative_to(Path(vault).resolve())
+                before[str(path.resolve())] = hashlib.sha256(path.read_bytes()).hexdigest()
+            except (OSError, ValueError):
+                pass
+        issues = function(*args, **kwargs)
+        for issue in issues:
+            issue.extra.setdefault("vault_path", str(Path(vault).resolve()))
+            revision = before.get(str(Path(issue.note_path).resolve()))
+            if revision is not None:
+                issue.extra.setdefault("raw_source_revision", revision)
+        return issues
+    return scanned
+
+
+def _repair_context(issue=None, path=None):
+    from note_transactions import context_for_vault
+    from runtime_context import current_runtime_context
+    from obsidian_utils import load_config
+    native = current_runtime_context()
+    declared = issue.extra.get("vault_path") if issue is not None else None
+    configured = native.vault_path if native is not None else load_config().get("vault_path")
+    # Only old, unconfigured Issue callers need the historical folder fallback.
+    vault = declared or configured or Path(path or issue.note_path).resolve().parents[1]
+    return context_for_vault(vault)
+
+
+@contextlib.contextmanager
+def repair_scope(issues):
+    """Keep original scan intent and trusted output across doctor checks."""
+    from note_transactions import record_raw_read
+    if _REPAIRS.get() is not None:
+        yield _REPAIRS.get()
+        return
+    issues = list(issues)
+    revisions = {}
+    for issue in issues:
+        if issue.extra.get("unresolved"):
+            continue
+        context = _repair_context(issue)
+        path = Path(issue.note_path).resolve()
+        if path.exists():
+            current = record_raw_read(context, path, path.read_bytes())
+            original = issue.extra.get("raw_source_revision", current)
+            revisions.setdefault(str(path), (context, original, original))
+    token = _REPAIRS.set(revisions)
+    invocation = _INVOCATION.set(uuid4().hex)
+    try:
+        yield revisions
+    finally:
+        _INVOCATION.reset(invocation)
+        _REPAIRS.reset(token)
+
+
+def repair_batch(function):
+    """Own a standalone batch or join the dispatcher's trusted repair scope."""
+    @functools.wraps(function)
+    def repaired(issues, backup_root):
+        from note_transactions import record_raw_read, LockBusy
+        issues = list(issues)
+        try:
+            with repair_scope(issues) as revisions:
+                approved, rejected = [], []
+                for issue in issues:
+                    path = Path(issue.note_path).resolve()
+                    saved = revisions.get(str(path))
+                    if saved is not None and path.exists():
+                        record_raw_read(saved[0], path, path.read_bytes())
+                        baseline = issue.extra.get("raw_source_revision", saved[1])
+                        if baseline != saved[1]:
+                            rejected.append(Result(
+                                issue.check, issue.note_path, "error",
+                                error="doctor publication conflict: this issue has a different scan baseline",
+                            ))
+                            continue
+                    approved.append(issue)
+                return rejected + function(approved, backup_root)
+        except (OSError, ValueError, LockBusy) as exc:
+            return [Result(issue.check, issue.note_path, "error", error=str(exc)) for issue in issues]
+    return repaired
+
+
+def repair_read(path, vault_path=None):
+    """Read exact bytes and register their revision before constructing a fix."""
+    from note_transactions import context_for_vault, record_raw_read
+    state = _REPAIRS.get()
+    saved = state.get(str(Path(path).resolve())) if state is not None else None
+    context = (context_for_vault(vault_path) if vault_path else
+               saved[0] if saved else _repair_context(path=path))
+    raw = Path(path).read_bytes()
+    revision = record_raw_read(context, path, raw)
+    if state is not None:
+        state.setdefault(str(Path(path).resolve()), (context, revision, revision))
+    return raw.decode("utf-8")
+
+
+def repair_write(path, text, *, encoding_repair=False):
+    """Publish only against the bytes observed before the repair was computed."""
+    from note_transactions import NoteMutation, apply_mutations, record_raw_read
+    import hashlib
+    resolved = Path(path).resolve()
+    state = _REPAIRS.get()
+    saved = state.get(str(resolved)) if state is not None else None
+    context = saved[0] if saved else _repair_context(path=path)
+    revision = saved[2] if saved else record_raw_read(context, path, resolved.read_bytes())
+    # Ordinary repairs must not silently bake invalid bytes into replacement chars.
+    if not encoding_repair:
+        resolved.read_bytes().decode("utf-8")
+    operation = "doctor-" + hashlib.sha256(
+        ((_INVOCATION.get() or uuid4().hex) + "\0" + str(resolved) + "\0" + str(revision) + "\0" + text).encode("utf-8")).hexdigest()
+    kind = "repair_document" if encoding_repair else "document"
+    result = apply_mutations(context, [NoteMutation(resolved, revision, {kind: text}, operation)])
+    if result.status not in {"applied", "unchanged"}:
+        raise OSError("doctor publication " + result.status + ": " + "; ".join(result.warnings))
+    if state is not None:
+        state[str(resolved)] = (context, saved[1] if saved else revision, result.revision)
+    return result
+
+
+def repair_move(source, destination, *, expected_revision="tracked"):
+    """Move or roll back only against the version observed by this repair."""
+    from note_transactions import move_note, record_raw_read
+    import hashlib
+    source = Path(source).resolve()
+    destination = Path(destination).resolve()
+    state = _REPAIRS.get()
+    saved = state.get(str(source)) if state is not None else None
+    context = saved[0] if saved else _repair_context(path=source)
+    revision = saved[2] if saved else record_raw_read(context, source, source.read_bytes())
+    if expected_revision != "tracked":
+        revision = expected_revision
+    operation = "doctor-move-" + hashlib.sha256(
+        ((_INVOCATION.get() or uuid4().hex) + "\0" + str(source) + "\0" + str(destination) + "\0" + str(revision)).encode("utf-8")).hexdigest()
+    result = move_note(context, source, destination, revision, operation)
+    if result.status not in {"applied", "unchanged"}:
+        raise OSError("doctor move " + result.status + ": " + "; ".join(result.warnings))
+    if state is not None:
+        state.pop(str(source), None)
+        state[str(destination)] = (context, saved[1] if saved else revision, result.revision)
+    return result

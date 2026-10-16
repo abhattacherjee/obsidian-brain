@@ -1,0 +1,29 @@
+name: Synthetic host fixture refresh
+on:
+  schedule:
+    - cron: '23 6 * * 1'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - run: python -m pip install -r requirements-dev.txt
+      - name: Capture isolated fixtures and exact source hashes
+        env:
+          TESTED_SHA: ${{ github.sha }}
+        run: |
+          mkdir -p artifacts/synthetic-hosts
+          python scripts/dev-test/capture-synthetic-host-fixtures.py --tested-sha "$TESTED_SHA" > artifacts/synthetic-hosts/metadata.json
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: synthetic-host-conformance
+          path: artifacts/synthetic-hosts
+          if-no-files-found: error

@@ -1822,3 +1822,6 @@ class TestEdgeCases:
         result = vault_index._sanitize_fts_query('hello "unmatched')
         assert '"hello"' in result
         assert '"unmatched"' in result
+
+from selected_legacy_vault import selected_host_context
+pytestmark = pytest.mark.usefixtures("selected_host_context")

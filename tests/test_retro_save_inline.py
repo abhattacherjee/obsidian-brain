@@ -36,14 +36,16 @@ def test_inline_rule_precedes_step_5():
 
 
 def test_step_7_keeps_the_path_note_writer_printed():
-    body = _section(
-        SKILL_PATH.read_text(encoding="utf-8"), "Step 7 — Generate filename and write"
-    )
-    assert "<NOTE_PATH>" in body
-    # The gate is armed with the returned path, not one rebuilt from config.
-    assert "\"<current-session-id>\" '<NOTE_PATH>'" in body
-    assert "'\\''" in body
-    assert "$VAULT_PATH/$INSIGHTS_FOLDER/<filename>" not in body
+    body=_section(SKILL_PATH.read_text(), 'Step 7 — Generate filename and write')
+    assert '<NOTE_PATH>' in body
+    assert "--operation 'classification-pending'" in body
+    assert '"path"' in body
+    import inspect, skill_procedures
+    source=inspect.getsource(skill_procedures._retro_gate)
+    assert '_note_path(context, payload)' in source
+    assert 'mark_retro_classification_pending(context.native_session_id, str(path))' in source
+    assert '$VAULT_PATH/$INSIGHTS_FOLDER/<filename>' not in body
+
 
 
 def test_note_path_is_never_a_shell_variable():

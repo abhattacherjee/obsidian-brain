@@ -211,3 +211,7 @@ def test_symlinked_project_pointing_inside_the_root_is_skipped(home):
     (hidden / "s.md").write_text("nested")
     (home / ".claude" / "projects" / "evil").symlink_to(p1 / "sub")
     assert [ms.memory_name(p) for p in ms.memory_sources("claude-code")] == ["p1/a.md"]
+
+
+# These oracles exercise the observed Claude native memory-file layout.
+pytestmark = pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")

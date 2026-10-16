@@ -17,19 +17,20 @@ import vault_doctor_checks.source_sessions as ss  # noqa: E402 (must follow sys.
 
 
 @pytest.fixture
-def doctor_vault(tmp_path):
+def doctor_vault(tmp_path, selected_host_context):
     """Tmp vault layout with folders + JSONL home for session matching."""
-    vault = tmp_path / "vault"
+    vault = selected_host_context.vault_path
     (vault / "claude-sessions").mkdir(parents=True)
     (vault / "claude-insights").mkdir(parents=True)
     (vault / "claude-decisions").mkdir(parents=True)
     (vault / "claude-error-fixes").mkdir(parents=True)
     (vault / "claude-retros").mkdir(parents=True)
-    claude_home = tmp_path / ".claude" / "projects" / "-Users-foo-proj1"
+    home = Path(os.environ['CLAUDE_CONFIG_DIR']).parent
+    claude_home = Path(os.environ['CLAUDE_CONFIG_DIR']) / "projects" / "-Users-foo-proj1"
     claude_home.mkdir(parents=True)
     return {
         "vault": vault,
-        "home": tmp_path,
+        "home": home,
         "jsonl_dir": claude_home,
         "project": "proj1",
     }
@@ -1473,7 +1474,7 @@ def test_list_all_session_notes_warns_on_malformed_frontmatter(tmp_path, capsys)
     assert "2026-04-22-malformed.md" in captured.err
 
 
-def test_phase_1b_fallback_via_find_jsonl_anywhere(tmp_path, monkeypatch):
+def test_phase_1b_fallback_via_find_jsonl_anywhere(tmp_path, monkeypatch, selected_host_context):
     """Phase 1b's session-window lookup must fall back to _find_jsonl_anywhere
     when the session-note's worktree-suffixed `project:` does not resolve via
     `_jsonl_dir_for_project`. Without the fix, the date matcher proposes a
@@ -1486,7 +1487,9 @@ def test_phase_1b_fallback_via_find_jsonl_anywhere(tmp_path, monkeypatch):
     # (worktrees share parent-repo CC project dir), but the session-NOTE for
     # sid_correct claims a worktree-suffixed `project:` value that won't
     # resolve via _jsonl_dir_for_project.
-    canonical_dir = tmp_path / ".claude" / "projects" / "-Users-foo-obsidian-brain"
+    native_root = selected_host_context.native_home if selected_host_context.host == 'claude' else tmp_path / '.claude'
+    monkeypatch.setenv('CLAUDE_CONFIG_DIR', str(native_root))
+    canonical_dir = native_root / 'projects' / '-Users-foo-obsidian-brain'
     canonical_dir.mkdir(parents=True)
     monkeypatch.setenv("HOME", str(tmp_path))
 
@@ -2068,13 +2071,13 @@ def test_unresolvable_uuid_with_date_window_candidate_hint(doctor_vault, monkeyp
     )
 
 
-def test_apply_raises_runtime_error_on_unknown_signal_class(tmp_path):
+def test_apply_raises_runtime_error_on_unknown_signal_class(tmp_path, selected_host_context):
     """Spec #106 (apply guard): apply() refuses any non-skipped Issue whose
     signal_class != 'uuid-basename-stale', regardless of confidence value.
     --min-confidence override-safety."""
     from vault_doctor_checks import Issue
 
-    note_path = tmp_path / "note.md"
+    note_path = selected_host_context.vault_path / "note.md"
     note_path.write_text(
         "---\n"
         "type: claude-insight\n"

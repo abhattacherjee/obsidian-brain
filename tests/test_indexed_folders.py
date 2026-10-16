@@ -204,19 +204,20 @@ def test_wiki_folder_is_normalised_before_dedup():
 
 
 def test_load_config_fresh_bypasses_session_cache(tmp_path, monkeypatch):
-    cfg = tmp_path / "cfg.json"
-    cfg.write_text('{"vault_path": "/v", "wiki_folder": "new-wiki"}')
-    monkeypatch.setattr(obsidian_utils, "_CONFIG_PATH", cfg)
-    # The fake cache serves the current defaults signature and a dict with
-    # every default key (#409), or the cached config counts as written by
-    # other code and is never returned.
-    sig = obsidian_utils._defaults_signature()
-    cached = dict(obsidian_utils._DEFAULTS, vault_path="/v", wiki_folder="old")
-    monkeypatch.setattr(obsidian_utils, "cache_get", lambda sid, key: sig if key == "config_defaults_sig"
-                        else cached)
-    monkeypatch.setattr(obsidian_utils, "cache_set", lambda sid, key, val: None)
-    assert obsidian_utils.load_config()["wiki_folder"] == "old"
-    assert obsidian_utils.load_config(fresh=True)["wiki_folder"] == "new-wiki"
+    with using_runtime_context(None):
+        cfg = tmp_path / "cfg.json"
+        cfg.write_text('{"vault_path": "/v", "wiki_folder": "new-wiki"}')
+        monkeypatch.setattr(obsidian_utils, "_CONFIG_PATH", cfg)
+        # The fake cache serves the current defaults signature and a dict with
+        # every default key (#409), or the cached config counts as written by
+        # other code and is never returned.
+        sig = obsidian_utils._defaults_signature()
+        cached = dict(obsidian_utils._DEFAULTS, vault_path="/v", wiki_folder="old")
+        monkeypatch.setattr(obsidian_utils, "cache_get", lambda sid, key: sig if key == "config_defaults_sig"
+                            else cached)
+        monkeypatch.setattr(obsidian_utils, "cache_set", lambda sid, key, val: None)
+        assert obsidian_utils.load_config()["wiki_folder"] == "old"
+        assert obsidian_utils.load_config(fresh=True)["wiki_folder"] == "new-wiki"
 
 
 def test_guard_catches_sliced_helper(tmp_path):
@@ -289,3 +290,8 @@ def test_forbidden_segments_rejected_before_normalising(raw):
     # Normalising alone would erase the ".." / "~" / dot segment (X-006).
     with pytest.raises(ValueError, match="wiki_folder"):
         indexed_folders({"wiki_folder": raw}, strict=True)
+
+from selected_legacy_vault import selected_host_context
+pytestmark = pytest.mark.usefixtures("selected_host_context")
+
+from runtime_context import using_runtime_context

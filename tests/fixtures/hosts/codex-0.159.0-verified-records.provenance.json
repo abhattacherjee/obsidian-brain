@@ -1,0 +1,6 @@
+{
+  "client_version": "0.159.0-alpha.12.1",
+  "source": "Reviewer-observed 200rollout read-only schema profile plus current bounded read-only schema aggregate; synthetic placeholders only",
+  "native_capture_verified": false,
+  "fixture_sha256": "b5798a3bc176b5f9ea91787877c8d4dfce68fc3d64d5450c1722b02d28e24e3d"
+}

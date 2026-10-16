@@ -23,8 +23,13 @@ snapshots picked up by `/recall` summarization.
 If you haven't run the automated checks yet:
 
 ```bash
-bash scripts/dev-test/test-vault-doctor-snapshots-manual.sh
+OB_CACHE_PATH=/absolute/package/root bash scripts/dev-test/test-vault-doctor-snapshots-manual.sh
 ```
+
+The automated script sets scratch `HOME`, native config homes, and
+`XDG_STATE_HOME`. Its coordination journal stays in that scratch state; it
+does not use the account state directory. The exit trap removes only directories
+created by that script.
 
 All automated checks should pass before starting the live flow below.
 

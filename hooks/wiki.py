@@ -2,9 +2,8 @@
 
 Library + JSON CLI (``python3 hooks/wiki.py rule|lookup|stale|count|file|memgrep``).
 Every vault write goes through ``write_vault_note`` (atomic, 0o600,
-contained under the vault) while holding one wiki lock. The one exception:
-``rebuild_wiki_index`` deletes stale ``index-*.md`` files directly (only
-those typed ``claude-wiki-index``). Design:
+contained under the vault). Vault ownership precedes the legacy wiki lock
+and covers page, index and log publication. Design:
 ``docs/plans/383-llm-wiki-design.md``.
 
 CLI contract: subcommands that take input read one JSON object on stdin
@@ -18,6 +17,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import hashlib
+import functools
 import json
 import os
 import re
@@ -620,18 +620,38 @@ def _wiki_root(ctx: dict) -> Path:
     return root
 
 
-def _write(ctx: dict, rel_folder: str, filename: str, content: str) -> None:
+def _vault_owned(function):
+    """Keep the final wiki publication under shared OS vault ownership."""
+    @functools.wraps(function)
+    def owned(ctx, *args, **kwargs):
+        from note_transactions import context_for_vault, ownership_lock, LockBusy
+        try:
+            with ownership_lock(context_for_vault(ctx["vault"])):
+                return function(ctx, *args, **kwargs)
+        except LockBusy as exc:
+            raise WikiRefusal(str(exc)) from exc
+    return owned
+
+
+def _revision(ctx, path):
+    from note_transactions import context_for_vault, read_revision
+    return read_revision(context_for_vault(ctx["vault"]), path)
+
+
+def _write(ctx: dict, rel_folder: str, filename: str, content: str,
+           expected_revision="unspecified") -> None:
     """Write one wiki file. Refused unless the folder, symlinks followed,
     is inside the resolved wiki root (a symlinked ``queries/`` could
     otherwise put a page elsewhere in the vault)."""
     from obsidian_utils import write_vault_note
 
     final = Path(ctx["vault"]) / rel_folder / filename
-    real = final.parent.resolve() / final.name
+    real = final.resolve()
     if not real.is_relative_to(_wiki_root(ctx).resolve()):
         raise WikiRefusal(f"{real} is outside the wiki folder {_wiki_root(ctx).resolve()}; "
                           "refusing to write it")
-    err = write_vault_note(ctx["vault"], rel_folder, filename, content)
+    err = write_vault_note(ctx["vault"], rel_folder, filename, content,
+                           expected_revision=expected_revision)
     if err:
         raise WikiRefusal(err)
 
@@ -682,52 +702,69 @@ def render_wiki_index(ctx: dict) -> dict:
 def rebuild_wiki_index(ctx: dict) -> list:
     """Write the files from ``render_wiki_index`` and delete any other
     ``index-*.md`` typed ``claude-wiki-index``. Returns the written paths."""
+    from note_transactions import context_for_vault
+    context_for_vault(ctx["vault"])
     root = _wiki_root(ctx)
+    # Record before rendering: a manual edit during rendering must survive.
+    revisions = {p.name: _revision(ctx, p) for p in root.glob("index*.md")}
     files = render_wiki_index(ctx)
+    return _publish_wiki_index(ctx, root, revisions, files)
+
+
+@_vault_owned
+def _publish_wiki_index(ctx, root, revisions, files):
     written = []
     for name, text in files.items():
-        _write(ctx, ctx["wiki_folder"], name, text)
+        _write(ctx, ctx["wiki_folder"], name, text, revisions.get(name))
         written.append(str(root / name))
     for old in root.glob("index-*.md"):
         if old.name in files:
             continue
         # Only delete our own index files: a user note may share the name.
         try:
-            if read_page(old)[0].get("type") == INDEX_TYPE:
-                old.unlink()
+            owned_index = read_page(old)[0].get("type") == INDEX_TYPE
         except (OSError, ValueError, WikiRefusal):
             continue
+        if owned_index:
+            if not old.resolve().is_relative_to(root.resolve()):
+                raise WikiRefusal(f"{old} is outside the wiki folder; refusing to delete it")
+            from note_transactions import context_for_vault, delete_note
+            expected = revisions.get(old.name)
+            operation = "wiki-index-delete-" + hashlib.sha256(
+                (str(old) + "\0" + str(expected)).encode("utf-8")).hexdigest()
+            result = delete_note(context_for_vault(ctx["vault"]), old, expected, operation)
+            if result.status not in {"applied", "unchanged"}:
+                raise WikiRefusal("index deletion " + result.status + ": " + "; ".join(result.warnings))
     return written
 
 
-def append_log(ctx: dict, op: str, caller: str, question: str, basename: str, today) -> None:
+@_vault_owned
+def append_log(ctx: dict, op: str, caller: str, question: str, basename: str, today,
+               filing_id="") -> None:
     root = _wiki_root(ctx)
     name = f"log-{today.year:04d}.md"
     path = root / name
-    # errors="replace": a corrupt byte in the log must never block filing.
-    text = (path.read_text(encoding="utf-8", errors="replace") if path.exists()
-            else _index_header("Wiki log"))
+    # Preserve a corrupt log and report its failure after saving the page.
+    from note_transactions import context_for_vault, record_read
+    original = path.read_bytes().decode("utf-8") if path.exists() else None
+    revision = record_read(context_for_vault(ctx["vault"]), path, original)
+    text = original if original is not None else _index_header("Wiki log")
+    marker = f"<!-- obsidian-brain:wiki-filing:{filing_id} -->" if filing_id else ""
+    if marker and marker in text:
+        return
     verb = "Updated" if op == "update" else "Created"
     text = text.rstrip("\n") + (f"\n\n## [{today.isoformat()}] {op} | {caller or '-'} | {question}\n"
-                                f"- {verb}: [[{basename}]]\n")
-    _write(ctx, ctx["wiki_folder"], name, text)
+                                f"- {verb}: [[{basename}]]\n" + (marker + "\n" if marker else ""))
+    _write(ctx, ctx["wiki_folder"], name, text, revision)
 
 
 def file_page(ctx: dict, payload: dict, today) -> dict:
-    """Validate and count, then, under one lock, pick the target, write the
-    page, and update the index and log.
-
-    The target checks (update containment, type, self-citation, reviewed
-    flag) and the new page's name choice run inside the lock, so two filers
-    cannot pick the same name and a page marked reviewed after validation is
-    still refused. Every write is checked against the resolved wiki root.
-    Once the page is written, an index or log failure does not raise: the
-    result gets a ``warning`` naming the stage instead.
-    """
+    """Prepare sources outside ownership, then publish with late source checks."""
     import vault_index
-    from note_writer import _acquire_lock, _release_lock
     from obsidian_utils import scrub_secrets
 
+    from note_transactions import context_for_vault
+    context_for_vault(ctx["vault"])
     p = _validate_payload(payload)
     root = _wiki_root(ctx)
     vault_index.ensure_index(ctx["vault"], ctx["folders"], db_path=ctx["db"])
@@ -744,74 +781,110 @@ def file_page(ctx: dict, payload: dict, today) -> dict:
     queries = root / "queries"
     resolved = counted["resolved"]
     projects = sorted({r["project"] for r in resolved if r["project"]})
+    filing_id = hashlib.sha256(json.dumps({
+        **p, "question": question, "body": body, "date": today.isoformat(),
+        "resolved": [str(Path(r["path"]).resolve().relative_to(Path(ctx["vault"]).resolve()))
+                     for r in resolved],
+    }, sort_keys=True).encode("utf-8")).hexdigest()
     action = "update" if p["update"] else ("file-auto" if p["filed_by"] == "auto" else "file")
 
-    root.mkdir(parents=True, exist_ok=True)
-    lock, err = _acquire_lock(root / ".wiki")
-    if err:
-        raise WikiRefusal(err)
+    source_revisions = {str(Path(item["path"]).resolve()):
+                        hashlib.sha256(Path(item["path"]).read_bytes()).hexdigest()
+                        for item in resolved + counted["memory_resolved"]}
+    out = _publish_file_page(ctx, p, today, root, queries, counted, resolved, projects,
+                             filing_id, action, question, body, source_revisions)
+    # Publication has succeeded. Slow index refresh needs no writer ownership;
+    # each derived note then performs its own revision-checked transaction.
+    stage = "index"
     try:
-        created = today.isoformat()
-        if p["update"]:
-            target = Path(p["update"]).resolve()
-            if not target.is_relative_to(queries.resolve()):
-                raise WikiRefusal(f"update must name a page under {queries}")
-            if not target.is_file():
-                raise WikiRefusal(f"update page not found: {target}")
-            if any(Path(r["path"]).resolve() == target for r in resolved):
-                raise WikiRefusal(f"a page cannot cite itself; drop [[{target.stem}]] from sources")
-            old, _ = read_page(target)
-            if old.get("type") != PAGE_TYPE:
-                raise WikiRefusal(f"{target} is not a wiki page")
-            if is_reviewed(old.get("reviewed")) and not p["override_reviewed"]:
-                raise WikiRefusal(f"{target.name} is marked reviewed; refusing to overwrite it")
-            created = str(old.get("created") or created)
-            rel_folder = str(target.parent.relative_to(Path(ctx["vault"]).resolve()))
-            filename = target.name
-        else:
-            rel_folder = f"{ctx['wiki_folder']}/queries/{today.year:04d}"
-            stem = f"{today.month:02d}-{today.day:02d}-{slugify(question)}"
-            filename, n = f"{stem}.md", 1
-            while (Path(ctx["vault"]) / rel_folder / filename).exists():
-                n += 1
-                filename = f"{stem}-{n}.md"
+        vault_index.ensure_index(ctx["vault"], ctx["folders"], db_path=ctx["db"])
+        rebuild_wiki_index(ctx)
+        stage = "log"
+        append_log(ctx, action, p["caller"], question, Path(out["path"]).stem, today, filing_id)
+    except Exception as exc:
+        then = ("the next filing rebuilds the index" if stage == "index"
+                else "this filing is missing from the log")
+        out["warning"] = f"page saved, but the {stage} update failed: {exc}; {then}"
+    return out
 
-        meta = {
-            # Literal type, not PAGE_TYPE: tests/test_type_scores.py finds
-            # writers by scanning for `"type": "claude-..."`.
-            "type": "claude-wiki", "title": question, "question": question,
-            "date": today.isoformat(), "created": created, "updated": today.isoformat(),
-            "projects": projects,
-            "sources": [f"[[{r['name']}]]" for r in resolved],
-            "memory_sources": [m["name"] for m in counted["memory_resolved"]],
-            "sources_fingerprint": {
-                **{r["name"]: fingerprint(r["path"]) for r in resolved},
-                **{MEMORY_PREFIX + m["name"]: fingerprint(m["path"])
-                   for m in counted["memory_resolved"]}},
-            "confidence": p["confidence"], "filed_by": p["filed_by"],
-        }
-        if p["filed_by"] == "auto":
-            meta["caller"] = p["caller"]
-        meta["tags"] = (["claude/wiki", f"claude/wiki/confidence-{p['confidence']}"]
-                        + [f"claude/project/{x}" for x in projects]
-                        + [f"claude/topic/{t}" for t in p["topics"]])
-        _write(ctx, rel_folder, filename, render_page(meta, body))
-        page = Path(ctx["vault"]) / rel_folder / filename
-        out = {"path": str(page), "action": action, "count": counted["count"]}
 
-        # The page is saved: from here a failure is a warning, not a refusal.
-        stage = "index"
+@_vault_owned
+def _publish_file_page(ctx, p, today, root, queries, counted, resolved, projects,
+                       filing_id, action, question, body, source_revisions):
+    root.mkdir(parents=True, exist_ok=True)
+    for path, expected in source_revisions.items():
         try:
-            vault_index.ensure_index(ctx["vault"], ctx["folders"], db_path=ctx["db"])
-            rebuild_wiki_index(ctx)
-            stage = "log"
-            append_log(ctx, action, p["caller"], question, page.stem, today)
-        except Exception as exc:
-            then = ("the next filing rebuilds the index" if stage == "index"
-                    else "this filing is missing from the log")
-            out["warning"] = f"page saved, but the {stage} update failed: {exc}; {then}"
-    finally:
-        _release_lock(lock)
+            actual = hashlib.sha256(Path(path).read_bytes()).hexdigest()
+        except OSError as exc:
+            raise WikiRefusal("source changed before wiki publication") from exc
+        if actual != expected:
+            raise WikiRefusal("source changed before wiki publication")
+    created = today.isoformat()
+    retry = False
+    revision = None
+    if p["update"]:
+        target = Path(p["update"]).resolve()
+        if not target.is_relative_to(queries.resolve()):
+            raise WikiRefusal(f"update must name a page under {queries}")
+        if not target.is_file():
+            raise WikiRefusal(f"update page not found: {target}")
+        if any(Path(r["path"]).resolve() == target for r in resolved):
+            raise WikiRefusal(f"a page cannot cite itself; drop [[{target.stem}]] from sources")
+        revision = _revision(ctx, target)
+        old, _ = read_page(target)
+        if old.get("type") != PAGE_TYPE:
+            raise WikiRefusal(f"{target} is not a wiki page")
+        if is_reviewed(old.get("reviewed")) and not p["override_reviewed"]:
+            raise WikiRefusal(f"{target.name} is marked reviewed; refusing to overwrite it")
+        created = str(old.get("created") or created)
+        retry = old.get("filing_id") == filing_id
+        rel_folder = str(target.parent.relative_to(Path(ctx["vault"]).resolve()))
+        filename = target.name
+    else:
+        rel_folder = f"{ctx['wiki_folder']}/queries/{today.year:04d}"
+        stem = f"{today.month:02d}-{today.day:02d}-{slugify(question)}"
+        filename, n = f"{stem}.md", 1
+        while (Path(ctx["vault"]) / rel_folder / filename).exists():
+            existing = Path(ctx["vault"]) / rel_folder / filename
+            try:
+                old, _ = read_page(existing)
+            except (OSError, ValueError, WikiRefusal):
+                old = {}
+            if old.get("filing_id") == filing_id:
+                retry = True
+                break
+            n += 1
+            filename = f"{stem}-{n}.md"
+
+    meta = {
+        # Literal type, not PAGE_TYPE: tests/test_type_scores.py finds
+        # writers by scanning for `"type": "claude-..."`.
+        "type": "claude-wiki", "title": question, "question": question,
+        "date": today.isoformat(), "created": created, "updated": today.isoformat(),
+        "projects": projects,
+        "sources": [f"[[{r['name']}]]" for r in resolved],
+        "memory_sources": [m["name"] for m in counted["memory_resolved"]],
+        "sources_fingerprint": {
+            **{r["name"]: fingerprint(r["path"]) for r in resolved},
+            **{MEMORY_PREFIX + m["name"]: fingerprint(m["path"])
+               for m in counted["memory_resolved"]}},
+        "confidence": p["confidence"], "filed_by": p["filed_by"],
+        "filing_id": filing_id,
+    }
+    from runtime_context import current_runtime_context
+    actor = current_runtime_context()
+    if actor is not None:
+        meta["author_host"] = actor.host
+    if p["filed_by"] == "auto":
+        meta["caller"] = p["caller"]
+    meta["tags"] = (["claude/wiki", f"claude/wiki/confidence-{p['confidence']}"]
+                    + [f"claude/project/{x}" for x in projects]
+                    + [f"claude/topic/{t}" for t in p["topics"]])
+    if not retry:
+        _write(ctx, rel_folder, filename, render_page(meta, body), revision)
+    page = Path(ctx["vault"]) / rel_folder / filename
+    out = {"path": str(page), "action": action, "count": counted["count"]}
+
     return out
 
 
@@ -844,10 +917,14 @@ def _read_stdin() -> dict:
     return obj
 
 
-def _context() -> dict:
+def _context(context=None) -> dict:
     """Vault, wiki folder, indexed folders and DB from a fresh config read."""
     from obsidian_utils import indexed_folders, load_config
     import vault_index
+    if context is not None:
+        from runtime_context import using_runtime_context
+        with using_runtime_context(context):
+            return _context()
 
     cfg = load_config(fresh=True)
     vault = cfg.get("vault_path") or ""

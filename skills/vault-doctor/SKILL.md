@@ -5,11 +5,74 @@ metadata:
   version: 1.3.0
 ---
 
+## Native runtime and installed resources
+
+Use the absolute path of this loaded `SKILL.md` as `OB_SKILL_PATH`. Read the
+reference for the invoking host when this skill has paired host references.
+Set `OB_HOST`, `OB_SESSION_ID`, and `OB_CWD` from that native invocation.
+Claude has one frontend: use the fixed host client `claude-code`. Reject an
+inherited `OB_CLIENT` that differs, including an empty declaration.
+For Codex, read the operator-declared, inherited `OB_CLIENT`; never choose or
+export it yourself. It must be `codex-cli` or `codex-desktop`; if missing or
+invalid, stop with "Current native client binding is unavailable". Never label a Desktop
+invocation as a CLI invocation or infer the frontend from transcript creation
+metadata or inherited environment markers. Use the selected host's own session ID. Keep curated note taxonomy
+separate from `agent_provider` and `agent_session_id` provenance.
+
+```bash
+case "$OB_HOST" in
+  claude)
+    if [ "${OB_CLIENT+x}" = x ] && [ "$OB_CLIENT" != claude-code ]; then
+      printf '%s\n' 'Current native client binding is unavailable: conflicting Claude declaration.' >&2
+      exit 1
+    fi
+    OB_CLIENT=claude-code
+    ;;
+  codex)
+    case "${OB_CLIENT:-}" in
+      codex-cli|codex-desktop) ;;
+      *) printf '%s\n' 'Current native client binding is unavailable; stop without choosing a frontend.' >&2; exit 1 ;;
+    esac
+    ;;
+  *) printf '%s\n' 'Current native client binding is unavailable: unknown host.' >&2; exit 1 ;;
+esac
+OB_SKILL_PATH='<absolute path of this loaded SKILL.md>'
+OB_RESOURCE_ROOT=$(python3 -c 'import pathlib,sys; p=pathlib.Path(sys.argv[1]); assert p.is_absolute(); p=p.resolve(); assert p.name == "SKILL.md" and p.parent.parent.name == "skills"; print(p.parents[2])' "$OB_SKILL_PATH")
+python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" context < /dev/null
+```
+
+Use the returned `config_path`, `vault_path`, `index_path`, and `state_path`.
+Create the operation with this fixed literal request:
+
+```bash
+printf '{}' | python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'prepare'
+```
+
+Call `prepare` to create a private operation under native state. Retain its
+`operation_id` and `operation_dir`. Register approved helper output names with `artifact-store`;
+inputs are read through the immutable artifact manifest. Do not discover resources from the current directory or another plugin
+cache. Each shell invocation supplies the same explicit values; a previous
+shell's variables are not assumed to persist.
+
+Each data operation uses the installed launcher with a JSON request on stdin:
+
+```bash
+python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation '<fixed operation>' < "$REQUEST_PATH"
+```
+
+Map config JSON `vault_path`, `sessions_folder`, and `insights_folder` to the
+procedure variables `VAULT_PATH`/`VAULT`, `SESSIONS_FOLDER`/`SESS`, and
+`INSIGHTS_FOLDER`/`INS`. Use the canonical project returned in config JSON (and native `session` when available),
+not the basename of an unrelated shell working directory.
+
+Use only the operations documented for this skill. Their writes bind the source revisions before analysis and preserve manual edits on conflict. Content is JSON data, never shell code. Read `references/host-claude.md` or `references/host-codex.md` when present. Codex has no native memory-file API; shared vault retrieval and wiki filing continue without borrowing another host's memory.
+
+
 # vault-doctor — Audit and Repair the Obsidian Vault
 
 Audit and repair the Obsidian vault. Ships with 13 checks — 9 in the default sweep and 4 opt-in ones that must be named with `--check`. More can be added as separate modules under `scripts/vault_doctor_checks/` without changing this skill.
 
-**Tools needed:** Bash, Read
+**Tools needed:** native shell, native file reading
 
 ## Invocation
 
@@ -19,16 +82,32 @@ Audit and repair the Obsidian vault. Ships with 13 checks — 9 in the default s
 - `/vault-doctor --check snapshot-integrity` — snapshot orphans, broken backlinks, stale/missing session snapshot lists, status/summary mismatches
 - `/vault-doctor --check snapshot-migration` — migrate pre-spec snapshots (legacy filenames, missing status/backlink fields, missing session snapshot lists). Runs 4 ordered sub-checks; idempotent.
 - `/vault-doctor --check project-name-canonicalization` — one-time backfill check that rewrites worktree-slug project names to the canonical main-repo basename in session notes and insights. Phase 1: for each session note with a `project_path:`, derives canonical via `git rev-parse --git-common-dir` (cached per path) and proposes rewriting `project:` + the observed `claude/project/*` tag lines (production tags are slugified/40-char-truncated — both forms matched; sibling tags never touched). Phase 2: for each insight with a `source_session:` UUID, looks up the Phase-1 canonical (not the stale frontmatter value) and proposes the same rewrite. WARN rows for: missing `project_path`, path no longer exists, git unavailable/timed out, git errors (dubious ownership etc. — never silently treated as non-repo), empty `project:` field, insight source_session not in index. Non-git project dirs left alone; snapshot notes skipped. `--project` matches the old name OR the derived canonical (filtered sessions still seed the Phase-2 index); `--days` is ignored (full-vault backfill). **Opt-in** — excluded from default all-checks sweep (`OPT_IN=True`); run via `--check project-name-canonicalization`. Conceptually run after `--check project-name-normalization` (underscore → hyphen) for clean input.
-- `/vault-doctor --check session-coverage` — detect SessionEnd-hook coverage gaps: JSONLs in `~/.claude/projects/` with no corresponding session note. **Opt-in** — excluded from the default all-checks sweep (heavy all-projects JSONL walk); must be named via `--check`. Sessions below the configured `min_messages`/`min_duration_minutes` thresholds are excluded (the hook would also skip them; only text-bearing user messages count). Add `--strict` to emit `FAIL:` (not `WARN:`) when any note references the orphaned session via `source_session` (changes the reason prefix only, not the exit code). Add `--reconstruct` to enable `--apply` to reconstruct the missing note by re-running the SessionEnd hook via `replay-sessionend.py` (never automatic; always requires `--apply`). `--days` bounds JSONL mtime age (default 30). Note: the per-gap project name is derived from the JSONL's `cwd` basename, so `--project` expects the cwd-basename slug — worktree sessions may display a non-canonical expected note path (detection itself is session_id/hash-based and unaffected).
+- `/vault-doctor --check session-coverage`: follow the selected host capability and bounded source adapter. See [Claude](references/host-claude.md) and [Codex](references/host-codex.md) for source support and reconstruction rules.
 - `/vault-doctor --check audit-historic-repairs` — one-shot audit of historic source-sessions repairs: diffs doctor backups against current notes, classifies each repair (A restore / B keep / C ambiguous / D both-wrong) by date agreement, and restores category-A mtime-bug corruptions on `fix`. **Opt-in** — excluded from the default all-checks sweep; must be named via `--check`. `--days` bounds backup-run age (default 180).
 - `/vault-doctor --check missing-frontmatter-fence` — repair notes whose frontmatter lost its opening `---` fence (the leading-fence-eaten failure mode: the first byte is the first frontmatter key, so the note parses as having no frontmatter at all and is invisible to tag-based Dataview queries). Only flags a note when all four preconditions hold: first line is not `---`, first line is `key:`-shaped, a closing `---` exists within the frontmatter line bound, and every line above it is frontmatter-shaped. The fix inserts `---` as a new first line and changes nothing else (line endings and file mode preserved). `--days` is ignored (the damage is historic). Re-run `/vault-reindex` afterwards so the recovered frontmatter reaches the index.
-- `/vault-doctor --check memory-index` — detect memory-index drift: entries under `~/.claude/projects/<project>/memory/` that are unreachable from that store's `MEMORY.md`, dangling index pointers, stores with entries but no `MEMORY.md`, unreadable entries, and `MEMORY.md` size against the ~17 KB compaction threshold / ~24 KB read budget. Orphans are transitive (BFS from `MEMORY.md`): `orphan-isolated` when nothing links the entry at all, `orphan-unreachable` when only another orphan does. Link matching is deliberately asymmetric — reachability counts markdown links, `[[wikilinks]]` and bare `name.md` mentions, while dangling counts markdown links **only**, and only ones naming a direct child of the store (`MEMORY.md` legitimately wikilinks Obsidian vault notes, prose cites `CLAUDE.md`, and a `reference` memory line may link a URL ending in `.md`). **Report-only:** every row is unresolved at confidence 0.0, so `fix` never writes to a memory store — and `--min-confidence` above 0.0 hides every row. The index is decoded strictly: a `MEMORY.md` that is not valid UTF-8 makes that store unreadable, because replacing bad bytes would report every entry in it as an orphan. An unreadable store is dropped from the report and gets one `store-unreadable` row; only when **every** selected store fails does the check raise and surface as exit 2 / `crashed_checks`. Entries are decoded leniently but an undecodable one gets an `entry-undecodable` row, and any unreadable or undecodable entry downgrades that store's `orphan-isolated` rows to `orphan-unreachable` (its links could not be read, so the stronger claim is unprovable). A pointer whose target differs only in case is `index-case-mismatch`, not dangling: it resolves on a case-insensitive filesystem and breaks on a case-sensitive one. If `MEMORY.md` has text in it but names no file at all while the store holds entries, the check adds an `index-names-nothing` summary row **on top of** the per-entry orphan rows — the index read is strict, so every entry really is unreachable and the per-entry rows are what tell you which files need a pointer line. A `--project` value that matches no store at all reports one `project-filter-matched-nothing` row rather than an empty clean report — a filter typo used to look identical to a healthy machine. Dangling detection covers every CommonMark form naming a direct child: `](name.md)`, `](./name.md)`, `](name.md "Title")` and `](<name.md>)`. Reachability folds case across markdown links, wikilinks and bare mentions, so `[[Their-Name]]` still finds `their-name.md`. Row counts, sizes, both spellings of a case mismatch, the store counts behind a filter miss and the underlying read error are all in the `--json` payload, not just in the prose `reason`. `--days` is ignored (the drift is undated); `--project` is a case-insensitive **substring** match against the project directory name (e.g. `--project obsidian-brain`). **Opt-in** — excluded from the default all-checks sweep (a full run on the author's machine produced 92 rows across 7 projects, measured 2026-08-12); must be named via `--check`.
-- `/vault-doctor --check wiki-pages` — check the LLM wiki's pages under `<wiki_folder>/queries/` (#396). Per page: `stale` (a source changed, a newer note matches the question, or the fingerprint is unverifiable), `broken-source` (a cited note or memory file is gone), `reviewed-stale` (a page marked `reviewed` that is stale; `/vault-ask` never refreshes these on its own, so you re-check your edits), `auto-filed` (`filed_by: auto`, listed for review), `orphan` (no vault note links `[[page]]` except the page itself and the wiki's own `index.md`, `index-<project>.md` and `log-<year>.md` at the wiki root; only pages whose `updated` date is inside `--days`) and `page-unreadable` (always shown, even under `--project`, because its project is unknown). Once for the wiki: `index-drift` when the index files differ from a fresh rebuild (a hand edit, a missing `index.md`, or a leftover `index-*.md` typed `claude-wiki-index`). **Only `index-drift` is fixed by `fix`:** it backs up the current index files under the backup root, then rebuilds them under the wiki lock (skipped with a reason if another process holds it). Every other row is report-only (unresolved, confidence 0.0), so `--min-confidence` above 0.0 hides every row except `index-drift`. The wiki folder comes from the config file, read at run time; a wiki that is turned off or not created yet reports nothing, and so does an empty wiki (no pages and no index files yet). A corrupt config, an invalid `wiki_folder`, or a `queries/` folder that cannot be read crashes the check (exit 2) instead of looking clean. The check lists the pages, then syncs the vault index, because index lines come from it. The index is shared and belongs to the configured `vault_path`, so a `--vault` (or `OBSIDIAN_BRAIN_VAULT`) that names another folder skips this check with one stderr line. In the default sweep; `--days` defaults to all time here.
+- `/vault-doctor --check memory-index`: use the selected host memory capability. Detailed Claude index rules and the explicit Codex limitation are in the paired references.
+- `/vault-doctor --check wiki-pages` — check the LLM wiki's pages under `<wiki_folder>/queries/` (#396). Per page: `stale` (a source changed, a newer note matches the question, or the fingerprint is unverifiable), `broken-source` (a cited note or memory file is gone), `reviewed-stale` (a page marked `reviewed` that is stale; `/vault-ask` never refreshes these on its own, so you re-check your edits), `auto-filed` (`filed_by: auto`, listed for review), `orphan` (no vault note links `[[page]]` except the page itself and the wiki's own `index.md`, `index-<project>.md` and `log-<year>.md` at the wiki root; only pages whose `updated` date is inside `--days`) and `page-unreadable` (always shown, even under `--project`, because its project is unknown). Once for the wiki: `index-drift` when the index files differ from a fresh rebuild (a hand edit, a missing `index.md`, or a leftover `index-*.md` typed `claude-wiki-index`). **Only `index-drift` is fixed by `fix`:** it backs up the current index files under the backup root, then rebuilds them under the shared vault lock (skipped with a reason if another process holds it). Every other row is report-only (unresolved, confidence 0.0), so `--min-confidence` above 0.0 hides every row except `index-drift`. The wiki folder comes from the config file, read at run time; a wiki that is turned off or not created yet reports nothing, and so does an empty wiki (no pages and no index files yet). A corrupt config, an invalid `wiki_folder`, or a `queries/` folder that cannot be read crashes the check (exit 2) instead of looking clean. The check lists the pages, then syncs the vault index, because index lines come from it. The index is shared and belongs to the configured `vault_path`, so a `--vault` (or `OBSIDIAN_BRAIN_VAULT`) that names another folder skips this check with one stderr line. In the default sweep; `--days` defaults to all time here.
 - `/vault-doctor --days 14` — override default window (default: 7 days)
 - `/vault-doctor --project obsidian-brain` — limit to one project
 - `/vault-doctor fix --check source-sessions --days 7` — combine flags
 - `/vault-doctor --min-confidence 0.9` — dry-run showing only issues with confidence >= 0.9; report header notes the active filter and dropped count
 - `/vault-doctor fix --min-confidence 0.9` — apply only the high-confidence subset (conf >= 0.9); preview matches apply scope exactly
+
+## Explicit pending-intent acknowledgment
+
+Ordinary `fix` retains conflicting pending intents and manual note edits. Dry-run
+reports registered same-vault pending state without replay or migration. A bounded
+audit is incomplete, not clean. Pending information exits 1; actual recovery
+errors or lost input exit 2. Explicit apply allows up to 60 seconds for verified
+coordination migration before the separate bounded recovery pass.
+
+Discard an intent only when the user explicitly names that private intent and
+approves its exact SHA256 digest. Send `--apply --discard-pending <absolute private
+intent path> --expected-pending-sha256 <64 lowercase hex digits>` in the doctor
+request's `argv`. This acknowledges only that unchanged registered intent, then
+returns. It never applies its proposed note changes or repairs other notes.
+`--yes` alone does not authorize discard. A changed digest or an unrelated path
+is refused. Keep private intent contents out of the report and conversation.
 
 ## Procedure
 
@@ -47,35 +126,32 @@ Parse the user's invocation into flags:
 - `--reconstruct` → set RECONSTRUCT=1 (session-coverage only: mark gaps resolvable for apply)
 - `--min-confidence <FLOAT>` → set MIN_CONFIDENCE (0.0–1.0 inclusive; default 0.0 keeps all; applies to both dry-run report and --apply); note: unresolved/WARN rows (confidence=0.0) are hidden at any threshold > 0 — drop the flag to audit them
 
-Locate the Python dispatcher by resolving the obsidian-brain install: prefer the local checkout registered in `known_marketplaces.json` (this also covers local dev sessions, deterministically rather than via `$PWD`), falling back to the newest allowlisted version directory in the plugin cache:
+Use the absolute loaded SKILL.md to select the installed resource root.
+
+Request for `doctor` (substitute the values as data):
+
+```json
+{
+  "argv": [
+    "--json",
+    "<selected doctor flags>"
+  ]
+}
+```
+
+Request for `doctor`:
+
+```json
+{
+  "argv": [
+    "--json",
+    "<selected doctor flags>"
+  ]
+}
+```
 
 ```bash
-DISPATCHER="$(python3 -c "
-import glob, json, os, re
-def _ob_doctor():
-    try:
-        for _m in json.load(open(os.path.expanduser('~/.claude/plugins/known_marketplaces.json'))).values():
-            _s = _m.get('source') if isinstance(_m, dict) else None
-            if not (isinstance(_s, dict) and _s.get('source') == 'directory'):
-                continue
-            _i = _m.get('installLocation') if isinstance(_m, dict) else None
-            if not (isinstance(_i, str) and os.path.isabs(_i)):
-                continue
-            _h = os.path.join(_i, 'hooks')
-            if os.path.isfile(os.path.join(_h, 'obsidian_utils.py')):
-                _v = os.path.join(os.path.dirname(_h), 'scripts', 'vault_doctor.py')
-                if os.path.isfile(_v):
-                    return _v
-    except Exception:
-        pass
-    _c = [_d for _d in glob.glob(os.path.expanduser('~/.claude/plugins/cache/*/obsidian-brain/*/scripts/vault_doctor.py')) if re.fullmatch('[0-9]+([.][0-9]+)*', _d.split('/')[-3])]
-    return max(_c, key=lambda _p: ([int(_n) for _n in _p.split('/')[-3].split('.')], _p), default='')
-print(_ob_doctor())
-")"
-if [[ -z "$DISPATCHER" || ! -f "$DISPATCHER" ]]; then
-    echo "ERROR: could not find scripts/vault_doctor.py" >&2
-    exit 1
-fi
+python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'doctor' < "$REQUEST_PATH"
 ```
 
 If the dispatcher cannot be located, tell the user:
@@ -88,22 +164,36 @@ Stop here if the dispatcher is missing.
 
 Always run with `--json` first so you can parse the output deterministically. Pass through only the flags the user provided:
 
+Request for `doctor` (substitute the values as data):
+
+```json
+{
+  "argv": [
+    "--json",
+    "<selected doctor flags>"
+  ]
+}
+```
+
+Request for `doctor`:
+
+```json
+{
+  "argv": [
+    "--json",
+    "<selected doctor flags>"
+  ]
+}
+```
+
 ```bash
-ARGS=()
-[[ -n "${CHECK:-}" ]] && ARGS+=(--check "$CHECK")
-[[ -n "${DAYS:-}" ]] && ARGS+=(--days "$DAYS")
-[[ -n "${PROJECT:-}" ]] && ARGS+=(--project "$PROJECT")
-[[ -n "${STRICT:-}" ]] && ARGS+=(--strict)
-[[ -n "${RECONSTRUCT:-}" ]] && ARGS+=(--reconstruct)
-[[ -n "${MIN_CONFIDENCE:-}" ]] && ARGS+=(--min-confidence "$MIN_CONFIDENCE")
-ARGS+=(--json)
-python3 "$DISPATCHER" "${ARGS[@]}"
+python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'doctor' < "$REQUEST_PATH"
 ```
 
 Capture stdout as the JSON report. Exit codes:
 
 - `0` — clean vault, nothing to do
-- `1` — issues found (expected for a dry-run that finds things)
+- `1` — issues found or capture recovery pending; read `capture_recovery` even when `total_issues` is zero
 - `2` — apply errors OR one or more checks crashed (results incomplete; see `crashed_checks` in JSON)
 - `3` — usage error (bad args, missing config)
 
@@ -111,7 +201,13 @@ If exit code is `3`, surface the stderr message directly to the user and stop.
 
 ### Step 3 — Present the report to the user
 
-Parse the JSON and present a grouped-by-project table.
+Parse the JSON and present a grouped-by-project table. Also read `capture_recovery`
+when present, including pending source/mutation counts, warnings, and loss of
+input. Pending retained input is not a clean report even when there are zero
+note-repair issues. `pending_intents` gives at most 32 private paths and exact
+SHA256 digests for operator review. A true `pending_intent_references_bounded`
+means those references are incomplete. Never print proposed intent contents or
+discard an intent without the user approving its exact path and digest.
 
 For each issue, after the `proposed:` line (when present), render a
 `signal: <capture_signal> (conf <capture_confidence>)` line. The values
@@ -179,29 +275,30 @@ Stop here.
 If the user did NOT pass `fix`:
 
 > Dry-run complete. Found **N** stale backlink(s) across **K** project(s).
-> Run `/vault-doctor fix` to apply repairs. Backups will be written to `~/.claude/obsidian-brain-doctor-backup/<timestamp>/`.
+> Run `/vault-doctor fix` to apply repairs. Backups will be written to `<reported native doctor backup root>/<timestamp>/`.
 
 Stop here.
 
 If the user DID pass `fix`:
 
-> Found **N** repairable issue(s) across **K** project(s). I'll apply per project with confirmation.
+Ask the user to approve the listed repairs. After approval, send `--apply --yes` in
+`argv`. This applies exactly the approved scan scope without a second prompt.
 
-Re-run the dispatcher with `--apply` (do NOT pass `--yes` — let the dispatcher prompt per project interactively):
-
-```bash
-ARGS=()
-[[ -n "${CHECK:-}" ]] && ARGS+=(--check "$CHECK")
-[[ -n "${DAYS:-}" ]] && ARGS+=(--days "$DAYS")
-[[ -n "${PROJECT:-}" ]] && ARGS+=(--project "$PROJECT")
-[[ -n "${STRICT:-}" ]] && ARGS+=(--strict)
-[[ -n "${RECONSTRUCT:-}" ]] && ARGS+=(--reconstruct)
-[[ -n "${MIN_CONFIDENCE:-}" ]] && ARGS+=(--min-confidence "$MIN_CONFIDENCE")
-ARGS+=(--apply)
-python3 "$DISPATCHER" "${ARGS[@]}"
+```json
+{
+  "argv": ["--json", "--apply", "--yes", "<selected doctor flags>"]
+}
 ```
 
-The dispatcher will prompt `Apply N fix(es) for project 'X' in check 'Y'? [y/N]` on stderr for each project. Relay each prompt to the user and pipe their response to the dispatcher's stdin.
+If approval is per project, run only the approved project with `--project`.
+The launcher closes child stdin unless the request supplies a `stdin` string.
+To use the dispatcher's prompts instead, omit `--yes` and put one approved
+`y\n` or `n\n` answer per prompt in `stdin`, in the displayed check/project order.
+Never claim that a child can read further answers from the parent terminal.
+
+```bash
+python3 "$OB_RESOURCE_ROOT/hooks/brain_cli.py" --host "$OB_HOST" --client "$OB_CLIENT" --resource-root "$OB_RESOURCE_ROOT" --session-id "$OB_SESSION_ID" --cwd "$OB_CWD" run --skill-path "$OB_SKILL_PATH" --operation 'doctor' < "$REQUEST_PATH"
+```
 
 ### Step 5 — Report the outcome
 
@@ -212,7 +309,7 @@ vault_doctor apply complete
   obsidian-brain: 3 applied, 0 unresolved, 0 errors
   tiny-vacation-agent: 1 applied, 0 unresolved, 0 errors
 
-Backups saved to: ~/.claude/obsidian-brain-doctor-backup/2026-04-11T17-04-22+00-00/
+Backups saved to: <reported native doctor backup root>/2026-04-11T17-04-22+00-00/
 ```
 
 If exit code is 2, distinguish the source:
@@ -232,4 +329,4 @@ After a successful fix run:
 - All detection and repair logic lives in `scripts/vault_doctor.py` and `scripts/vault_doctor_checks/*.py`. **Do not re-implement any of it in this skill.** The skill is pure orchestration and presentation.
 - The dispatcher is dry-run by default. Pass `--apply` only when the user explicitly requests `fix`.
 - Unresolved issues are never automatically repaired. Surface them in the report but do not try to guess a replacement.
-- Backups are written automatically by the dispatcher to `~/.claude/obsidian-brain-doctor-backup/<ISO-timestamp>/<project>/<basename>`. Always mention the backup path in your summary so the user knows where to look.
+- Backups are written automatically by the dispatcher to `<reported native doctor backup root>/<ISO-timestamp>/<project>/<basename>`. Always mention the backup path in your summary so the user knows where to look.

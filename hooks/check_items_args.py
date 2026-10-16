@@ -9,6 +9,8 @@ from __future__ import annotations
 import os
 import re
 import sys
+import time
+from pathlib import Path
 from dataclasses import dataclass, field
 
 from obsidian_utils import get_workspace_roots
@@ -28,6 +30,7 @@ class Scope:
     # suggestion (SKILL.md Step 1) can reuse it instead of re-querying the
     # vault index and re-walking every workspace root a second time.
     known_projects: set[str] = field(default_factory=set)
+    json_output: bool = False
 
 
 _WINDOW_RE = re.compile(r"^(\d+)d$")
@@ -61,14 +64,13 @@ def _vault_known_projects() -> set[str]:
     """
     try:
         import vault_index
-        conn = vault_index._connect(vault_index._default_db_path())
-        try:
+        from session_lookup import _readonly_index
+        path = Path(vault_index._default_db_path())
+        with _readonly_index(path, time.monotonic() + 1) as conn:
             rows = conn.execute(
                 "SELECT DISTINCT project FROM notes "
                 "WHERE project IS NOT NULL AND project != ''"
             ).fetchall()
-        finally:
-            conn.close()
         return {str(r[0]) for r in rows if r and r[0]}
     except Exception as exc:  # noqa: BLE001 - see docstring
         print(f"[check-items] vault project lookup unavailable: {exc}",
@@ -84,6 +86,9 @@ def parse_scope(argv):
     projects = _known_projects() | _vault_known_projects()
     scope.known_projects = projects
     for tok in argv:
+        if tok == "--json":
+            scope.json_output = True
+            continue
         if tok == "--show-all":
             scope.show_all = True
             continue

@@ -31,6 +31,37 @@ import vault_doctor_checks.memory_index as mi  # noqa: E402
 
 _SCRIPT = Path(__file__).parent.parent / "scripts" / "vault_doctor.py"
 
+
+def _bound_cli(command, **kwargs):
+    from runtime_context import current_runtime_context
+    actor = current_runtime_context()
+    assert actor is not None
+    root = _SCRIPT.parent.parent
+    child = ('import sys; from runtime_context import resolve_runtime_context, using_runtime_context; '
+             'from vault_doctor import main; ctx=resolve_runtime_context(sys.argv[1],sys.argv[2],{},'
+             "{'config_path':sys.argv[3],'resource_root':sys.argv[4],'session_id':sys.argv[5],"
+             "'cwd':sys.argv[6],'vault_path':sys.argv[7]}); "
+             'sys.argv=["vault-doctor",*sys.argv[8:]]; '
+             '\nwith using_runtime_context(ctx): raise SystemExit(main())')
+    kwargs['env'] = {**kwargs.get('env', os.environ),
+                     'PYTHONPATH': os.pathsep.join([str(root / 'hooks'), str(root / 'scripts')])}
+    vault = command[command.index('--vault') + 1]
+    return subprocess.run([sys.executable, '-c', child, actor.host, actor.client,
+                           str(actor.config_path), str(root), actor.native_session_id,
+                           str(actor.canonical_project_root), vault, *command[2:]],
+                          stdin=subprocess.DEVNULL, timeout=30, **kwargs)
+
+
+def _unsupported_native_memory(result):
+    from runtime_context import current_runtime_context
+    if current_runtime_context().host != 'codex':
+        return False
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload['total_issues'] == 0 and payload['issues'] == []
+    assert 'no equivalent native memory-file API' in result.stderr
+    return True
+
 _ROOT_SKIP = pytest.mark.skipif(
     hasattr(os, "geteuid") and os.geteuid() == 0,
     reason="chmod-based unreadability does not apply to root",
@@ -67,7 +98,7 @@ def _seed_store(env, project_dir: str = "-Users-me-dev-demo") -> Path:
 
 def _scan(project: str | None = None):
     """Run scan() with the interface's unused vault arguments stubbed."""
-    return mi.scan("/unused/vault", "claude-sessions", "claude-insights",
+    return mi._scan_claude_memory("/unused/vault", "claude-sessions", "claude-insights",
                    mi.DEFAULT_WINDOW_DAYS, project=project)
 
 
@@ -82,7 +113,9 @@ def _classes(issues) -> dict[str, list[str]]:
 @pytest.fixture
 def env(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
-    projects = tmp_path / ".claude" / "projects"
+    from runtime_context import current_runtime_context
+    actor = current_runtime_context()
+    projects = Path(os.environ['CLAUDE_CONFIG_DIR']) / 'projects' if actor is not None else tmp_path / ".claude" / "projects"
     projects.mkdir(parents=True)
     vault = tmp_path / "vault"
     (vault / "claude-sessions").mkdir(parents=True)
@@ -96,6 +129,7 @@ def env(tmp_path, monkeypatch):
 
 class TestThreeWayFixture:
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     def test_flags_exactly_the_orphan_and_the_dangling_pointer(self, env):
         _seed_store(env)
         issues = _scan()
@@ -104,12 +138,14 @@ class TestThreeWayFixture:
             "index-dangling": ["deleted_entry.md"],
         }
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     def test_the_clean_entry_is_never_flagged(self, env):
         """Stuck-ON control: the indexed entry must not appear in any row."""
         _seed_store(env)
         flagged = {Path(i.note_path).name for i in _scan()}
         assert "clean_entry.md" not in flagged
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     def test_a_fully_indexed_store_is_clean(self, env):
         """Stuck-ON control at store level: zero rows when nothing has drifted."""
         store = _store(env)
@@ -118,6 +154,7 @@ class TestThreeWayFixture:
         (store / "MEMORY.md").write_text("- [A](a.md) — x\n- [B](b.md) — y\n")
         assert _scan() == []
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     def test_orphan_row_carries_an_actionable_proposal(self, env):
         _seed_store(env)
         orphan = next(i for i in _scan()
@@ -133,6 +170,7 @@ class TestThreeWayFixture:
 
 class TestReachabilityRules:
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     def test_wikilink_in_the_index_counts_as_reachable(self, env):
         """#308's measured correction: markdown-links-only over-reported orphans."""
         store = _store(env)
@@ -140,6 +178,7 @@ class TestReachabilityRules:
         (store / "MEMORY.md").write_text("see [[wiki_target]] for detail\n")
         assert _scan() == []
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     def test_wikilink_with_alias_and_heading_counts(self, env):
         store = _store(env)
         (store / "aliased.md").write_text("x\n")
@@ -149,12 +188,14 @@ class TestReachabilityRules:
         )
         assert _scan() == []
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     def test_bare_filename_mention_counts_as_reachable(self, env):
         store = _store(env)
         (store / "bare_target.md").write_text("x\n")
         (store / "MEMORY.md").write_text("mentioned inline: bare_target.md\n")
         assert _scan() == []
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     def test_wikilink_to_a_non_memory_file_is_not_dangling(self, env):
         """The live store's only 'dangling' hit was a wikilink to a VAULT note."""
         store = _store(env)
@@ -165,6 +206,7 @@ class TestReachabilityRules:
         )
         assert _scan() == []
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     def test_bare_mention_of_a_missing_file_is_not_dangling(self, env):
         """CLAUDE.md / README.md appear in prose constantly — never dangling."""
         store = _store(env)
@@ -174,6 +216,7 @@ class TestReachabilityRules:
         )
         assert _scan() == []
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     def test_markdown_link_to_a_missing_file_is_dangling(self, env):
         """Positive control for the rule above: the explicit form DOES flag."""
         store = _store(env)
@@ -183,12 +226,14 @@ class TestReachabilityRules:
         )
         assert _classes(_scan()) == {"index-dangling": ["CLAUDE.md"]}
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     def test_relative_path_in_a_markdown_link_resolves_by_basename(self, env):
         store = _store(env)
         (store / "a.md").write_text("x\n")
         (store / "MEMORY.md").write_text("- [A](./a.md) — x\n")
         assert _scan() == []
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     def test_index_self_reference_is_not_dangling(self, env):
         store = _store(env)
         (store / "a.md").write_text("x\n")
@@ -204,6 +249,7 @@ class TestReachabilityRules:
 
 class TestTransitiveReachability:
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     def test_entry_linked_only_from_an_indexed_entry_is_reachable(self, env):
         store = _store(env)
         (store / "hub.md").write_text("see [[leaf]]\n")
@@ -211,6 +257,7 @@ class TestTransitiveReachability:
         (store / "MEMORY.md").write_text("- [Hub](hub.md) — x\n")
         assert _scan() == []
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     def test_entry_linked_only_from_an_orphan_is_unreachable(self, env):
         """Weaker orphan class: inbound link exists, but not from the index."""
         store = _store(env)
@@ -223,6 +270,7 @@ class TestTransitiveReachability:
             "orphan-unreachable": ["lost_leaf.md"],
         }
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     def test_a_link_cycle_among_orphans_still_reports_both(self, env):
         """BFS must terminate and must not launder a cycle into reachability."""
         store = _store(env)
@@ -234,6 +282,7 @@ class TestTransitiveReachability:
             "orphan-unreachable": ["ring_a.md", "ring_b.md"],
         }
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     def test_self_link_does_not_make_an_orphan_look_linked(self, env):
         store = _store(env)
         (store / "anchor.md").write_text("x\n")
@@ -248,6 +297,7 @@ class TestTransitiveReachability:
 
 class TestIndexMissing:
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     def test_store_with_entries_and_no_index_reports_one_row(self, env):
         store = _store(env)
         for n in ("a.md", "b.md", "c.md"):
@@ -256,10 +306,12 @@ class TestIndexMissing:
         assert _classes(issues) == {"index-missing": ["MEMORY.md"]}
         assert issues[0].extra["entry_count"] == 3
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     def test_empty_store_is_silent(self, env):
         _store(env)
         assert _scan() == []
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     def test_project_dir_without_a_memory_store_is_skipped(self, env):
         (env["projects"] / "-Users-me-dev-other").mkdir(parents=True)
         _seed_store(env)
@@ -283,23 +335,28 @@ class TestIndexSizeBudget:
         assert index.stat().st_size == size
         return index
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     def test_one_byte_below_the_soft_limit_is_clean(self, env):
         self._index_of_size(env, mi.INDEX_SIZE_SOFT_LIMIT_BYTES - 1)
         assert _scan() == []
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     def test_exactly_the_soft_limit_is_flagged(self, env):
         """`>=` boundary: a wide-gap fixture would pass with `>` too."""
         self._index_of_size(env, mi.INDEX_SIZE_SOFT_LIMIT_BYTES)
         assert _classes(_scan()) == {"index-oversize-soft": ["MEMORY.md"]}
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     def test_one_byte_below_the_hard_limit_is_still_soft(self, env):
         self._index_of_size(env, mi.INDEX_SIZE_HARD_LIMIT_BYTES - 1)
         assert _classes(_scan()) == {"index-oversize-soft": ["MEMORY.md"]}
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     def test_exactly_the_hard_limit_escalates(self, env):
         self._index_of_size(env, mi.INDEX_SIZE_HARD_LIMIT_BYTES)
         assert _classes(_scan()) == {"index-oversize-hard": ["MEMORY.md"]}
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     def test_size_row_carries_the_counts_and_limits(self, env):
         self._index_of_size(env, mi.INDEX_SIZE_HARD_LIMIT_BYTES)
         row = _scan()[0]
@@ -316,6 +373,7 @@ class TestIndexSizeBudget:
 
 class TestUnreadable:
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     @_ROOT_SKIP
     def test_unreadable_index_raises(self, env):
         store = _seed_store(env)
@@ -326,6 +384,7 @@ class TestUnreadable:
         finally:
             (store / "MEMORY.md").chmod(0o600)
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     @_ROOT_SKIP
     def test_unreadable_entry_is_a_row_not_a_crash(self, env):
         store = _seed_store(env)
@@ -353,13 +412,16 @@ class TestUnreadable:
 
 class TestCheckInterface:
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     def test_registered_under_its_name(self):
         assert vault_doctor_checks.get_check("memory-index") is mi
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     def test_opt_in_excludes_it_from_the_default_sweep(self):
         assert mi.OPT_IN is True
         assert mi not in vault_doctor_checks.all_checks()
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     def test_days_is_ignored(self, env):
         """Drift is undated — a 1-day window must not hide a 4-month orphan.
 
@@ -375,23 +437,27 @@ class TestCheckInterface:
             "orphan-isolated": ["orphan_entry.md"],
             "index-dangling": ["deleted_entry.md"],
         }
-        assert _classes(mi.scan("/unused", "s", "i", 9999)) == expected
-        assert _classes(mi.scan("/unused", "s", "i", 1)) == expected
+        assert _classes(mi._scan_claude_memory("/unused", "s", "i", 9999)) == expected
+        assert _classes(mi._scan_claude_memory("/unused", "s", "i", 1)) == expected
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     def test_project_filter_is_a_substring_match_on_the_store_dir(self, env):
         _seed_store(env, "-Users-me-dev-demo")
         _seed_store(env, "-Users-me-dev-other")
         assert {i.project for i in _scan(project="demo")} == {"-Users-me-dev-demo"}
         assert len({i.project for i in _scan()}) == 2
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     def test_project_filter_is_case_insensitive(self, env):
         _seed_store(env, "-Users-me-dev-Demo")
         assert _scan(project="DEMO")
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     def test_missing_projects_root_is_clean_not_a_crash(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HOME", str(tmp_path))
         assert _scan() == []
 
+    @pytest.mark.usefixtures("selected_host_context")
     def test_apply_writes_nothing_and_reports_unresolved(self, env):
         store = _seed_store(env)
         before = {p.name: p.read_bytes() for p in store.glob("*.md")}
@@ -418,22 +484,28 @@ class TestCLIE2E:
             "--json",
             *args,
         ]
-        return subprocess.run(
+        return _bound_cli(
             cmd, capture_output=True, text=True,
             env={**os.environ, "HOME": str(env["tmp_path"])},
         )
 
+    @pytest.mark.usefixtures("selected_host_context")
     def test_clean_store_exits_0(self, env):
         store = _store(env)
         (store / "a.md").write_text("x\n")
         (store / "MEMORY.md").write_text("- [A](a.md) — x\n")
         r = self._run(env)
+        if _unsupported_native_memory(r):
+            return
         assert r.returncode == 0, r.stderr
         assert json.loads(r.stdout)["total_issues"] == 0
 
+    @pytest.mark.usefixtures("selected_host_context")
     def test_drift_exits_1_with_the_expected_json_shape(self, env):
         _seed_store(env)
         r = self._run(env)
+        if _unsupported_native_memory(r):
+            return
         assert r.returncode == 1, r.stderr
 
         payload = json.loads(r.stdout)
@@ -451,27 +523,34 @@ class TestCLIE2E:
         assert "min_confidence" not in payload
         assert "crashed_checks" not in payload
 
+    @pytest.mark.usefixtures("selected_host_context")
     @_ROOT_SKIP
     def test_unreadable_store_exits_2_and_names_the_crashed_check(self, env):
         store = _seed_store(env)
         (store / "MEMORY.md").chmod(0o000)
         try:
             r = self._run(env)
+            if _unsupported_native_memory(r):
+                return
         finally:
             (store / "MEMORY.md").chmod(0o600)
         assert r.returncode == 2, r.stderr
         assert json.loads(r.stdout)["crashed_checks"] == ["memory-index"]
         assert "MemoryStoreUnreadable" in r.stderr
 
+    @pytest.mark.usefixtures("selected_host_context")
     def test_min_confidence_hides_every_row(self, env):
         """Report-only rows are confidence 0.0 — documented consequence."""
         _seed_store(env)
         r = self._run(env, "--min-confidence", "0.5")
+        if _unsupported_native_memory(r):
+            return
         assert r.returncode == 0, r.stderr
         payload = json.loads(r.stdout)
         assert payload["total_issues"] == 0
         assert payload["dropped_by_confidence"] == 2
 
+    @pytest.mark.usefixtures("selected_host_context")
     def test_not_run_in_the_default_sweep(self, env):
         """OPT_IN: a bare sweep over a drifted store must report nothing."""
         _seed_store(env)
@@ -482,7 +561,7 @@ class TestCLIE2E:
             "--insights-folder", "claude-insights",
             "--json",
         ]
-        r = subprocess.run(
+        r = _bound_cli(
             cmd, capture_output=True, text=True,
             env={**os.environ, "HOME": str(env["tmp_path"])},
         )
@@ -496,6 +575,7 @@ class TestCLIE2E:
 
 class TestStoreUnreadable:
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     @_ROOT_SKIP
     def test_unreadable_store_directory_raises(self, env):
         """Path.glob() swallows the scandir OSError; iterdir() raises it.
@@ -511,6 +591,7 @@ class TestStoreUnreadable:
         finally:
             store.chmod(0o700)
 
+    @pytest.mark.usefixtures("selected_host_context")
     @_ROOT_SKIP
     def test_unreadable_store_directory_exits_2_through_the_cli(self, env):
         store = _seed_store(env)
@@ -523,10 +604,12 @@ class TestStoreUnreadable:
             "--check", "memory-index", "--json",
         ]
         try:
-            r = subprocess.run(
+            r = _bound_cli(
                 cmd, capture_output=True, text=True,
                 env={**os.environ, "HOME": str(env["tmp_path"])},
             )
+            if _unsupported_native_memory(r):
+                return
         finally:
             store.chmod(0o700)
         assert r.returncode == 2, r.stderr
@@ -540,6 +623,7 @@ class TestStoreUnreadable:
 
 class TestEntrylessStore:
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     def test_no_entries_but_a_drifted_index_still_reports(self, env):
         """`if not entries: return []` used to drop both of these rows."""
         store = _store(env)
@@ -554,11 +638,13 @@ class TestEntrylessStore:
             "index-oversize-hard": ["MEMORY.md"],
         }
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     def test_no_entries_and_no_index_is_still_silent(self, env):
         """Every project dir carries an empty memory/ — it must stay quiet."""
         _store(env)
         assert _scan() == []
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     def test_no_entries_and_a_clean_index_is_silent(self, env):
         store = _store(env)
         (store / "MEMORY.md").write_text("# Memory index\n")
@@ -571,6 +657,7 @@ class TestEntrylessStore:
 
 class TestEncoding:
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     def test_utf16_index_raises_instead_of_orphaning_the_whole_store(self, env):
         """errors='replace' turned a UTF-16 index into a storeful of orphans."""
         store = _store(env)
@@ -582,6 +669,7 @@ class TestEncoding:
         with pytest.raises(mi.MemoryStoreUnreadable):
             _scan()
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     def test_latin1_index_raises_rather_than_inventing_two_wrong_rows(self, env):
         """Replacement here produced a false orphan AND a false dangling row."""
         store = _store(env)
@@ -590,6 +678,7 @@ class TestEncoding:
         with pytest.raises(mi.MemoryStoreUnreadable):
             _scan()
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     def test_undecodable_entry_is_reported_and_the_store_still_scans(self, env):
         store = _store(env)
         (store / "bad.md").write_bytes(b"links to [[a]] but byte \xff is not utf-8\n")
@@ -619,6 +708,7 @@ class TestPartialStoreFailure:
         (store / "MEMORY.md").write_bytes("- [A](a.md)\n".encode("utf-16"))
         return store
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     def test_other_stores_survive_and_the_bad_one_gets_a_row(self, env):
         _seed_store(env, "-Users-me-dev-aaa")
         self._bad_index(env, "-Users-me-dev-bbb")
@@ -635,12 +725,14 @@ class TestPartialStoreFailure:
         assert bad.extra["unresolved"] is True
         assert bad.confidence == 0.0
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     def test_every_store_unreadable_still_raises(self, env):
         self._bad_index(env, "-Users-me-dev-aaa")
         self._bad_index(env, "-Users-me-dev-bbb")
         with pytest.raises(mi.MemoryStoreUnreadable):
             _scan()
 
+    @pytest.mark.usefixtures("selected_host_context")
     def test_partial_failure_exits_1_through_the_cli(self, env):
         _seed_store(env, "-Users-me-dev-aaa")
         self._bad_index(env, "-Users-me-dev-bbb")
@@ -651,10 +743,12 @@ class TestPartialStoreFailure:
             "--insights-folder", "claude-insights",
             "--check", "memory-index", "--json",
         ]
-        r = subprocess.run(
+        r = _bound_cli(
             cmd, capture_output=True, text=True,
             env={**os.environ, "HOME": str(env["tmp_path"])},
         )
+        if _unsupported_native_memory(r):
+            return
         assert r.returncode == 1, r.stderr
         payload = json.loads(r.stdout)
         assert "crashed_checks" not in payload
@@ -669,6 +763,7 @@ class TestPartialStoreFailure:
 
 class TestRegexCost:
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     def test_link_targets_stays_fast_on_a_long_word_run(self):
         """80 KB of one unbroken word: 0.044 s bounded, 8.26 s unbounded.
 
@@ -680,6 +775,7 @@ class TestRegexCost:
         mi._link_targets("a" * 80_000)
         assert time.perf_counter() - start < 2.0
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     def test_link_targets_stays_fast_on_a_dotted_run(self):
         """The adversarial input for the bound: 0.031 s bounded, 5.87 s not.
 
@@ -692,6 +788,7 @@ class TestRegexCost:
         mi._link_targets("a." * 40_000)
         assert time.perf_counter() - start < 2.0
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     def test_a_mention_in_underscore_emphasis_still_counts(self, env):
         """_note.md_ is italic markdown, not a different filename.
 
@@ -703,6 +800,7 @@ class TestRegexCost:
         (store / "MEMORY.md").write_text("superseded by _note.md_\n")
         assert _scan() == []
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     def test_link_targets_stays_fast_on_a_run_of_open_link_brackets(self):
         """Same guard for _MD_LINK_RE, which was quadratic too.
 
@@ -713,6 +811,7 @@ class TestRegexCost:
         mi._link_targets("](a" * 30_000)
         assert time.perf_counter() - start < 2.0
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     def test_bare_mention_inside_a_path_still_counts(self, env):
         """_BARE_MD_RE is deliberately unanchored — see the comment on it."""
         store = _store(env)
@@ -729,6 +828,7 @@ class TestRegexCost:
 
 class TestCaseMismatch:
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     def test_case_only_mismatch_is_its_own_class_not_a_double_false_positive(self, env):
         """On macOS the link resolves; on Linux it breaks. Neither is drift."""
         store = _store(env)
@@ -741,6 +841,7 @@ class TestCaseMismatch:
         assert "case-sensitive" in row.reason
         assert row.extra["entry_names"] == ["mynote.md"]
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     def test_a_genuinely_missing_target_is_still_dangling(self, env):
         """Negative control: case folding must not swallow real dangling rows."""
         store = _store(env)
@@ -750,6 +851,7 @@ class TestCaseMismatch:
         )
         assert _classes(_scan()) == {"index-dangling": ["othernote.md"]}
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     def test_a_case_matched_entry_can_reach_others(self, env):
         """The pointer works on the machine that wrote it, so the BFS uses it."""
         store = _store(env)
@@ -765,6 +867,7 @@ class TestCaseMismatch:
 
 class TestNonChildLinkTargets:
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     def test_urls_parents_and_subdirs_are_not_dangling(self, env):
         """A top-level entry is required here — without one the entry-less
         early return used to hide the phantom rows."""
@@ -780,6 +883,7 @@ class TestNonChildLinkTargets:
         )
         assert _scan() == []
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     def test_a_subdirectory_named_like_an_entry_is_not_an_entry(self, env):
         """`p.is_file()`: without it the directory reads as an unreadable entry."""
         store = _store(env)
@@ -788,6 +892,7 @@ class TestNonChildLinkTargets:
         (store / "MEMORY.md").write_text("- [A](a.md) — x\n")
         assert _scan() == []
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     def test_index_pointer_at_a_broken_symlink_is_dangling(self, env):
         """A deleted file is a dangling pointer, not a permissions problem."""
         store = _store(env)
@@ -805,6 +910,7 @@ class TestNonChildLinkTargets:
 
 class TestWikilinkNormalisation:
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     def test_wikilink_with_a_subdirectory_reaches_the_entry(self, env):
         """Markdown links were basename-normalised; wikilinks were not."""
         store = _store(env)
@@ -812,6 +918,7 @@ class TestWikilinkNormalisation:
         (store / "MEMORY.md").write_text("archived: [[archive/a]]\n")
         assert _scan() == []
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     def test_wikilink_with_a_subdirectory_and_an_alias_reaches_the_entry(self, env):
         store = _store(env)
         (store / "a.md").write_text("x\n")
@@ -825,6 +932,7 @@ class TestWikilinkNormalisation:
 
 class TestUnreadableEntryDownstream:
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     @_ROOT_SKIP
     def test_leaf_of_an_unreadable_hub_is_not_called_isolated(self, env):
         """hub.md links leaf.md — the check simply could not read the link."""
@@ -845,6 +953,7 @@ class TestUnreadableEntryDownstream:
         assert "1 entry file(s)" in leaf.reason
         assert "provisional" in leaf.reason
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     def test_an_undecodable_entry_also_downgrades_the_verdict(self, env):
         store = _store(env)
         (store / "hub.md").write_bytes(b"see [[leaf]] \xff\n")
@@ -863,6 +972,7 @@ class TestUnreadableEntryDownstream:
 
 class TestEntryVanishesMidScan:
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     def test_a_vanished_entry_produces_no_rows_at_all(self, env, monkeypatch):
         """Reporting it would blame permissions and orphan a file that is gone."""
         store = _store(env)
@@ -896,6 +1006,7 @@ class TestEntryVanishesMidScan:
 
 class TestStoreWalk:
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     def test_a_memory_path_that_is_a_regular_file_is_named_on_stderr(self, env, capsys):
         proj = env["projects"] / "-Users-me-dev-bogus"
         proj.mkdir(parents=True)
@@ -905,6 +1016,7 @@ class TestStoreWalk:
         assert "is not a directory" in err
         assert "scanned 0 memory store(s)" in err
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     def test_a_memory_symlink_to_a_real_directory_is_scanned(self, env, tmp_path):
         """Plausible setup: the store lives elsewhere and memory/ points at it."""
         real = tmp_path / "elsewhere"
@@ -917,6 +1029,7 @@ class TestStoreWalk:
         (proj / "memory").symlink_to(real, target_is_directory=True)
         assert _classes(_scan()) == {"orphan-isolated": ["orphan_entry.md"]}
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     def test_stderr_summary_counts_stores_issues_and_the_project_filter(self, env, capsys):
         """The summary line is this check's only console output."""
         _seed_store(env, "-Users-me-dev-demo")
@@ -927,6 +1040,7 @@ class TestStoreWalk:
         assert "(1 filtered out by --project demo)" in err
         assert "2 issue(s)" in err
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     def test_project_filter_ignores_surrounding_whitespace(self, env):
         _seed_store(env, "-Users-me-dev-demo")
         assert {i.project for i in _scan(project="  demo  ")} == {
@@ -949,23 +1063,29 @@ class TestCLIApplyAndProject:
             "--check", "memory-index", "--json",
             *args,
         ]
-        return subprocess.run(
+        return _bound_cli(
             cmd, capture_output=True, text=True,
             env={**os.environ, "HOME": str(env["tmp_path"])},
         )
 
+    @pytest.mark.usefixtures("selected_host_context")
     def test_apply_yes_changes_nothing_in_the_store(self, env):
         """Report-only: --apply must leave every memory file byte-identical."""
         store = _seed_store(env)
         before = {p.name: p.read_bytes() for p in sorted(store.iterdir())}
         r = self._run(env, "--apply", "--yes")
+        if _unsupported_native_memory(r):
+            return
         assert r.returncode == 1, r.stderr
         assert {p.name: p.read_bytes() for p in sorted(store.iterdir())} == before
 
+    @pytest.mark.usefixtures("selected_host_context")
     def test_project_filter_through_the_cli(self, env):
         _seed_store(env, "-Users-me-dev-demo")
         _seed_store(env, "-Users-me-dev-other")
         r = self._run(env, "--project", "demo")
+        if _unsupported_native_memory(r):
+            return
         assert r.returncode == 1, r.stderr
         payload = json.loads(r.stdout)
         assert {row["project"] for row in payload["issues"]} == {
@@ -992,11 +1112,12 @@ class TestJSONExtras:
             "--check", "memory-index", "--json",
             *args,
         ]
-        return subprocess.run(
+        return _bound_cli(
             cmd, capture_output=True, text=True,
             env={**os.environ, "HOME": str(env["tmp_path"])},
         )
 
+    @pytest.mark.usefixtures("selected_host_context")
     def test_the_oversize_row_carries_its_counts_and_limits_in_json(self, env):
         store = _store(env)
         (store / "a.md").write_text("x\n")
@@ -1005,6 +1126,8 @@ class TestJSONExtras:
             head + b"#" * (mi.INDEX_SIZE_HARD_LIMIT_BYTES - len(head))
         )
         r = self._run(env)
+        if _unsupported_native_memory(r):
+            return
         assert r.returncode == 1, r.stderr
         row = json.loads(r.stdout)["issues"][0]
         assert row["index_size_bytes"] == mi.INDEX_SIZE_HARD_LIMIT_BYTES
@@ -1013,44 +1136,65 @@ class TestJSONExtras:
         assert row["entry_count"] == 1
         assert row["indexed_count"] == 1
 
+    @pytest.mark.usefixtures("selected_host_context")
     def test_index_missing_carries_its_entry_count_in_json(self, env):
         store = _store(env)
         for n in ("a.md", "b.md", "c.md"):
             (store / n).write_text("x\n")
-        row = json.loads(self._run(env).stdout)["issues"][0]
+        result = self._run(env)
+        if _unsupported_native_memory(result):
+            return
+        row = json.loads(result.stdout)["issues"][0]
         assert row["signal_class"] == "index-missing"
         assert row["entry_count"] == 3
 
+    @pytest.mark.usefixtures("selected_host_context")
     def test_dangling_carries_the_index_path_in_json(self, env):
         _seed_store(env)
-        rows = {r["signal_class"]: r for r in json.loads(self._run(env).stdout)["issues"]}
+        result = self._run(env)
+        if _unsupported_native_memory(result):
+            return
+        rows = {r["signal_class"]: r for r in json.loads(result.stdout)["issues"]}
         assert rows["index-dangling"]["index_path"].endswith("/memory/MEMORY.md")
 
+    @pytest.mark.usefixtures("selected_host_context")
     def test_store_unreadable_carries_the_underlying_error_in_json(self, env):
         """F4's row is useless without it: the class alone says nothing."""
         _seed_store(env, "-Users-me-dev-aaa")
         bad = _store(env, "-Users-me-dev-bbb")
         (bad / "a.md").write_text("x\n")
         (bad / "MEMORY.md").write_bytes("- [A](a.md)\n".encode("utf-16"))
-        rows = {r["signal_class"]: r for r in json.loads(self._run(env).stdout)["issues"]}
+        result = self._run(env)
+        if _unsupported_native_memory(result):
+            return
+        rows = {r["signal_class"]: r for r in json.loads(result.stdout)["issues"]}
         assert "codec can't decode" in rows["store-unreadable"]["read_error"]
         assert "MEMORY.md" in rows["store-unreadable"]["read_error"]
 
+    @pytest.mark.usefixtures("selected_host_context")
     def test_undecodable_entry_carries_its_byte_offset_in_json(self, env):
         store = _store(env)
         (store / "bad.md").write_bytes(b"x \xff\n")
         (store / "MEMORY.md").write_text("- [Bad](bad.md) — x\n")
-        rows = {r["signal_class"]: r for r in json.loads(self._run(env).stdout)["issues"]}
+        result = self._run(env)
+        if _unsupported_native_memory(result):
+            return
+        rows = {r["signal_class"]: r for r in json.loads(result.stdout)["issues"]}
         assert rows["entry-undecodable"]["byte_offset"] == 2
 
+    @pytest.mark.usefixtures("selected_host_context")
     def test_case_mismatch_carries_both_spellings_in_json(self, env):
         store = _store(env)
         (store / "mynote.md").write_text("x\n")
         (store / "MEMORY.md").write_text("- [C](MyNote.md) — x\n")
-        row = json.loads(self._run(env).stdout)["issues"][0]
+        result = self._run(env)
+        if _unsupported_native_memory(result):
+            return
+        row = json.loads(result.stdout)["issues"][0]
         assert row["signal_class"] == "index-case-mismatch"
         assert row["entry_names"] == ["mynote.md"]
 
+    @pytest.mark.usefixtures("selected_host_context")
     def test_other_checks_row_shape_is_unchanged(self, env):
         """The new keys are conditional: a check that sets none gets the
         prior schema exactly."""
@@ -1066,7 +1210,7 @@ class TestJSONExtras:
             "--insights-folder", "claude-insights",
             "--check", "source-sessions", "--json",
         ]
-        r = subprocess.run(
+        r = _bound_cli(
             cmd, capture_output=True, text=True,
             env={**os.environ, "HOME": str(env["tmp_path"])},
         )
@@ -1085,6 +1229,7 @@ class TestJSONExtras:
 
 class TestUnreadableProjectDir:
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     @_ROOT_SKIP
     def test_an_unreadable_project_dir_is_counted_not_skipped(self, env):
         """The probe is wrapped in try/except; that is the guard.
@@ -1108,6 +1253,7 @@ class TestUnreadableProjectDir:
                    if i.extra["signal_class"] == "store-unreadable")
         assert row.project == "-Users-me-dev-bad"
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     @_ROOT_SKIP
     def test_the_store_count_includes_the_unreadable_project_dir(self, env, capsys):
         bad = _store(env, "-Users-me-dev-bad")
@@ -1126,6 +1272,7 @@ class TestUnreadableProjectDir:
 
 class TestTraversalOrder:
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     def test_a_long_chain_is_fully_reachable(self, env):
         """BFS or DFS, the reachable set is the same — this pins that it
         terminates and reaches the far end of a deep chain."""
@@ -1144,6 +1291,7 @@ class TestTraversalOrder:
 
 class TestBlankProjectFilter:
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     def test_a_whitespace_only_project_filter_is_ignored(self, env, capsys):
         """`"  ".strip()` is "", and "" is a substring of every name."""
         _seed_store(env, "-Users-me-dev-demo")
@@ -1151,6 +1299,7 @@ class TestBlankProjectFilter:
         assert len({i.project for i in _scan(project="  ")}) == 2
         assert "filtered out" not in capsys.readouterr().err
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     def test_a_real_project_filter_still_filters(self, env):
         """Negative control: the guard must not disable filtering outright."""
         _seed_store(env, "-Users-me-dev-demo")
@@ -1164,6 +1313,7 @@ class TestBlankProjectFilter:
 
 class TestIndexVanishesMidScan:
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     def test_a_vanished_index_reports_index_missing_not_a_crash(self, env, monkeypatch):
         store = _store(env)
         (store / "a.md").write_text("x\n")
@@ -1188,6 +1338,7 @@ class TestIndexVanishesMidScan:
 
 class TestIndexNamesNothing:
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     def test_an_index_with_text_but_no_links_summarises_AND_lists(self, env):
         """The summary row must not replace the per-entry rows.
 
@@ -1210,6 +1361,7 @@ class TestIndexNamesNothing:
         orphan = next(i for i in issues if Path(i.note_path).name == "a.md")
         assert "a.md" in orphan.proposed_source
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     def test_an_empty_index_is_still_ordinary_drift(self, env):
         """Negative control: no text at all means the pointer lines were
         never written, which is exactly what this check exists to report."""
@@ -1218,6 +1370,7 @@ class TestIndexNamesNothing:
         (store / "MEMORY.md").write_text("")
         assert _classes(_scan()) == {"orphan-isolated": ["a.md"]}
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     def test_the_backstop_sits_alongside_every_other_row(self, env):
         store = _store(env)
         (store / "a.md").write_text("x\n")
@@ -1237,6 +1390,7 @@ class TestIndexNamesNothing:
 
 class TestUndecodableReplacementSemantics:
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     def test_a_bad_byte_inside_a_link_breaks_that_link(self, env):
         """errors='replace', not 'ignore': ignoring the byte would splice
         `no` and `te` into a working `[[note]]` and hide the damage. The
@@ -1256,6 +1410,7 @@ class TestUndecodableReplacementSemantics:
 
 class TestEntryReadCatchIsSymmetric:
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     def test_a_valueerror_from_an_entry_read_is_a_row_not_a_crash(self, env, monkeypatch):
         """The index read catches (OSError, ValueError); the entry read must
         too, or tightening the index read further would crash the check."""
@@ -1292,11 +1447,12 @@ class TestProjectFilterMatchesNothing:
             "--check", "memory-index", "--json",
             *args,
         ]
-        return subprocess.run(
+        return _bound_cli(
             cmd, capture_output=True, text=True,
             env={**os.environ, "HOME": str(env["tmp_path"])},
         )
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     def test_a_typo_in_the_filter_is_a_row_not_a_clean_report(self, env):
         """A typo used to scan nothing and report clean at exit 0."""
         _seed_store(env, "-Users-me-dev-demo")
@@ -1307,10 +1463,13 @@ class TestProjectFilterMatchesNothing:
         assert row.extra["stores_scanned"] == 0
         assert row.extra["stores_filtered_out"] == 1
 
+    @pytest.mark.usefixtures("selected_host_context")
     def test_the_row_reaches_the_cli_at_exit_1_with_its_counts(self, env):
         _seed_store(env, "-Users-me-dev-demo")
         _seed_store(env, "-Users-me-dev-other")
         r = self._run(env, "--project", "nosuchproject")
+        if _unsupported_native_memory(r):
+            return
         assert r.returncode == 1, r.stderr
         payload = json.loads(r.stdout)
         assert payload["total_issues"] == 1
@@ -1319,12 +1478,14 @@ class TestProjectFilterMatchesNothing:
         assert row["stores_scanned"] == 0
         assert row["stores_filtered_out"] == 2
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     def test_a_filter_that_matches_produces_no_such_row(self, env):
         """Negative control: the row must not fire whenever a filter is used."""
         _seed_store(env, "-Users-me-dev-demo")
         _seed_store(env, "-Users-me-dev-other")
         assert "project-filter-matched-nothing" not in _classes(_scan(project="demo"))
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     def test_no_filter_and_no_stores_is_still_silent(self, env):
         """Negative control: an empty machine is clean, not a filter miss."""
         assert _scan() == []
@@ -1343,6 +1504,7 @@ class TestCommonMarkLinkForms:
             f"- [Here](here.md) — x\n{index_line}\n"
         )
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     @pytest.mark.parametrize("index_line", [
         "- [X](gone.md) — bare",
         "- [X](./gone.md) — dot-slash",
@@ -1355,6 +1517,7 @@ class TestCommonMarkLinkForms:
         self._store_with(env, index_line)
         assert _classes(_scan()) == {"index-dangling": ["gone.md"]}
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     @pytest.mark.parametrize("index_line", [
         "- [X](<../gone.md>) — angle-bracketed parent",
         "- [X](../gone.md) — parent",
@@ -1366,6 +1529,7 @@ class TestCommonMarkLinkForms:
         self._store_with(env, index_line)
         assert _scan() == []
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     def test_a_dot_slash_pointer_at_a_real_entry_is_clean(self, env):
         store = _store(env)
         (store / "here.md").write_text("x\n")
@@ -1379,6 +1543,7 @@ class TestCommonMarkLinkForms:
 
 class TestCaseFoldingAcrossLinkKinds:
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     def test_a_wikilink_differing_only_in_case_reaches_the_entry(self, env):
         """[[Their-Name]] is the documented way one memory links another."""
         store = _store(env)
@@ -1386,12 +1551,14 @@ class TestCaseFoldingAcrossLinkKinds:
         (store / "MEMORY.md").write_text("- [[Feedback_Foo]] — x\n")
         assert _scan() == []
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     def test_a_bare_mention_differing_only_in_case_reaches_the_entry(self, env):
         store = _store(env)
         (store / "feedback_bar.md").write_text("x\n")
         (store / "MEMORY.md").write_text("see Feedback_Bar.md for detail\n")
         assert _scan() == []
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     def test_an_entry_to_entry_wikilink_folds_case_too(self, env):
         """The edge that matters most: entries link each other by wikilink."""
         store = _store(env)
@@ -1400,6 +1567,7 @@ class TestCaseFoldingAcrossLinkKinds:
         (store / "MEMORY.md").write_text("- [Hub](hub.md) — x\n")
         assert _scan() == []
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     def test_a_genuinely_different_name_is_still_an_orphan(self, env):
         """Negative control: folding case must not make everything reachable."""
         store = _store(env)
@@ -1408,6 +1576,7 @@ class TestCaseFoldingAcrossLinkKinds:
         (store / "MEMORY.md").write_text("- [Hub](hub.md) — x\n")
         assert _classes(_scan()) == {"orphan-isolated": ["leaf_name.md"]}
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     def test_the_markdown_link_case_mismatch_row_still_fires(self, env):
         """P4 must not swallow the index-case-mismatch warning."""
         store = _store(env)
@@ -1422,6 +1591,7 @@ class TestCaseFoldingAcrossLinkKinds:
 
 class TestUnreadableEntryIsOneRow:
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     @_ROOT_SKIP
     def test_unreadable_and_unindexed_gets_only_the_unreadable_row(self, env):
         store = _store(env)
@@ -1435,6 +1605,7 @@ class TestUnreadableEntryIsOneRow:
             (store / "secret.md").chmod(0o600)
         assert classes == {"entry-unreadable": ["secret.md"]}
 
+    @pytest.mark.host_only("claude", reason="no-verified-native-memory-adapter", capability="memory.native_discovery")
     @_ROOT_SKIP
     def test_unreadable_and_indexed_does_not_become_dangling(self, env):
         """The shape the obvious fix breaks.

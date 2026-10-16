@@ -19,6 +19,10 @@ set -e
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PROJECT_HASH=$(python3 -c "import hashlib, sys; print(hashlib.md5(sys.argv[1].encode()).hexdigest()[:8])" "$(realpath "$PROJECT_DIR")")
 TOKEN_FILE="/tmp/.preflight-token-${PROJECT_HASH}"
+# Invalidate the previous result before any check can fail or be interrupted.
+# __PREFLIGHT_INVALIDATE_START__
+rm -f "$TOKEN_FILE"
+# __PREFLIGHT_INVALIDATE_END__
 TOKEN_EXPIRY_SECONDS=300  # Token valid for 5 minutes
 # The HEAD this preflight ran at. require-preflight allows a commit only
 # while HEAD still matches, so a call another hook denies does not spend
@@ -105,7 +109,7 @@ if [ -f "$PLUGIN_JSON_PRE" ] && [ -f "$MARKETPLACE_JSON_PRE" ]; then
     echo "🔖 Checking plugin manifest version sync..."
     VERSION_SYNC_EXIT=0
     VERSION_CHECK_TMP=$(mktemp "${TMPDIR:-/tmp}/preflight-version.XXXXXX")
-    VERSION_CHECK_STDOUT=$(python3 - "$PLUGIN_JSON_PRE" "$MARKETPLACE_JSON_PRE" 2>"$VERSION_CHECK_TMP" <<'PY'
+    VERSION_CHECK_STDOUT=$(python3 - "$PLUGIN_JSON_PRE" "$MARKETPLACE_JSON_PRE" "$PROJECT_DIR/.codex-plugin/plugin.json" 2>"$VERSION_CHECK_TMP" <<'PY'
 import json, sys, traceback
 plugin_path, market_path = sys.argv[1], sys.argv[2]
 try:
@@ -116,6 +120,20 @@ except Exception as e:
     sys.exit(2)
 plugin_v = plugin.get("version")
 plugin_name = plugin.get("name")
+from pathlib import Path
+codex_path = Path(sys.argv[3])
+if plugin_name == "obsidian-brain" and not codex_path.is_file():
+    sys.stderr.write("Codex descriptor is missing from obsidian-brain packaging\n")
+    sys.exit(2)
+if codex_path.is_file():
+    try:
+        codex = json.loads(codex_path.read_text())
+        if codex.get("name") != plugin_name or codex.get("version") != plugin_v:
+            sys.stderr.write("Codex descriptor name/version differs from Claude descriptor\n")
+            sys.exit(2)
+    except (ValueError, OSError, AttributeError) as exc:
+        sys.stderr.write(f"Codex descriptor parse error: {exc}\n")
+        sys.exit(2)
 if not plugin_v or not plugin_name:
     sys.stderr.write("plugin.json missing 'name' or 'version'\n")
     sys.exit(2)
@@ -181,6 +199,24 @@ PY
     echo ""
 fi
 
+# Shared host rules also apply to authored documentation and skip modes.
+echo "Checking shared host boundaries..."
+if ! python3 "$PROJECT_DIR/scripts/ci-checks/host_neutral_lint.py" --root "$PROJECT_DIR"; then
+    rm -f "$TOKEN_FILE"
+    exit 1
+fi
+
+# Keep the static helper inventory current; collection enforces its actor contracts.
+HOST_INVENTORY=$(mktemp "${TMPDIR:-/tmp}/obsidian-host-inventory.XXXXXX")
+if ! python3 "$PROJECT_DIR/scripts/ci-checks/host-test-contract.py" --root "$PROJECT_DIR" --output "$HOST_INVENTORY" --parity-matrix "$PROJECT_DIR/docs/parity/capabilities.json"; then
+    rm -f "$HOST_INVENTORY" "$TOKEN_FILE"
+    exit 1
+fi
+rm -f "$HOST_INVENTORY"
+
+# The full pytest run below collects with the actor guard before executing any test.
+# Keep one guarded collection; a separate collect-only pass duplicates that work.
+
 # Handle skip tests mode
 if [ "$SKIP_TESTS" = true ]; then
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -189,14 +225,11 @@ if [ "$SKIP_TESTS" = true ]; then
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo ""
 
-    # Even in skip mode, version-sync must be recorded if it ran above
-    # — it is the one check that is NEVER actually skipped. Use a
-    # generic "skipped" marker for everything else (lint, secret scan,
-    # tests are all skipped, not just tests) so the audit trail is
-    # accurate (Copilot iter-5 finding on PR #14).
-    SKIP_CHECKS_RUN="skipped"
+    # Record the host check and any version check even when tests are skipped.
+    # Other checks retain the skipped marker in the audit trail.
+    SKIP_CHECKS_RUN="host-neutral,skipped"
     if [ "$VERSION_SYNC_RAN" = true ]; then
-        SKIP_CHECKS_RUN="version-sync,skipped"
+        SKIP_CHECKS_RUN="version-sync,host-neutral,skipped"
     fi
     TIMESTAMP=$(date +%s)
     TOKEN_DATA=$(cat <<EOF
@@ -219,7 +252,7 @@ EOF
 fi
 
 # Track what we checked
-CHECKS_RUN=""
+CHECKS_RUN="host-neutral,"
 CHECKS_PASSED=true
 
 # ── Secret scanning (always runs) ────────────────────────────
@@ -260,18 +293,63 @@ echo "🧪 Running tests..."
 
 # __HARDEN_TEST_START__
 if [ -d "tests" ]; then
-    if command -v pytest &>/dev/null; then
-        echo "🧪 Running pytest with coverage..."
-        if pytest tests/ -v --tb=short --cov=hooks --cov-report=term-missing --cov-fail-under=90; then
+    PREFLIGHT_TEST_PYTHON="$(command -v python3)"
+    if "$PREFLIGHT_TEST_PYTHON" - <<'PY'
+import importlib
+import sys
+
+missing = []
+for name in ("pytest", "pytest_cov", "xdist", "coverage"):
+    try:
+        importlib.import_module(name)
+    except ImportError:
+        missing.append(name)
+if missing:
+    print("Test dependencies unavailable in " + sys.executable + ": " + ", ".join(missing), file=sys.stderr)
+    sys.exit(1)
+PY
+    then
+        echo "🧪 Running parallel tests and serial timing controls with coverage..."
+        # __PARALLEL_COVERAGE_START__
+        if (
+            TEST_RUN_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ob-preflight-tests.XXXXXXXX")" || exit 1
+            echo "Test receipts: $TEST_RUN_DIR"
+            mkdir -p "$TEST_RUN_DIR/artifacts/local-0" || exit 1
+            export COVERAGE_FILE="$TEST_RUN_DIR/.coverage"
+            "$PREFLIGHT_TEST_PYTHON" scripts/ci-checks/test_shards.py list \
+                --root "$PROJECT_DIR" --count 1 --index 0 \
+                --manifest "$TEST_RUN_DIR/artifacts/local-0/manifest.json" \
+                > "$TEST_RUN_DIR/test-files.txt" || exit 1
+            PYTHONPATH=tests:hooks:scripts "$PREFLIGHT_TEST_PYTHON" -m pytest tests/ \
+                -v --tb=short -n 4 --dist=load --max-worker-restart=0 \
+                --deselect=tests/test_security.py::TestDecisionTimeIsBounded:: \
+                --deselect=tests/test_security.py::TestPatternDecisionTimeIsBounded:: \
+                --basetemp="$TEST_RUN_DIR/pytest-coverage" \
+                --cov=hooks --cov-report= --cov-fail-under=0 \
+                -p parity_collection_plugin --parity-matrix docs/parity/capabilities.json || exit 1
+            PYTHONPATH=tests:hooks:scripts "$PREFLIGHT_TEST_PYTHON" -m pytest \
+                tests/test_security.py::TestDecisionTimeIsBounded \
+                tests/test_security.py::TestPatternDecisionTimeIsBounded \
+                -v --tb=short -p no:xdist \
+                --basetemp="$TEST_RUN_DIR/pytest-coverage-timing" \
+                --cov=hooks --cov-append --cov-report= --cov-fail-under=0 \
+                -p parity_collection_plugin --parity-matrix docs/parity/capabilities.json || exit 1
+            cp "$COVERAGE_FILE" "$TEST_RUN_DIR/artifacts/local-0/.coverage" || exit 1
+            "$PREFLIGHT_TEST_PYTHON" scripts/ci-checks/test_shards.py coverage \
+                --root "$PROJECT_DIR" --count 1 --prefix local \
+                --artifacts "$TEST_RUN_DIR/artifacts" || exit 1
+        ); then
             CHECKS_RUN="${CHECKS_RUN}tests,"
         else
             echo "❌ Tests failed or coverage below 90%"
             CHECKS_PASSED=false
         fi
+        # __PARALLEL_COVERAGE_END__
     else
-        echo "❌ tests/ directory exists but pytest is not installed"
-        echo "   Install with: pip install pytest pytest-cov"
-        CHECKS_PASSED=false
+        echo "❌ Required test dependencies are missing; tests did not start"
+        echo "   Install with: $PREFLIGHT_TEST_PYTHON -m pip install -r requirements-dev.txt"
+        rm -f "$TOKEN_FILE"
+        exit 1
     fi
 else
     echo "⏭️  No test directory — skipping tests"

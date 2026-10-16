@@ -2,12 +2,10 @@
 
 Two layers, deliberately redundant where they overlap:
 
-- Subprocess-level (black-box) tests invoke
-  ``python3 hooks/note_writer.py write <vault_path> <folder> <filename>``
-  exactly as skills will, piping note content on stdin. These are the only
-  tests that prove argv parsing, real stdin piping, process exit codes, and
-  stdout/stderr formatting work end-to-end through the actual CLI entry
-  point skills call — do not replace them with in-process calls.
+- Subprocess tests bind an explicit native actor in the test driver, then
+  invoke the real ``note_writer.main()`` with writer argv and piped stdin.
+  The parent checks the child actor observed by the mutation service.
+  These cases retain real parsing, stdin limits, exit codes and output.
 - In-process tests import ``note_writer`` directly and call
   ``run_write()``/``main()`` in-process (with ``monkeypatch``), so
   coverage.py can instrument the module and branches unreachable except by
@@ -56,24 +54,61 @@ if HOOKS_DIR not in sys.path:
 import note_writer  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def selected_host_context(host, tmp_path, tmp_path_factory, monkeypatch):
+    import json
+    from runtime_context import resolve_runtime_context, using_runtime_context
+    private = tmp_path_factory.mktemp("writer-native")
+    home, project = private / 'home', private / 'project'
+    home.mkdir(); project.mkdir()
+    config = private / 'config.json'
+    config.write_text(json.dumps({'vault_path':str(tmp_path / 'vault')}))
+    monkeypatch.setenv('HOME', str(home))
+    monkeypatch.setenv('CLAUDE_CONFIG_DIR', str(home / '.claude'))
+    monkeypatch.setenv('CODEX_HOME', str(home / '.codex'))
+    selected = resolve_runtime_context(host, 'claude-code' if host == 'claude' else 'codex-cli', {}, {
+        'session_id':'native-writer-session', 'cwd':str(project), 'config_path':str(config),
+        'resource_root':str(NOTE_WRITER.parent.parent), 'index_path':str(private / 'index.sqlite3'),
+        'state_path':str(private / 'state')})
+    with using_runtime_context(selected):
+        yield selected
+
+
+def _native_child(arguments, *, input, capture_output=True, text=True, timeout=30, cwd=None):
+    """Launch with explicit actor flags and verify the child's actual mutation actor."""
+    import json
+    from runtime_context import current_runtime_context
+    context = current_runtime_context()
+    driver = Path(__file__).with_name('native_note_writer_test_driver.py')
+    command = [sys.executable, str(driver), '--host', context.host, '--client', context.client,
+        '--session-id', context.native_session_id, '--cwd', str(context.worktree),
+        '--vault', str(context.vault_path), '--config', str(context.config_path),
+        '--resource-root', str(context.resource_root), '--index', str(context.index_path),
+        '--state', str(context.state_path), '--', *map(str, arguments)]
+    result = subprocess.run(command, input=input, capture_output=capture_output, text=text,
+                            timeout=timeout, cwd=cwd)
+    prefix = 'NATIVE_CONTEXT_PROOF:'
+    proofs = [json.loads(line[len(prefix):]) for line in result.stderr.splitlines() if line.startswith(prefix)]
+    assert len(proofs) == 1, result.stderr
+    proof = proofs[0]
+    expected = {name:str(getattr(context, name)) for name in ('host','client','native_session_id',
+        'worktree','vault_path','config_path','resource_root','index_path','state_path')}
+    assert {name:proof[name] for name in expected} == expected
+    expected_actor = {name:expected[name] for name in ('host','client','native_session_id','vault_path','index_path')}
+    assert all(actor == expected_actor for actor in proof['mutation_contexts'])
+    if result.returncode == 0:
+        assert proof['mutation_contexts'], 'Successful child writer never reached the native mutation service'
+    result.native_context_proof = proof
+    result.stderr = ''.join(line + '\n' for line in result.stderr.splitlines() if not line.startswith(prefix))
+    return result
+
+
 def _run_write(vault_path, folder, filename, content: str) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        [sys.executable, str(NOTE_WRITER), "write", str(vault_path), folder, filename],
-        input=content,
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
+    return _native_child(['write', str(vault_path), folder, filename], input=content, capture_output=True, text=True, timeout=30)
 
 
 def _run_argv(*args: str, stdin: str = "") -> subprocess.CompletedProcess:
-    return subprocess.run(
-        [sys.executable, str(NOTE_WRITER), *args],
-        input=stdin,
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
+    return _native_child([*args], input=stdin, capture_output=True, text=True, timeout=30)
 
 
 # ---------------------------------------------------------------------------
@@ -296,7 +331,7 @@ def test_unknown_command_exits_2(tmp_path):
 # error branch can be forced without depending on a real filesystem failure.
 # ---------------------------------------------------------------------------
 
-def test_run_write_in_process_success(tmp_path, capsys):
+def test_run_write_in_process_success(selected_host_context, tmp_path, capsys):
     vault = tmp_path / "vault"
     (vault / "claude-sessions").mkdir(parents=True)
     content = MINIMAL_FM + "# Session\nBody.\n"
@@ -313,7 +348,7 @@ def test_run_write_in_process_success(tmp_path, capsys):
     assert "ERROR" not in captured.err
 
 
-def test_run_write_forced_error_path_prints_error_and_returns_1(
+def test_run_write_forced_error_path_prints_error_and_returns_1(selected_host_context,
     tmp_path, monkeypatch, capsys
 ):
     """Forces obsidian_utils.write_vault_note's error branch directly —
@@ -339,7 +374,7 @@ def test_run_write_forced_error_path_prints_error_and_returns_1(
     assert list(vault.iterdir()) == []
 
 
-def test_main_write_dispatch_success_in_process(tmp_path, monkeypatch, capsys):
+def test_main_write_dispatch_success_in_process(selected_host_context, tmp_path, monkeypatch, capsys):
     vault = tmp_path / "vault"
     (vault / "claude-sessions").mkdir(parents=True)
     content = MINIMAL_FM + "in-process main() content\n"
@@ -359,7 +394,7 @@ def test_main_write_dispatch_success_in_process(tmp_path, monkeypatch, capsys):
     assert captured.out.strip() == f"OK: {dest.resolve()}"
 
 
-def test_main_unknown_command_exits_2_in_process(monkeypatch, capsys):
+def test_main_unknown_command_exits_2_in_process(selected_host_context, monkeypatch, capsys):
     monkeypatch.setattr(sys, "argv", ["note_writer.py", "bogus-command"])
     monkeypatch.setattr(sys, "stdin", io.StringIO(""))
 
@@ -371,7 +406,7 @@ def test_main_unknown_command_exits_2_in_process(monkeypatch, capsys):
     assert "unknown command" in captured.err.lower()
 
 
-def test_main_wrong_arity_exits_2_in_process(monkeypatch, capsys):
+def test_main_wrong_arity_exits_2_in_process(selected_host_context, monkeypatch, capsys):
     monkeypatch.setattr(sys, "argv", ["note_writer.py", "write", "only-one-arg"])
     monkeypatch.setattr(sys, "stdin", io.StringIO(""))
 
@@ -383,7 +418,7 @@ def test_main_wrong_arity_exits_2_in_process(monkeypatch, capsys):
     assert "usage" in captured.err.lower()
 
 
-def test_main_no_argv_exits_2_in_process(monkeypatch, capsys):
+def test_main_no_argv_exits_2_in_process(selected_host_context, monkeypatch, capsys):
     monkeypatch.setattr(sys, "argv", ["note_writer.py"])
     monkeypatch.setattr(sys, "stdin", io.StringIO(""))
 
@@ -599,14 +634,7 @@ def test_write_rejects_empty_vault_path_does_not_leak_into_cwd(tmp_path):
     """Runs the real CLI with cwd=tmp_path — standing in for "the user's
     repo root", which every skill call site cds into before invoking the
     CLI — and asserts nothing lands there when vault_path is empty."""
-    result = subprocess.run(
-        [sys.executable, str(NOTE_WRITER), "write", "", "claude-insights", "leak.md"],
-        input="leak content\n",
-        capture_output=True,
-        text=True,
-        timeout=30,
-        cwd=str(tmp_path),
-    )
+    result = _native_child(['write', '', 'claude-insights', 'leak.md'], input='leak content\n', capture_output=True, text=True, timeout=30, cwd=str(tmp_path))
 
     assert result.returncode == 1
     assert "ERROR" in result.stderr
@@ -619,14 +647,7 @@ def test_write_rejects_relative_vault_path(tmp_path):
     also resolves against the CWD rather than a fixed vault root."""
     (tmp_path / "some" / "dir").mkdir(parents=True)
 
-    result = subprocess.run(
-        [sys.executable, str(NOTE_WRITER), "write", "some/dir", "claude-insights", "leak.md"],
-        input="x\n",
-        capture_output=True,
-        text=True,
-        timeout=30,
-        cwd=str(tmp_path),
-    )
+    result = _native_child(['write', 'some/dir', 'claude-insights', 'leak.md'], input='x\n', capture_output=True, text=True, timeout=30, cwd=str(tmp_path))
 
     assert result.returncode == 1
     assert "ERROR" in result.stderr
@@ -697,7 +718,7 @@ def test_validate_folder_and_filename_in_process():
     assert note_writer._validate_filename("2026-07-25-retro-a3f2.md") is None
 
 
-def test_run_write_in_process_rejects_invalid_folder_no_write_vault_note_call(
+def test_run_write_in_process_rejects_invalid_folder_no_write_vault_note_call(selected_host_context,
     tmp_path, monkeypatch, capsys
 ):
     """In-process counterpart to the validation-rejection branch in
@@ -758,13 +779,7 @@ def _run_append_update(
         args += ["--last-updated", last_updated]
     if add_tags is not None:
         args += ["--add-tags", add_tags]
-    return subprocess.run(
-        [sys.executable, str(NOTE_WRITER), *args],
-        input=update_text,
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
+    return _native_child([*args], input=update_text, capture_output=True, text=True, timeout=30)
 
 
 def _make_note(vault: Path, folder: str, filename: str, content: str) -> Path:
@@ -1248,14 +1263,7 @@ def test_append_update_rejects_empty_vault_path_does_not_touch_cwd(tmp_path):
     note = _make_note(tmp_path, "claude-insights", "note.md", BASIC_NOTE)
     before = note.read_bytes()
 
-    result = subprocess.run(
-        [sys.executable, str(NOTE_WRITER), "append-update", "", str(note)],
-        input=UPDATE_SECTION,
-        capture_output=True,
-        text=True,
-        timeout=30,
-        cwd=str(tmp_path),
-    )
+    result = _native_child(['append-update', '', str(note)], input=UPDATE_SECTION, capture_output=True, text=True, timeout=30, cwd=str(tmp_path))
 
     assert result.returncode == 1
     assert "ERROR" in result.stderr
@@ -1267,14 +1275,7 @@ def test_append_update_rejects_relative_vault_path(tmp_path):
     note = _make_note(tmp_path, "claude-insights", "note.md", BASIC_NOTE)
     before = note.read_bytes()
 
-    result = subprocess.run(
-        [sys.executable, str(NOTE_WRITER), "append-update", ".", str(note)],
-        input=UPDATE_SECTION,
-        capture_output=True,
-        text=True,
-        timeout=30,
-        cwd=str(tmp_path),
-    )
+    result = _native_child(['append-update', '.', str(note)], input=UPDATE_SECTION, capture_output=True, text=True, timeout=30, cwd=str(tmp_path))
 
     assert result.returncode == 1
     assert "ERROR" in result.stderr
@@ -1460,7 +1461,7 @@ def test_parse_append_update_flags_in_process():
 # In-process tests -- run_append_update()/main() dispatch
 # ---------------------------------------------------------------------------
 
-def test_run_append_update_in_process_success(tmp_path, capsys):
+def test_run_append_update_in_process_success(selected_host_context, tmp_path, capsys):
     vault = tmp_path / "vault"
     note = _make_note(vault, "claude-insights", "insight.md", BASIC_NOTE)
 
@@ -1472,7 +1473,7 @@ def test_run_append_update_in_process_success(tmp_path, capsys):
     assert "## Update (2026-07-25)" in note.read_text(encoding="utf-8")
 
 
-def test_run_append_update_forced_write_error_path_file_unchanged(
+def test_run_append_update_forced_write_error_path_file_unchanged(selected_host_context,
     tmp_path, monkeypatch, capsys
 ):
     """Forces _atomic_rewrite's error branch directly, mirroring
@@ -1496,7 +1497,7 @@ def test_run_append_update_forced_write_error_path_file_unchanged(
     assert note.read_bytes() == before
 
 
-def test_main_append_update_dispatch_success_in_process(tmp_path, monkeypatch, capsys):
+def test_main_append_update_dispatch_success_in_process(selected_host_context, tmp_path, monkeypatch, capsys):
     vault = tmp_path / "vault"
     note = _make_note(vault, "claude-insights", "insight.md", BASIC_NOTE)
 
@@ -1515,7 +1516,7 @@ def test_main_append_update_dispatch_success_in_process(tmp_path, monkeypatch, c
     assert "last_updated: 2026-07-25" in written
 
 
-def test_main_append_update_flag_error_exits_2_in_process(monkeypatch, capsys):
+def test_main_append_update_flag_error_exits_2_in_process(selected_host_context, monkeypatch, capsys):
     monkeypatch.setattr(
         sys, "argv", ["note_writer.py", "append-update", "vault", "note.md", "--bogus"]
     )
@@ -1542,7 +1543,7 @@ def test_main_append_update_flag_error_exits_2_in_process(monkeypatch, capsys):
 # for the `write` command's equivalent).
 # ---------------------------------------------------------------------------
 
-def test_run_append_update_in_process_rejects_path_outside_vault(tmp_path, capsys):
+def test_run_append_update_in_process_rejects_path_outside_vault(selected_host_context, tmp_path, capsys):
     vault = tmp_path / "vault"
     vault.mkdir()
     outside = tmp_path / "outside.md"
@@ -1557,7 +1558,7 @@ def test_run_append_update_in_process_rejects_path_outside_vault(tmp_path, capsy
     assert outside.read_bytes() == before
 
 
-def test_run_append_update_in_process_rejects_directory_as_note_path(tmp_path, capsys):
+def test_run_append_update_in_process_rejects_directory_as_note_path(selected_host_context, tmp_path, capsys):
     """Also exercises _resolve_note_path's is_file() branch (line coverage
     for the 'not a regular file' rejection) in-process."""
     vault = tmp_path / "vault"
@@ -1572,7 +1573,7 @@ def test_run_append_update_in_process_rejects_directory_as_note_path(tmp_path, c
     assert not_a_file.is_dir()
 
 
-def test_run_append_update_in_process_unreadable_file_reports_cannot_read(
+def test_run_append_update_in_process_unreadable_file_reports_cannot_read(selected_host_context,
     tmp_path, capsys
 ):
     """Forces the `except OSError` branch around the read (distinct from
@@ -1592,7 +1593,7 @@ def test_run_append_update_in_process_unreadable_file_reports_cannot_read(
     assert captured.err.strip().startswith("ERROR: cannot read")
 
 
-def test_run_append_update_in_process_malformed_frontmatter_variants(tmp_path, capsys):
+def test_run_append_update_in_process_malformed_frontmatter_variants(selected_host_context, tmp_path, capsys):
     vault = tmp_path / "vault"
 
     no_fm = _make_note(
@@ -1613,7 +1614,7 @@ def test_run_append_update_in_process_malformed_frontmatter_variants(tmp_path, c
     assert "no closing '---'" in capsys.readouterr().err
 
 
-def test_run_append_update_in_process_missing_date_field_still_writes(tmp_path, capsys):
+def test_run_append_update_in_process_missing_date_field_still_writes(selected_host_context, tmp_path, capsys):
     """In-process counterpart: no `date:` anchor is no longer fatal."""
     vault = tmp_path / "vault"
     note = _make_note(
@@ -1630,7 +1631,7 @@ def test_run_append_update_in_process_missing_date_field_still_writes(tmp_path, 
     assert "last_updated: 2026-07-25\n" in note.read_text(encoding="utf-8")
 
 
-def test_run_append_update_in_process_inserts_before_marker_hitting_loop_break(
+def test_run_append_update_in_process_inserts_before_marker_hitting_loop_break(selected_host_context,
     tmp_path, capsys
 ):
     """Exercises the insertion_idx scan loop's break branch directly (the
@@ -1649,14 +1650,10 @@ def test_run_append_update_in_process_inserts_before_marker_hitting_loop_break(
     assert written.index("## Update (2026-07-25)") < written.index("## Tool Usage")
 
 
-def test_atomic_rewrite_forces_inner_and_outer_exception_branches(
+def test_atomic_rewrite_forces_inner_and_outer_exception_branches(selected_host_context,
     tmp_path, monkeypatch, capsys
 ):
-    """Forces os.rename to fail AFTER the temp file has already been written
-    and chmod'd, driving _atomic_rewrite through its inner except (unlink
-    the temp file, re-raise) and outer except (format the error string) in
-    one call -- the forced-error test above only fakes _atomic_rewrite's
-    return value wholesale and never actually runs its body."""
+    """A failed replacement preserves the note and removes its temporary file."""
     vault = tmp_path / "vault"
     note = _make_note(vault, "claude-insights", "insight.md", BASIC_NOTE)
     before = note.read_bytes()
@@ -1664,16 +1661,18 @@ def test_atomic_rewrite_forces_inner_and_outer_exception_branches(
     def _boom_rename(*a, **k):
         raise OSError("forced rename failure for test")
 
-    monkeypatch.setattr(note_writer.os, "rename", _boom_rename)
+    import note_transactions
+    monkeypatch.setattr(note_transactions.os, "replace", _boom_rename)
 
-    err = note_writer._atomic_rewrite(note, "new content\n")
+    err = note_writer._atomic_rewrite(note, "new content\n", context=selected_host_context)
 
     assert err is not None
     assert "forced rename failure" in err
     assert note.read_bytes() == before
     # the temp file was cleaned up, not left behind
-    leftover = list(note.parent.glob(".ob-*.md.tmp"))
+    leftover = list(note.parent.glob(".ob-*.tmp"))
     assert leftover == []
+
 
 
 # ===========================================================================
@@ -1780,7 +1779,7 @@ def test_normalize_eol_in_process():
     assert note_writer._normalize_eol("a\nb\r\nc\r", "\r\n") == "a\r\nb\r\nc\r"
 
 
-def test_atomic_rewrite_writes_content_bytes_verbatim_no_translation(tmp_path):
+def test_atomic_rewrite_writes_content_bytes_verbatim_no_translation(selected_host_context, tmp_path):
     """_atomic_rewrite's own newline="" write path: content containing
     literal CRLF sequences must land on disk exactly as given, byte for
     byte -- not translated in either direction."""
@@ -1788,7 +1787,7 @@ def test_atomic_rewrite_writes_content_bytes_verbatim_no_translation(tmp_path):
     note = _make_note(vault, "claude-insights", "insight.md", BASIC_NOTE)
     content = "line one\r\nline two\r\nline three\r\n"
 
-    err = note_writer._atomic_rewrite(note, content)
+    err = note_writer._atomic_rewrite(note, content, context=selected_host_context)
 
     assert err is None
     assert note.read_bytes() == content.encode("utf-8")
@@ -1942,7 +1941,7 @@ def test_append_update_eof_no_trailing_newline_gets_blank_line_separator(tmp_pat
     assert "Body content here.\n## Update" not in written
 
 
-def test_run_append_update_in_process_eof_no_trailing_newline(tmp_path, capsys):
+def test_run_append_update_in_process_eof_no_trailing_newline(selected_host_context, tmp_path, capsys):
     vault = tmp_path / "vault"
     note = _make_note(vault, "claude-insights", "insight.md", NO_TRAILING_NEWLINE_NOTE)
 
@@ -1979,7 +1978,7 @@ def test_append_update_stdin_update_text_without_trailing_newline_gets_one(tmp_p
     assert "No trailing newline here.\n## Tool Usage" not in written
 
 
-def test_run_append_update_in_process_update_text_without_trailing_newline(tmp_path):
+def test_run_append_update_in_process_update_text_without_trailing_newline(selected_host_context, tmp_path):
     """In-process counterpart of the subprocess test above -- a subprocess
     call is invisible to coverage.py, so this exercises the
     `if not block_text.endswith(eol): block_text += eol` branch directly.
@@ -2566,7 +2565,7 @@ def test_validate_update_text_in_process():
     assert note_writer._validate_update_text("## Update\n") is None
 
 
-def test_run_write_in_process_refuses_existing_note(tmp_path, capsys):
+def test_run_write_in_process_refuses_existing_note(selected_host_context, tmp_path, capsys):
     vault = tmp_path / "vault"
     (vault / "claude-insights").mkdir(parents=True)
     dest = vault / "claude-insights" / "x.md"
@@ -2587,7 +2586,7 @@ def test_run_write_in_process_refuses_existing_note(tmp_path, capsys):
     assert dest.read_text(encoding="utf-8") == MINIMAL_FM + "new\n"
 
 
-def test_run_append_update_in_process_content_and_flag_errors(tmp_path, capsys):
+def test_run_append_update_in_process_content_and_flag_errors(selected_host_context, tmp_path, capsys):
     vault = tmp_path / "vault"
     note = _make_note(vault, "claude-insights", "n.md", BASIC_NOTE)
     before = note.read_bytes()
@@ -2611,7 +2610,7 @@ def test_run_append_update_in_process_content_and_flag_errors(tmp_path, capsys):
     assert note.read_bytes() == before
 
 
-def test_run_append_update_in_process_frontmatter_only_no_trailing_newline(tmp_path):
+def test_run_append_update_in_process_frontmatter_only_no_trailing_newline(selected_host_context, tmp_path):
     """In-process counterpart of the closing-fence weld fix."""
     vault = tmp_path / "vault"
     note = _make_note(
@@ -2673,7 +2672,7 @@ def test_write_symlinked_folder_cannot_escape_vault(tmp_path):
     assert not (vault / "linkdir" / "evil.md").exists()
 
 
-def test_write_symlinked_folder_escape_blocked_in_process(tmp_path, capsys):
+def test_write_symlinked_folder_escape_blocked_in_process(selected_host_context, tmp_path, capsys):
     """In-process mirror so coverage.py sees run_write's error branch for this
     vector (the subprocess run above is not instrumented)."""
     vault = tmp_path / "vault"
@@ -3035,7 +3034,7 @@ def test_validate_last_updated_anchoring_in_process():
     assert note_writer._validate_last_updated("٢٠٢٦-٠١-٠١") is not None
 
 
-def test_run_append_update_in_process_unmergeable_tags_error(tmp_path, capsys):
+def test_run_append_update_in_process_unmergeable_tags_error(selected_host_context, tmp_path, capsys):
     """In-process counterpart for the tag-merge error branch (a subprocess run
     is invisible to coverage.py)."""
     vault = tmp_path / "vault"
@@ -3490,7 +3489,7 @@ def test_write_then_append_update_round_trips(tmp_path):
 
 # --- C-008: concurrent write detection -------------------------------------
 
-def test_atomic_rewrite_refuses_when_the_file_changed_since_it_was_read(tmp_path):
+def test_atomic_rewrite_refuses_when_the_file_changed_since_it_was_read(selected_host_context, tmp_path):
     """C-008. Unlocked read-modify-write: two concurrent append-updates both
     exited 0 and one writer's update section AND tag vanished."""
     dest = tmp_path / "note.md"
@@ -3505,7 +3504,7 @@ def test_atomic_rewrite_refuses_when_the_file_changed_since_it_was_read(tmp_path
     assert list(tmp_path.glob(".ob-*.md.tmp")) == []  # temp cleaned up
 
 
-def test_append_update_detects_a_concurrent_writer_end_to_end(tmp_path, capsys):
+def test_append_update_detects_a_concurrent_writer_end_to_end(selected_host_context, tmp_path, capsys):
     """End-to-end: another process rewrites the note between our read and our
     rename. Must fail loudly and leave the OTHER writer's content intact."""
     vault = tmp_path / "vault"
@@ -3537,39 +3536,30 @@ def test_append_update_detects_a_concurrent_writer_end_to_end(tmp_path, capsys):
 
 # --- C-008: the note lock ---------------------------------------------------
 
-def test_append_update_refuses_while_another_process_holds_the_lock(tmp_path):
-    """The stat re-check alone was measured to be insufficient: two
-    simultaneous append-updates both read the original, both re-checked while
-    it was still original, and both renamed — 5/5 trials lost one writer's
-    update at rc 0. The O_EXCL lock closes that window."""
+def test_append_update_refuses_while_another_process_holds_the_lock(selected_host_context, tmp_path):
+    """The shared flock excludes a child writer and preserves the note."""
+    from note_transactions import ownership_lock
     vault = tmp_path / "vault"
     note = _make_note(vault, "claude-insights", "insight.md", BASIC_NOTE)
     before = note.read_bytes()
-    lock = note.parent / f".{note.name}.ob-lock"
-    lock.write_text("99999\n", encoding="utf-8")  # a live holder
-
-    result = _run_append_update(vault, note, UPDATE_SECTION, add_tags="claude/topic/x")
-
+    with ownership_lock(selected_host_context):
+        result = _run_append_update(vault, note, UPDATE_SECTION, add_tags="claude/topic/x")
     assert result.returncode == 1
     assert "lock held" in result.stderr
     assert note.read_bytes() == before
-    assert lock.exists()  # someone else's lock must not be removed
 
 
-def test_append_update_takes_over_a_stale_lock(tmp_path):
-    """A crashed process must not wedge a note forever."""
+def test_append_update_ignores_obsolete_pid_lock(tmp_path):
+    """A stale or reused PID cannot override the shared ownership lock."""
     vault = tmp_path / "vault"
     note = _make_note(vault, "claude-insights", "insight.md", BASIC_NOTE)
     lock = note.parent / f".{note.name}.ob-lock"
-    lock.write_text("1\n", encoding="utf-8")
-    stale = time.time() - (note_writer._STALE_LOCK_SECONDS + 5)
-    os.utime(lock, (stale, stale))
-
+    lock.write_text(str(os.getpid()) + "\n", encoding="utf-8")
+    before = lock.read_bytes()
     result = _run_append_update(vault, note, UPDATE_SECTION)
-
     assert result.returncode == 0, result.stderr
     assert "## Update (2026-07-25)" in note.read_text(encoding="utf-8")
-    assert not lock.exists()  # taken over, then released
+    assert lock.read_bytes() == before  # Compatibility artifacts are untouched.
 
 
 def test_append_update_releases_the_lock_on_success_and_on_failure(tmp_path):
@@ -3643,18 +3633,22 @@ def test_acquire_lock_reports_unwritable_directory(tmp_path, monkeypatch):
     def _boom(path, flags, *a, **kw):
         raise PermissionError(13, "read-only")
 
-    monkeypatch.setattr(os, "open", _boom)
-    lock, err = note_writer._acquire_lock(dest)
+    with monkeypatch.context() as permission_failure:
+        permission_failure.setattr(os, "open", _boom)
+        lock, err = note_writer._acquire_lock(dest)
 
-    assert lock is None
-    assert "cannot create lock file" in err
+        assert lock is None
+        assert "cannot create lock file" in err
 
 
-def test_run_append_update_in_process_reports_lock_contention(tmp_path, capsys):
+def test_run_append_update_in_process_reports_lock_contention(selected_host_context, tmp_path, capsys, monkeypatch):
     vault = tmp_path / "vault"
     note = _make_note(vault, "claude-insights", "n.md", BASIC_NOTE)
     before = note.read_bytes()
-    (note.parent / f".{note.name}.ob-lock").write_text("1\n", encoding="utf-8")
+    import note_transactions
+    def busy(*args):
+        raise note_transactions.LockBusy("Held by another writer")
+    monkeypatch.setattr(note_transactions, "ownership_lock", busy)
 
     rc = note_writer.run_append_update(str(vault), str(note), UPDATE_SECTION)
 

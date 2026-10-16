@@ -1,7 +1,7 @@
 """L2 pre-filter for /check-items Stage 4.
 
 Deterministic triage that classifies items with no plausible completion
-evidence as ACTIVE/STALE without dispatching a claude -p sub-agent.
+evidence as ACTIVE/STALE without dispatching native analysis.
 Python stdlib only. Per spec docs/superpowers/specs/2026-05-15-check-items-call-reduction-design.md.
 """
 from __future__ import annotations

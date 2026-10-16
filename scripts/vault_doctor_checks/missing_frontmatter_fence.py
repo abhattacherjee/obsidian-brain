@@ -36,6 +36,8 @@ parse. Notes with invalid UTF-8 are skipped — that is
 
 from __future__ import annotations
 
+from . import vault_scan, repair_batch, repair_write, repair_read
+
 import os
 import re
 import shutil
@@ -205,6 +207,7 @@ def _project_matches(note_project: str, filter_project: str | None) -> bool:
     return note_project.lower() == filter_project.lower()
 
 
+@vault_scan
 def scan(
     vault_path: str,
     sessions_folder: str,
@@ -273,6 +276,7 @@ def scan(
     return issues
 
 
+@repair_batch
 def apply(issues: list[Issue], backup_root: str) -> list[Result]:
     """Insert the missing ``---`` opening fence, atomically."""
     results: list[Result] = []
@@ -312,7 +316,7 @@ def apply(issues: list[Issue], backup_root: str) -> list[Result]:
             backup_dir.mkdir(parents=True, exist_ok=True)
             backup_path = backup_dir / Path(note_path).name
             shutil.copy2(note_path, backup_path)
-        except OSError as exc:
+        except (OSError, UnicodeDecodeError) as exc:
             results.append(Result(
                 check=NAME,
                 note_path=note_path,
@@ -332,20 +336,8 @@ def apply(issues: list[Issue], backup_root: str) -> list[Result]:
             # one line; it is not the place to silently re-permission a user
             # file. Copying the source mode can only ever reproduce what the
             # user already has, never widen it.
-            mode = os.stat(note_path).st_mode & 0o7777
-            fd, tmp = tempfile.mkstemp(
-                dir=str(dest.parent),
-                prefix=".vd-fence-",
-                suffix=".tmp",
-            )
-            try:
-                os.write(fd, new_bytes)
-                os.fsync(fd)
-            finally:
-                os.close(fd)
-            os.chmod(tmp, mode)
-            os.replace(tmp, str(dest))
-        except OSError as exc:
+            repair_write(note_path, new_bytes.decode("utf-8"))
+        except (OSError, UnicodeDecodeError) as exc:
             if tmp is not None:
                 try:
                     os.unlink(tmp)

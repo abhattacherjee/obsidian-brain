@@ -1,44 +1,15 @@
 #!/usr/bin/env bash
 # Usage: ./scripts/test-security.sh
-# Validates security hardening against the resolved obsidian-brain install:
-# the marketplace-registered directory-source checkout when there is one (#278),
-# otherwise the plugin cache — in which case run /dev-test install first.
+# Validates security hardening against the installation containing this script.
 # Does NOT require a Claude Code session — tests Python directly.
 # Set OB_HOOKS_DIR=hooks to test repo hooks directly (used in CI).
 set -euo pipefail
 
-if [ -n "${OB_HOOKS_DIR:-}" ]; then
-    HOOKS_DIR="$OB_HOOKS_DIR"
-else
-    # Canonical obsidian-brain hooks resolver (#278): marketplace-registered
-    # install location first, allowlisted-and-version-sorted cache fallback.
-    HOOKS_DIR=$(python3 -c '
-import glob, json, os, re
-def _ob_hooks():
-    try:
-        for _m in json.load(open(os.path.expanduser("~/.claude/plugins/known_marketplaces.json"))).values():
-            _s = _m.get("source") if isinstance(_m, dict) else None
-            if not (isinstance(_s, dict) and _s.get("source") == "directory"):
-                continue
-            _i = _m.get("installLocation") if isinstance(_m, dict) else None
-            if not (isinstance(_i, str) and os.path.isabs(_i)):
-                continue
-            _h = os.path.join(_i, "hooks")
-            if os.path.isfile(os.path.join(_h, "obsidian_utils.py")):
-                return _h
-    except Exception:
-        pass
-    _c = [_d for _d in glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")) if re.fullmatch("[0-9]+([.][0-9]+)*", _d.split("/")[-2])]
-    return max(_c, key=lambda _p: ([int(_n) for _n in _p.split("/")[-2].split(".")], _p), default="")
-print(_ob_hooks())
-')
-fi
-
-if [ -z "$HOOKS_DIR" ]; then
-    echo "FAIL: No obsidian-brain hooks found (checked the marketplace-registered"
-    echo "      directory-source install location, then the plugin cache). On a"
-    echo "      directory-source install, checking out the right branch in the"
-    echo "      registered checkout is enough; otherwise run /dev-test install first."
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+RESOURCE_ROOT=$(python3 "$SCRIPT_DIR/dev-test/loaded_resource_root.py" "$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")")
+HOOKS_DIR="${OB_HOOKS_DIR:-$RESOURCE_ROOT/hooks}"
+if [ ! -f "$HOOKS_DIR/obsidian_utils.py" ]; then
+    echo "FAIL: Selected hooks sentinel is missing." >&2
     exit 1
 fi
 
@@ -297,12 +268,13 @@ assert 'ESCAPE' in src, 'LIKE ESCAPE clause missing in vault_index'
 # --- Test 8: commit-preflight.sh injection fix (H4) ---
 run_test "H4: commit-preflight.sh uses sys.argv for PROJECT_HASH" \
     python3 -c "
-with open('scripts/commit-preflight.sh') as f:
+import sys
+with open(sys.argv[1]) as f:
     src = f.read()
 assert 'sys.argv[1]' in src, 'commit-preflight still interpolates path'
 # Verify old vulnerable pattern is gone
 assert \"hashlib.md5('\$(realpath\" not in src, 'old vulnerable pattern still present'
-"
+" "$RESOURCE_ROOT/scripts/commit-preflight.sh"
 
 # --- Test 9: flip_note_status exists (M5) ---
 run_test "M5: flip_note_status function exists" \

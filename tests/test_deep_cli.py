@@ -23,6 +23,14 @@ import deep_cli
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture
+def tmp_vault(selected_host_context):
+    vault = selected_host_context.vault_path
+    for folder in ("claude-sessions", "claude-insights"):
+        (vault / folder).mkdir()
+    return vault
+
+
 def _patch_config(monkeypatch, tmp_vault):
     """Point deep_cli's load_config (imported inside the functions from
     obsidian_utils) at tmp_vault."""
@@ -50,7 +58,13 @@ def _run_batch_edit(monkeypatch, tmp_vault, edits, capsys):
     """Invoke run_batch_edit with `edits` on stdin; return (stdout, stderr)."""
     _patch_config(monkeypatch, tmp_vault)
     monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(edits)))
-    deep_cli.run_batch_edit()
+    from runtime_context import current_runtime_context
+    from tests.test_host_deep_edit_revisions import prepared
+    from pathlib import Path
+    context = current_runtime_context()
+    # These guard cases have no AI phase; prepare the reviewed sources now.
+    identifier, revisions = prepared(context, {Path(edit[0]) for edit in edits})
+    deep_cli.run_batch_edit(expected_revisions=revisions, operation_id=identifier)
     cap = capsys.readouterr()
     return cap.out, cap.err
 

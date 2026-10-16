@@ -104,3 +104,10 @@ def test_unreadable_note_encoding_error_sets_fallback_reason(tmp_path):
     assert status.startswith("Failed: cannot read"), status
     assert fallback_reason == "unreadable_note"
     assert model_used is None
+
+
+# Every scoped operation uses the same selected temporary vault.
+from selected_legacy_vault import selected_host_context, native_ai_frontend  # noqa: F401,E402
+import pytest
+
+pytestmark = pytest.mark.usefixtures("selected_host_context")

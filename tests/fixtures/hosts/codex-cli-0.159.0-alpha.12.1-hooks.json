@@ -1,0 +1,112 @@
+{
+  "client": "codex-cli",
+  "version": "0.159.0-alpha.12.1",
+  "method": "hooks/list",
+  "response": {
+    "data": [
+      {
+        "cwd": "<sandbox>",
+        "hooks": [
+          {
+            "key": "obsidian-brain@obsidian-brain-repo:hooks/hooks.json:pre_compact:0:0",
+            "eventName": "preCompact",
+            "handlerType": "command",
+            "command": "python3 <plugin>/hooks/obsidian_context_snapshot.py",
+            "async": false,
+            "matcher": null,
+            "timeoutSec": 600,
+            "statusMessage": null,
+            "additionalContextLimit": null,
+            "sourcePath": "<plugin>/hooks/hooks.json",
+            "source": "plugin",
+            "pluginId": "obsidian-brain@obsidian-brain-repo",
+            "displayOrder": 0,
+            "enabled": true,
+            "isManaged": false,
+            "currentHash": "sha256:062e929e7c78437d4e2a5a01c696394703e145f4581128d673525e59d5f39cba",
+            "trustStatus": "untrusted"
+          },
+          {
+            "key": "obsidian-brain@obsidian-brain-repo:hooks/hooks.json:session_start:0:0",
+            "eventName": "sessionStart",
+            "handlerType": "command",
+            "command": "python3 <plugin>/hooks/obsidian_session_hint.py",
+            "async": false,
+            "matcher": "startup|resume|clear|compact",
+            "timeoutSec": 600,
+            "statusMessage": null,
+            "additionalContextLimit": null,
+            "sourcePath": "<plugin>/hooks/hooks.json",
+            "source": "plugin",
+            "pluginId": "obsidian-brain@obsidian-brain-repo",
+            "displayOrder": 1,
+            "enabled": true,
+            "isManaged": false,
+            "currentHash": "sha256:5fbfa1fe41972a76c12496723442ff2e671e103b5793e296549a19635ce0f149",
+            "trustStatus": "untrusted"
+          },
+          {
+            "key": "obsidian-brain@obsidian-brain-repo:hooks/hooks.json:session_end:0:0",
+            "eventName": "sessionEnd",
+            "handlerType": "command",
+            "command": "python3 <plugin>/hooks/obsidian_session_log.py",
+            "async": false,
+            "matcher": null,
+            "timeoutSec": 1,
+            "statusMessage": null,
+            "additionalContextLimit": null,
+            "sourcePath": "<plugin>/hooks/hooks.json",
+            "source": "plugin",
+            "pluginId": "obsidian-brain@obsidian-brain-repo",
+            "displayOrder": 2,
+            "enabled": true,
+            "isManaged": false,
+            "currentHash": "sha256:53d3986ae642dd80684ecf64e994f08216d1c1e7002fb834a367a3e76d28beea",
+            "trustStatus": "untrusted"
+          },
+          {
+            "key": "obsidian-brain@obsidian-brain-repo:hooks/hooks.json:stop:0:0",
+            "eventName": "stop",
+            "handlerType": "command",
+            "command": "python3 <plugin>/hooks/obsidian_retro_gate.py",
+            "async": false,
+            "matcher": null,
+            "timeoutSec": 600,
+            "statusMessage": null,
+            "additionalContextLimit": null,
+            "sourcePath": "<plugin>/hooks/hooks.json",
+            "source": "plugin",
+            "pluginId": "obsidian-brain@obsidian-brain-repo",
+            "displayOrder": 3,
+            "enabled": true,
+            "isManaged": false,
+            "currentHash": "sha256:399d75c2f0cddcdf4d6c99da521e1917660939a45d8bddd89f4a1918da9e53ae",
+            "trustStatus": "untrusted"
+          },
+          {
+            "key": "obsidian-parity-probe@obsidian-parity-probe-market:hooks/codex-hooks.json:session_end:0:0",
+            "eventName": "sessionEnd",
+            "handlerType": "command",
+            "command": "python3 -c 'print(\"{}\")'",
+            "async": false,
+            "matcher": null,
+            "timeoutSec": 3,
+            "statusMessage": null,
+            "additionalContextLimit": null,
+            "sourcePath": "<probe-plugin>/hooks/codex-hooks.json",
+            "source": "plugin",
+            "pluginId": "obsidian-parity-probe@obsidian-parity-probe-market",
+            "displayOrder": 4,
+            "enabled": true,
+            "isManaged": false,
+            "currentHash": "sha256:858ac50260ce212b908e699fd8d458795d14d9c83313325143cc3c5c824b07d1",
+            "trustStatus": "untrusted"
+          }
+        ],
+        "warnings": [],
+        "errors": []
+      }
+    ]
+  },
+  "recorded_at": "2026-10-05"
+}

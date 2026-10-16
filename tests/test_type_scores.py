@@ -69,7 +69,7 @@ def test_scan_finds_exactly_the_known_types():
     # quietly pull in a new type; a real new writer updates this list on purpose.
     assert collect_written_types() == _ORIGINAL_TYPES | {
         "claude-snapshot", "claude-memory", "claude-emerge", "claude-stats",
-        "claude-check-items-report", "claude-wiki", "claude-wiki-index",
+        "claude-check-items-report", "claude-wiki", "claude-wiki-index", "claude-dashboard",
     }
 
 
@@ -142,3 +142,18 @@ def test_unindexed_types_need_no_weight():
     # claude-wiki-index notes never reach the index, so they never get a score.
     for ctx in vault_index._TYPE_SCORES_BY_CONTEXT:
         assert not (vault_index._UNINDEXED_TYPES & set(vault_index.get_type_scores(ctx))), ctx
+
+
+
+def test_equal_text_dashboard_ranks_like_scaffolding_below_curated_evidence():
+    base = {'title':'Same query', 'body':'Identical useful query terms.', 'rank':-3.0,
+            'tags':'', 'date':'2026-10-06', 'importance':5}
+    candidates = [dict(base,path='dashboard.md',type='claude-dashboard'),
+                  dict(base,path='report.md',type='claude-check-items-report'),
+                  dict(base,path='insight.md',type='claude-insight')]
+    for context in ('debugging','standup','search','emerge','general'):
+        ranked = vault_index.rerank_results(candidates,['query','terms'],task_context=context)
+        assert ranked[0]['path'] == 'insight.md'
+        scores = {row['path']:row['rerank_score'] for row in ranked}
+        assert scores['dashboard.md'] == scores['report.md']
+        assert scores['dashboard.md'] < scores['insight.md']

@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import pytest
+from selected_legacy_vault import selected_host_context
+pytestmark = pytest.mark.usefixtures("selected_host_context")
+
 import os
 import sys
 

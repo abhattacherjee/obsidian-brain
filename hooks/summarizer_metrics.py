@@ -12,8 +12,11 @@ import json
 import os
 import sys
 from pathlib import Path
+from runtime_context import current_runtime_context
+from runtime_adapters import metrics_path
+from runtime_adapters.claude import legacy_metrics_path
 
-METRICS_PATH: Path = Path.home() / ".claude" / "obsidian-brain-summarizer-metrics.jsonl"
+METRICS_PATH: Path = legacy_metrics_path()
 ROTATE_BYTES: int = 100 * 1024  # 100 KB
 
 
@@ -21,21 +24,23 @@ def append_metrics_record(record: dict) -> None:
     """Append one record as a JSON line. Rotates at ROTATE_BYTES.
     Swallows all errors after a single stderr warning per call."""
     try:
-        parent = METRICS_PATH.parent
+        context = current_runtime_context()
+        path = metrics_path(context) if context is not None else METRICS_PATH
+        parent = path.parent
         parent.mkdir(mode=0o700, exist_ok=True)
 
         # Rotate first if the existing file is over the threshold. Check BEFORE
         # append so the post-rotation file contains only this call's line.
-        if METRICS_PATH.exists() and METRICS_PATH.stat().st_size > ROTATE_BYTES:
-            rotated = METRICS_PATH.with_suffix(".jsonl.1")
-            os.replace(METRICS_PATH, rotated)  # atomic; overwrites any prior
+        if path.exists() and path.stat().st_size > ROTATE_BYTES:
+            rotated = path.with_suffix(".jsonl.1")
+            os.replace(path, rotated)  # atomic; overwrites any prior
 
         line = json.dumps(record, separators=(",", ":"), ensure_ascii=False) + "\n"
-        new_file = not METRICS_PATH.exists()
-        with open(METRICS_PATH, "a", encoding="utf-8") as f:
+        new_file = not path.exists()
+        with open(path, "a", encoding="utf-8") as f:
             f.write(line)
         if new_file:
-            os.chmod(METRICS_PATH, 0o600)
+            os.chmod(path, 0o600)
     except Exception as exc:  # noqa: BLE001 — instrumentation never raises
         try:
             print(

@@ -13,10 +13,10 @@ the steady state. See obsidian-brain #308.
 
 Scope
 -----
-The store lives at ``~/.claude/projects/<project-dir>/memory/``, i.e. outside
+The store lives at ``the selected native projects root/<project-dir>/memory/``, i.e. outside
 the Obsidian vault. That is adjacent to but outside vault-doctor's usual
 subject; the precedent is ``session-coverage``, which already walks
-``~/.claude/projects/`` for JSONLs. The vault path is not read by this check.
+``the selected native projects root/`` for JSONLs. The vault path is not read by this check.
 
 ``OPT_IN = True``: a full sweep of the author's machine produced 92 rows
 across 7 projects (measured 2026-08-12), which would drown every other check
@@ -508,14 +508,28 @@ def _scan_store(store: Path, project: str) -> list[Issue]:
     return issues
 
 
-def scan(
+def scan(vault_path, sessions_folder, insights_folder, days, project=None):
+    """Select native memory without borrowing another invoking host's store."""
+    from runtime_context import current_runtime_context, historical_source_roots
+    context = current_runtime_context()
+    if context is not None and context.host != 'claude':
+        print(f'[{NAME}] native memory discovery is unsupported for {context.host}: '
+              'no equivalent native memory-file API', file=sys.stderr)
+        return []
+    projects = context.native_home / 'projects' if context is not None else historical_source_roots('claude')[0]
+    return _scan_claude_memory(vault_path, sessions_folder, insights_folder, days,
+                              project=project, projects_root=projects)
+
+
+def _scan_claude_memory(
     vault_path: str,
     sessions_folder: str,
     insights_folder: str,
     days: int,
     project: str | None = None,
+    projects_root: Path | None = None,
 ) -> list[Issue]:
-    """Walk ``~/.claude/projects/*/memory/`` and report index drift.
+    """Walk ``the selected native projects root/*/memory/`` and report index drift.
 
     ``vault_path``/``sessions_folder``/``insights_folder``/``days`` are part
     of the check interface and are unused here — the store is outside the
@@ -523,10 +537,12 @@ def scan(
     """
     # Path.home() reads $HOME on POSIX (tests monkeypatch it) and falls back
     # to pwd-database lookups when unset — sibling-module convention.
-    projects_root = Path.home() / ".claude" / "projects"
+    if projects_root is None:
+        from runtime_context import historical_source_roots
+        projects_root = historical_source_roots('claude')[0]
     if not projects_root.is_dir():
         print(
-            "[memory-index] ~/.claude/projects not found; nothing to scan",
+            "[memory-index] the selected native projects root not found; nothing to scan",
             file=sys.stderr,
         )
         return []

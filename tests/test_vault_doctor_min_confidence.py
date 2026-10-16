@@ -135,7 +135,7 @@ class TestRangeValidation:
     def test_min_confidence_1_5_exits_3(self, tmp_vault):
         """--min-confidence 1.5 is out of range → exit 3."""
         script = Path(__file__).parent.parent / "scripts" / "vault_doctor.py"
-        r = subprocess.run(
+        r = run_doctor(
             [sys.executable, str(script), "--min-confidence", "1.5", "--json"],
             capture_output=True, text=True, env=tmp_vault,
         )
@@ -147,7 +147,7 @@ class TestRangeValidation:
     def test_min_confidence_neg_0_1_exits_3(self, tmp_vault):
         """--min-confidence -0.1 is out of range → exit 3."""
         script = Path(__file__).parent.parent / "scripts" / "vault_doctor.py"
-        r = subprocess.run(
+        r = run_doctor(
             [sys.executable, str(script), "--min-confidence", "-0.1", "--json"],
             capture_output=True, text=True, env=tmp_vault,
         )
@@ -159,7 +159,7 @@ class TestRangeValidation:
     def test_min_confidence_0_0_valid(self, tmp_vault):
         """--min-confidence 0.0 is valid (default, no issues in empty vault)."""
         script = Path(__file__).parent.parent / "scripts" / "vault_doctor.py"
-        r = subprocess.run(
+        r = run_doctor(
             [sys.executable, str(script), "--check", "source-sessions",
              "--min-confidence", "0.0", "--json"],
             capture_output=True, text=True, env=tmp_vault,
@@ -172,7 +172,7 @@ class TestRangeValidation:
     def test_min_confidence_1_0_valid(self, tmp_vault):
         """--min-confidence 1.0 is valid (edge of range)."""
         script = Path(__file__).parent.parent / "scripts" / "vault_doctor.py"
-        r = subprocess.run(
+        r = run_doctor(
             [sys.executable, str(script), "--check", "source-sessions",
              "--min-confidence", "1.0", "--json"],
             capture_output=True, text=True, env=tmp_vault,
@@ -257,7 +257,7 @@ class TestMinConfidenceCLI:
         vault, env, note_high, note_unresolved = _build_vault_with_mixed_confidence_issues(tmp_path)
         script = Path(__file__).parent.parent / "scripts" / "vault_doctor.py"
 
-        r = subprocess.run(
+        r = run_doctor(
             [sys.executable, str(script),
              "--check", "source-sessions", "--days", "10000", "--project", "proj1",
              "--min-confidence", "0.9", "--json"],
@@ -285,7 +285,7 @@ class TestMinConfidenceCLI:
         vault, env, note_high, note_unresolved = _build_vault_with_mixed_confidence_issues(tmp_path)
         script = Path(__file__).parent.parent / "scripts" / "vault_doctor.py"
 
-        r = subprocess.run(
+        r = run_doctor(
             [sys.executable, str(script),
              "--check", "source-sessions", "--days", "10000", "--project", "proj1",
              "--min-confidence", "0.9"],
@@ -309,7 +309,7 @@ class TestMinConfidenceCLI:
         vault, env, note_high, note_unresolved = _build_vault_with_mixed_confidence_issues(tmp_path)
         script = Path(__file__).parent.parent / "scripts" / "vault_doctor.py"
 
-        r = subprocess.run(
+        r = run_doctor(
             [sys.executable, str(script),
              "--check", "source-sessions", "--days", "10000", "--project", "proj1",
              "--min-confidence", "0.9", "--json"],
@@ -328,7 +328,7 @@ class TestMinConfidenceCLI:
         vault, env, note_high, note_unresolved = _build_vault_with_mixed_confidence_issues(tmp_path)
         script = Path(__file__).parent.parent / "scripts" / "vault_doctor.py"
 
-        r = subprocess.run(
+        r = run_doctor(
             [sys.executable, str(script),
              "--check", "source-sessions", "--days", "10000", "--project", "proj1"],
             capture_output=True, text=True, env=env,
@@ -348,7 +348,7 @@ class TestMinConfidenceCLI:
         vault, env, note_high, note_unresolved = _build_vault_with_mixed_confidence_issues(tmp_path)
         script = Path(__file__).parent.parent / "scripts" / "vault_doctor.py"
 
-        r = subprocess.run(
+        r = run_doctor(
             [sys.executable, str(script),
              "--check", "source-sessions", "--days", "10000", "--project", "proj1",
              "--json"],
@@ -372,7 +372,7 @@ class TestMinConfidenceCLI:
 
         original_unresolved = note_unresolved.read_text(encoding="utf-8")
 
-        r = subprocess.run(
+        r = run_doctor(
             [sys.executable, str(script),
              "--check", "source-sessions", "--days", "10000", "--project", "proj1",
              "--min-confidence", "0.9", "--apply", "--yes"],
@@ -400,7 +400,7 @@ class TestMinConfidenceCLI:
         vault, env, note_high, note_unresolved = _build_vault_with_mixed_confidence_issues(tmp_path)
         script = Path(__file__).parent.parent / "scripts" / "vault_doctor.py"
 
-        r = subprocess.run(
+        r = run_doctor(
             [sys.executable, str(script),
              "--check", "source-sessions", "--days", "10000", "--project", "proj1",
              "--min-confidence", "1.0", "--json"],
@@ -447,7 +447,7 @@ class TestDroppedPerCheck:
         _add_spurious_wikilink_session_note(vault)
         script = Path(__file__).parent.parent / "scripts" / "vault_doctor.py"
 
-        r = subprocess.run(
+        r = run_doctor(
             [sys.executable, str(script),
              "--days", "10000", "--project", "proj1",
              "--min-confidence", "1.0", "--json"],
@@ -475,7 +475,7 @@ class TestDroppedPerCheck:
         _add_spurious_wikilink_session_note(vault)
         script = Path(__file__).parent.parent / "scripts" / "vault_doctor.py"
 
-        r = subprocess.run(
+        r = run_doctor(
             [sys.executable, str(script),
              "--days", "10000", "--project", "proj1",
              "--min-confidence", "1.0"],
@@ -498,7 +498,7 @@ class TestDroppedPerCheck:
         vault, env, note_high, note_unresolved = _build_vault_with_mixed_confidence_issues(tmp_path)
         script = Path(__file__).parent.parent / "scripts" / "vault_doctor.py"
 
-        r = subprocess.run(
+        r = run_doctor(
             [sys.executable, str(script),
              "--check", "source-sessions", "--days", "10000", "--project", "proj1",
              "--min-confidence", "0.9"],
@@ -519,7 +519,7 @@ class TestDroppedPerCheck:
         vault, env, note_high, note_unresolved = _build_vault_with_mixed_confidence_issues(tmp_path)
         script = Path(__file__).parent.parent / "scripts" / "vault_doctor.py"
 
-        r = subprocess.run(
+        r = run_doctor(
             [sys.executable, str(script),
              "--check", "source-sessions", "--days", "10000", "--project", "proj1",
              "--json"],
@@ -545,7 +545,7 @@ class TestAllFilteredCleanLine:
         vault, env, note_high, note_unresolved = _build_vault_with_mixed_confidence_issues(tmp_path)
         script = Path(__file__).parent.parent / "scripts" / "vault_doctor.py"
 
-        r = subprocess.run(
+        r = run_doctor(
             [sys.executable, str(script),
              "--check", "source-sessions", "--days", "10000", "--project", "proj1",
              "--min-confidence", "1.0"],
@@ -587,7 +587,7 @@ class TestAllFilteredCleanLine:
         env["OBSIDIAN_BRAIN_INSIGHTS_FOLDER"] = "claude-insights"
         script = Path(__file__).parent.parent / "scripts" / "vault_doctor.py"
 
-        r = subprocess.run(
+        r = run_doctor(
             [sys.executable, str(script),
              "--check", "source-sessions", "--min-confidence", "0.9"],
             capture_output=True, text=True, env=env,
@@ -639,3 +639,11 @@ class TestInvalidConfidenceGuard:
         assert vault_doctor._confidence_passes(issue, 0.9) is True
         assert vault_doctor._confidence_passes(issue, 1.0) is False  # >= semantics
         assert capsys.readouterr().err == ""
+
+
+import pytest
+from doctor_cli_test_helpers import run_doctor
+
+@pytest.fixture(autouse=True)
+def _selected_doctor_cli_actor(selected_host_context):
+    return selected_host_context

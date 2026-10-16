@@ -977,7 +977,7 @@ class TestDeleteNoteMaintainsThemeState:
 
 
 class TestUpgradeWiresThemes:
-    def test_upgrade_triggers_theme_assignment(self, tmp_vault, mock_config):
+    def test_upgrade_triggers_theme_assignment(self, tmp_vault, mock_config, selected_host_context):
         """After upgrade_note_with_summary(), the note must join a seeded matching theme."""
         import obsidian_utils
 
@@ -1008,7 +1008,7 @@ class TestUpgradeWiresThemes:
         )
 
         import vault_index
-        db_path = str(tmp_vault / "test.db")
+        db_path = str(selected_host_context.index_path)
         vault_index.ensure_index(
             str(tmp_vault), ["claude-sessions"], db_path=db_path,
         )
@@ -1070,7 +1070,7 @@ class TestUpgradeWiresThemes:
             "upgrade_note_with_summary did not trigger theme assignment"
         )
 
-    def test_upgrade_survives_missing_vault_index(self, tmp_vault, mock_config):
+    def test_upgrade_survives_missing_vault_index(self, tmp_vault, mock_config, selected_host_context):
         """If the DB file is missing, upgrade must still succeed (theme pipeline is best-effort)."""
         import obsidian_utils
         import vault_index
@@ -1121,7 +1121,7 @@ class TestUpgradeWiresThemes:
         )
 
     def test_upgrade_skips_theme_assignment_when_parse_fails(
-        self, tmp_vault, mock_config
+        self, tmp_vault, mock_config, selected_host_context
     ):
         """If _parse_note returns None (unparsable note), assign_to_theme must NOT run.
 
@@ -1156,7 +1156,7 @@ class TestUpgradeWiresThemes:
             encoding="utf-8",
         )
 
-        db_path = str(tmp_vault / "test.db")
+        db_path = str(selected_host_context.index_path)
         vault_index.ensure_index(
             str(tmp_vault), ["claude-sessions"], db_path=db_path,
         )
@@ -1312,3 +1312,5 @@ class TestGetTopThemesForProject:
         rows = themes.get_top_themes_for_project(db, "p", top_n=2)
         assert len(rows) == 2
         assert [r["id"] for r in rows] == [5, 4]
+
+from selected_legacy_vault import selected_host_context  # noqa: E402,F401

@@ -1,0 +1,26 @@
+{
+  "client": "claude-code",
+  "client_version": "2.1.291",
+  "fixture_filename": "claude-2.1.291-metadata.jsonl",
+  "fixture_sha256": "ed7ccdf5d6e49b36496c5c4600e23fca911e24aefc8e3af9357bbdc3f4330e8d",
+  "provenance": "Synthetic sanitized template of exact metadata schemas observed by the independent Claude reviewer; not a transcript captured by this implementation agent.",
+  "native_capture_verified": false,
+  "schemas": {
+    "mode": [
+      "type",
+      "mode",
+      "sessionId"
+    ],
+    "ai-title": [
+      "type",
+      "aiTitle",
+      "sessionId"
+    ],
+    "atis-latch": [
+      "type",
+      "atis",
+      "sessionId"
+    ]
+  },
+  "privacy": "All session IDs, message bodies and title are synthetic; no personal corpus copied."
+}

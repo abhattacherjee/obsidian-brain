@@ -62,7 +62,7 @@ def _note(vault, folder, name, ntype, extra="", body="zebracorn body", date="202
 
 
 @pytest.fixture(autouse=True)
-def _no_live_memory(monkeypatch):
+def _no_live_memory(monkeypatch, selected_host_context):
     """Tests never read the real ~/.claude/projects; the mem fixture opts in.
     The listing seam reads through ``_memory_files``, so a test that sets
     ``_memory_files`` also sets what ``stale`` sees."""
@@ -71,8 +71,8 @@ def _no_live_memory(monkeypatch):
 
 
 @pytest.fixture
-def vault(tmp_path):
-    v = tmp_path / "v"
+def vault(tmp_path, selected_host_context):
+    v = selected_host_context.vault_path
     _note(v, "claude-insights", "i1", "claude-insight")
     _note(v, "claude-insights", "i2", "claude-insight")
     _note(v, "claude-insights", "d1", "claude-decision")
@@ -321,7 +321,7 @@ def test_file_happy_path(ctx):
     assert rows[page.name] == "claude-wiki" and "index.md" not in rows and "log-2026.md" not in rows
 
 
-def test_file_golden_page(ctx):
+def test_file_golden_page(ctx, selected_host_context):
     out = wiki.file_page(ctx, _payload(topics=[]), D)
     text = Path(out["path"]).read_text()
     fp = {n: wiki.fingerprint(Path(ctx["vault"]) / "claude-insights" / f"{n}.md") for n in ("i1", "i2", "d1")}
@@ -339,11 +339,14 @@ def test_file_golden_page(ctx):
         f"sources_fingerprint: {json.dumps(fp)}\n"
         'confidence: "high"\n'
         'filed_by: "user"\n'
+        f'author_host: "{selected_host_context.host}"\n'
         "tags:\n  - claude/wiki\n  - claude/wiki/confidence-high\n  - claude/project/demo\n"
         "---\n"
         "Ranking uses bm25.\n\n### Sources\n- [[i1]]\n"
     )
-    assert text == expected
+    # The retry identity is additive; the existing page format remains exact.
+    assert re.search(r'filing_id: "[0-9a-f]{64}"\n', text)
+    assert re.sub(r'filing_id: "[0-9a-f]{64}"\n', "", text) == expected
 
 
 @pytest.mark.parametrize("kw,msg", [
@@ -426,13 +429,29 @@ def test_secrets_scrubbed_from_body_and_question(ctx):
     assert tok not in (_wiki(ctx) / "index.md").read_text()
 
 
-def test_held_lock_refuses_and_writes_nothing(ctx):
-    _wiki(ctx).mkdir(parents=True)
-    lock = _wiki(ctx) / "..wiki.ob-lock"
-    lock.write_text("held")
-    with pytest.raises(wiki.WikiRefusal, match="another process is updating"):
-        wiki.file_page(ctx, _payload(), D)
-    assert _all_files(ctx) == ["..wiki.ob-lock"]
+def test_held_lock_refuses_and_writes_nothing(ctx, selected_host_context):
+    import threading
+    import note_transactions
+    ready, release = threading.Event(), threading.Event()
+    errors = []
+    def owner():
+        try:
+            with note_transactions.ownership_lock(selected_host_context):
+                ready.set()
+                release.wait(4)
+        except BaseException as exc:
+            errors.append(exc)
+    thread = threading.Thread(target=owner)
+    thread.start()
+    try:
+        assert ready.wait(2), errors
+        with pytest.raises(wiki.WikiRefusal, match="owns the vault"):
+            wiki.file_page(ctx, _payload(), D)
+        assert _all_files(ctx) == []
+    finally:
+        release.set()
+        thread.join(3)
+    assert not thread.is_alive() and not errors
 
 
 def test_stale_refresh_below_threshold_leaves_page(ctx):
@@ -625,8 +644,9 @@ def test_corrupt_log_does_not_block_filing(ctx):
     _wiki(ctx).mkdir(parents=True)
     (_wiki(ctx) / "log-2026.md").write_bytes(b"---\ntype: \"claude-wiki-index\"\n---\n\xff\xfe bad\n")
     out = wiki.file_page(ctx, _payload(), D)
-    assert "warning" not in out
-    assert "## [2026-10-04] file" in (_wiki(ctx) / "log-2026.md").read_text(encoding="utf-8")
+    assert Path(out["path"]).is_file()
+    assert out["warning"].startswith("page saved, but the log update failed:")
+    assert (_wiki(ctx) / "log-2026.md").read_bytes().endswith(b"\xff\xfe bad\n")
 
 
 def test_index_and_lookup_show_unescaped_question(ctx):
@@ -771,9 +791,9 @@ def test_index_and_log_writes_are_contained(ctx):
     calls = []
     real = wiki._write
 
-    def spy(c, rel, name, content):
+    def spy(c, rel, name, content, expected_revision="unspecified"):
         calls.append(name)
-        return real(c, rel, name, content)
+        return real(c, rel, name, content, expected_revision)
 
     wiki._write = spy
     try:
@@ -834,14 +854,14 @@ def test_file_records_memory_sources_and_fingerprints(ctx, mem):
     assert "- memory: proj/x.md" in got and "[[proj/x.md]]" not in got
 
 
-def test_stale_sees_a_changed_or_deleted_memory_file(ctx, mem):
+def test_stale_sees_a_changed_or_deleted_memory_file(ctx, mem, host):
     page = Path(wiki.file_page(ctx, _payload(sources=["i1", "i2"], memory_sources=["proj/x.md"]), D)["path"])
     roots = [str(Path(ctx["vault"]) / f) for f in FOLDERS]
-    assert wiki.stale(ctx["db"], page, roots)["reasons"] == []
+    assert wiki.stale(ctx["db"], page, roots)["reasons"] == _memory_expected(host, [])
     mem["x"].write_text("changed\n")
-    assert "changed: memory:proj/x.md" in wiki.stale(ctx["db"], page, roots)["reasons"]
+    assert wiki.stale(ctx["db"], page, roots)["reasons"] == _memory_expected(host, ["changed: memory:proj/x.md"])
     mem["x"].unlink()
-    assert "missing: memory:proj/x.md" in wiki.stale(ctx["db"], page, roots)["reasons"]
+    assert wiki.stale(ctx["db"], page, roots)["reasons"] == _memory_expected(host, ["missing: memory:proj/x.md"])
 
 
 def test_memory_source_without_fingerprint_is_unverifiable(ctx, mem):
@@ -920,16 +940,21 @@ def _block_memory_page(ctx, mem):
     return page
 
 
-def test_block_style_page_with_memory_keys_is_fresh_then_changed(ctx, mem):
+def test_block_style_page_with_memory_keys_is_fresh_then_changed(ctx, mem, host):
     page = _block_memory_page(ctx, mem)
     roots = [str(Path(ctx["vault"]) / f) for f in FOLDERS]
     assert set(wiki.read_page(page)[0]["sources_fingerprint"]) == {
         "i1", "i2", "memory:proj/x.md", "memory:proj/y.md"}
-    assert wiki.stale(ctx["db"], page, roots)["reasons"] == []
+    assert wiki.stale(ctx["db"], page, roots)["reasons"] == _memory_expected(host, [], names=("proj/x.md", "proj/y.md"))
     mem["x"].write_text("edited\n")
     mem["y"].write_text("edited too\n")
-    assert wiki.stale(ctx["db"], page, roots)["reasons"] == [
-        "changed: memory:proj/x.md", "changed: memory:proj/y.md"]
+    assert wiki.stale(ctx["db"], page, roots)["reasons"] == _memory_expected(host, [
+        "changed: memory:proj/x.md", "changed: memory:proj/y.md"], names=("proj/x.md", "proj/y.md"))
+
+
+def _memory_expected(host, claude_reasons, names=("proj/x.md",)):
+    # Codex cannot verify a Claude native-memory store.
+    return claude_reasons if host == "claude" else [f"unverifiable: memory:{name}" for name in names]
 
 
 def _roots_of(ctx):
@@ -940,11 +965,11 @@ def _mem_page(ctx):
     return Path(wiki.file_page(ctx, _payload(sources=["i1", "i2"], memory_sources=["proj/x.md"]), D)["path"])
 
 
-def test_memory_file_gone_from_a_good_listing_is_missing(ctx, mem, monkeypatch):
+def test_memory_file_gone_from_a_good_listing_is_missing(ctx, mem, monkeypatch, host):
     page = _mem_page(ctx)
     mem["x"].unlink()
     monkeypatch.setattr(wiki, "_memory_files", lambda: [mem["y"]])
-    assert wiki.stale(ctx["db"], page, _roots_of(ctx))["reasons"] == ["missing: memory:proj/x.md"]
+    assert wiki.stale(ctx["db"], page, _roots_of(ctx))["reasons"] == _memory_expected(host, ["missing: memory:proj/x.md"])
 
 
 def test_memory_on_another_host_is_unverifiable(ctx, mem, monkeypatch):
@@ -962,14 +987,14 @@ def test_memory_root_error_is_unverifiable(ctx, mem, monkeypatch):
     assert wiki.stale(ctx["db"], page, _roots_of(ctx))["reasons"] == ["unverifiable: memory:proj/x.md"]
 
 
-def test_memory_project_error_is_unverifiable_for_that_project_only(ctx, mem, monkeypatch):
+def test_memory_project_error_is_unverifiable_for_that_project_only(ctx, mem, monkeypatch, host):
     import memory_sources as ms
     page = Path(wiki.file_page(ctx, _payload(sources=["i1", "i2"], memory_sources=["proj/x.md"]), D)["path"])
-    err = [{"path": str(ms._projects_root() / "proj" / "memory"), "error": "Permission denied"}]
+    err = [{"path": str(mem["x"].parent), "error": "Permission denied"}]
     monkeypatch.setattr(wiki, "_memory_listing", lambda: ([], err, "claude-code"))
     assert wiki.stale(ctx["db"], page, _roots_of(ctx))["reasons"] == ["unverifiable: memory:proj/x.md"]
-    err[0]["path"] = str(ms._projects_root() / "other" / "memory")
-    assert wiki.stale(ctx["db"], page, _roots_of(ctx))["reasons"] == ["missing: memory:proj/x.md"]
+    err[0]["path"] = str(mem["x"].parent.parent.parent / "other" / "memory")
+    assert wiki.stale(ctx["db"], page, _roots_of(ctx))["reasons"] == _memory_expected(host, ["missing: memory:proj/x.md"])
 
 
 @pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0, reason="root ignores file permissions")
@@ -983,10 +1008,10 @@ def test_listed_but_unreadable_memory_file_is_unverifiable(ctx, mem):
     assert reasons == ["unverifiable: memory:proj/x.md"]
 
 
-def test_stale_returns_memory_paths(ctx, mem):
+def test_stale_returns_memory_paths(ctx, mem, host):
     page = _mem_page(ctx)
     assert wiki.stale(ctx["db"], page, _roots_of(ctx)) == {
-        "stale": False, "reasons": [], "memory_paths": {"proj/x.md": str(mem["x"])}}
+        "stale": host == "codex", "reasons": _memory_expected(host, []), "memory_paths": {"proj/x.md": str(mem["x"])}}
 
 
 def test_memgrep_reports_unreadable_files(mem, tmp_path):
@@ -996,7 +1021,7 @@ def test_memgrep_reports_unreadable_files(mem, tmp_path):
     assert [s["path"] for s in skipped] == [str(tmp_path / "gone.md")] and skipped[0]["error"]
 
 
-def test_memory_file_and_vault_note_with_one_name_stay_apart(ctx, mem, monkeypatch):
+def test_memory_file_and_vault_note_with_one_name_stay_apart(ctx, mem, monkeypatch, host):
     m = mem["x"].parent / "i1.md"
     m.write_text("memory i1\n")
     monkeypatch.setattr(wiki, "_memory_files", lambda: [mem["x"], mem["y"], m])
@@ -1004,7 +1029,7 @@ def test_memory_file_and_vault_note_with_one_name_stay_apart(ctx, mem, monkeypat
     fps = wiki.read_page(page)[0]["sources_fingerprint"]
     assert {"i1", "memory:proj/i1.md"} <= set(fps) and fps["i1"] != fps["memory:proj/i1.md"]
     m.write_text("memory i1 edited\n")
-    assert wiki.stale(ctx["db"], page, _roots_of(ctx))["reasons"] == ["changed: memory:proj/i1.md"]
+    assert wiki.stale(ctx["db"], page, _roots_of(ctx))["reasons"] == _memory_expected(host, ["changed: memory:proj/i1.md"], names=("proj/i1.md",))
 
 
 def test_memory_paths_cover_fingerprint_keys_missing_from_the_list(ctx, mem):
@@ -1025,13 +1050,13 @@ def _three_mem(mem, monkeypatch):
     return ["proj/x.md", "proj/y.md", "proj/z.md"]
 
 
-def test_memory_only_page_is_fresh_then_changed(ctx, mem, monkeypatch):
+def test_memory_only_page_is_fresh_then_changed(ctx, mem, monkeypatch, host):
     names = _three_mem(mem, monkeypatch)
     page = Path(wiki.file_page(ctx, _payload(sources=[], memory_sources=names), D)["path"])
     assert wiki.read_page(page)[0]["sources"] == []
-    assert wiki.stale(ctx["db"], page, _roots_of(ctx))["reasons"] == []
+    assert wiki.stale(ctx["db"], page, _roots_of(ctx))["reasons"] == _memory_expected(host, [], names=names)
     mem["y"].write_text("edited\n")
-    assert wiki.stale(ctx["db"], page, _roots_of(ctx))["reasons"] == ["changed: memory:proj/y.md"]
+    assert wiki.stale(ctx["db"], page, _roots_of(ctx))["reasons"] == _memory_expected(host, ["changed: memory:proj/y.md"], names=names)
 
 
 @pytest.mark.parametrize("sources_line,memory_line", [
@@ -1062,11 +1087,227 @@ def test_memory_only_page_with_malformed_names_is_never_fresh(ctx, mem, monkeypa
     assert r["stale"] and r["reasons"][0] == f"unverifiable: memory:{bad}"
 
 
-def test_stale_uses_a_given_memory_listing(ctx, mem, monkeypatch):
+def test_stale_uses_a_given_memory_listing(ctx, mem, monkeypatch, host):
     page = _mem_page(ctx)
     calls = []
     monkeypatch.setattr(wiki, "_memory_listing", lambda: calls.append(1) or ([mem["x"]], [], "claude-code"))
     listing = ([mem["y"]], [], "claude-code")  # x is not in the given listing
     r = wiki.stale(ctx["db"], page, _roots_of(ctx), memory_listing=listing)
-    assert calls == [] and r["reasons"] == ["missing: memory:proj/x.md"]
-    assert wiki.stale(ctx["db"], page, _roots_of(ctx))["reasons"] == [] and calls == [1]
+    assert calls == [] and r["reasons"] == _memory_expected(host, ["missing: memory:proj/x.md"])
+    assert wiki.stale(ctx["db"], page, _roots_of(ctx))["reasons"] == _memory_expected(host, []) and calls == [1]
+
+
+def test_filing_owns_vault_without_consulting_aged_pid_lock(ctx, monkeypatch):
+    import os
+    import time
+    import note_transactions as tx
+    import note_writer
+    root = _wiki(ctx)
+    root.mkdir(parents=True, exist_ok=True)
+    lock = note_writer._lock_path(root / ".wiki")
+    lock.write_text("1 old-wiki-owner")
+    os.utime(lock, (time.time()-3600, time.time()-3600))
+    monkeypatch.setattr(note_writer, "_acquire_lock", lambda *a: pytest.fail("Legacy PID lock was consulted"))
+    real = wiki._write
+    seen = []
+    def write(*args, **kwargs):
+        assert getattr(tx._HELD, "locks", {}), "Wiki publication must retain OS vault ownership"
+        seen.append(args[2])
+        return real(*args, **kwargs)
+    monkeypatch.setattr(wiki, "_write", write)
+    out = wiki.file_page(ctx, _payload(), D)
+    assert Path(out["path"]).is_file() and seen
+    assert lock.read_text() == "1 old-wiki-owner"
+
+
+def test_index_render_cannot_overwrite_manual_edit(ctx, monkeypatch):
+    wiki.file_page(ctx, _payload(), D)
+    path = _wiki(ctx) / "index.md"
+    original = wiki.render_wiki_index
+
+    def edited(c):
+        result = original(c)
+        path.write_text("my manual index\n")
+        return result
+
+    monkeypatch.setattr(wiki, "render_wiki_index", edited)
+    with pytest.raises(wiki.WikiRefusal, match="conflict"):
+        wiki.rebuild_wiki_index(ctx)
+    assert path.read_text() == "my manual index\n"
+
+
+@pytest.mark.parametrize("stage", ["index", "log"])
+def test_exact_retry_after_stage_failure_keeps_one_page(ctx, monkeypatch, stage):
+    name = "rebuild_wiki_index" if stage == "index" else "append_log"
+    real = getattr(wiki, name)
+
+    def fail(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(wiki, name, fail)
+    first = wiki.file_page(ctx, _payload(), D)
+    monkeypatch.setattr(wiki, name, real)
+    second = wiki.file_page(ctx, _payload(), D)
+    assert first["path"] == second["path"]
+    assert len(list((_wiki(ctx) / "queries").rglob("*.md"))) == 1
+    third = wiki.file_page(ctx, _payload(), D)
+    assert third["path"] == first["path"]
+    assert (_wiki(ctx) / "log-2026.md").read_text().count("- Created:") == 1
+
+
+def test_stale_index_deletion_preserves_edit_after_revision_read(ctx, monkeypatch):
+    wiki.file_page(ctx, _payload(), D)
+    stale = _wiki(ctx) / "index-unused.md"
+    stale.write_text(wiki._index_header("old index"))
+    original = wiki.read_page
+
+    def edit(path):
+        result = original(path)
+        if Path(path) == stale:
+            stale.write_text("my manual note\n")
+        return result
+
+    monkeypatch.setattr(wiki, "read_page", edit)
+    with pytest.raises(wiki.WikiRefusal, match="index deletion conflict"):
+        wiki.rebuild_wiki_index(ctx)
+    assert stale.read_text() == "my manual note\n"
+
+
+def test_log_append_preserves_edit_after_read(ctx, monkeypatch):
+    import note_transactions as tx
+    wiki.file_page(ctx, _payload(), D)
+    log = _wiki(ctx) / "log-2026.md"
+    original = tx.record_read
+
+    def edit(context, path, text):
+        revision = original(context, path, text)
+        if Path(path) == log:
+            log.write_text("my manual log\n")
+        return revision
+
+    monkeypatch.setattr(tx, "record_read", edit)
+    with pytest.raises(wiki.WikiRefusal, match="conflict"):
+        wiki.append_log(ctx, "file", "", "another question", "another-page", D)
+    assert log.read_text() == "my manual log\n"
+
+
+def test_index_file_symlink_cannot_write_elsewhere_in_vault(ctx):
+    outside = Path(ctx["vault"]) / "claude-insights" / "outside.md"
+    outside.write_text("keep this\n")
+    _wiki(ctx).mkdir(parents=True)
+    (_wiki(ctx) / "index.md").symlink_to(outside)
+    with pytest.raises(wiki.WikiRefusal, match="outside the wiki folder"):
+        wiki.rebuild_wiki_index(ctx)
+    assert outside.read_text() == "keep this\n"
+
+
+def test_obsolete_index_symlink_cannot_delete_elsewhere_in_vault(ctx):
+    wiki.file_page(ctx, _payload(), D)
+    outside = Path(ctx["vault"]) / "claude-insights" / "outside.md"
+    outside.write_text(wiki._index_header("keep this"))
+    (_wiki(ctx) / "index-unused.md").symlink_to(outside)
+    with pytest.raises(wiki.WikiRefusal, match="outside the wiki folder"):
+        wiki.rebuild_wiki_index(ctx)
+    assert outside.is_file()
+
+
+def test_corrupt_name_collision_is_preserved_and_gets_suffix(ctx):
+    path = _wiki(ctx) / "queries" / "2026" / "10-04-how-does-zebracorn-ranking-work.md"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"user note\xff")
+    out = wiki.file_page(ctx, _payload(), D)
+    assert out["path"].endswith("ranking-work-2.md")
+    assert path.read_bytes() == b"user note\xff"
+
+
+def test_slow_source_preparation_does_not_block_other_note_writer(ctx, selected_host_context, monkeypatch):
+    import contextvars
+    import threading
+    import note_transactions
+    entered, release = threading.Event(), threading.Event()
+    original = vault_index.ensure_index
+    calls = []
+    def slow(*args, **kwargs):
+        calls.append(True)
+        if len(calls) == 1:
+            entered.set()
+            assert release.wait(3)
+        return original(*args, **kwargs)
+    monkeypatch.setattr(vault_index,'ensure_index',slow)
+    results, errors = [], []
+    def file_it():
+        try:
+            results.append(wiki.file_page(ctx,_payload(),D))
+        except Exception as exc:
+            errors.append(exc)
+    copied = contextvars.copy_context()
+    thread = threading.Thread(target=lambda: copied.run(file_it))
+    thread.start()
+    try:
+        assert entered.wait(2)
+        other = selected_host_context.vault_path/'independent.md'
+        with note_transactions.ownership_lock(selected_host_context, deadline=__import__("time").monotonic()+0.05):
+            result = note_transactions.apply_mutations(selected_host_context,[
+                note_transactions.NoteMutation(other,None,{'document':'Independent prose.\n'},'wiki-concurrent-independent')])
+        assert result.status == 'applied'
+    finally:
+        release.set()
+        thread.join(4)
+    assert not thread.is_alive() and not errors and results
+
+
+def test_source_changed_after_preparation_refuses_wiki_publication(ctx, monkeypatch):
+    publish = wiki._publish_file_page
+    def edit_before_publication(*args, **kwargs):
+        path = Path(ctx['vault'])/'claude-insights'/'i1.md'
+        path.write_text(path.read_text()+'\nLater manual source fact.\n')
+        return publish(*args, **kwargs)
+    monkeypatch.setattr(wiki,'_publish_file_page',edit_before_publication)
+    with pytest.raises(wiki.WikiRefusal,match='source changed'):
+        wiki.file_page(ctx,_payload(),D)
+    assert not list((_wiki(ctx)/'queries').rglob('*.md'))
+
+
+def test_index_rendering_does_not_hold_vault_publication_lock(ctx, selected_host_context, monkeypatch):
+    import contextvars
+    import threading
+    import time
+    import note_transactions
+    entered, release = threading.Event(), threading.Event()
+    render = wiki.render_wiki_index
+    def slow(context):
+        entered.set()
+        assert release.wait(3)
+        return render(context)
+    monkeypatch.setattr(wiki,'render_wiki_index',slow)
+    errors = []
+    copied = contextvars.copy_context()
+    def rebuild():
+        try:
+            wiki.rebuild_wiki_index(ctx)
+        except Exception as exc:
+            errors.append(exc)
+    thread = threading.Thread(target=lambda:copied.run(rebuild))
+    thread.start()
+    try:
+        assert entered.wait(2)
+        with note_transactions.ownership_lock(selected_host_context,deadline=time.monotonic()+0.05):
+            result = note_transactions.apply_mutations(selected_host_context,[
+                note_transactions.NoteMutation(selected_host_context.vault_path/'during-render.md',None,
+                    {'document':'Concurrent independent note.\n'},'wiki-render-concurrent-independent')])
+        assert result.status == 'applied'
+    finally:
+        release.set()
+        thread.join(4)
+    assert not errors and not thread.is_alive()
+
+
+def test_foreign_vault_is_refused_before_preparing_its_index(ctx, tmp_path, monkeypatch):
+    foreign = tmp_path/'foreign-vault'
+    foreign.mkdir()
+    foreign_ctx = {**ctx,'vault':str(foreign),'db':str(tmp_path/'foreign.db')}
+    calls = []
+    monkeypatch.setattr(vault_index,'ensure_index',lambda *args,**kwargs:calls.append(True))
+    with pytest.raises(ValueError,match='cannot switch'):
+        wiki.file_page(foreign_ctx,_payload(),D)
+    assert not calls and not (tmp_path/'foreign.db').exists()

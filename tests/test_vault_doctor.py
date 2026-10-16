@@ -85,7 +85,7 @@ def test_cli_dry_run_reports_issues(tmp_path):
     env["OBSIDIAN_BRAIN_INSIGHTS_FOLDER"] = "claude-insights"
 
     script = Path(__file__).parent.parent / "scripts" / "vault_doctor.py"
-    result = subprocess.run(
+    result = run_doctor(
         [sys.executable, str(script), "--check", "source-sessions", "--days", "10000",
          "--project", "proj1", "--json"],
         capture_output=True,
@@ -141,7 +141,7 @@ def test_cli_apply_with_yes(tmp_path):
     env["OBSIDIAN_BRAIN_INSIGHTS_FOLDER"] = "claude-insights"
 
     script = Path(__file__).parent.parent / "scripts" / "vault_doctor.py"
-    result = subprocess.run(
+    result = run_doctor(
         [sys.executable, str(script), "--check", "source-sessions", "--days", "10000",
          "--project", "proj1", "--apply", "--yes"],
         capture_output=True,
@@ -164,7 +164,7 @@ def test_cli_unknown_check_errors(tmp_path):
     env["OBSIDIAN_BRAIN_VAULT"] = str(tmp_path)
 
     script = Path(__file__).parent.parent / "scripts" / "vault_doctor.py"
-    result = subprocess.run(
+    result = run_doctor(
         [sys.executable, str(script), "--check", "nonexistent-check", "--json"],
         capture_output=True,
         text=True,
@@ -504,8 +504,8 @@ class TestCrashContainment:
         )
 
 
-def test_cli_missing_vault_errors(tmp_path, monkeypatch):
-    """Missing vault config → exit 3."""
+def test_bound_cli_uses_selected_vault_when_ambient_config_is_missing(tmp_path, monkeypatch):
+    """The selected runtime supplies the vault despite missing ambient config."""
     import subprocess, sys, os
     from pathlib import Path
 
@@ -519,11 +519,18 @@ def test_cli_missing_vault_errors(tmp_path, monkeypatch):
     isolated_cwd.mkdir()
 
     script = Path(__file__).parent.parent / "scripts" / "vault_doctor.py"
-    result = subprocess.run(
+    result = run_doctor(
         [sys.executable, str(script), "--json"],
         capture_output=True,
         text=True,
         env=env,
         cwd=str(isolated_cwd),
     )
-    assert result.returncode == 3, f"expected exit 3, got {result.returncode}: {result.stderr}"
+    assert result.returncode == 0, f"selected vault should remain available: {result.stderr}"
+
+
+from doctor_cli_test_helpers import run_doctor
+
+@pytest.fixture(autouse=True)
+def _selected_doctor_actor(selected_host_context):
+    return selected_host_context

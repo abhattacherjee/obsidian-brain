@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from tests.native_pipeline_test_adapter import private_pipeline_output, run_native_pipeline
 import os
 
 import pytest
@@ -24,6 +25,46 @@ from open_item_dedup import (
     partition_for_review,
     parse_cascade_skipped_total,
 )
+
+
+@pytest.fixture
+def selected_host_context(host, selected_host_context, tmp_path, tmp_path_factory):
+    from dataclasses import replace
+    from runtime_context import using_runtime_context
+    private = tmp_path_factory.mktemp("dedup-private")
+    selected = replace(selected_host_context, vault_path=tmp_path,
+        state_path=private / "state", index_path=private / "index.sqlite3",
+        config=dict(selected_host_context.config, vault_path=str(tmp_path)))
+    with using_runtime_context(selected):
+        yield selected
+
+@pytest.fixture
+def tmp_vault(selected_host_context):
+    vault = selected_host_context.vault_path
+    for folder in ("claude-sessions", "claude-insights"):
+        (vault / folder).mkdir()
+    return vault
+
+
+def _prepared_groups(groups):
+    """Bind group fixtures to the exact bytes captured before publication."""
+    import hashlib
+    from pathlib import Path
+    revisions = {}
+    for group in groups:
+        for member in group['members']:
+            path = member['file']
+            if path not in revisions:
+                revisions[path] = hashlib.sha256(Path(path).read_bytes()).hexdigest()
+            member['source_revision'] = revisions[path]
+    return groups
+
+
+@pytest.fixture(autouse=True)
+def _isolated_native_config(monkeypatch):
+    """Legacy path-only APIs must not read the developer's live vault config."""
+    import obsidian_utils
+    monkeypatch.setattr(obsidian_utils, "load_config", lambda: {})
 
 
 # ---------------------------------------------------------------------------
@@ -233,7 +274,7 @@ def test_cascade_checkoff():
 # 11. dedup_note_open_items — removes high-confidence duplicate from newer note
 # ---------------------------------------------------------------------------
 
-def test_dedup_note_open_items(tmp_vault):
+def test_dedup_note_open_items(selected_host_context, tmp_vault):
     sessions_dir = tmp_vault / "claude-sessions"
 
     # Older note (already has the item)
@@ -268,7 +309,7 @@ def test_dedup_note_open_items(tmp_vault):
 # 12. batch_cascade_checkoff — returns a string result
 # ---------------------------------------------------------------------------
 
-def test_batch_cascade_checkoff(tmp_vault):
+def test_batch_cascade_checkoff(selected_host_context, tmp_vault):
     sessions_dir = tmp_vault / "claude-sessions"
 
     _create_session_note(
@@ -292,7 +333,7 @@ def test_batch_cascade_checkoff(tmp_vault):
 # 13. batch_cascade_checkoff_empty — no items → appropriate message
 # ---------------------------------------------------------------------------
 
-def test_batch_cascade_checkoff_empty(tmp_vault):
+def test_batch_cascade_checkoff_empty(selected_host_context, tmp_vault):
     # No notes in vault at all
     result = batch_cascade_checkoff(
         str(tmp_vault),
@@ -432,7 +473,7 @@ def test_collect_open_items_section_break(tmp_vault):
 # 20. dedup_note_open_items: OSError reading note_path (lines 213-215)
 # ---------------------------------------------------------------------------
 
-def test_dedup_note_oserror(tmp_vault, monkeypatch, capsys):
+def test_dedup_note_oserror(selected_host_context, tmp_vault, monkeypatch, capsys):
     sessions_dir = tmp_vault / "claude-sessions"
     note = _create_session_note(
         sessions_dir, "2026-04-10-proj-derr.md", "myproject", ["Bad file item"]
@@ -458,7 +499,7 @@ def test_dedup_note_oserror(tmp_vault, monkeypatch, capsys):
 # 21. dedup_note_open_items: no existing items (early return, line 222)
 # ---------------------------------------------------------------------------
 
-def test_dedup_note_no_existing_items(tmp_vault):
+def test_dedup_note_no_existing_items(selected_host_context, tmp_vault):
     sessions_dir = tmp_vault / "claude-sessions"
     # Only one session note — no other notes for comparison
     note = _create_session_note(
@@ -474,7 +515,7 @@ def test_dedup_note_no_existing_items(tmp_vault):
 # 22. dedup_note_open_items: section break → no duplicates found (line 247)
 # ---------------------------------------------------------------------------
 
-def test_dedup_note_no_duplicates_found(tmp_vault):
+def test_dedup_note_no_duplicates_found(selected_host_context, tmp_vault):
     sessions_dir = tmp_vault / "claude-sessions"
     _create_session_note(
         sessions_dir, "2026-04-09-proj-old2.md", "myproject",
@@ -498,7 +539,7 @@ def test_dedup_note_no_duplicates_found(tmp_vault):
 # 23. dedup_note_open_items: stat OSError fallback (lines 261-262)
 # ---------------------------------------------------------------------------
 
-def test_dedup_note_stat_oserror_fallback(tmp_vault, monkeypatch):
+def test_dedup_note_stat_oserror_fallback(selected_host_context, tmp_vault, monkeypatch):
     sessions_dir = tmp_vault / "claude-sessions"
     _create_session_note(
         sessions_dir, "2026-04-09-proj-statold.md", "myproject",
@@ -509,26 +550,34 @@ def test_dedup_note_stat_oserror_fallback(tmp_vault, monkeypatch):
         ["Fix hooks/obsidian_utils.py import error", "Another item"],
     )
 
-    original_stat = os.stat
+    from pathlib import Path
+
+    original_stat = Path.stat
+    failed_stats = []
 
     def patched_stat(path, *args, **kwargs):
-        if str(newer_note) in str(path):
+        if path == newer_note:
+            failed_stats.append(path)
             raise OSError("stat failed")
         return original_stat(path, *args, **kwargs)
 
-    monkeypatch.setattr(os, "stat", patched_stat)
+    # Python 3.9 caches os.stat in pathlib's accessor. Patch the API the
+    # publisher actually calls, so every supported Python injects the fault.
+    monkeypatch.setattr(Path, "stat", patched_stat)
     removed = dedup_note_open_items(
         str(tmp_vault), "claude-sessions", "myproject", str(newer_note)
     )
-    # Should still remove the duplicate even without stat
-    assert len(removed) >= 1
+    # Without source metadata, preserve the note and report no published removal.
+    assert failed_stats
+    assert removed == []
+    assert "- [ ] Fix hooks/obsidian_utils.py import error" in newer_note.read_text()
 
 
 # ---------------------------------------------------------------------------
 # 24. dedup_note_open_items: atomic write OSError → cleanup (lines 267-273)
 # ---------------------------------------------------------------------------
 
-def test_dedup_note_atomic_write_oserror(tmp_vault, monkeypatch, capsys):
+def test_dedup_note_atomic_write_oserror(selected_host_context, tmp_vault, monkeypatch, capsys):
     sessions_dir = tmp_vault / "claude-sessions"
     _create_session_note(
         sessions_dir, "2026-04-09-proj-wold.md", "myproject",
@@ -542,7 +591,7 @@ def test_dedup_note_atomic_write_oserror(tmp_vault, monkeypatch, capsys):
     original_replace = os.replace
 
     def patched_replace(src, dst):
-        if ".ob-dedup-" in src:
+        if str(dst) == str(newer_note):
             raise OSError("replace failed")
         return original_replace(src, dst)
 
@@ -559,7 +608,7 @@ def test_dedup_note_atomic_write_oserror(tmp_vault, monkeypatch, capsys):
 # 25. dedup_note_open_items: ## section break inside note (line 236)
 # ---------------------------------------------------------------------------
 
-def test_dedup_note_section_break_stops_scan(tmp_vault):
+def test_dedup_note_section_break_stops_scan(selected_host_context, tmp_vault):
     sessions_dir = tmp_vault / "claude-sessions"
     _create_session_note(
         sessions_dir, "2026-04-09-proj-sbold.md", "myproject",
@@ -586,7 +635,7 @@ def test_dedup_note_section_break_stops_scan(tmp_vault):
 # 26. batch_cascade_checkoff: fuzzy-only duplicates (lines 304-305, 377-384)
 # ---------------------------------------------------------------------------
 
-def test_batch_cascade_checkoff_fuzzy_suggestions(tmp_vault):
+def test_batch_cascade_checkoff_fuzzy_suggestions(selected_host_context, tmp_vault):
     sessions_dir = tmp_vault / "claude-sessions"
     # Create a note with a fuzzy-matchable item (high token overlap, no distinctive tokens)
     note = sessions_dir / "2026-04-09-proj-fuzzy.md"
@@ -613,7 +662,7 @@ def test_batch_cascade_checkoff_fuzzy_suggestions(tmp_vault):
 # 27. batch_cascade_checkoff: no duplicates found path (line 313-314)
 # ---------------------------------------------------------------------------
 
-def test_batch_cascade_checkoff_no_duplicates(tmp_vault):
+def test_batch_cascade_checkoff_no_duplicates(selected_host_context, tmp_vault):
     sessions_dir = tmp_vault / "claude-sessions"
     _create_session_note(
         sessions_dir, "2026-04-09-proj-nodupe.md", "myproject",
@@ -632,7 +681,7 @@ def test_batch_cascade_checkoff_no_duplicates(tmp_vault):
 # 28. batch_cascade_checkoff: cascade file read OSError (lines 329-331)
 # ---------------------------------------------------------------------------
 
-def test_batch_cascade_checkoff_file_read_oserror(tmp_vault, monkeypatch, capsys):
+def test_batch_cascade_checkoff_file_read_oserror(selected_host_context, tmp_vault, monkeypatch, capsys):
     sessions_dir = tmp_vault / "claude-sessions"
     note = _create_session_note(
         sessions_dir, "2026-04-09-proj-casc.md", "myproject",
@@ -666,7 +715,7 @@ def test_batch_cascade_checkoff_file_read_oserror(tmp_vault, monkeypatch, capsys
 # 29. batch_cascade_checkoff: line no longer has checkbox (line 340)
 # ---------------------------------------------------------------------------
 
-def test_batch_cascade_checkoff_line_already_changed(tmp_vault, monkeypatch, capsys):
+def test_batch_cascade_checkoff_line_already_changed(selected_host_context, tmp_vault, monkeypatch, capsys):
     sessions_dir = tmp_vault / "claude-sessions"
     # Create a note that has already been checked off (- [x])
     note = sessions_dir / "2026-04-09-proj-checked.md"
@@ -703,7 +752,7 @@ def test_batch_cascade_checkoff_line_already_changed(tmp_vault, monkeypatch, cap
 # 30. batch_cascade_checkoff: cascade write OSError (lines 363-368)
 # ---------------------------------------------------------------------------
 
-def test_batch_cascade_checkoff_write_oserror(tmp_vault, monkeypatch, capsys):
+def test_batch_cascade_checkoff_write_oserror(selected_host_context, tmp_vault, monkeypatch, capsys):
     sessions_dir = tmp_vault / "claude-sessions"
     note = _create_session_note(
         sessions_dir, "2026-04-09-proj-wfail.md", "myproject",
@@ -713,7 +762,7 @@ def test_batch_cascade_checkoff_write_oserror(tmp_vault, monkeypatch, capsys):
     original_replace = os.replace
 
     def patched_replace(src, dst):
-        if ".ob-cascade-" in src:
+        if str(dst) == str(note):
             raise OSError("cascade write failed")
         return original_replace(src, dst)
 
@@ -732,7 +781,7 @@ def test_batch_cascade_checkoff_write_oserror(tmp_vault, monkeypatch, capsys):
 # 31. batch_cascade_checkoff: stat OSError fallback in cascade write (lines 355-356)
 # ---------------------------------------------------------------------------
 
-def test_batch_cascade_checkoff_stat_oserror(tmp_vault, monkeypatch):
+def test_batch_cascade_checkoff_stat_oserror(selected_host_context, tmp_vault, monkeypatch):
     sessions_dir = tmp_vault / "claude-sessions"
     note = _create_session_note(
         sessions_dir, "2026-04-09-proj-cstat.md", "myproject",
@@ -761,7 +810,7 @@ def test_batch_cascade_checkoff_stat_oserror(tmp_vault, monkeypatch):
 # 32. batch_cascade_checkoff: multi-project isolation (standup Step 14)
 # ---------------------------------------------------------------------------
 
-def test_batch_cascade_checkoff_multi_project_isolation(tmp_vault):
+def test_batch_cascade_checkoff_multi_project_isolation(selected_host_context, tmp_vault):
     """Cascade for project A must not affect project B's open items."""
     sessions_dir = tmp_vault / "claude-sessions"
 
@@ -802,7 +851,7 @@ def test_batch_cascade_checkoff_multi_project_isolation(tmp_vault):
 # 33. batch_cascade_checkoff: multiple items in single call (standup Step 14)
 # ---------------------------------------------------------------------------
 
-def test_batch_cascade_checkoff_multiple_items(tmp_vault):
+def test_batch_cascade_checkoff_multiple_items(selected_host_context, tmp_vault):
     """Standup may pass multiple completed items for one project at once."""
     sessions_dir = tmp_vault / "claude-sessions"
 
@@ -837,7 +886,7 @@ def test_batch_cascade_checkoff_multiple_items(tmp_vault):
 # 34. batch_cascade_checkoff: verifies file modification (standup Step 14)
 # ---------------------------------------------------------------------------
 
-def test_batch_cascade_checkoff_modifies_files(tmp_vault):
+def test_batch_cascade_checkoff_modifies_files(selected_host_context, tmp_vault):
     """After cascade, duplicate items in both notes should be checked off."""
     sessions_dir = tmp_vault / "claude-sessions"
 
@@ -871,7 +920,7 @@ def test_batch_cascade_checkoff_modifies_files(tmp_vault):
 # 35. batch_cascade_checkoff: empty items list (standup Step 14 edge case)
 # ---------------------------------------------------------------------------
 
-def test_batch_cascade_checkoff_empty_items_list(tmp_vault):
+def test_batch_cascade_checkoff_empty_items_list(selected_host_context, tmp_vault):
     """Passing an empty items list should return gracefully."""
     sessions_dir = tmp_vault / "claude-sessions"
     _create_session_note(
@@ -902,7 +951,7 @@ def test_batch_cascade_checkoff_empty_items_list(tmp_vault):
 # already uses.
 # ---------------------------------------------------------------------------
 
-def test_batch_cascade_checkoff_wrong_line_drift_not_flipped(tmp_vault, monkeypatch, capsys):
+def test_batch_cascade_checkoff_wrong_line_drift_not_flipped(selected_host_context, tmp_vault, monkeypatch, capsys):
     """A stale line hint that now points to a DIFFERENT active item is
     verified against its own stored text and skipped; a genuinely matching
     sibling in the same file still flips (#250 mode 1)."""
@@ -942,7 +991,7 @@ def test_batch_cascade_checkoff_wrong_line_drift_not_flipped(tmp_vault, monkeypa
     assert "proj-drift.md:7" in result
 
 
-def test_batch_cascade_checkoff_preserves_sibling_duplicates(tmp_vault, monkeypatch):
+def test_batch_cascade_checkoff_preserves_sibling_duplicates(selected_host_context, tmp_vault, monkeypatch):
     """Two members in ONE file with identical text both flip.
 
     Regression guard for the design decision: a naive Guard-B mirror
@@ -979,7 +1028,7 @@ def test_batch_cascade_checkoff_preserves_sibling_duplicates(tmp_vault, monkeypa
     assert "Cascaded 2 high-confidence duplicate(s)" in result
 
 
-def test_batch_cascade_checkoff_drift_onto_text_similar_line_still_flips(tmp_vault, monkeypatch):
+def test_batch_cascade_checkoff_drift_onto_text_similar_line_still_flips(selected_host_context, tmp_vault, monkeypatch):
     """Residual honesty test: if the drifted line is ITSELF text-similar
     enough to anchor (a near-duplicate reword), it still flips. Verify-
     don't-re-resolve does NOT close this — anchor matching (LCS >= 25
@@ -1017,7 +1066,7 @@ def test_batch_cascade_checkoff_drift_onto_text_similar_line_still_flips(tmp_vau
     )
 
 
-def test_batch_cascade_checkoff_blank_text_skipped_and_surfaced(tmp_vault, monkeypatch, capsys):
+def test_batch_cascade_checkoff_blank_text_skipped_and_surfaced(selected_host_context, tmp_vault, monkeypatch, capsys):
     """A high-confidence target with blank/missing stored text is
     UNVERIFIABLE and must be skipped, not flipped. This can't arise through
     the normal find_duplicates path (a blank item_text can never earn "high"
@@ -1109,40 +1158,26 @@ def test_find_duplicates_exact_match_case_and_markdown_insensitive():
 # R11 tests: _outer_subagent_timeout (Fix 1 — env-override)
 # ---------------------------------------------------------------------------
 
-def test_outer_wrapper_honors_env_timeout(monkeypatch, tmp_path):
-    """merge_groups_semantically passes _outer_subagent_timeout() (inner*6) to subprocess.run.
-
-    The outer wraps a sequential dispatch over N chunks of <=CLASSIFIER_CHUNK_SIZE
-    each, so it must allow inner-per-chunk * max-chunks slack. Setting the env
-    var sets the INNER timeout; outer derives.
-    """
-    import subprocess
+def test_bound_merge_keeps_native_request_timeout(selected_host_context, monkeypatch):
+    """The bound wrapper keeps the native deadline and selected actor."""
+    import ai_backend
+    import check_items_cli
     import open_item_dedup as oid_module
-
+    from runtime_context import current_runtime_context
     monkeypatch.setenv("CHECK_ITEMS_SUBAGENT_TIMEOUT_SEC", "300")
-
-    captured_kwargs: list[dict] = []
-
-    def fake_run(cmd, **kwargs):
-        captured_kwargs.append(kwargs)
-        result = subprocess.CompletedProcess(cmd, returncode=1, stdout="", stderr="")
-        return result
-
-    monkeypatch.setattr(subprocess, "run", fake_run)
-
-    flat_groups = [
-        {"group_id": "abc", "project": "proj", "representative": "Fix #1", "members": []}
-    ]
-    monkeypatch.setattr(oid_module, "_check_items_workdir", lambda: tmp_path)
-
-    oid_module.merge_groups_semantically(flat_groups)
-
-    # Outer is inner*6 — env=300 → outer=1800. Guards against the regression
-    # where outer used inner directly and killed multi-chunk dispatches early.
-    assert any(kw.get("timeout") == 1800 for kw in captured_kwargs), (
-        f"Expected outer timeout=1800 (inner=300 * 6); got "
-        f"{[kw.get('timeout') for kw in captured_kwargs]}"
-    )
+    seen = []
+    def execute(context, operation, request):
+        assert context is selected_host_context
+        assert current_runtime_context() is context
+        seen.append(request)
+        return ai_backend.AIResult('unavailable', None, request.input_revision,
+                                   'synthetic_failure', context.host, None)
+    monkeypatch.setattr(ai_backend, 'execute_ai', execute)
+    monkeypatch.setattr(oid_module.subprocess, 'run',
+                        lambda *a, **k: pytest.fail('Bound merge launched a legacy child'))
+    groups = [{'group_id':'abc', 'project':'proj', 'representative':'Fix #1', 'members':[]}]
+    assert oid_module.merge_groups_semantically(groups) == groups
+    assert seen and all(request.timeout == 300 for request in seen)
 
 
 def test_outer_subagent_timeout_default_is_6x_inner(monkeypatch):
@@ -1170,7 +1205,7 @@ def _make_note(path, lines_of_text: list[str]) -> None:
     path.write_text(content, encoding="utf-8")
 
 
-def test_cascade_group_members_flips_all_members(tmp_path):
+def test_cascade_group_members_flips_all_members(selected_host_context, tmp_path):
     """Single group with 3 members across 2 files: all 3 flip."""
     file_a = tmp_path / "note_a.md"
     file_b = tmp_path / "note_b.md"
@@ -1186,6 +1221,7 @@ def test_cascade_group_members_flips_all_members(tmp_path):
             ]
         }
     ]
+    groups = _prepared_groups(groups)
     summary = cascade_group_members(groups, source_skips=None)
 
     content_a = file_a.read_text(encoding="utf-8")
@@ -1196,7 +1232,21 @@ def test_cascade_group_members_flips_all_members(tmp_path):
     assert "Cascaded 3 member-line(s) across 2 file(s)." in summary
 
 
-def test_cascade_group_members_respects_source_skips(tmp_path):
+def test_prepared_cascade_preserves_manual_edit(selected_host_context, tmp_path, capsys):
+    note = tmp_path / "manual.md"
+    _make_note(note, ["Fix issue #42"])
+    groups = _prepared_groups([{"members":[{"file":str(note), "line":6, "text":"Fix issue #42"}]}])
+    captured_revision = groups[0]['members'][0]['source_revision']
+    manual = note.read_bytes() + b"User addition after grouping.\n"
+    note.write_bytes(manual)
+    summary = cascade_group_members(groups)
+    assert "SOURCE REVISION CONFLICT: manual.md" in summary
+    assert note.read_bytes() == manual
+    assert groups[0]['members'][0]['source_revision'] == captured_revision
+    assert "source revision conflict" in capsys.readouterr().err
+
+
+def test_cascade_group_members_respects_source_skips(selected_host_context, tmp_path):
     """Member in source_skips must not be flipped again."""
     file_a = tmp_path / "note_a.md"
     _make_note(file_a, ["Fix issue #42", "Sibling item"])
@@ -1209,6 +1259,7 @@ def test_cascade_group_members_respects_source_skips(tmp_path):
             ]
         }
     ]
+    groups = _prepared_groups(groups)
     source_skips = {(str(file_a), 6)}  # line 6 already primary-flipped
     cascade_group_members(groups, source_skips=source_skips)
 
@@ -1219,20 +1270,21 @@ def test_cascade_group_members_respects_source_skips(tmp_path):
     assert "- [x] Sibling item\n" in content
 
 
-def test_cascade_group_members_atomic_write_preserves_mode(tmp_path):
+def test_cascade_group_members_atomic_write_preserves_mode(selected_host_context, tmp_path):
     """File mode must be preserved after cascade rewrites the file."""
     note = tmp_path / "note.md"
     _make_note(note, ["Fix issue #42"])
     os.chmod(str(note), 0o640)
 
     groups = [{"members": [{"file": str(note), "line": 6, "text": "Fix issue #42"}]}]
+    groups = _prepared_groups(groups)
     cascade_group_members(groups)
 
     stat = os.stat(str(note))
     assert oct(stat.st_mode & 0o777) == oct(0o640)
 
 
-def test_cascade_group_members_skips_already_checked_line(tmp_path, capsys):
+def test_cascade_group_members_skips_already_checked_line(selected_host_context, tmp_path, capsys):
     """Line already checked off (- [x]) triggers a stderr warning, no double-flip."""
     note = tmp_path / "note.md"
     # Write line 6 as already-checked
@@ -1243,6 +1295,7 @@ def test_cascade_group_members_skips_already_checked_line(tmp_path, capsys):
     )
 
     groups = [{"members": [{"file": str(note), "line": 6, "text": "Fix issue #42"}]}]
+    groups = _prepared_groups(groups)
     summary = cascade_group_members(groups)
 
     captured = capsys.readouterr()
@@ -1258,7 +1311,7 @@ def test_cascade_group_members_skips_already_checked_line(tmp_path, capsys):
     assert "whose checkbox is gone" in summary
 
 
-def test_cascade_group_members_empty_groups_returns_empty_summary():
+def test_cascade_group_members_empty_groups_returns_empty_summary(selected_host_context):
     """Empty groups list returns the no-cascade summary without raising."""
     result = cascade_group_members([])
     assert "No member lines to cascade." in result
@@ -1268,7 +1321,7 @@ def test_cascade_group_members_empty_groups_returns_empty_summary():
 # #250: text-anchor cascade_group_members (verify-don't-re-resolve)
 # ---------------------------------------------------------------------------
 
-def test_cascade_group_members_wrong_line_drift_not_flipped(tmp_path, capsys):
+def test_cascade_group_members_wrong_line_drift_not_flipped(selected_host_context, tmp_path, capsys):
     """A member whose stored line now holds a DIFFERENT active item is
     verified against its own stored text and skipped; a sibling member in
     the same file whose line still matches is still flipped (#250 mode 1)."""
@@ -1284,6 +1337,7 @@ def test_cascade_group_members_wrong_line_drift_not_flipped(tmp_path, capsys):
             {"file": str(note), "line": 7, "text": "Legit sibling item"},
         ]
     }]
+    groups = _prepared_groups(groups)
     summary = cascade_group_members(groups)
 
     content = note.read_text(encoding="utf-8")
@@ -1295,7 +1349,7 @@ def test_cascade_group_members_wrong_line_drift_not_flipped(tmp_path, capsys):
     assert "Cascaded 1 member-line(s)" in summary
 
 
-def test_cascade_group_members_preserves_sibling_duplicates(tmp_path):
+def test_cascade_group_members_preserves_sibling_duplicates(selected_host_context, tmp_path):
     """Two members in ONE file with identical text both flip.
 
     Regression guard for the design decision: a naive Guard-B mirror
@@ -1315,6 +1369,7 @@ def test_cascade_group_members_preserves_sibling_duplicates(tmp_path):
             {"file": str(note), "line": 7, "text": "Merge feature/auth-fix into develop"},
         ]
     }]
+    groups = _prepared_groups(groups)
     summary = cascade_group_members(groups)
 
     content = note.read_text(encoding="utf-8")
@@ -1322,7 +1377,7 @@ def test_cascade_group_members_preserves_sibling_duplicates(tmp_path):
     assert "Cascaded 2 member-line(s) across 1 file(s)." in summary
 
 
-def test_cascade_group_members_drift_onto_text_similar_line_still_flips(tmp_path):
+def test_cascade_group_members_drift_onto_text_similar_line_still_flips(selected_host_context, tmp_path):
     """Residual honesty test: if the drifted line is ITSELF text-similar
     enough to anchor (e.g. a near-duplicate that was reworded), it still
     flips. This is NOT closed by verify-don't-re-resolve -- anchor matching
@@ -1340,6 +1395,7 @@ def test_cascade_group_members_drift_onto_text_similar_line_still_flips(tmp_path
             "text": "Investigate the summarization pipeline configuration for batch recall upgrade process alpha",
         }],
     }]
+    groups = _prepared_groups(groups)
     summary = cascade_group_members(groups)
 
     content = note.read_text(encoding="utf-8")
@@ -1350,7 +1406,7 @@ def test_cascade_group_members_drift_onto_text_similar_line_still_flips(tmp_path
     assert "Cascaded 1 member-line(s)" in summary
 
 
-def test_cascade_group_members_blank_text_skipped_and_surfaced(tmp_path, capsys):
+def test_cascade_group_members_blank_text_skipped_and_surfaced(selected_host_context, tmp_path, capsys):
     """A member with blank stored text is UNVERIFIABLE and must be skipped,
     not flipped -- flipping a target we cannot verify is exactly the
     vulnerability this change closes (#250). The skip is surfaced in the
@@ -1359,6 +1415,7 @@ def test_cascade_group_members_blank_text_skipped_and_surfaced(tmp_path, capsys)
     _make_note(note, ["Some open item"])
 
     groups = [{"members": [{"file": str(note), "line": 6, "text": ""}]}]
+    groups = _prepared_groups(groups)
     summary = cascade_group_members(groups)
 
     content = note.read_text(encoding="utf-8")
@@ -1372,13 +1429,14 @@ def test_cascade_group_members_blank_text_skipped_and_surfaced(tmp_path, capsys)
     assert "note.md:6" in summary  # surfaced even though nothing flipped
 
 
-def test_cascade_group_members_missing_text_key_treated_as_blank(tmp_path):
+def test_cascade_group_members_missing_text_key_treated_as_blank(selected_host_context, tmp_path):
     """A member dict with no 'text' key at all (not just an empty string) is
     treated the same as blank -- unverifiable, skipped."""
     note = tmp_path / "note.md"
     _make_note(note, ["Some open item"])
 
     groups = [{"members": [{"file": str(note), "line": 6}]}]  # no "text" key
+    groups = _prepared_groups(groups)
     summary = cascade_group_members(groups)
 
     content = note.read_text(encoding="utf-8")
@@ -1388,7 +1446,7 @@ def test_cascade_group_members_missing_text_key_treated_as_blank(tmp_path):
     assert "Cascaded 0 member-line(s) — every candidate was refused or failed to save." in summary
 
 
-def test_cascade_group_members_monotonicity_happy_path(tmp_path):
+def test_cascade_group_members_monotonicity_happy_path(selected_host_context, tmp_path):
     """Old code flipped these lines; new code must flip the SAME lines
     (monotonicity: the happy path where stored text still matches is
     untouched by the change)."""
@@ -1401,6 +1459,7 @@ def test_cascade_group_members_monotonicity_happy_path(tmp_path):
             {"file": str(note), "line": 7, "text": "Another clean item"},
         ]
     }]
+    groups = _prepared_groups(groups)
     summary = cascade_group_members(groups)
 
     content = note.read_text(encoding="utf-8")
@@ -1409,7 +1468,7 @@ def test_cascade_group_members_monotonicity_happy_path(tmp_path):
     assert "Cascaded 2 member-line(s) across 1 file(s)." in summary
 
 
-def test_cascade_group_members_skip_list_capped_with_more_tail(tmp_path):
+def test_cascade_group_members_skip_list_capped_with_more_tail(selected_host_context, tmp_path):
     """A large drift event surfaces a capped list (max 5) + a '+N more'
     tail, so it can't produce an unbounded summary string."""
     lines = [f"Original item {i}" for i in range(7)]
@@ -1422,6 +1481,7 @@ def test_cascade_group_members_skip_list_capped_with_more_tail(tmp_path):
             for i in range(7)
         ]
     }]
+    groups = _prepared_groups(groups)
     summary = cascade_group_members(groups)
 
     # #320 F3: 7 targets existed and were all refused (drift), so this
@@ -1430,7 +1490,7 @@ def test_cascade_group_members_skip_list_capped_with_more_tail(tmp_path):
     assert "+2 more" in summary
 
 
-def test_cascade_group_members_skips_surfaced_in_return_value(tmp_path):
+def test_cascade_group_members_skips_surfaced_in_return_value(selected_host_context, tmp_path):
     """Dedicated pin for Task 3: a drifted member is named in the RETURN
     VALUE string, not only stderr."""
     note = tmp_path / "note.md"
@@ -1441,6 +1501,7 @@ def test_cascade_group_members_skips_surfaced_in_return_value(tmp_path):
             {"file": str(note), "line": 6, "text": "Fix the auth bug in login flow"},
         ]
     }]
+    groups = _prepared_groups(groups)
     summary = cascade_group_members(groups)
 
     assert "note.md:6" in summary
@@ -1451,7 +1512,7 @@ def test_cascade_group_members_skips_surfaced_in_return_value(tmp_path):
 # #320 F2 — a failed atomic write must be named, not read as "nothing to do"
 # ---------------------------------------------------------------------------
 
-def test_cascade_group_members_write_failure_surfaced_not_silent(tmp_path, monkeypatch):
+def test_cascade_group_members_write_failure_surfaced_not_silent(selected_host_context, tmp_path, monkeypatch):
     """A verified flip that fails to reach disk (os.replace OSError) must be
     named in the summary as a lost write, not collapsed into the
     empty-input 'No member lines to cascade.' message (#320 F2)."""
@@ -1468,6 +1529,7 @@ def test_cascade_group_members_write_failure_surfaced_not_silent(tmp_path, monke
     monkeypatch.setattr(os, "replace", failing_replace)
 
     groups = [{"members": [{"file": str(note), "line": 6, "text": "Fix issue #42"}]}]
+    groups = _prepared_groups(groups)
     summary = cascade_group_members(groups)
 
     # Nothing actually landed on disk.
@@ -1484,7 +1546,7 @@ def test_cascade_group_members_write_failure_surfaced_not_silent(tmp_path, monke
     assert "note.md" in summary
 
 
-def test_batch_cascade_checkoff_write_failure_surfaced_not_silent(tmp_vault, monkeypatch):
+def test_batch_cascade_checkoff_write_failure_surfaced_not_silent(selected_host_context, tmp_vault, monkeypatch):
     """Same as above for batch_cascade_checkoff: a lost write must be named,
     not reported as 'No duplicates found for cascading.' (#320 F2)."""
     sessions_dir = tmp_vault / "claude-sessions"
@@ -1496,7 +1558,7 @@ def test_batch_cascade_checkoff_write_failure_surfaced_not_silent(tmp_vault, mon
     original_replace = os.replace
 
     def patched_replace(src, dst):
-        if ".ob-cascade-" in src:
+        if str(dst) == str(note):
             raise OSError("cascade write failed")
         return original_replace(src, dst)
 
@@ -1517,7 +1579,7 @@ def test_batch_cascade_checkoff_write_failure_surfaced_not_silent(tmp_vault, mon
 # #320 F6 — dedup rule coverage: first non-blank text wins over a later blank
 # ---------------------------------------------------------------------------
 
-def test_cascade_group_members_first_nonblank_text_wins_over_later_blank(tmp_path):
+def test_cascade_group_members_first_nonblank_text_wins_over_later_blank(selected_host_context, tmp_path):
     """A later blank-text entry for the SAME (file, line) key must not
     clobber an earlier usable anchor (#250's dedup rule, previously
     untested -- mutating it to plain last-write-wins left the suite green)."""
@@ -1527,6 +1589,7 @@ def test_cascade_group_members_first_nonblank_text_wins_over_later_blank(tmp_pat
         {"file": str(note), "line": 6, "text": "Some open item"},
         {"file": str(note), "line": 6, "text": ""},          # later blank must not clobber
     ]}]
+    groups = _prepared_groups(groups)
     assert "Cascaded 1 member-line(s)" in cascade_group_members(groups)
 
 
@@ -1534,7 +1597,7 @@ def test_cascade_group_members_first_nonblank_text_wins_over_later_blank(tmp_pat
 # #320 F7 — non-string stored text must not crash the cascade mid-loop
 # ---------------------------------------------------------------------------
 
-def test_cascade_group_members_non_string_text_does_not_crash(tmp_path):
+def test_cascade_group_members_non_string_text_does_not_crash(selected_host_context, tmp_path):
     """A member whose stored 'text' is a non-string (int/list/dict) -- e.g.
     a corrupted merged.json entry -- must not raise AttributeError; it is
     treated as unverifiable (blank) and skipped, not flipped (#320 F7)."""
@@ -1543,6 +1606,7 @@ def test_cascade_group_members_non_string_text_does_not_crash(tmp_path):
 
     for bad_text in (12345, ["a", "list"], {"k": "v"}):
         groups = [{"members": [{"file": str(note), "line": 6, "text": bad_text}]}]
+        groups = _prepared_groups(groups)
         summary = cascade_group_members(groups)  # must not raise
         assert isinstance(summary, str)
 
@@ -1550,7 +1614,7 @@ def test_cascade_group_members_non_string_text_does_not_crash(tmp_path):
     assert "- [ ] Some open item" in content  # never blindly flipped
 
 
-def test_batch_cascade_checkoff_non_string_text_does_not_crash(tmp_vault, monkeypatch):
+def test_batch_cascade_checkoff_non_string_text_does_not_crash(selected_host_context, tmp_vault, monkeypatch):
     """Same as above for batch_cascade_checkoff's high_targets path -- a
     non-string item_text (simulated corrupted upstream data) must not
     crash with AttributeError (#320 F7)."""
@@ -1589,7 +1653,7 @@ def test_batch_cascade_checkoff_non_string_text_does_not_crash(tmp_vault, monkey
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("bad_line", ["10", 1.5, True])
-def test_cascade_group_members_bad_line_type_skipped_sibling_still_flips(tmp_path, capsys, bad_line):
+def test_cascade_group_members_bad_line_type_skipped_sibling_still_flips(selected_host_context, tmp_path, capsys, bad_line):
     """A member whose stored 'line' is a str, a float, or a bool must not
     raise, and must be skipped rather than flipped. A legitimate sibling
     member in the SAME group still flips, proving the bad member is
@@ -1603,6 +1667,7 @@ def test_cascade_group_members_bad_line_type_skipped_sibling_still_flips(tmp_pat
             {"file": str(note), "line": 7, "text": "Sibling item"},
         ]
     }]
+    groups = _prepared_groups(groups)
     summary = cascade_group_members(groups)  # must not raise
     assert isinstance(summary, str)
 
@@ -1615,7 +1680,7 @@ def test_cascade_group_members_bad_line_type_skipped_sibling_still_flips(tmp_pat
 
 
 @pytest.mark.parametrize("bad_line", ["10", 1.5, True])
-def test_batch_cascade_checkoff_bad_line_type_skipped_sibling_still_flips(tmp_vault, monkeypatch, capsys, bad_line):
+def test_batch_cascade_checkoff_bad_line_type_skipped_sibling_still_flips(selected_host_context, tmp_vault, monkeypatch, capsys, bad_line):
     """Same as above for batch_cascade_checkoff's high_targets collection
     loop (#320 R1 Gemini)."""
     sessions_dir = tmp_vault / "claude-sessions"
@@ -1958,7 +2023,7 @@ def _run_pipeline_with_fake_git(tmp_path, fake_run, db_name="test-vault.db"):
     Returns (result_str, proj_evidence dict for 'myproject')."""
     repo_dir = tmp_path / "fake-repo"
     repo_dir.mkdir(exist_ok=True)
-    output_path = str(tmp_path / "pipeline-out.json")
+    output_path = str(private_pipeline_output(tmp_path, "pipeline-out.json"))
     vault_path = str(tmp_path)
     sessions_folder = "sessions"
     insights_folder = "insights"
@@ -1971,7 +2036,7 @@ def _run_pipeline_with_fake_git(tmp_path, fake_run, db_name="test-vault.db"):
          patch.dict("sys.modules", {"vault_index": fake_vi}), \
          patch.object(oid, "_resolve_project_paths", return_value={"myproject": str(repo_dir)}):
 
-        result = oid.deep_analysis_pipeline(
+        result = run_native_pipeline(
             basenames=[],
             projects_json=_json.dumps(["myproject"]),
             output_path=output_path,
@@ -1987,7 +2052,7 @@ def _run_pipeline_with_fake_git(tmp_path, fake_run, db_name="test-vault.db"):
     return result, proj_evidence
 
 
-def test_deep_analysis_pipeline_collects_tags_and_changed_paths(tmp_path):
+def test_deep_analysis_pipeline_collects_tags_and_changed_paths(selected_host_context, tmp_path):
     """proj_evidence must carry a bounded `tags` list (git tag --list) and a
     bounded, deduped `changed_paths` list (git log --name-only) alongside the
     existing commits/merged_prs/closed_issues/releases evidence."""
@@ -2024,7 +2089,7 @@ def test_deep_analysis_pipeline_collects_tags_and_changed_paths(tmp_path):
     ]
 
 
-def test_deep_analysis_pipeline_tags_and_paths_are_capped_and_deduped(tmp_path):
+def test_deep_analysis_pipeline_tags_and_paths_are_capped_and_deduped(selected_host_context, tmp_path):
     """Boundedness: a repo with many tags/changed paths (with duplicates) must
     collect a CAPPED, DEDUPED set — never an unbounded git-output dump."""
 
@@ -2069,7 +2134,7 @@ def test_deep_analysis_pipeline_tags_and_paths_are_capped_and_deduped(tmp_path):
     assert len(paths) == len(set(paths)), "changed_paths must be deduped"
 
 
-def test_deep_analysis_pipeline_tags_and_paths_degrade_on_git_absence(tmp_path):
+def test_deep_analysis_pipeline_tags_and_paths_degrade_on_git_absence(selected_host_context, tmp_path):
     """git missing (FileNotFoundError/OSError) for tag/log --name-only must
     degrade tags/changed_paths to [] — never raise, never crash the pipeline."""
 
@@ -2108,7 +2173,7 @@ def test_deep_analysis_pipeline_tags_and_paths_degrade_on_git_absence(tmp_path):
     )
 
 
-def test_deep_analysis_pipeline_tags_and_paths_degrade_on_nonzero_rc_and_timeout(tmp_path):
+def test_deep_analysis_pipeline_tags_and_paths_degrade_on_nonzero_rc_and_timeout(selected_host_context, tmp_path):
     """git tag returns non-zero rc; git log --name-only times out. Both must
     degrade to [] (or absent) without raising, matching the existing
     commits/merged_prs/closed_issues guard pattern exactly."""
@@ -2219,3 +2284,64 @@ def test_fold_tags_and_paths_noop_when_no_tags_or_paths():
     zone = {"releases_text": "v1.0.0", "changelog_excerpt": "notes"}
     out = fold_tags_and_paths_into_completion_zone(zone, {})
     assert out == zone
+
+
+def test_summary_dedup_preserves_manual_open_items(selected_host_context, tmp_vault):
+    sessions = tmp_vault / 'claude-sessions'
+    duplicate = 'Fix hooks/obsidian_utils.py import error'
+    _create_session_note(sessions, '2026-04-09-proj-old.md', 'myproject', [duplicate])
+    note = _create_session_note(sessions, '2026-04-10-proj-new.md', 'myproject', [duplicate])
+    manual = note.read_text()
+    summary = ('<!-- obsidian-brain:summary:start -->\n## Summary\nCompleted the schema.\n'
+               '## Open Questions / Next Steps\n- [ ] ' + duplicate + '\n'
+               '- [ ] Keep the distinct follow-up\n<!-- obsidian-brain:summary:end -->\n')
+    suffix = '\n## Manual follow-up\n- [ ] ' + duplicate + '\n'
+    note.write_text(manual + summary + suffix)
+
+    removed = dedup_note_open_items(str(tmp_vault), 'claude-sessions', 'myproject', str(note))
+
+    assert note.read_text().startswith(manual)
+    assert note.read_text().endswith(suffix)
+    assert removed == [duplicate]
+    managed = note.read_text()[len(manual):-len(suffix)]
+    assert '- [ ] ' + duplicate not in managed
+    assert '- [ ] Keep the distinct follow-up' in managed
+
+
+@pytest.mark.parametrize('owned_tail', [
+    '<!-- obsidian-brain:capture:start -->\nRetained activity.\n<!-- obsidian-brain:capture:end -->\n',
+    '<!-- obsidian-brain:summary:start -->\nIncomplete region.\n',
+], ids=['capture-only', 'incomplete-summary'])
+def test_dedup_without_owned_summary_preserves_manual_bytes(selected_host_context, tmp_vault, owned_tail):
+    sessions = tmp_vault / 'claude-sessions'
+    duplicate = 'Fix hooks/obsidian_utils.py import error'
+    _create_session_note(sessions, '2026-04-09-proj-old.md', 'myproject', [duplicate])
+    note = _create_session_note(sessions, '2026-04-10-proj-new.md', 'myproject', [duplicate])
+    note.write_text(note.read_text() + owned_tail)
+    before = note.read_bytes()
+
+    assert dedup_note_open_items(str(tmp_vault), 'claude-sessions', 'myproject', str(note)) == []
+    assert note.read_bytes() == before
+
+
+@pytest.mark.parametrize('structure', ['nested', 'duplicate'], ids=['nested', 'duplicate'])
+def test_dedup_malformed_owned_regions_never_publish(selected_host_context, tmp_vault, monkeypatch, structure):
+    sessions = tmp_vault / 'claude-sessions'
+    duplicate = 'Fix hooks/obsidian_utils.py import error'
+    _create_session_note(sessions, '2026-04-09-proj-old.md', 'myproject', [duplicate])
+    note = _create_session_note(sessions, '2026-04-10-proj-new.md', 'myproject', [])
+    section = '## Open Questions / Next Steps\n- [ ] ' + duplicate + '\n'
+    if structure == 'nested':
+        owned = ('<!-- obsidian-brain:summary:start -->\n' + section +
+                 '<!-- obsidian-brain:capture:start -->\nManual capture text.\n'
+                 '<!-- obsidian-brain:capture:end -->\n<!-- obsidian-brain:summary:end -->\n')
+    else:
+        block = '<!-- obsidian-brain:summary:start -->\n' + section + '<!-- obsidian-brain:summary:end -->\n'
+        owned = block + '\nManual text between duplicate regions.\n' + block
+    note.write_text(note.read_text() + owned)
+    before = note.read_bytes()
+    monkeypatch.setattr('note_transactions.apply_mutations',
+                        lambda *args, **kwargs: pytest.fail('Malformed ownership must not publish'))
+
+    assert dedup_note_open_items(str(tmp_vault), 'claude-sessions', 'myproject', str(note)) == []
+    assert note.read_bytes() == before
