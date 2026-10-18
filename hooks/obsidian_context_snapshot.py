@@ -23,6 +23,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 # An import failure must still exit 0 and leave a hook-log line (#371).
 try:
     from obsidian_utils import (  # noqa: E402
+        is_capture_worker,
         _hook_payload_codex_reason,
         claim_hook_run,
         extract_assistant_messages,
@@ -190,6 +191,10 @@ def main() -> None:
 
 
 def _run() -> None:
+    # #425: a capture worker's own `claude -p` session takes no snapshot.
+    if is_capture_worker():
+        return
+
     # 1. Read hook input from stdin
     try:
         raw = sys.stdin.read(1_000_000)

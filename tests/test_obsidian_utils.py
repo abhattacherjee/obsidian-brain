@@ -3429,7 +3429,7 @@ class TestUpgradeBatchBatching:
             f"===== SUMMARY 2 =====\n{bad_block}"
         )
 
-        def fake_subprocess_run(cmd, input=None, capture_output=False, text=False, timeout=None):
+        def fake_subprocess_run(cmd, input=None, capture_output=False, text=False, timeout=None, env=None):
             class _Res:
                 returncode = 0
                 stdout = stdout_text
@@ -3499,7 +3499,7 @@ class TestUpgradeBatchBatching:
             f"===== SUMMARY 2 =====\n{valid_block_2}"
         )
 
-        def fake_subprocess_run(cmd, input=None, capture_output=False, text=False, timeout=None):
+        def fake_subprocess_run(cmd, input=None, capture_output=False, text=False, timeout=None, env=None):
             class _Res:
                 returncode = 0
                 stdout = stdout_text
@@ -3611,7 +3611,7 @@ class TestUpgradeBatchBatching:
         )
         stdout_text = f"===== SUMMARY 1 =====\n{valid_block}"
 
-        def fake_subprocess_run(cmd, input=None, capture_output=False, text=False, timeout=None):
+        def fake_subprocess_run(cmd, input=None, capture_output=False, text=False, timeout=None, env=None):
             class _Res:
                 returncode = 0
                 stdout = stdout_text
@@ -4955,7 +4955,7 @@ class TestBatchRecovery:
 
         stdout_text = self._make_stdout(self._loose_block(), self._good_block())
 
-        def fake_run(cmd, input=None, capture_output=False, text=False, timeout=None):
+        def fake_run(cmd, input=None, capture_output=False, text=False, timeout=None, env=None):
             class _R:
                 returncode = 0
                 stdout = stdout_text
@@ -4997,7 +4997,7 @@ class TestBatchRecovery:
 
         stdout_text = self._make_stdout(self._loose_block(), self._good_block())
 
-        def fake_run(cmd, input=None, capture_output=False, text=False, timeout=None):
+        def fake_run(cmd, input=None, capture_output=False, text=False, timeout=None, env=None):
             class _R:
                 returncode = 0
                 stdout = stdout_text

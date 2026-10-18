@@ -24,6 +24,19 @@ from pathlib import Path
 # actually counts (#275). Same constant and same policy as
 # hooks/note_writer.py.
 STDIN_CAP_CHARS = 1_000_000
+
+
+def worker_env() -> dict:
+    """Environment for `claude -p` children, with the #425 worker guard set.
+
+    Mirrors obsidian_utils.worker_env(); kept local because this CLI does not
+    import obsidian_utils (tests pin the two to the same variable name).
+    """
+    env = dict(os.environ)
+    env["OBSIDIAN_BRAIN_WORKER"] = "1"
+    return env
+
+
 SUBAGENT_TIMEOUT_SEC = int(os.environ.get("CHECK_ITEMS_SUBAGENT_TIMEOUT_SEC", "300"))
 
 # Cap groups per classifier sub-agent dispatch. Above this count, run_classifier()
@@ -237,6 +250,7 @@ def run_semantic_merge(stdin_json: str, output_path: str) -> int:
             capture_output=True,
             text=True,
             timeout=SUBAGENT_TIMEOUT_SEC,
+            env=worker_env(),
         )
     except subprocess.TimeoutExpired:
         print(f"[check-items-cli] timeout after {SUBAGENT_TIMEOUT_SEC}s on model={model}",
@@ -651,7 +665,7 @@ def _dispatch_classifier_chunk(
         try:
             cp = subprocess.run(
                 cmd, input=prompt, capture_output=True, text=True,
-                timeout=SUBAGENT_TIMEOUT_SEC,
+                timeout=SUBAGENT_TIMEOUT_SEC, env=worker_env(),
             )
         except subprocess.TimeoutExpired:
             print(

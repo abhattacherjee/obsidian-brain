@@ -36,6 +36,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 # An import failure must still exit 0 and leave a hook-log line (#371).
 try:
     from obsidian_utils import (  # noqa: E402
+        is_capture_worker,
         _hook_payload_codex_reason,
         RETRO_GATE_TTL_SECONDS,
         clear_retro_classification_pending,
@@ -65,6 +66,8 @@ _BLOCK_REASON = (
 
 def main() -> None:
     """Read stdin, check sentinel, block or pass through."""
+    if is_capture_worker():  # #425: never gate a capture worker's session
+        return
     try:
         raw = sys.stdin.read(1_000_000)
         data = json.loads(raw)

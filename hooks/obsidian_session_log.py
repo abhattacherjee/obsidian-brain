@@ -26,6 +26,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 try:
     import obsidian_utils  # noqa: E402  — used for _first_seen_date qualified call
     from obsidian_utils import (  # noqa: E402
+        is_capture_worker,
         _append_sessionend_log,
         build_raw_fallback,
         claim_hook_run,
@@ -212,6 +213,10 @@ def _run() -> None:
     # not bleed into this run's EXCEPTION telemetry.
     _LAST_PROJECT = "unknown"
     _LAST_SESSION_ID = "unknown"
+
+    # #425: a capture worker's own `claude -p` session is never logged.
+    if is_capture_worker():
+        return
 
     # 1. Read hook input from stdin
     try:
