@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Auto-capture (#425). obsidian-brain now saves insights, decisions and error-fixes while sessions run, with no command and no extra turn. A batch runs at most every 10 minutes of transcript growth, after an autocompact, at session end, and at the next session start for sessions that ended with unread transcript, headless runs included. Each batch is a detached `claude -p --model sonnet` with no tools (`OBSIDIAN_BRAIN_WORKER=1`, so the plugin's own hooks skip it) that reads up to 3 slices of 400 KB and returns candidates as JSON. Python dedups each one as `/compress` Step 3.5 does: a match gets an `## Update (<date>) — auto-capture <id>` section, anything else is a new note tagged `claude/auto` with `source: auto-capture`. The read offset moves only after the saves, so a failed batch retries the same slice. New `hooks/capture_state.py`, `capture_slice.py`, `capture_save.py`, `capture_reject.py`, `capture_worker.py`, `capture_cli.py` and `hooks/capture_worker_prompt.md`.
+- The Captures pane (`/captures`), a mod that ships inside the plugin (`mods/capture`, loaded from `hooks/hooks.json` `modules`). It starts batches on turn ends and a 60-second timer, and lists this session's captures with a Reject button on the terminal and on Claude Desktop. Reject moves a new note to `<insights>/_rejected/`, or cuts an update section out and saves it there; the indexer skips `_rejected/`, and the worker prompt lists recent rejections so it stops capturing notes like them.
+- Config keys `auto_capture_enabled` (default `true`) and `auto_capture_interval_minutes` (default `10`). The env var `OBSIDIAN_BRAIN_CAPTURE_DISABLED=1` stops workers from starting; the test suite sets it for every test.
+- `scripts/capture-replay.sh <transcript> <project>`, a dev tool that replays capture over one transcript against a copy of the vault, for tuning the worker prompt. On the `claude-code-config-a838` transcript (1.9 MB) it saved 15 notes in 2 runs of 3 slices, including the `$6.28` Fable 5.1 cold-cache point and the stale statusline price table.
+
+### Fixed
+- `scrub_secrets()` now redacts `sk-`, `sk-ant-` and `sk-proj-` API keys, `github_pat_` tokens and Slack `xox*` tokens (#379).
+- `/compress` dedup no longer counts an OR-fallback search hit as a duplicate when it shares only one term with the query (#382). An OR-fallback hit must now share at least `min(2, query terms)` terms (`MIN_OR_FALLBACK_TERM_OVERLAP`). The AND path is unchanged.
+
 ## [3.8.1] - 2026-10-05
 
 ### Fixed

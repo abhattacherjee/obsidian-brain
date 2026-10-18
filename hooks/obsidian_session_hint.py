@@ -134,6 +134,18 @@ def main() -> None:
     sys.exit(0)
 
 
+def _capture_startup(session_id: str) -> None:
+    """#425: write the CLI path for the Captures mod, then sweep unprocessed sessions."""
+    try:
+        import capture_cli
+
+        capture_cli.write_cli_path()
+        if load_config().get("auto_capture_enabled", True):
+            capture_cli.sweep(exclude=session_id or None)
+    except Exception as exc:  # capture never breaks SessionStart
+        print(f"[obsidian-brain] capture sweep failed: {exc}", file=sys.stderr)
+
+
 def _run() -> None:
     # #425: a capture worker's own `claude -p` session gets no hint or sweep.
     if is_capture_worker():
@@ -177,6 +189,7 @@ def _run() -> None:
     if session_id:
         bootstrap_updated = _write_bootstrap_atomic(project, session_id)
     _append_hook_log(project, session_id, bootstrap_updated)
+    _capture_startup(session_id)
 
     # 3. Load config
     config = load_config()

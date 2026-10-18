@@ -1,0 +1,233 @@
+"""capture_worker.py -- run and launch background capture batches (#425).
+
+``run_batch`` is the foreground worker: claim the session, read the next
+transcript slice, ask a headless ``claude -p`` (no tools) for candidate
+notes as JSON, save them, and only then move the read offset forward. A
+failed or timed-out batch leaves the offset where it was, so the next
+batch or the startup sweep retries the same slice.
+
+``launch`` is what the mod, SessionEnd and the sweep call: it checks the
+batch is due and starts ``capture_cli.py run-batch`` fully detached
+(``start_new_session=True``), so it outlives the session that started it.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import capture_reject
+import capture_save
+import capture_slice
+import capture_state
+import obsidian_utils
+
+SENTINEL = "OBSIDIAN-BRAIN-CAPTURE-WORKER v1"
+WORKER_TIMEOUT_SECONDS = 600
+MAX_SLICES_PER_RUN = 3
+DISABLE_ENV_VAR = "OBSIDIAN_BRAIN_CAPTURE_DISABLED"  # the test suite sets it so no hook spawns a worker
+_PROMPT = Path(__file__).resolve().with_name("capture_worker_prompt.md")
+_CLI = Path(__file__).resolve().with_name("capture_cli.py")
+_DISALLOWED = "Bash,Edit,Write,Read,Glob,Grep,WebFetch,WebSearch,Agent,NotebookEdit,ToolSearch"
+_TRANSCRIPTS_ROOT = Path.home() / ".claude" / "projects"
+_FENCE_RE = re.compile(r"```(?:json)?\s*(\[.*?\])\s*```", re.S)
+
+
+def build_prompt(slice_text: str, project: str, rejections: list[str]) -> str:
+    """The worker prompt; its first line is always ``SENTINEL``."""
+    if rejections:
+        listed = "\n".join(f"  - {t}" for t in rejections if t)
+        skip = ("- The developer rejected these recent captures from this project. "
+                f"Do not capture more notes like them:\n{listed}\n")
+    else:
+        skip = ""
+    body = (_PROMPT.read_text(encoding="utf-8")
+            .replace("{{project}}", project)
+            .replace("{{rejections}}", skip)
+            .replace("{{transcript}}", slice_text))
+    return f"{SENTINEL}\n\n{body}"
+
+
+def worker_argv(model: str = "sonnet") -> list[str]:
+    return ["claude", "-p", "--model", model, "--setting-sources", "project", "--strict-mcp-config",
+            "--output-format", "json", "--disallowedTools", _DISALLOWED]
+
+
+def _first_array(text: str):
+    text = text.strip()
+    for candidate in (text, *(_FENCE_RE.findall(text))):
+        try:
+            value = json.loads(candidate)
+        except ValueError:
+            continue
+        if isinstance(value, list):
+            return value
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r"\[", text):
+        try:
+            value, _ = decoder.raw_decode(text, match.start())
+        except ValueError:
+            continue
+        if isinstance(value, list):
+            return value
+    raise ValueError("no JSON array in worker output")
+
+
+def parse_candidates(stdout: str) -> list[dict]:
+    """Candidates from ``claude -p --output-format json`` stdout."""
+    text = stdout
+    try:
+        envelope = json.loads(stdout)
+    except ValueError:
+        envelope = None
+    if isinstance(envelope, dict):
+        if envelope.get("is_error"):
+            raise ValueError(f"worker reported an error: {str(envelope.get('result'))[:200]}")
+        text = str(envelope.get("result") or "")
+    items = _first_array(text)
+    return [i for i in items if isinstance(i, dict) and i.get("type") and i.get("title") and i.get("body")]
+
+
+def _worker_cwd() -> Path:
+    d = capture_state.capture_dir() / "worker-cwd"
+    d.mkdir(exist_ok=True, mode=0o700)
+    return d
+
+
+def run_batch(sid: str, transcript_path: Path, project: str, config: dict | None = None) -> str:
+    """Process up to ``MAX_SLICES_PER_RUN`` slices; return the outcome string."""
+    if not capture_state.claim(sid):
+        capture_state.append_capture_log(project, sid, "claimed")
+        return "claimed"
+    outcome, saved, slices, detail = "empty", 0, 0, ""
+    try:
+        config = config or obsidian_utils.load_config()
+        session_note = None
+        for _ in range(MAX_SLICES_PER_RUN):
+            offset = capture_state.get_state(sid)["offset"]
+            rows, end = capture_slice.read_slice(Path(transcript_path), offset)
+            if end == offset:
+                break
+            text = capture_slice.render_slice(rows)
+            if text.strip():
+                prompt = build_prompt(text, project, capture_reject.recent_rejections(project))
+                try:
+                    result = subprocess.run(worker_argv(), input=prompt, capture_output=True, text=True,
+                                            timeout=WORKER_TIMEOUT_SECONDS, env=obsidian_utils.worker_env(),
+                                            cwd=str(_worker_cwd()))
+                except (subprocess.TimeoutExpired, OSError) as exc:
+                    outcome, detail = "worker-failed", type(exc).__name__
+                    break
+                if result.returncode != 0:
+                    outcome, detail = "worker-failed", f"rc={result.returncode}"
+                    break
+                try:
+                    candidates = parse_candidates(result.stdout)
+                except ValueError as exc:
+                    outcome, detail = "parse-failed", str(exc)[:120]
+                    break
+                if candidates and session_note is None:
+                    session_note = capture_save.session_note_for(sid, project, config)
+                try:
+                    for cand in candidates:
+                        try:
+                            capture_save.save_candidate(cand, session_id=sid, project=project,
+                                                        session_note=session_note, config=config)
+                            saved += 1
+                        except ValueError:
+                            continue  # one malformed candidate never blocks the slice
+                except Exception as exc:  # noqa: BLE001 -- vault unwritable etc.: retry this slice later
+                    outcome, detail = "save-failed", f"{type(exc).__name__}: {exc}"[:160]
+                    break
+            capture_state.set_state(sid, offset=end, transcript_path=str(transcript_path),
+                                    project=project, last_batch_at=time.time())
+            slices += 1
+        if slices:
+            detail = f"slices={slices}" + (f";then={outcome}:{detail}" if outcome != "empty" else "")
+            outcome = f"saved:{saved}"
+        return outcome
+    finally:
+        capture_state.release(sid)
+        capture_state.append_capture_log(project, sid, outcome, detail)
+
+
+def is_due(sid: str, interval_min: int, transcript_path: Path) -> bool:
+    """New transcript bytes, and either the interval passed or PreCompact asked."""
+    state = capture_state.get_state(sid)
+    try:
+        size = Path(transcript_path).stat().st_size
+    except OSError:
+        return False
+    if size <= state["offset"]:
+        return False
+    if capture_state.pop_flush(sid):
+        return True
+    if not state["last_batch_at"]:
+        # First sighting this session: start the clock instead of firing at turn one.
+        capture_state.set_state(sid, last_batch_at=time.time(), transcript_path=str(transcript_path))
+        return False
+    return time.time() - state["last_batch_at"] >= interval_min * 60
+
+
+def _valid_transcript(path: Path) -> bool:
+    root = _TRANSCRIPTS_ROOT.resolve()
+    try:
+        return path.resolve().is_relative_to(root) and path.is_file()
+    except OSError:
+        return False
+
+
+def _transcript_cwd(path: Path) -> str | None:
+    rows, _ = capture_slice.read_slice(path, 0, 200_000)
+    for row in rows:
+        if isinstance(row, dict) and isinstance(row.get("cwd"), str):
+            return row["cwd"]
+    return None
+
+
+def project_for(path: Path) -> str:
+    """Canonical project name for a transcript, from the cwd its rows record."""
+    cwd = _transcript_cwd(path)
+    if not cwd or not Path(cwd).is_dir():
+        return Path(cwd).name if cwd else "unknown"
+    return obsidian_utils.canonical_project_name(cwd)
+
+
+def launch(sid: str, transcript_path: Path | None, project: str | None, if_due: bool,
+           config: dict | None = None) -> bool:
+    """Start a detached ``run-batch`` for ``sid`` when one is due. Never raises."""
+    try:
+        if obsidian_utils.is_capture_worker() or os.environ.get(DISABLE_ENV_VAR) == "1":
+            return False
+        config = config or obsidian_utils.load_config()
+        if not config.get("auto_capture_enabled", True) or not config.get("vault_path"):
+            return False
+        state = capture_state.get_state(sid)
+        path = Path(transcript_path) if transcript_path else (
+            Path(state["transcript_path"]) if state["transcript_path"] else obsidian_utils.find_transcript_jsonl(sid))
+        if path is None or not _valid_transcript(Path(path)):
+            return False
+        project = project or state["project"] or project_for(Path(path))
+        if state["project"] != project:
+            capture_state.set_state(sid, project=project, transcript_path=str(path))
+        if if_due and not is_due(sid, int(config.get("auto_capture_interval_minutes", 10)), path):
+            return False
+        if capture_state.claim_is_live(sid):
+            return False
+        log = os.open(str(capture_state.capture_dir() / "worker.log"), os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600)
+        try:
+            subprocess.Popen([sys.executable, str(_CLI), "run-batch", sid, str(path), project],
+                             start_new_session=True, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                             close_fds=True, cwd=str(capture_state.capture_dir()))
+        finally:
+            os.close(log)
+        return True
+    except Exception as exc:  # noqa: BLE001 -- a launch failure never breaks the caller's hook
+        capture_state.append_capture_log(project or "unknown", sid if isinstance(sid, str) else None,
+                                         "launch-failed", f"{type(exc).__name__}: {exc}"[:160])
+        return False

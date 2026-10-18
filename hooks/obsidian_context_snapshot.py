@@ -230,6 +230,14 @@ def _run() -> None:
         print("[obsidian-brain] snapshot skipped: sibling plugin already handled this compact", file=sys.stderr)
         return
 
+    # #425: the mod runs a capture batch at the next turn end, interval or not.
+    try:
+        import capture_state
+
+        capture_state.set_flush(session_id)
+    except Exception as exc:  # capture never breaks the snapshot
+        print(f"[obsidian-brain] capture flush failed: {exc}", file=sys.stderr)
+
     # 2. Load config
     config = load_config()
     vault_path = config.get("vault_path", "")

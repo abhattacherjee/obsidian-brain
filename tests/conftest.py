@@ -308,3 +308,12 @@ def _isolate_harness_session_id_globally(monkeypatch):
     import obsidian_utils
     for name in obsidian_utils._CODEX_HOST_MARKERS:
         monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _never_spawn_capture_workers(monkeypatch):
+    """#425: no test may start a detached capture worker (it would run a real
+    `claude -p`). SessionEnd and SessionStart now launch workers, and
+    subprocess tests inherit this variable through os.environ.copy(). Tests of
+    launch() itself delenv it and fake Popen."""
+    monkeypatch.setenv("OBSIDIAN_BRAIN_CAPTURE_DISABLED", "1")

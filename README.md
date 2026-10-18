@@ -20,6 +20,7 @@ CC Session Lifecycle
     |
     |-- SessionStart --> Injects last-session context hint
     |-- PreCompact ---> Saves context snapshot before compression
+    |-- every 10 min -> Auto-captures insights, decisions, error-fixes (background)
     |-- /compress ----> You curate & save specific insights
     |-- /recall ------> Loads project context from vault
     |-- /vault-search > Searches across all sessions & insights
@@ -171,6 +172,18 @@ Sessions are automatically logged to your vault on every session end (via hooks)
 
 **Smart filtering:** Sessions with fewer than 3 user messages or shorter than 2 minutes are skipped.
 
+## Auto-Capture
+
+While you work, obsidian-brain saves insights, decisions and error-fixes on its own, so you do not have to remember to run `/compress`, `/decide` or `/error-log`. It runs in the background and never adds a turn or a prompt to your session.
+
+- **When:** at most every 10 minutes while the transcript grows, right after an autocompact, when the session ends, and at the next session start for any session that ended with unread transcript (headless `claude -p` runs and crashed sessions included).
+- **How:** a detached `claude -p --model sonnet` with no tools reads the new part of the transcript and returns candidate notes. The same dedup `/compress` uses decides whether each one updates an existing note (an `## Update (<date>) — auto-capture <id>` section) or becomes a new one.
+- **The bar is low on purpose.** A weak note is cheap to reject; a missed one is gone.
+- **Where to look:** run `/captures` for the Captures pane (terminal and Claude Desktop). Every captured note has the `claude/auto` tag and `source: auto-capture` in its frontmatter.
+- **Reject:** the pane's Reject button moves a new note to `<insights folder>/_rejected/`, or cuts an update section out and saves it there. Nothing is deleted, and the index skips `_rejected/`. Reviewing is optional. The worker reads your recent rejections and stops capturing notes like them.
+- **Turn it off:** set `"auto_capture_enabled": false` in the config. Change the batch interval with `auto_capture_interval_minutes`.
+- **Cost:** each batch is one Sonnet call on your Claude login. With a subscription that has extra usage turned on, batches can use it.
+
 ## Vault Structure
 
 ```
@@ -278,7 +291,9 @@ Machine-local config at `~/.claude/obsidian-brain-config.json`:
   "summary_model": "haiku",
   "auto_log_enabled": true,
   "snapshot_on_compact": true,
-  "snapshot_on_clear": true
+  "snapshot_on_clear": true,
+  "auto_capture_enabled": true,
+  "auto_capture_interval_minutes": 10
 }
 ```
 
@@ -287,6 +302,7 @@ Machine-local config at `~/.claude/obsidian-brain-config.json`:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `CHECK_ITEMS_PREFILTER` | `on` | Set to `off` to disable the L2 evidence-presence pre-filter and route all L1-miss items to the `claude -p` sub-agent. Useful for debugging or A/B comparison. L1 cache is unaffected. |
+| `OBSIDIAN_BRAIN_CAPTURE_DISABLED` | unset | Set to `1` to stop auto-capture from starting workers. The test suite sets it. |
 | `CHECK_ITEMS_SUBAGENT_TIMEOUT_SEC` | `180` | Timeout in seconds for each `claude -p` sub-agent call during `/check-items` Stage 4 classification. |
 
 ## Multi-Device Support

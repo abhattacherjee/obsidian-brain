@@ -207,6 +207,21 @@ def main() -> None:
     sys.exit(0)
 
 
+def _launch_capture(hook_input: dict, session_id: str) -> None:
+    """#425: capture at exit -- start a detached batch for the session's unprocessed tail."""
+    if not session_id:
+        return
+    try:
+        import capture_worker
+
+        cwd = hook_input.get("cwd") or ""
+        project = obsidian_utils.canonical_project_name(cwd) if cwd else None
+        capture_worker.launch(session_id, hook_input.get("transcript_path") or None,
+                              None if project == "unknown" else project, if_due=False)
+    except Exception as exc:  # capture never changes SessionEnd's own outcome
+        print(f"[obsidian-brain] capture launch failed: {exc}", file=sys.stderr)
+
+
 def _run() -> None:
     global _LAST_PROJECT, _LAST_SESSION_ID
     # Reset so a stale value from a prior invocation in the same process does
@@ -503,6 +518,7 @@ def _run() -> None:
         # accumulate stale cache files on any SessionEnd outcome — including
         # threshold skips, missing config, auto_log_disabled, or errors.
         _cleanup_session_cache(session_id)
+        _launch_capture(hook_input, session_id)
 
 
 if __name__ == "__main__":
