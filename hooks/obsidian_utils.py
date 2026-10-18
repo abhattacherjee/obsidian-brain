@@ -4577,6 +4577,10 @@ Rate this session 1-10. 1-3: trivial (config, interrupted). 4-6: standard work. 
 
 _SECRET_PATTERNS = [
     (re.compile(r'gh[ps]_[A-Za-z0-9_]{36,}'), '[REDACTED:github-token]'),
+    # #379: bare provider tokens — Anthropic/OpenAI keys, GitHub fine-grained PATs, Slack.
+    (re.compile(r'\bsk-(?:ant-|proj-)?[A-Za-z0-9_\-]{20,}'), '[REDACTED:api-key]'),
+    (re.compile(r'\bgithub_pat_[A-Za-z0-9_]{22,}'), '[REDACTED:github-token]'),
+    (re.compile(r'\bxox[abprs]-[A-Za-z0-9-]{10,}'), '[REDACTED:slack-token]'),
     (re.compile(r'AKIA[0-9A-Z]{16}'), '[REDACTED:aws-key]'),
     (re.compile(r'(?i)(password|passwd|secret|token|api[_-]?key)\s*[=:]\s*\S+'), r'\1=[REDACTED]'),
     (re.compile(r'-----BEGIN [A-Z ]+-----'), '[REDACTED:pem-header]'),
