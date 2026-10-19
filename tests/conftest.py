@@ -308,3 +308,22 @@ def _isolate_harness_session_id_globally(monkeypatch):
     import obsidian_utils
     for name in obsidian_utils._CODEX_HOST_MARKERS:
         monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _never_spawn_capture_workers(monkeypatch):
+    """#425: no test may start a detached capture worker (it would run a real
+    `claude -p`). SessionEnd and SessionStart now launch workers, and
+    subprocess tests inherit this variable through os.environ.copy(). Tests of
+    launch() itself delenv it and fake Popen."""
+    monkeypatch.setenv("OBSIDIAN_BRAIN_CAPTURE_DISABLED", "1")
+
+
+@pytest.fixture(autouse=True)
+def _isolate_hook_log(tmp_path_factory, monkeypatch):
+    """#425: hook-log lines written by tests (SessionStart, SessionEnd, Capture,
+    Reaped, bootstrap) go to a tmp dir, never to the real
+    ~/.claude/obsidian-brain-hook.log (fake lines leaked there before).
+    Every writer builds the path from ``~``, so each test gets a tmp HOME;
+    subprocess hooks inherit it. Tests that set their own HOME still win."""
+    monkeypatch.setenv("HOME", str(tmp_path_factory.mktemp("home")))

@@ -60,6 +60,12 @@ assert MIN_COSINE_RESCUE >= MIN_COSINE, (
 # overlap via low IDF weight; this param is available for future tightening).
 MIN_TERM_OVERLAP = 0
 
+# #382: an OR-fallback hit (the AND query matched nothing) must share at least
+# this many weighted terms with the query, capped at the query's own size so a
+# one-term query can still match. One high-IDF shared word ("sentry") carried a
+# cross-topic note past the rank and cosine gates as a "very strong" match.
+MIN_OR_FALLBACK_TERM_OVERLAP = 2
+
 
 def is_high_confidence_match(
     results,
@@ -69,6 +75,7 @@ def is_high_confidence_match(
     min_cosine=None,
     min_term_overlap=None,
     min_cosine_rescue=None,
+    min_or_fallback_overlap=None,
 ):
     """Return True if the top search result is a high-confidence match.
 
@@ -96,6 +103,11 @@ def is_high_confidence_match(
             must keep min_cosine_rescue >= min_cosine; the function does
             not re-validate override params (the module-level assert only
             guards the default constants).
+        min_or_fallback_overlap: optional override for
+            MIN_OR_FALLBACK_TERM_OVERLAP. When the top result is an
+            OR-fallback hit with a tfidf_vector, it must share at least
+            min(this, number of weighted query terms) terms with the query
+            (#382). Ignored when query_vec is None. 0 disables it.
 
     Returns:
         bool. True only if:
@@ -125,6 +137,8 @@ def is_high_confidence_match(
         min_term_overlap = MIN_TERM_OVERLAP
     if min_cosine_rescue is None:
         min_cosine_rescue = MIN_COSINE_RESCUE
+    if min_or_fallback_overlap is None:
+        min_or_fallback_overlap = MIN_OR_FALLBACK_TERM_OVERLAP
 
     if not results:
         return False
@@ -162,14 +176,12 @@ def is_high_confidence_match(
             if top_cosine is None:
                 top_cosine = _cosine_similarity(query_vec, note_vec)
             cosine = top_cosine
-            if min_term_overlap > 0:
-                shared = sum(
-                    1
-                    for term, w in query_vec.items()
-                    if w > 0 and term in note_vec
-                )
-                if shared < min_term_overlap:
-                    return False
+            query_terms = [term for term, w in query_vec.items() if w > 0]
+            shared = sum(1 for term in query_terms if term in note_vec)
+            if min_term_overlap > 0 and shared < min_term_overlap:
+                return False
+            if is_or_fallback and shared < min(min_or_fallback_overlap, len(query_terms)):
+                return False
             if cosine < min_cosine:
                 return False
         else:

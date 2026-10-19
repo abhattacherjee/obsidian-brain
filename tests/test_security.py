@@ -164,6 +164,26 @@ class TestSecretScrubbing:
         text = "normal conversation about code review and debugging"
         assert scrub_secrets(text) == text
 
+    # #379: bare provider tokens (auto-capture #425 writes notes unreviewed).
+    @pytest.mark.parametrize("token,label", [
+        ("sk-ant-api03-" + "A1b2C3d4E5f6G7h8I9j0K1l2", "[REDACTED:api-key]"),
+        ("sk-proj-" + "a1B2c3D4e5F6g7H8i9J0k1L2", "[REDACTED:api-key]"),
+        ("sk-" + "abcdefghijklmnopqrstuvwx", "[REDACTED:api-key]"),
+        ("github_pat_" + "11ABCDEFG0123456789abc_xyz", "[REDACTED:github-token]"),
+        ("xoxb-" + "1234567890-abcdefghij", "[REDACTED:slack-token]"),
+        ("xoxp-" + "1234567890-abcdefghij", "[REDACTED:slack-token]"),
+    ])
+    def test_scrub_provider_tokens(self, token, label):
+        from obsidian_utils import scrub_secrets
+        result = scrub_secrets(f"body key {token} end")
+        assert token not in result
+        assert label in result
+
+    def test_scrub_provider_token_negative_control(self):
+        from obsidian_utils import scrub_secrets
+        text = "the sk-learn task and a risk-averse plan"
+        assert scrub_secrets(text) == text
+
 
 class TestRawMessageToggle:
     """H2: log_raw_messages config controls conversation logging."""

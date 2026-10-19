@@ -11,6 +11,7 @@ from compress_guard import (
     MIN_COSINE_RESCUE,
     MIN_RANK_DELTA,
     MIN_RANK_STRENGTH,
+    MIN_OR_FALLBACK_TERM_OVERLAP,
     MIN_TERM_OVERLAP,
     is_high_confidence_match,
 )
@@ -546,3 +547,48 @@ def test_rank_delta_nearmiss_no_tfidf_vector_rejects():
         {"rank": _NEAR_MISS_RUNNER_UP_RANK},
     ]
     assert is_high_confidence_match(results_none, query_vec=_QUERY_RESCUE) is False
+
+
+# --- #382: one shared word must never be a high-confidence match -------------
+
+_QUERY_382 = {t: 1.0 for t in (
+    "using", "mcp", "automate", "entire", "workflow", "update", "settings",
+    "instead", "relying", "navigate", "via", "ui", "me", "to",
+)}
+_QUERY_382["sentry"] = 10.0
+_NOTE_382 = {"sentry": 10.0, "epic": 1.0, "spec": 1.0}
+
+
+def test_single_shared_term_never_high_confidence():
+    """The 2026-09-30 shape: rank -25.08 vs -24.62, shared_terms == ['sentry']."""
+    results = [
+        {"rank": -25.08, "tfidf_vector": _NOTE_382, "or_fallback": True},
+        {"rank": -24.62},
+    ]
+    assert is_high_confidence_match(results, query_vec=_QUERY_382) is False
+    # Non-vacuity: with the overlap check off, the same input is accepted, so
+    # the term-overlap gate (not some other gate) is what rejects it.
+    assert is_high_confidence_match(results, query_vec=_QUERY_382, min_or_fallback_overlap=0) is True
+
+
+def test_two_shared_terms_still_match():
+    note = dict(_NOTE_382, workflow=8.0)
+    results = [{"rank": -25.08, "tfidf_vector": note, "or_fallback": True}, {"rank": -24.62}]
+    assert is_high_confidence_match(results, query_vec=_QUERY_382) is True
+
+
+def test_single_term_query_is_not_blocked_by_overlap():
+    """A one-term query can only share one term; the gate caps at the query size."""
+    results = [{"rank": -29.0, "tfidf_vector": {"sentry": 5.0}, "or_fallback": True}, {"rank": -20.0}]
+    assert is_high_confidence_match(results, query_vec={"sentry": 3.0}) is True
+
+
+def test_and_path_single_shared_term_unchanged():
+    """The #382 gate is OR-fallback only: an AND-path hit keeps today's verdict."""
+    results = [{"rank": -25.08, "tfidf_vector": _NOTE_382}, {"rank": -24.62}]
+    assert is_high_confidence_match(results, query_vec=_QUERY_382) is True
+
+
+def test_or_fallback_overlap_defaults():
+    assert MIN_OR_FALLBACK_TERM_OVERLAP == 2
+    assert MIN_TERM_OVERLAP == 0

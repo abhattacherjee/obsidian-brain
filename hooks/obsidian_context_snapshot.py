@@ -23,6 +23,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 # An import failure must still exit 0 and leave a hook-log line (#371).
 try:
     from obsidian_utils import (  # noqa: E402
+        is_capture_worker,
         _hook_payload_codex_reason,
         claim_hook_run,
         extract_assistant_messages,
@@ -190,6 +191,10 @@ def main() -> None:
 
 
 def _run() -> None:
+    # #425: a capture worker's own `claude -p` session takes no snapshot.
+    if is_capture_worker():
+        return
+
     # 1. Read hook input from stdin
     try:
         raw = sys.stdin.read(1_000_000)
@@ -224,6 +229,14 @@ def _run() -> None:
     if not claim_hook_run("PreCompact", session_id):
         print("[obsidian-brain] snapshot skipped: sibling plugin already handled this compact", file=sys.stderr)
         return
+
+    # #425: the mod runs a capture batch at the next turn end, interval or not.
+    try:
+        import capture_state
+
+        capture_state.set_flush(session_id)
+    except Exception as exc:  # capture never breaks the snapshot
+        print(f"[obsidian-brain] capture flush failed: {exc}", file=sys.stderr)
 
     # 2. Load config
     config = load_config()

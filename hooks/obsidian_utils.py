@@ -2250,7 +2250,27 @@ _DEFAULTS: dict = {
     "snapshot_on_clear": True,
     "optional_deps_prompted": False,
     "optional_deps_declined": [],
+    "auto_capture_enabled": True,  # #425: background capture of insights/decisions/error fixes
+    "auto_capture_interval_minutes": 10,  # #425: minimum gap between mid-session capture batches
+    # #425: projects whose sessions are captured below the 3-user-message gate (headless runs)
+    "auto_capture_headless_projects": ["openclaw"],
 }
+
+# #425: set on every `claude -p` this plugin starts, so the child session's
+# hooks (and the capture sweep) never treat a worker as a real session.
+WORKER_ENV_VAR = "OBSIDIAN_BRAIN_WORKER"
+
+
+def is_capture_worker() -> bool:
+    """True when this process runs inside a `claude -p` the plugin started."""
+    return os.environ.get(WORKER_ENV_VAR) == "1"
+
+
+def worker_env() -> dict:
+    """A copy of the environment with the worker guard set, for `claude -p` children."""
+    env = dict(os.environ)
+    env[WORKER_ENV_VAR] = "1"
+    return env
 
 
 # ---------------------------------------------------------------------------
@@ -4288,6 +4308,7 @@ def generate_snapshot_summary(
             result = subprocess.run(
                 ["claude", "-p", "--model", model],
                 input=prompt, capture_output=True, text=True, timeout=attempt_timeout,
+                env=worker_env(),
             )
             if result.returncode == 0 and result.stdout.strip():
                 return result.stdout.strip(), None
@@ -4353,6 +4374,7 @@ def generate_theme_names(
             result = subprocess.run(
                 ["claude", "-p", "--model", model],
                 input=prompt, capture_output=True, text=True, timeout=attempt_timeout,
+                env=worker_env(),
             )
         except FileNotFoundError:
             return None, "haiku_subprocess_error"
@@ -4506,6 +4528,7 @@ Rate this session 1-10. 1-3: trivial (config, interrupted). 4-6: standard work. 
                 capture_output=True,
                 text=True,
                 timeout=attempt_timeout,
+                env=worker_env(),
             )
             if result.returncode == 0 and result.stdout.strip():
                 summary_text = result.stdout.strip()
@@ -4556,6 +4579,10 @@ Rate this session 1-10. 1-3: trivial (config, interrupted). 4-6: standard work. 
 
 _SECRET_PATTERNS = [
     (re.compile(r'gh[ps]_[A-Za-z0-9_]{36,}'), '[REDACTED:github-token]'),
+    # #379: bare provider tokens — Anthropic/OpenAI keys, GitHub fine-grained PATs, Slack.
+    (re.compile(r'\bsk-(?:ant-|proj-)?[A-Za-z0-9_\-]{20,}'), '[REDACTED:api-key]'),
+    (re.compile(r'\bgithub_pat_[A-Za-z0-9_]{22,}'), '[REDACTED:github-token]'),
+    (re.compile(r'\bxox[abprs]-[A-Za-z0-9-]{10,}'), '[REDACTED:slack-token]'),
     (re.compile(r'AKIA[0-9A-Z]{16}'), '[REDACTED:aws-key]'),
     (re.compile(r'(?i)(password|passwd|secret|token|api[_-]?key)\s*[=:]\s*\S+'), r'\1=[REDACTED]'),
     (re.compile(r'-----BEGIN [A-Z ]+-----'), '[REDACTED:pem-header]'),
@@ -6950,6 +6977,7 @@ def generate_summaries_batch(
                 capture_output=True,
                 text=True,
                 timeout=attempt_timeout,
+                env=worker_env(),
             )
             if result.returncode == 0 and result.stdout.strip():
                 stdout_text = result.stdout.strip()
