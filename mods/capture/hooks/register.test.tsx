@@ -145,19 +145,27 @@ test('pane lists captures and Reject rejects, on both surfaces', async ($, on) =
   }
 })
 
-test('terminal rows keep fixed columns at narrow widths, so nothing wraps', async ($, on) => {
+test('terminal rows keep fixed columns; a long title wraps under its column to 3 lines', async ($, on) => {
   const w = await openPane($, on)
+  const words = Array.from({ length: 40 }, (_, i) => `word${i}`).join(' ')
   w.rows = [
-    { id: 'ccc', ts: 1792348860, type: 'error-fix', title: 'x'.repeat(200), kind: 'updated', status: 'active' },
+    { id: 'ccc', ts: 1792348860, type: 'error-fix', title: words, kind: 'updated', status: 'active', summary: words },
   ]
   await $.command.run({ command: 'captures', args: '' } as never)
   const ui = await $.ui.mount(paneProps('terminal', 60))
-  const title = await ui.find({ type: 'Text', text: /^x+…$/ })
-  expect(title).toBeDefined()
   // 60 columns less time (5), type (7), kind (7) and three gaps.
-  expect(String(title!.text).length).toBe(60 - 5 - 7 - 7 - 3)
+  const first = await ui.find({ type: 'Text', text: /^word0 word1 / })
+  expect(String(first!.text).length).toBe(60 - 5 - 7 - 7 - 3)
   expect(await ui.find({ type: 'Text', text: 'error  ' })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: 'updated' })).toBeDefined()
+  // Lines 2 and 3 sit under the title column; the third ends with "…" and there is no fourth.
+  expect(await ui.find({ type: 'Text', text: /^ {14}word6 word7 .*word11$/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^ {14}word12 .*word16…$/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /word17 word18 word19 word20 word21 word22$/ })).toBeUndefined()
+  // The summary wraps to 3 lines too, the last cut with "…".
+  expect(await ui.find({ type: 'Text', text: /^ {2}word0 word1 .*word8$/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^ {2}word17 .*word24…$/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^ {2}word25/ })).toBeUndefined()
   expect(await ui.find({ key: 'reject-ccc' })).toBeDefined()
   expect(await ui.find({ text: /Reject update/ })).toBeDefined()
   await ui.unmount()
@@ -172,7 +180,7 @@ test('terminal detail strip shows the selected row; focus moves the selection an
   await $.command.run({ command: 'captures', args: '' } as never)
   const ui = await $.ui.mount(paneProps('terminal'))
   expect(await ui.find({ text: /sum one/ })).toBeDefined()
-  expect(await ui.find({ type: 'Link', href: 'obsidian://open?vault=my%20vault&file=claude-insights%2Fa.md' })).toBeDefined()
+  expect(await ui.find({ type: 'Link', href: 'obsidian://open?vault=my%20vault&file=claude-insights%2Fa.md' } as never)).toBeDefined()
   expect(await ui.find({ key: 'reject-n1' })).toBeDefined()
   await $.ui.focus({ component: 'Pane', requestId: 'captures', plugin: PLUGIN, element: 'row-n2', origin: { kind: 'person' } } as never)
   expect(await ui.find({ text: /sum two/ })).toBeDefined()
@@ -187,9 +195,10 @@ test('terminal draws only the rows that fit, so the footer stays on screen', asy
   w.rows = Array.from({ length: 40 }, (_, i) => ({ id: `r${i}`, ts: 1792348860 - i, type: 'insight', title: `t${i}`, kind: 'new', status: 'active' }))
   await $.command.run({ command: 'captures', args: '' } as never)
   const ui = await $.ui.mount(paneProps('terminal', 72, 16))
+  // 16 rows less header, column names, footer and a two-line detail strip leave 11.
   expect(await ui.find({ key: 'row-r0' })).toBeDefined()
-  expect(await ui.find({ key: 'row-r9' })).toBeDefined()
-  expect(await ui.find({ key: 'row-r10' })).toBeUndefined()
+  expect(await ui.find({ key: 'row-r10' })).toBeDefined()
+  expect(await ui.find({ key: 'row-r11' })).toBeUndefined()
   expect(await ui.find({ text: /r reject · s scope/ })).toBeDefined()
   await ui.unmount()
 })

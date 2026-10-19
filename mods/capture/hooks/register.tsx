@@ -116,6 +116,33 @@ function fit(text: string, width: number): string {
   return text.length > width ? `${text.slice(0, Math.max(0, width - 1))}…` : text.padEnd(width)
 }
 
+// Word-wrap to `width`, as control-tower's wrapText does; a word longer than the line is split.
+// Past `max` lines the last one is cut with "…".
+function wrap(text: string, width: number, max: number): string[] {
+  const room = Math.max(1, width)
+  const lines: string[] = []
+  let line = ''
+  for (const word of text.split(/\s+/)) {
+    if (!word) continue
+    if (line && line.length + 1 + word.length > room) {
+      lines.push(line)
+      line = ''
+    }
+    let rest = word
+    while (!line && rest.length > room) {
+      lines.push(rest.slice(0, room))
+      rest = rest.slice(room)
+    }
+    line = line ? `${line} ${rest}` : rest
+  }
+  if (line) lines.push(line)
+  if (lines.length <= max) return lines.length ? lines : ['']
+  const kept = lines.slice(0, max)
+  const last = kept[max - 1]!
+  kept[max - 1] = last.length >= room ? `${last.slice(0, room - 1)}…` : `${last}…`
+  return kept
+}
+
 function obsidianUrl(vault: string | undefined, notePath: string | undefined): string | undefined {
   if (!vault || !notePath) return undefined
   return `obsidian://open?vault=${encodeURIComponent(vault)}&file=${encodeURIComponent(notePath)}`
@@ -159,8 +186,8 @@ function footer(now: CaptureStatus | null): string {
 const TIME_W = 5
 const TYPE_W = 7
 const KIND_W = 7
-// Header, column names, the two-line detail strip and the footer.
-const CHROME_ROWS = 6
+// A long title or summary wraps to at most this many lines.
+const MAX_LINES = 3
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
@@ -289,15 +316,39 @@ export const register: Register = on => {
 
     const cols = Math.max(40, e.props.bodyColumns)
     const titleW = cols - TIME_W - TYPE_W - KIND_W - 3
+    const indent = ' '.repeat(TIME_W + TYPE_W + 2)
     const active = list.filter(r => r.status !== 'rejected')
     const focus = list.find(r => r.id === chosen && r.status !== 'rejected') ?? active[0]
-    // Draw only the rows that fit, around the selected one, so the strip and footer stay on screen.
-    const room = Math.max(3, e.props.scroll.bodyRows - CHROME_ROWS)
-    const at = focus ? list.indexOf(focus) : 0
-    const start = Math.max(0, Math.min(at - Math.floor(room / 2), list.length - room))
-    const shown = list.slice(start, start + room)
     const multi = which !== 'session'
     const url = focus ? obsidianUrl(now?.vault, focus.note_path) : undefined
+    const titleOf = (row: CaptureRow) => (multi ? `${row.project ?? '?'}: ${row.title ?? ''}` : (row.title ?? ''))
+    const titleLines = list.map(row => (row.status === 'rejected' ? [fit(titleOf(row), titleW)] : wrap(titleOf(row), titleW, MAX_LINES)))
+    const summaryLines = focus?.summary ? wrap(focus.summary, cols - 2, MAX_LINES) : []
+    const pathLines = focus?.note_path ? Math.ceil(focus.note_path.length / (cols - 2)) : 0
+    // Header, column names and footer; then the detail strip: a gap, its first line, the path and the summary.
+    const chrome = 3 + (list.length === 0 ? 1 : 0) + (focus ? 2 + pathLines + summaryLines.length : 0)
+    // Draw only the rows that fit, around the selected one, so the strip and footer stay on screen.
+    const room = Math.max(1, e.props.scroll.bodyRows - chrome)
+    const at = focus ? list.indexOf(focus) : 0
+    let first = at
+    let last = at
+    let used = titleLines[at]?.length ?? 0
+    for (let grew = true; grew; ) {
+      grew = false
+      const below = titleLines[last + 1]
+      if (below && used + below.length <= room) {
+        last += 1
+        used += below.length
+        grew = true
+      }
+      const above = titleLines[first - 1]
+      if (above && used + above.length <= room) {
+        first -= 1
+        used += above.length
+        grew = true
+      }
+    }
+    const shown = list.slice(first, last + 1)
 
     return (
       <Box flexDirection="column">
@@ -320,34 +371,53 @@ export const register: Register = on => {
         {list.length === 0 && <Text dimColor>No captures yet{which === 'session' ? ' this session' : ''}.</Text>}
         {shown.map(row => {
           const t = typeOf(row)
-          const title = multi ? `${row.project ?? '?'}: ${row.title ?? ''}` : (row.title ?? '')
+          const lines = titleLines[list.indexOf(row)]!
           const kind = fit(row.kind === 'updated' ? 'updated' : 'new', KIND_W)
           if (row.status === 'rejected') {
             return (
               <Text key={`row-${row.id}`} dimColor>
-                {fit(clockTime(row.ts), TIME_W)} {fit(t.short, TYPE_W)} <Text strikethrough>{fit(title, titleW)}</Text> {fit('rejected', KIND_W)}
+                {fit(clockTime(row.ts), TIME_W)} {fit(t.short, TYPE_W)} <Text strikethrough>{lines[0]}</Text> {fit('rejected', KIND_W)}
               </Text>
             )
           }
+          const bold = row.id === focus?.id
           return (
-            <Button key={`row-${row.id}`} plain onPress={() => void update($, selected, () => row.id)}>
-              <Text dimColor>{fit(clockTime(row.ts), TIME_W)}</Text> <Text color={t.color}>{fit(t.short, TYPE_W)}</Text>{' '}
-              <Text bold={row.id === focus?.id}>{fit(title, titleW)}</Text> <Text dimColor>{kind}</Text>
-            </Button>
+            <Box key={`item-${row.id}`} flexDirection="column">
+              <Button key={`row-${row.id}`} plain onPress={() => void update($, selected, () => row.id)}>
+                <Text dimColor>{fit(clockTime(row.ts), TIME_W)}</Text> <Text color={t.color}>{fit(t.short, TYPE_W)}</Text>{' '}
+                <Text bold={bold}>{fit(lines[0]!, titleW)}</Text> <Text dimColor>{kind}</Text>
+              </Button>
+              {lines.slice(1).map((line, i) => (
+                <Text key={`more-${row.id}-${i}`}>
+                  {indent}
+                  <Text bold={bold}>{line}</Text>
+                </Text>
+              ))}
+            </Box>
           )
         })}
         {focus ? (
           <Box key="detail" flexDirection="column" marginTop={1}>
-            <Box flexDirection="row" gap={1}>
+            <Box flexDirection="row" justifyContent="space-between">
               <Text>
-                ▸ {clockTime(focus.ts)} {typeOf(focus).long.toLowerCase()} ·
+                ▸ {clockTime(focus.ts)} {typeOf(focus).long.toLowerCase()} · {focus.kind === 'updated' ? 'updated a note' : 'new note'}
               </Text>
-              {url ? <Link href={url}>{focus.note_path ?? ''}</Link> : <Text>{focus.note_path ?? ''}</Text>}
               <Button key={`reject-${focus.id}`} hotkey="r" variant="primary" onPress={() => void reject($, focus.id)}>
                 {focus.kind === 'updated' ? 'Reject update' : 'Reject'}
               </Button>
             </Box>
-            {focus.summary ? <Text dimColor>{fit(`  ${focus.summary}`, cols)}</Text> : null}
+            {focus.note_path ? (
+              <Box flexDirection="row">
+                <Text>{'  '}</Text>
+                {url ? <Link href={url}>{focus.note_path}</Link> : <Text>{focus.note_path}</Text>}
+              </Box>
+            ) : null}
+            {summaryLines.map((line, i) => (
+              <Text key={`summary-${i}`} dimColor>
+                {'  '}
+                {line}
+              </Text>
+            ))}
           </Box>
         ) : null}
         <Box key="footer" flexDirection="row" justifyContent="space-between">

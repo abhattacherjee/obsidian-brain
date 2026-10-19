@@ -320,10 +320,10 @@ def _never_spawn_capture_workers(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def _isolate_capture_hook_log(tmp_path_factory, monkeypatch):
-    """#425: capture's ``Capture`` telemetry lines go to a tmp dir, never to the
-    real ~/.claude/obsidian-brain-hook.log (81 fake lines leaked there before)."""
-    import capture_state
-
-    log_dir = tmp_path_factory.mktemp("capture-log")
-    monkeypatch.setattr(capture_state, "_log_dir", lambda: log_dir)
+def _isolate_hook_log(tmp_path_factory, monkeypatch):
+    """#425: hook-log lines written by tests (SessionStart, SessionEnd, Capture,
+    Reaped, bootstrap) go to a tmp dir, never to the real
+    ~/.claude/obsidian-brain-hook.log (fake lines leaked there before).
+    Every writer builds the path from ``~``, so each test gets a tmp HOME;
+    subprocess hooks inherit it. Tests that set their own HOME still win."""
+    monkeypatch.setenv("HOME", str(tmp_path_factory.mktemp("home")))

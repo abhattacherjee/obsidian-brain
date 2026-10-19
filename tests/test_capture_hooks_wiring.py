@@ -2,6 +2,8 @@
 
 import io
 import json
+import os
+from pathlib import Path
 
 import pytest
 
@@ -101,8 +103,10 @@ def test_sessionstart_headless_does_not_sweep(monkeypatch, sweeps):
 
 
 def test_capture_log_is_isolated(tmp_path):
+    import pwd
+
     capture_state.append_capture_log("demo", SID, "saved:1")
-    real = capture_state.Path.home() / ".claude" / "obsidian-brain-hook.log"
+    real = Path(pwd.getpwuid(os.getuid()).pw_dir) / ".claude" / "obsidian-brain-hook.log"
     assert capture_state._log_dir() != real.parent
     assert "Capture project=demo" in (capture_state._log_dir() / "obsidian-brain-hook.log").read_text()
 
