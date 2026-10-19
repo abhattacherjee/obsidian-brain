@@ -73,6 +73,12 @@ SUMMARY_CHARS = 200  # the pane's one-line preview of the body
 _HEADING_RE = re.compile(r"^(#{1,6})(?=\s)")
 
 
+def summary_of(body: str) -> str:
+    """The pane's preview: the body's text on one line, headings left out."""
+    text = " ".join(line for line in body.splitlines() if not _HEADING_RE.match(line.lstrip()))
+    return " ".join(text.split())[:SUMMARY_CHARS]
+
+
 def fence_step(open_fence: tuple[str, int] | None, line: str) -> tuple[tuple[str, int] | None, bool]:
     """CommonMark fence state after ``line``: ``(open fence, line is a fence line)``.
 
@@ -196,7 +202,7 @@ def save_candidate(
         raise ValueError("candidate has an empty body")
     cid = secrets.token_hex(6)
     row = {"id": cid, "session_id": session_id, "project": project, "type": c["type"],
-           "title": title, "status": "active", "summary": " ".join(body.split())[:SUMMARY_CHARS]}
+           "title": title, "status": "active", "summary": summary_of(body)}
 
     match = find_match(f"{title}\n{body[:300]}", config)
     sink = io.StringIO()

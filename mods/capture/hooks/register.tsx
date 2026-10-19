@@ -143,6 +143,11 @@ function wrap(text: string, width: number, max: number): string[] {
   return kept
 }
 
+// Rows saved before the ledger left headings out still carry "## Error"-style markers.
+function plainSummary(text: string | undefined): string {
+  return (text ?? '').replace(/(^|\s)#{1,6}\s+/g, '$1').trim()
+}
+
 function obsidianUrl(vault: string | undefined, notePath: string | undefined): string | undefined {
   if (!vault || !notePath) return undefined
   return `obsidian://open?vault=${encodeURIComponent(vault)}&file=${encodeURIComponent(notePath)}`
@@ -293,7 +298,7 @@ export const register: Register = on => {
                       </Text>
                     </Box>
                     <Text weight="semibold">{row.title ?? ''}</Text>
-                    {row.summary ? <Text dimColor>{row.summary}</Text> : null}
+                    {row.summary ? <Text dimColor>{plainSummary(row.summary)}</Text> : null}
                     <Box flexDirection="row" gap={2} alignItems="center">
                       {url ? <Link href={url}>Open in Obsidian</Link> : null}
                       <Button key={`reject-${row.id}`} onPress={() => void reject($, row.id)}>
@@ -323,7 +328,7 @@ export const register: Register = on => {
     const url = focus ? obsidianUrl(now?.vault, focus.note_path) : undefined
     const titleOf = (row: CaptureRow) => (multi ? `${row.project ?? '?'}: ${row.title ?? ''}` : (row.title ?? ''))
     const titleLines = list.map(row => (row.status === 'rejected' ? [fit(titleOf(row), titleW)] : wrap(titleOf(row), titleW, MAX_LINES)))
-    const summaryLines = focus?.summary ? wrap(focus.summary, cols - 2, MAX_LINES) : []
+    const summaryLines = focus?.summary ? wrap(plainSummary(focus.summary), cols - 2, MAX_LINES) : []
     const pathLines = focus?.note_path ? Math.ceil(focus.note_path.length / (cols - 2)) : 0
     // Header, column names and footer; then the detail strip: a gap, its first line, the path and the summary.
     const chrome = 3 + (list.length === 0 ? 1 : 0) + (focus ? 2 + pathLines + summaryLines.length : 0)

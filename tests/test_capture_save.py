@@ -27,6 +27,12 @@ def _front(path):
     return text.split("---", 2)[1], text
 
 
+
+def test_summary_leaves_out_headings():
+    body = "## Error\nThe registry listed two\n  services.\n\n## Fix\nRemoved them.\n#hashtag stays"
+    assert capture_save.summary_of(body) == "The registry listed two services. Removed them. #hashtag stays"
+    assert len(capture_save.summary_of("word " * 100)) == capture_save.SUMMARY_CHARS
+
 def test_new_insight_uses_template_fields(mock_config, tmp_vault, no_match):
     row = capture_save.save_candidate(_cand(), session_id=SID, project="obsidian-brain",
                                       session_note="2026-10-18-obsidian-brain-1a2b",

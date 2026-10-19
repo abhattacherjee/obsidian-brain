@@ -174,12 +174,12 @@ test('terminal rows keep fixed columns; a long title wraps under its column to 3
 test('terminal detail strip shows the selected row; focus moves the selection and Reject follows it', async ($, on) => {
   const w = await openPane($, on)
   w.rows = [
-    { id: 'n1', ts: 1792348860, type: 'insight', title: 'first', kind: 'new', status: 'active', note_path: 'claude-insights/a.md', summary: 'sum one' },
+    { id: 'n1', ts: 1792348860, type: 'insight', title: 'first', kind: 'new', status: 'active', note_path: 'claude-insights/a.md', summary: '## Error sum one' },
     { id: 'n2', ts: 1792348800, type: 'decision', title: 'second', kind: 'new', status: 'active', note_path: 'claude-insights/b.md', summary: 'sum two' },
   ]
   await $.command.run({ command: 'captures', args: '' } as never)
   const ui = await $.ui.mount(paneProps('terminal'))
-  expect(await ui.find({ text: /sum one/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^ {2}Error sum one$/ })).toBeDefined() // heading marker dropped
   expect(await ui.find({ type: 'Link', href: 'obsidian://open?vault=my%20vault&file=claude-insights%2Fa.md' } as never)).toBeDefined()
   expect(await ui.find({ key: 'reject-n1' })).toBeDefined()
   await $.ui.focus({ component: 'Pane', requestId: 'captures', plugin: PLUGIN, element: 'row-n2', origin: { kind: 'person' } } as never)
