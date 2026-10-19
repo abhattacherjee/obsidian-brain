@@ -31,12 +31,20 @@ import capture_state  # noqa: E402
 import capture_worker  # noqa: E402
 import obsidian_utils  # noqa: E402
 
-MIN_USER_MESSAGES = 3  # should_skip_session's default threshold
 
 
-def pending_sessions(limit: int, exclude: str | None = None) -> list[tuple[str, Path]]:
-    """Transcripts since install with unprocessed bytes, oldest first."""
-    since = capture_state.installed_at()
+def pending_sessions(limit: int, exclude: str | None = None,
+                     config: dict | None = None) -> list[tuple[str, Path]]:
+    """Ended transcripts since install with unread bytes that pass ``eligible``, oldest first.
+
+    A transcript written to within the last capture interval is skipped: its
+    session is probably still running, and its own mod captures it. A "not
+    eligible" verdict is kept as ``checked_size`` so the transcript is not
+    parsed again until it grows.
+    """
+    config = config or obsidian_utils.load_config()
+    quiet_s = int(config.get("auto_capture_interval_minutes", 10)) * 60
+    since, now = capture_state.installed_at(), time.time()
     found = []
     for path in capture_worker._TRANSCRIPTS_ROOT.glob("*/*.jsonl"):
         sid = path.stem
@@ -44,15 +52,19 @@ def pending_sessions(limit: int, exclude: str | None = None) -> list[tuple[str, 
             continue  # the current session, or a capture worker's own transcript
         try:
             st = path.stat()
-            if st.st_mtime < since or st.st_size <= capture_state.get_state(sid)["offset"]:
+            if st.st_mtime < since or now - st.st_mtime < quiet_s:
                 continue
+            state = capture_state.get_state(sid)
         except (OSError, ValueError):
             continue  # unreadable file, or a stem that is not a valid session id
+        if st.st_size <= state["offset"] or st.st_size == state["checked_size"]:
+            continue
         if capture_state.claim_is_live(sid):
             continue
-        if capture_slice.first_user_text(path).startswith(capture_worker.SENTINEL):
-            continue  # a capture worker's own transcript
-        if capture_slice.count_user_messages(path) < MIN_USER_MESSAGES:
+        project = state["project"] or capture_worker.project_for(path)
+        if (capture_slice.first_user_text(path).startswith(capture_worker.SENTINEL)
+                or not capture_worker.eligible(path, project, config)):
+            capture_state.set_state(sid, checked_size=st.st_size)
             continue
         found.append((st.st_mtime, sid, path))
     found.sort()

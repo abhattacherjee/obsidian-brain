@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 
 import capture_state
+import note_writer
 import obsidian_utils
 import vault_index
 
@@ -58,17 +59,26 @@ def reject(capture_id: str, config: dict | None = None) -> dict:
     rejected_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
 
     if row.get("kind") == "updated":
-        text = note.read_text(encoding="utf-8")
-        kept, section = _remove_section(text, row.get("update_heading", ""))
         dest = rejected_dir / f"{note.stem}-update-{capture_id}.md"
-        if section:
-            err = obsidian_utils.write_vault_note(str(vault), f"{folder}/{REJECTED_DIR}", dest.name, section + "\n")
-            if err:
-                raise RuntimeError(err)
-            rel_note = str(note.relative_to(vault.resolve()))
-            err = obsidian_utils.write_vault_note(str(vault), str(Path(rel_note).parent), note.name, kept)
-            if err:
-                raise RuntimeError(err)
+        # The same lock append-update takes, plus its stat re-check, so a capture
+        # appending to this note right now is never overwritten.
+        lock, err = note_writer._acquire_lock(note)
+        if err:
+            raise RuntimeError(err)
+        try:
+            st = os.stat(note)
+            with open(note, encoding="utf-8", newline="") as fh:
+                text = fh.read()
+            kept, section = _remove_section(text, row.get("update_heading", ""))
+            if section:
+                err = obsidian_utils.write_vault_note(str(vault), f"{folder}/{REJECTED_DIR}", dest.name, section + "\n")
+                if err:
+                    raise RuntimeError(err)
+                err = note_writer._atomic_rewrite(note, kept, (st.st_mtime_ns, st.st_size))
+                if err:
+                    raise RuntimeError(err)
+        finally:
+            note_writer._release_lock(lock)
     else:
         dest = rejected_dir / note.name
         if note.exists():

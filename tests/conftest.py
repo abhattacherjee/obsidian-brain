@@ -317,3 +317,13 @@ def _never_spawn_capture_workers(monkeypatch):
     subprocess tests inherit this variable through os.environ.copy(). Tests of
     launch() itself delenv it and fake Popen."""
     monkeypatch.setenv("OBSIDIAN_BRAIN_CAPTURE_DISABLED", "1")
+
+
+@pytest.fixture(autouse=True)
+def _isolate_capture_hook_log(tmp_path_factory, monkeypatch):
+    """#425: capture's ``Capture`` telemetry lines go to a tmp dir, never to the
+    real ~/.claude/obsidian-brain-hook.log (81 fake lines leaked there before)."""
+    import capture_state
+
+    log_dir = tmp_path_factory.mktemp("capture-log")
+    monkeypatch.setattr(capture_state, "_log_dir", lambda: log_dir)

@@ -1,6 +1,6 @@
 export type CaptureRow = {
   id: string
-  ts?: string
+  ts?: number | string
   type?: string
   title?: string
   kind?: 'new' | 'updated'

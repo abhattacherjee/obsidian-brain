@@ -12,11 +12,15 @@ import capture_state as cs
 SID = "11111111-2222-3333-4444-555555555555"
 
 
+DEFAULTS = {"offset": 0, "transcript_path": None, "project": None, "last_batch_at": 0.0,
+            "pending": None, "checked_size": -1}
+
+
 def test_state_roundtrip_and_defaults():
-    assert cs.get_state(SID) == {"offset": 0, "transcript_path": None, "project": None, "last_batch_at": 0.0}
+    assert cs.get_state(SID) == DEFAULTS
     cs.set_state(SID, offset=42, project="demo")
     cs.set_state(SID, last_batch_at=7.5)
-    assert cs.get_state(SID) == {"offset": 42, "transcript_path": None, "project": "demo", "last_batch_at": 7.5}
+    assert cs.get_state(SID) == {**DEFAULTS, "offset": 42, "project": "demo", "last_batch_at": 7.5}
     assert SID in cs.known_sessions()
 
 
@@ -41,29 +45,54 @@ def test_corrupt_state_reads_as_defaults():
 
 
 def test_claim_exclusive():
-    assert cs.claim(SID) is True
-    assert cs.claim(SID) is False
+    token = cs.claim(SID)
+    assert token and cs.claim(SID) is None
     assert cs.claim_is_live(SID) is True
-    cs.release(SID)
+    cs.release(SID, token)
     assert cs.claim_is_live(SID) is False
-    assert cs.claim(SID) is True
+    assert cs.claim(SID)
 
 
-def test_claim_stale_after_ttl(monkeypatch):
-    assert cs.claim(SID) is True
+def _age_claim(seconds):
     path = cs.capture_dir() / f"{SID}.claim"
-    old = path.stat().st_mtime - 1000
+    old = path.stat().st_mtime - seconds
     os.utime(path, (old, old))
+
+
+def test_claim_stale_after_ttl():
+    first = cs.claim(SID)
+    _age_claim(1000)
     assert cs.claim_is_live(SID, ttl=900) is False
-    assert cs.claim(SID, ttl=900) is True  # taken over
-    assert cs.claim(SID, ttl=900) is False  # and now live again
+    second = cs.claim(SID, ttl=900)  # taken over
+    assert second and second != first
+    assert cs.claim(SID, ttl=900) is None  # and now live again
+
+
+def test_release_and_renew_touch_only_your_own_claim():
+    first = cs.claim(SID)
+    _age_claim(1000)
+    second = cs.claim(SID, ttl=900)
+    cs.release(SID, first)  # the stale worker finishing late
+    assert cs.claim_is_live(SID) is True
+    assert cs.renew(SID, first) is False
+    cs.release(SID, second)
+    assert cs.claim_is_live(SID) is False
+
+
+def test_renew_pushes_expiry_back():
+    token = cs.claim(SID)
+    _age_claim(800)
+    assert cs.renew(SID, token) is True
+    _age_claim(200)
+    assert cs.claim_is_live(SID, ttl=900) is True
 
 
 def test_flush_pop_once():
-    assert cs.pop_flush(SID) is False
+    assert cs.pop_flush(SID) is False and cs.has_flush(SID) is False
     cs.set_flush(SID)
+    assert cs.has_flush(SID) is True and cs.has_flush(SID) is True  # peeking keeps it
     assert cs.pop_flush(SID) is True
-    assert cs.pop_flush(SID) is False
+    assert cs.pop_flush(SID) is False and cs.has_flush(SID) is False
 
 
 def test_ledger_append_list_newest_first():
@@ -115,7 +144,7 @@ def test_installed_at_stable():
 
 
 def test_append_capture_log_line(tmp_path, monkeypatch):
-    monkeypatch.setattr(cs.Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.setattr(cs, "_log_dir", lambda: tmp_path / ".claude")
     cs.append_capture_log("demo project", SID, "saved:2", "batch one")
     line = (tmp_path / ".claude" / "obsidian-brain-hook.log").read_text().strip()
     assert " Capture project=demo_project sid=11111111 outcome=saved:2 detail=batch_one" in line

@@ -33,7 +33,17 @@ CLAIM_TTL_SECONDS = 900
 LEDGER_NAME = "captures.jsonl"
 
 _SID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
-_STATE_DEFAULTS = {"offset": 0, "transcript_path": None, "project": None, "last_batch_at": 0.0}
+_STATE_DEFAULTS = {
+    "offset": 0,
+    "transcript_path": None,
+    "project": None,
+    "last_batch_at": 0.0,
+    # Candidates parsed for the slice at ``offset`` but not all saved yet, so a
+    # retry resumes them instead of asking the model again: {end, candidates, next}.
+    "pending": None,
+    # Transcript size when the sweep last found the session not eligible.
+    "checked_size": -1,
+}
 
 
 def capture_dir() -> Path:
@@ -94,8 +104,12 @@ def known_sessions() -> list[str]:
     return sorted(p.stem for p in capture_dir().glob("*.json") if _SID_RE.match(p.stem))
 
 
-def claim(sid: str, ttl: int = CLAIM_TTL_SECONDS) -> bool:
-    """Take the session's worker claim. False when a live claim exists."""
+def claim(sid: str, ttl: int = CLAIM_TTL_SECONDS) -> str | None:
+    """Take the session's worker claim; returns its token, or None when a live claim exists.
+
+    The token goes to ``renew`` and ``release``, so a worker only ever touches
+    its own claim, never one another worker took over after it went stale.
+    """
     path = _sid_path(sid, ".claim")
     for _ in range(2):
         try:
@@ -106,17 +120,36 @@ def claim(sid: str, ttl: int = CLAIM_TTL_SECONDS) -> bool:
             except FileNotFoundError:
                 continue  # released between our open and stat: try again
             if age <= ttl:
-                return False
+                return None
             # A worker that died without releasing: take the claim over.
             try:
                 path.unlink()
             except FileNotFoundError:
                 pass
             continue
+        token = f"{os.getpid()}-{secrets.token_hex(8)}"
         with os.fdopen(fd, "w") as fh:
-            fh.write(str(time.time()))
-        return True
-    return False
+            fh.write(token)
+        return token
+    return None
+
+
+def _holds(sid: str, token: str) -> bool:
+    try:
+        return _sid_path(sid, ".claim").read_text().strip() == token
+    except OSError:
+        return False
+
+
+def renew(sid: str, token: str) -> bool:
+    """Push a held claim's expiry back by a full TTL. False when it is no longer ours."""
+    if not _holds(sid, token):
+        return False
+    try:
+        os.utime(_sid_path(sid, ".claim"))
+    except OSError:
+        return False
+    return True
 
 
 def claim_is_live(sid: str, ttl: int = CLAIM_TTL_SECONDS) -> bool:
@@ -126,7 +159,10 @@ def claim_is_live(sid: str, ttl: int = CLAIM_TTL_SECONDS) -> bool:
         return False
 
 
-def release(sid: str) -> None:
+def release(sid: str, token: str) -> None:
+    """Drop the claim, but only while it is still the one ``token`` names."""
+    if not _holds(sid, token):
+        return
     try:
         _sid_path(sid, ".claim").unlink()
     except FileNotFoundError:
@@ -136,6 +172,11 @@ def release(sid: str) -> None:
 def set_flush(sid: str) -> None:
     """Ask for the next batch to run now (set by PreCompact)."""
     _atomic_write(_sid_path(sid, ".flush"), str(time.time()))
+
+
+def has_flush(sid: str) -> bool:
+    """True while a flush is asked for; ``pop_flush`` clears it once a batch starts."""
+    return _sid_path(sid, ".flush").exists()
 
 
 def pop_flush(sid: str) -> bool:
@@ -232,10 +273,15 @@ def installed_at() -> float:
     return now
 
 
+def _log_dir() -> Path:
+    """Where the shared hook log lives; tests point it at a tmp dir."""
+    return Path.home() / ".claude"
+
+
 def append_capture_log(project: str, sid: str | None, outcome: str, detail: str = "") -> None:
     """One ``Capture`` line in the shared hook log (same file and rotation as SessionEnd)."""
     try:
-        log_dir = Path.home() / ".claude"
+        log_dir = _log_dir()
         log_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         log_path = log_dir / obsidian_utils._HOOK_LOG_NAME
         try:

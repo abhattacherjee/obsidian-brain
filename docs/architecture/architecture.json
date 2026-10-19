@@ -160,7 +160,7 @@
           "files": [
             "hooks/obsidian_session_log.py"
           ],
-          "purpose": "SessionEnd: uses the transcript path before inherited Codex markers; skips Codex rollouts with a structured SKIPPED_CODEX_HOST outcome until host adapters ship. For Claude, writes the raw session note immediately. Discovers sibling snapshots (cross-midnight: unions a today+yesterday dated scan, deliberately WITHOUT the read-path snapshot-index memo, since it reads the list back after writing), applies message-count + duration thresholds (snapshot presence bypasses skips), dedup-claims before the expensive raw-body build, and logs a structured outcome line for every exit path. On every exit path with a session id it launches a detached capture batch for the session's unread tail (capture at exit)."
+          "purpose": "SessionEnd: uses the transcript path before inherited Codex markers; skips Codex rollouts with a structured SKIPPED_CODEX_HOST outcome until host adapters ship. For Claude, writes the raw session note immediately. Discovers sibling snapshots (cross-midnight: unions a today+yesterday dated scan, deliberately WITHOUT the read-path snapshot-index memo, since it reads the list back after writing), applies message-count + duration thresholds (snapshot presence bypasses skips), dedup-claims before the expensive raw-body build, and logs a structured outcome line for every exit path. On every exit path with a session id it launches a detached capture batch for the session's unread tail (capture at exit), if the session passes eligible()."
         },
         {
           "id": "hook-session-hint",
@@ -169,7 +169,7 @@
           "files": [
             "hooks/obsidian_session_hint.py"
           ],
-          "purpose": "SessionStart (matcher startup|resume|clear|compact): uses the payload's transcript path before inherited Codex markers and skips Codex rollouts with SKIPPED_CODEX_HOST stderr telemetry. For Claude, refreshes the bootstrap sid-file atomically, invokes the orphan reaper, and injects a read-only last-session context hint via hookSpecificOutput.additionalContext. Writes capture/cli_path and sweeps ended sessions that still have unread transcript."
+          "purpose": "SessionStart (matcher startup|resume|clear|compact): uses the payload's transcript path before inherited Codex markers and skips Codex rollouts with SKIPPED_CODEX_HOST stderr telemetry. For Claude, refreshes the bootstrap sid-file atomically, invokes the orphan reaper, and injects a read-only last-session context hint via hookSpecificOutput.additionalContext. Writes capture/cli_path and, on interactive starts only (not an sdk-* CLAUDE_CODE_ENTRYPOINT), sweeps ended sessions that still have unread transcript."
         },
         {
           "id": "hook-context-snapshot",
@@ -222,7 +222,7 @@
           "files": [
             "hooks/obsidian_utils.py"
           ],
-          "purpose": "Reads the machine-local config JSON over deepcopy(_DEFAULTS), session-scoped cached by cwd-derived SID. Side-effect: auto-chmods the config to 0600 if group/world bits are set. indexed_folders(config) (#383) returns the folders user-facing search indexes, [sessions_folder, insights_folder, wiki_folder] (wiki_folder default claude-wiki; empty disables it; an invalid value is dropped with a warning). Every skill and top-level scripts/ ensure_index/rebuild_index call uses it (scripts/dev-test/ exempt); tests/test_indexed_folders.py parses each call's folder argument and fails unless it is the helper call, with a per-call allow-list for build_context_brief and open_item_dedup, which receive folders as parameters. _sync deletes only under scanned folders, so wiki rows survive those calls, except when ensure_index recreates a corrupt or legacy DB from the folders it was given. strict=True (used by /vault-reindex and /obsidian-setup, whose rebuild prunes rows outside its folders) raises on an invalid wiki_folder instead of dropping it. load_config(fresh=True) skips the per-session config cache. Defaults include auto_capture_enabled (true) and auto_capture_interval_minutes (10)."
+          "purpose": "Reads the machine-local config JSON over deepcopy(_DEFAULTS), session-scoped cached by cwd-derived SID. Side-effect: auto-chmods the config to 0600 if group/world bits are set. indexed_folders(config) (#383) returns the folders user-facing search indexes, [sessions_folder, insights_folder, wiki_folder] (wiki_folder default claude-wiki; empty disables it; an invalid value is dropped with a warning). Every skill and top-level scripts/ ensure_index/rebuild_index call uses it (scripts/dev-test/ exempt); tests/test_indexed_folders.py parses each call's folder argument and fails unless it is the helper call, with a per-call allow-list for build_context_brief and open_item_dedup, which receive folders as parameters. _sync deletes only under scanned folders, so wiki rows survive those calls, except when ensure_index recreates a corrupt or legacy DB from the folders it was given. strict=True (used by /vault-reindex and /obsidian-setup, whose rebuild prunes rows outside its folders) raises on an invalid wiki_folder instead of dropping it. load_config(fresh=True) skips the per-session config cache. Defaults include auto_capture_enabled (true), auto_capture_interval_minutes (10) and auto_capture_headless_projects ([\"openclaw\"])."
         },
         {
           "id": "session-context",
@@ -807,7 +807,7 @@
           "files": [
             "hooks/capture_save.py"
           ],
-          "purpose": "Turns one candidate {type, title, body, topic} into a note. Runs /compress Step 3.5's dedup (curated types only, _rejected/ excluded, is_high_confidence_match); a match gets an '## Update (<date>) — auto-capture <id>' section via note_writer append-update, anything else a new note from templates/<type>.md tagged claude/auto with source: auto-capture. Appends one ledger row either way."
+          "purpose": "Turns one candidate {type, title, body, topic} into a note. Runs /compress Step 3.5's dedup (curated types only, _rejected/ excluded, is_high_confidence_match); a match gets an '## Update (<date>) — auto-capture <id>' section via note_writer append-update, its body headings demoted one level (outside code fences) so Reject finds the section's end, anything else a new note from templates/<type>.md tagged claude/auto with source: auto-capture. Appends one ledger row either way."
         },
         {
           "id": "capture-reject",
@@ -816,7 +816,7 @@
           "files": [
             "hooks/capture_reject.py"
           ],
-          "purpose": "Reject from the Captures pane: a new note moves to <insights>/_rejected/ and leaves the index; an update has only its section cut out, saved as _rejected/<stem>-update-<id>.md. Idempotent, path-contained. recent_rejections() feeds the worker prompt so it stops capturing what was rejected."
+          "purpose": "Reject from the Captures pane: a new note moves to <insights>/_rejected/ and leaves the index; an update has only its section cut out, under note_writer's lock and stat re-check, saved as _rejected/<stem>-update-<id>.md. Idempotent, path-contained. recent_rejections() feeds the worker prompt so it stops capturing what was rejected."
         },
         {
           "id": "capture-worker",
@@ -826,7 +826,7 @@
             "hooks/capture_worker.py",
             "hooks/capture_worker_prompt.md"
           ],
-          "purpose": "run_batch(): claim, read up to 3 slices, run claude -p --model sonnet with no tools, project-only settings and OBSIDIAN_BRAIN_WORKER=1, parse the JSON array, save each candidate, and only then advance the offset (a failed batch retries the same slice). is_due(): new bytes plus the interval (auto_capture_interval_minutes, 10) or a PreCompact flush. launch(): spawns capture_cli.py run-batch detached (start_new_session), never raises, and refuses under OBSIDIAN_BRAIN_WORKER or OBSIDIAN_BRAIN_CAPTURE_DISABLED."
+          "purpose": "run_batch(): claim (a token, renewed before each slice, released only by its owner), read up to 3 slices, run claude -p --model sonnet with no tools, project-only settings and OBSIDIAN_BRAIN_WORKER=1, parse the JSON array, save each candidate, and only then advance the offset, only past the rows the prompt held. Parsed candidates wait in the state (pending) so a retry resumes them without a second model call; a candidate that raises anything but OSError is skipped and logged. eligible(): 3+ user messages, or a project in auto_capture_headless_projects (default openclaw). is_due(): new bytes plus the interval (auto_capture_interval_minutes, 10) or a PreCompact flush, which launch clears only after the worker started. launch(): spawns capture_cli.py run-batch detached (start_new_session), never raises, and refuses under OBSIDIAN_BRAIN_WORKER or OBSIDIAN_BRAIN_CAPTURE_DISABLED."
         },
         {
           "id": "capture-cli",
@@ -835,7 +835,7 @@
           "files": [
             "hooks/capture_cli.py"
           ],
-          "purpose": "JSON CLI for the mod, hooks and workers: launch, run-batch, sweep, ledger-list, reject, status. sweep() launches batches for up to 3 transcripts since install with unread bytes, no live claim, 3+ user messages and no worker sentinel, oldest first."
+          "purpose": "JSON CLI for the mod, hooks and workers: launch, run-batch, sweep, ledger-list, reject, status. sweep() launches batches for up to 3 transcripts since install with unread bytes, no live claim, no worker sentinel and an eligible() pass, oldest first. It skips transcripts written to within the last interval (still running) and caches a not-eligible verdict as checked_size until the file grows."
         },
         {
           "id": "capture-mod",
@@ -845,7 +845,7 @@
             "mods/capture/hooks/register.tsx",
             "mods/capture/types/index.d.ts"
           ],
-          "purpose": "TypeScript hooks module loaded from hooks/hooks.json 'modules'. On a main-loop turn.complete and every 60 s it runs 'launch <sid> --if-due'; at session.start it sweeps and registers /captures. The Captures pane (terminal and Desktop) lists ledger-list rows with a Reject button and a 'next batch in N min · M waiting for sweep' footer. Errors show in the pane, never in the turn."
+          "purpose": "TypeScript hooks module loaded from hooks/hooks.json 'modules'. On a main-loop turn.complete and every 60 s (one timer per load) it runs 'launch <sid> --if-due'; at session.start it registers /captures (the SessionStart hook does the sweep). The Captures pane (terminal and Desktop) lists ledger-list rows with a Reject button and a 'next batch in N min · M waiting for sweep' footer. Errors show in the pane, never in the turn."
         }
       ]
     },
@@ -2024,7 +2024,7 @@
     {
       "id": "startup-sweep",
       "name": "Startup sweep",
-      "description": "At SessionStart, sessions that ended with unread transcript (headless runs, crashes, a killed worker) get a batch.",
+      "description": "At an interactive SessionStart, ended sessions that still have unread transcript (headless runs, crashes, a killed worker) get a batch.",
       "steps": [
         {
           "from": "hooks-registration",
@@ -2034,7 +2034,7 @@
         {
           "from": "hook-session-hint",
           "to": "capture-cli",
-          "label": "write cli_path; sweep (limit 3, current session excluded)"
+          "label": "write cli_path; sweep if not sdk-* (limit 3, current session excluded)"
         },
         {
           "from": "capture-cli",

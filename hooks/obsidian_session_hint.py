@@ -140,6 +140,10 @@ def _capture_startup(session_id: str) -> None:
         import capture_cli
 
         capture_cli.write_cli_path()
+        # Interactive starts only: a sweep started inside a headless run (an
+        # sdk-* entrypoint) would scan on every one of its many short runs.
+        if os.environ.get("CLAUDE_CODE_ENTRYPOINT", "").startswith("sdk"):
+            return
         if load_config().get("auto_capture_enabled", True):
             capture_cli.sweep(exclude=session_id or None)
     except Exception as exc:  # capture never breaks SessionStart

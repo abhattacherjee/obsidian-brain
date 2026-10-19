@@ -1,5 +1,5 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface as $, Register } from 'claude-code'
+import type { EngineInterface as $, Register, Timer } from 'claude-code'
 
 import type { CaptureRow, CaptureStatus } from '../types'
 
@@ -14,7 +14,9 @@ const REFRESH_MS = 30_000
 const rows = atom({ plugin: 'obsidian-brain', key: 'rows' } as const, [])
 const status = atom({ plugin: 'obsidian-brain', key: 'status' } as const, null)
 const problem = atom({ plugin: 'obsidian-brain', key: 'problem' } as const, '')
-let isRefreshing = false // one refresh timer per load, however often /captures runs
+// One of each per load, however often session.start (/clear, resume) or /captures runs.
+let tick: Timer | undefined
+let refresher: Timer | undefined
 
 async function cliPath($: $): Promise<string | undefined> {
   const home = await $.env.get('HOME')
@@ -73,8 +75,13 @@ async function reject($: $, id: string): Promise<void> {
   await refresh($)
 }
 
-function clockTime(ts?: string): string {
-  const m = ts?.match(/T(\d\d:\d\d)/)
+// The ledger writes epoch seconds; an ISO string is read too.
+function clockTime(ts?: number | string): string {
+  if (typeof ts === 'number') {
+    const d = new Date(ts * 1000)
+    return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
+  }
+  const m = typeof ts === 'string' ? ts.match(/T(\d\d:\d\d)/) : null
   return m ? m[1]! : '     '
 }
 
@@ -88,8 +95,8 @@ export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     const started = await next(e)
     await $.command.register({ name: 'captures', description: 'Show what auto-capture saved this session' })
-    void quietly($, () => cli($, ['sweep']))
-    $.clock.every(TICK_MS, () => void launchIfDue($))
+    // The SessionStart hook already sweeps ended sessions; this only drives this one.
+    tick ??= $.clock.every(TICK_MS, () => void launchIfDue($))
     return started
   })
 
@@ -102,11 +109,14 @@ export const register: Register = on => {
   on('command.run', { command: 'captures' }, async $ => {
     await refresh($)
     await $.ui.open({ id: PANE, title: 'Captures' })
-    if (!isRefreshing) {
-      isRefreshing = true
-      $.clock.every(REFRESH_MS, () => void refresh($))
-    }
+    refresher ??= $.clock.every(REFRESH_MS, () => void refresh($))
     return { text: 'Captures pane opened.' }
+  })
+
+  on('ui.close', { id: PANE }, async ($, e, next) => {
+    refresher?.cancel()
+    refresher = undefined
+    return next(e)
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {

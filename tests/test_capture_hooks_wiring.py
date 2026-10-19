@@ -73,6 +73,7 @@ def sweeps(monkeypatch):
     calls = []
     monkeypatch.setattr(capture_cli, "sweep", lambda limit=3, exclude=None: calls.append(exclude) or [])
     monkeypatch.setattr(obsidian_session_hint, "load_config", lambda: {})
+    monkeypatch.setenv("CLAUDE_CODE_ENTRYPOINT", "cli")  # an interactive start
     return calls
 
 
@@ -90,6 +91,20 @@ def test_sessionstart_runs_sweep_once(monkeypatch, sweeps, winner, expected):
     _stdin(monkeypatch, {"session_id": SID, "cwd": "/tmp"})
     obsidian_session_hint._run()
     assert sweeps == expected
+
+
+def test_sessionstart_headless_does_not_sweep(monkeypatch, sweeps):
+    monkeypatch.setenv("CLAUDE_CODE_ENTRYPOINT", "sdk-py")
+    obsidian_session_hint._capture_startup(SID)
+    assert sweeps == []
+    assert (capture_state.capture_dir() / "cli_path").exists()  # the mod can still find the CLI
+
+
+def test_capture_log_is_isolated(tmp_path):
+    capture_state.append_capture_log("demo", SID, "saved:1")
+    real = capture_state.Path.home() / ".claude" / "obsidian-brain-hook.log"
+    assert capture_state._log_dir() != real.parent
+    assert "Capture project=demo" in (capture_state._log_dir() / "obsidian-brain-hook.log").read_text()
 
 
 def test_sessionstart_sweep_respects_disabled(monkeypatch, sweeps):

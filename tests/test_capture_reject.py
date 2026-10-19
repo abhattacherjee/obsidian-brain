@@ -110,3 +110,58 @@ def test_recent_rejections_newest_first(mock_config, tmp_vault):
     capture_reject.reject(b, mock_config)
     assert capture_reject.recent_rejections("demo") == ["second", "first"]
     assert capture_reject.recent_rejections("other") == []
+
+
+def test_reject_removes_a_whole_decision_update(mock_config, tmp_vault, monkeypatch):
+    import capture_save
+
+    note = tmp_vault / "claude-insights" / "2026-10-01-hand-written-abcd.md"
+    note.write_text(NOTE + "\n## Later\n\nTail.\n")
+    monkeypatch.setattr(capture_save, "find_match", lambda q, c: "claude-insights/2026-10-01-hand-written-abcd.md")
+    body = "## Context\n\nWhy.\n\n## Decision\n\nWe chose X.\n\n```bash\n# keep this comment\n```"
+    row = capture_save.save_candidate({"type": "decision", "title": "Pick X", "body": body, "topic": "t"},
+                                      session_id=SID, project="demo", today="2026-10-18", config=mock_config)
+    text = note.read_text()
+    assert "### Context" in text and "## Context" not in text.replace("### Context", "")
+    assert "# keep this comment" in text and "## keep this comment" not in text
+    capture_reject.reject(row["id"], mock_config)
+    text = note.read_text()
+    assert "We chose X." not in text and "Context" not in text and "keep this comment" not in text
+    assert "Tail." in text and "# Zebra quokka capture" in text
+
+
+def test_reject_refuses_while_the_note_is_locked(mock_config, tmp_vault):
+    import note_writer
+
+    note = tmp_vault / "claude-insights" / "n.md"
+    heading = "## Update (2026-10-18) — auto-capture cccccccccccc"
+    note.write_text(NOTE + "\n" + heading + "\n\nDrop me.\n")
+    cid = capture_state.ledger_append({"session_id": SID, "status": "active", "kind": "updated",
+                                       "note_path": "claude-insights/n.md", "update_heading": heading})
+    lock, err = note_writer._acquire_lock(note)
+    assert err is None
+    try:
+        with pytest.raises(RuntimeError, match="another process"):
+            capture_reject.reject(cid, mock_config)
+    finally:
+        note_writer._release_lock(lock)
+    assert "Drop me." in note.read_text() and capture_state.ledger_get(cid)["status"] == "active"
+
+
+def test_reject_refuses_when_the_note_changes_mid_reject(mock_config, tmp_vault, monkeypatch):
+    note = tmp_vault / "claude-insights" / "n.md"
+    heading = "## Update (2026-10-18) — auto-capture dddddddddddd"
+    note.write_text(NOTE + "\n" + heading + "\n\nDrop me.\n")
+    cid = capture_state.ledger_append({"session_id": SID, "status": "active", "kind": "updated",
+                                       "note_path": "claude-insights/n.md", "update_heading": heading})
+    real = capture_reject._remove_section
+
+    def remove_and_edit(text, h):
+        with note.open("a") as fh:  # the user saves the note in Obsidian right now
+            fh.write("\nTyped by hand.\n")
+        return real(text, h)
+
+    monkeypatch.setattr(capture_reject, "_remove_section", remove_and_edit)
+    with pytest.raises(RuntimeError, match="changed on disk"):
+        capture_reject.reject(cid, mock_config)
+    assert "Typed by hand." in note.read_text() and "Drop me." in note.read_text()

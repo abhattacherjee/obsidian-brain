@@ -2252,6 +2252,8 @@ _DEFAULTS: dict = {
     "optional_deps_declined": [],
     "auto_capture_enabled": True,  # #425: background capture of insights/decisions/error fixes
     "auto_capture_interval_minutes": 10,  # #425: minimum gap between mid-session capture batches
+    # #425: projects whose sessions are captured below the 3-user-message gate (headless runs)
+    "auto_capture_headless_projects": ["openclaw"],
 }
 
 # #425: set on every `claude -p` this plugin starts, so the child session's

@@ -2,7 +2,7 @@
 
 import json
 
-from capture_slice import count_user_messages, first_user_text, read_slice, render_slice
+from capture_slice import END_KEY, count_user_messages, first_user_text, read_slice, render_slice, render_slice_upto
 
 
 def _user(text, **extra):
@@ -92,9 +92,25 @@ def test_render_scrubs_secrets_and_skips_meta(tmp_path):
     assert "ASSISTANT: running tests" in text and "TOOL Bash" in text
 
 
-def test_render_truncates(tmp_path):
-    text = render_slice([_user("z" * 3000) for _ in range(100)], max_chars=10_000)
-    assert len(text) < 10_100 and text.endswith("[… slice truncated]")
+def test_render_stops_at_a_row_boundary(tmp_path):
+    rows = [_user("z" * 3000) for _ in range(100)]
+    text, used = render_slice_upto(rows, max_chars=10_000)
+    assert used == 3 and len(text) <= 10_000 and "truncated" not in text
+    assert render_slice(rows, max_chars=10_000) == text
+
+
+def test_render_always_uses_the_first_row(tmp_path):
+    text, used = render_slice_upto([_user("z" * 3000), _user("next")], max_chars=1_000)
+    assert used == 1 and text.endswith("[… slice truncated]")
+
+
+def test_read_slice_marks_each_rows_end(tmp_path):
+    p = _write(tmp_path / "t.jsonl", [_user("a"), _user("bb"), _user("ccc")])
+    rows, end = read_slice(p, 0)
+    lines = p.read_bytes().split(b"\n")
+    assert [r[END_KEY] for r in rows] == [len(lines[0]) + 1, len(lines[0]) + len(lines[1]) + 2, end]
+    rows2, _ = read_slice(p, rows[0][END_KEY])
+    assert [r[END_KEY] for r in rows2] == [r[END_KEY] for r in rows[1:]]
 
 
 def test_first_user_text_and_count(tmp_path):

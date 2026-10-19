@@ -176,7 +176,8 @@ Sessions are automatically logged to your vault on every session end (via hooks)
 
 While you work, obsidian-brain saves insights, decisions and error-fixes on its own, so you do not have to remember to run `/compress`, `/decide` or `/error-log`. It runs in the background and never adds a turn or a prompt to your session.
 
-- **When:** at most every 10 minutes while the transcript grows, right after an autocompact, when the session ends, and at the next session start for any session that ended with unread transcript (headless `claude -p` runs and crashed sessions included).
+- **When:** at most every 10 minutes while the transcript grows, right after an autocompact, when the session ends, and at the next interactive session start for any session that ended with unread transcript (crashed sessions included).
+- **Which sessions:** those with 3 or more user messages, plus every session of a project in `auto_capture_headless_projects` (default `["openclaw"]`). One-shot `claude -p` runs that other tools make (graders, routers) are skipped.
 - **How:** a detached `claude -p --model sonnet` with no tools reads the new part of the transcript and returns candidate notes. The same dedup `/compress` uses decides whether each one updates an existing note (an `## Update (<date>) — auto-capture <id>` section) or becomes a new one.
 - **The bar is low on purpose.** A weak note is cheap to reject; a missed one is gone.
 - **Where to look:** run `/captures` for the Captures pane (terminal and Claude Desktop). Every captured note has the `claude/auto` tag and `source: auto-capture` in its frontmatter.
@@ -293,7 +294,8 @@ Machine-local config at `~/.claude/obsidian-brain-config.json`:
   "snapshot_on_compact": true,
   "snapshot_on_clear": true,
   "auto_capture_enabled": true,
-  "auto_capture_interval_minutes": 10
+  "auto_capture_interval_minutes": 10,
+  "auto_capture_headless_projects": ["openclaw"]
 }
 ```
 

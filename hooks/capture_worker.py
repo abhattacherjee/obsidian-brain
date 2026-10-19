@@ -30,6 +30,7 @@ import obsidian_utils
 SENTINEL = "OBSIDIAN-BRAIN-CAPTURE-WORKER v1"
 WORKER_TIMEOUT_SECONDS = 600
 MAX_SLICES_PER_RUN = 3
+MIN_USER_MESSAGES = 3  # should_skip_session's default threshold
 DISABLE_ENV_VAR = "OBSIDIAN_BRAIN_CAPTURE_DISABLED"  # the test suite sets it so no hook spawns a worker
 _PROMPT = Path(__file__).resolve().with_name("capture_worker_prompt.md")
 _CLI = Path(__file__).resolve().with_name("capture_cli.py")
@@ -99,9 +100,41 @@ def _worker_cwd() -> Path:
     return d
 
 
+def _ask_worker(text: str, project: str) -> list[dict]:
+    """One worker call for a rendered slice; raises _BatchStop on any failure."""
+    prompt = build_prompt(text, project, capture_reject.recent_rejections(project))
+    try:
+        result = subprocess.run(worker_argv(), input=prompt, capture_output=True, text=True,
+                                timeout=WORKER_TIMEOUT_SECONDS, env=obsidian_utils.worker_env(),
+                                cwd=str(_worker_cwd()))
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        raise _BatchStop("worker-failed", type(exc).__name__)
+    if result.returncode != 0:
+        raise _BatchStop("worker-failed", f"rc={result.returncode}")
+    try:
+        return parse_candidates(result.stdout)
+    except ValueError as exc:
+        raise _BatchStop("parse-failed", str(exc)[:120])
+
+
+class _BatchStop(Exception):
+    """Ends a batch early with an outcome; the offset stays where it is."""
+
+    def __init__(self, outcome: str, detail: str = ""):
+        super().__init__(outcome)
+        self.outcome, self.detail = outcome, detail
+
+
 def run_batch(sid: str, transcript_path: Path, project: str, config: dict | None = None) -> str:
-    """Process up to ``MAX_SLICES_PER_RUN`` slices; return the outcome string."""
-    if not capture_state.claim(sid):
+    """Process up to ``MAX_SLICES_PER_RUN`` slices; return the outcome string.
+
+    The offset moves only after every candidate of a slice is saved. Parsed
+    candidates are kept in the state (``pending``) and the index of the next
+    one to save goes up after each save, so a batch that stops halfway
+    resumes with the rest on retry: no second model call, no duplicate notes.
+    """
+    token = capture_state.claim(sid)
+    if not token:
         capture_state.append_capture_log(project, sid, "claimed")
         return "claimed"
     outcome, saved, slices, detail = "empty", 0, 0, ""
@@ -109,55 +142,57 @@ def run_batch(sid: str, transcript_path: Path, project: str, config: dict | None
         config = config or obsidian_utils.load_config()
         session_note = None
         for _ in range(MAX_SLICES_PER_RUN):
-            offset = capture_state.get_state(sid)["offset"]
-            rows, end = capture_slice.read_slice(Path(transcript_path), offset)
-            if end == offset:
-                break
-            text = capture_slice.render_slice(rows)
-            if text.strip():
-                prompt = build_prompt(text, project, capture_reject.recent_rejections(project))
+            if not capture_state.renew(sid, token):
+                raise _BatchStop("claim-lost")
+            state = capture_state.get_state(sid)
+            offset, pending = state["offset"], state["pending"]
+            if not (isinstance(pending, dict) and isinstance(pending.get("candidates"), list)):
+                rows, end = capture_slice.read_slice(Path(transcript_path), offset)
+                if end == offset:
+                    break
+                text, used = capture_slice.render_slice_upto(rows)
+                if used < len(rows):
+                    end = rows[used - 1][capture_slice.END_KEY]
+                candidates = _ask_worker(text, project) if text.strip() else []
+                pending = {"end": end, "candidates": candidates, "next": 0}
+                capture_state.set_state(sid, pending=pending)
+            if pending["candidates"] and session_note is None:
+                session_note = capture_save.session_note_for(sid, project, config)
+            for i in range(int(pending.get("next", 0)), len(pending["candidates"])):
+                cand = pending["candidates"][i]
                 try:
-                    result = subprocess.run(worker_argv(), input=prompt, capture_output=True, text=True,
-                                            timeout=WORKER_TIMEOUT_SECONDS, env=obsidian_utils.worker_env(),
-                                            cwd=str(_worker_cwd()))
-                except (subprocess.TimeoutExpired, OSError) as exc:
-                    outcome, detail = "worker-failed", type(exc).__name__
-                    break
-                if result.returncode != 0:
-                    outcome, detail = "worker-failed", f"rc={result.returncode}"
-                    break
-                try:
-                    candidates = parse_candidates(result.stdout)
-                except ValueError as exc:
-                    outcome, detail = "parse-failed", str(exc)[:120]
-                    break
-                if candidates and session_note is None:
-                    session_note = capture_save.session_note_for(sid, project, config)
-                try:
-                    for cand in candidates:
-                        try:
-                            capture_save.save_candidate(cand, session_id=sid, project=project,
-                                                        session_note=session_note, config=config)
-                            saved += 1
-                        except ValueError:
-                            continue  # one malformed candidate never blocks the slice
-                except Exception as exc:  # noqa: BLE001 -- vault unwritable etc.: retry this slice later
-                    outcome, detail = "save-failed", f"{type(exc).__name__}: {exc}"[:160]
-                    break
-            capture_state.set_state(sid, offset=end, transcript_path=str(transcript_path),
-                                    project=project, last_batch_at=time.time())
+                    capture_save.save_candidate(cand, session_id=sid, project=project,
+                                                session_note=session_note, config=config)
+                    saved += 1
+                except OSError as exc:  # vault unwritable or the like: retry from here later
+                    raise _BatchStop("save-failed", f"{type(exc).__name__}: {exc}"[:160])
+                except Exception as exc:  # noqa: BLE001 -- this candidate alone is bad: skip it
+                    capture_state.append_capture_log(project, sid, "candidate-skipped",
+                                                     f"{type(exc).__name__}: {exc}"[:160])
+                capture_state.set_state(sid, pending={**pending, "next": i + 1})
+            capture_state.set_state(sid, offset=int(pending["end"]), pending=None,
+                                    transcript_path=str(transcript_path), project=project,
+                                    last_batch_at=time.time())
             slices += 1
-        if slices:
-            detail = f"slices={slices}" + (f";then={outcome}:{detail}" if outcome != "empty" else "")
-            outcome = f"saved:{saved}"
-        return outcome
+    except _BatchStop as stop:
+        outcome, detail = stop.outcome, stop.detail
+    except Exception as exc:  # noqa: BLE001 -- logged as an error, never as "empty"
+        outcome, detail = "error", f"{type(exc).__name__}: {exc}"[:160]
     finally:
-        capture_state.release(sid)
-        capture_state.append_capture_log(project, sid, outcome, detail)
+        capture_state.release(sid, token)
+    if slices:
+        detail = f"slices={slices}" + (f";then={outcome}:{detail}" if outcome != "empty" else "")
+        outcome = f"saved:{saved}"
+    capture_state.append_capture_log(project, sid, outcome, detail)
+    return outcome
 
 
 def is_due(sid: str, interval_min: int, transcript_path: Path) -> bool:
-    """New transcript bytes, and either the interval passed or PreCompact asked."""
+    """New transcript bytes, and either the interval passed or PreCompact asked.
+
+    Reads the flush flag without clearing it; ``launch`` clears it only once a
+    worker has really started.
+    """
     state = capture_state.get_state(sid)
     try:
         size = Path(transcript_path).stat().st_size
@@ -165,13 +200,25 @@ def is_due(sid: str, interval_min: int, transcript_path: Path) -> bool:
         return False
     if size <= state["offset"]:
         return False
-    if capture_state.pop_flush(sid):
+    if capture_state.has_flush(sid):
         return True
     if not state["last_batch_at"]:
         # First sighting this session: start the clock instead of firing at turn one.
         capture_state.set_state(sid, last_batch_at=time.time(), transcript_path=str(transcript_path))
         return False
     return time.time() - state["last_batch_at"] >= interval_min * 60
+
+
+def eligible(path: Path, project: str, config: dict) -> bool:
+    """Worth a model call: 3+ user messages, or a project on the headless allowlist.
+
+    Most transcripts with fewer messages are one-shot ``claude -p`` runs other
+    tools make (graders, routers), about 100 a day; only the listed projects'
+    headless runs are captured.
+    """
+    if project in (config.get("auto_capture_headless_projects") or []):
+        return True
+    return capture_slice.count_user_messages(Path(path)) >= MIN_USER_MESSAGES
 
 
 def _valid_transcript(path: Path) -> bool:
@@ -219,6 +266,10 @@ def launch(sid: str, transcript_path: Path | None, project: str | None, if_due: 
             return False
         if capture_state.claim_is_live(sid):
             return False
+        if not eligible(path, project, config):
+            # Ask again only after another interval, not on every turn end.
+            capture_state.set_state(sid, last_batch_at=time.time())
+            return False
         log = os.open(str(capture_state.capture_dir() / "worker.log"), os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600)
         try:
             subprocess.Popen([sys.executable, str(_CLI), "run-batch", sid, str(path), project],
@@ -226,6 +277,7 @@ def launch(sid: str, transcript_path: Path | None, project: str | None, if_due: 
                              close_fds=True, cwd=str(capture_state.capture_dir()))
         finally:
             os.close(log)
+        capture_state.pop_flush(sid)  # cleared only once a worker really started
         return True
     except Exception as exc:  # noqa: BLE001 -- a launch failure never breaks the caller's hook
         capture_state.append_capture_log(project or "unknown", sid if isinstance(sid, str) else None,

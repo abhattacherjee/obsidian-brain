@@ -180,7 +180,7 @@ def test_is_due_flush_and_no_growth(transcript):
     capture_state.set_state(SID, last_batch_at=time.time())
     capture_state.set_flush(SID)
     assert capture_worker.is_due(SID, 10, transcript) is True
-    assert capture_state.pop_flush(SID) is False  # consumed
+    assert capture_state.has_flush(SID) is True  # kept until a worker really starts
     capture_state.set_state(SID, offset=transcript.stat().st_size, last_batch_at=1.0)
     assert capture_worker.is_due(SID, 10, transcript) is False
 
@@ -206,9 +206,9 @@ def test_launch_refuses(transcript, popen, mock_config, monkeypatch, tmp_path):
     assert capture_worker.launch(SID, transcript, "demo", if_due=False,
                                  config={**mock_config, "auto_capture_enabled": False}) is False
     assert capture_worker.launch(SID, transcript, "demo", if_due=True, config=mock_config) is False  # first sighting
-    capture_state.claim(SID)
+    token = capture_state.claim(SID)
     assert capture_worker.launch(SID, transcript, "demo", if_due=False, config=mock_config) is False
-    capture_state.release(SID)
+    capture_state.release(SID, token)
     monkeypatch.setenv("OBSIDIAN_BRAIN_WORKER", "1")
     assert capture_worker.launch(SID, transcript, "demo", if_due=False, config=mock_config) is False
     monkeypatch.delenv("OBSIDIAN_BRAIN_WORKER")
@@ -235,7 +235,8 @@ def test_launch_derives_project_from_transcript_cwd(tmp_path, popen, mock_config
     t.write_text(json.dumps({"type": "user", "cwd": str(tmp_path / "gone" / "myproj"),
                              "message": {"role": "user", "content": "hi"}}) + "\n")
     monkeypatch.setattr(capture_worker, "_TRANSCRIPTS_ROOT", root)
-    assert capture_worker.launch(SID, t, None, if_due=False, config=mock_config) is True
+    config = {**mock_config, "auto_capture_headless_projects": ["myproj"]}  # one message: allowlisted
+    assert capture_worker.launch(SID, t, None, if_due=False, config=config) is True
     assert popen[0][0][-1] == "myproj"
     assert capture_state.get_state(SID)["project"] == "myproj"
 
@@ -247,3 +248,99 @@ def test_project_for_existing_cwd_is_canonical(tmp_path, monkeypatch):
     assert capture_worker.project_for(t) == "canon"
     t.write_text("{}\n")
     assert capture_worker.project_for(t) == "unknown"
+
+
+def test_retry_resumes_pending_candidates_without_a_second_call(transcript, fake_claude, monkeypatch, mock_config):
+    monkeypatch.setattr(capture_worker.capture_save, "session_note_for", lambda *a: "")
+    calls = []
+
+    def save(c, **kw):
+        if c["title"] == "b" and not calls.count("b-failed"):
+            calls.append("b-failed")
+            raise PermissionError("vault read-only")
+        calls.append(c["title"])
+
+    monkeypatch.setattr(capture_worker.capture_save, "save_candidate", save)
+    fake_claude.outputs = [_envelope([{**CAND, "title": t} for t in "abc"])]
+    assert capture_worker.run_batch(SID, transcript, "demo", mock_config) == "save-failed"
+    assert capture_state.get_state(SID)["offset"] == 0
+    assert capture_worker.run_batch(SID, transcript, "demo", mock_config) == "saved:2"
+    assert calls == ["a", "b-failed", "b", "c"]  # a is not saved twice
+    assert len(fake_claude.calls) == 1
+    st = capture_state.get_state(SID)
+    assert st["offset"] == transcript.stat().st_size and st["pending"] is None
+
+
+def test_a_candidate_that_keeps_failing_is_skipped(transcript, fake_claude, monkeypatch, mock_config):
+    monkeypatch.setattr(capture_worker.capture_save, "session_note_for", lambda *a: "")
+
+    def save(c, **kw):
+        if c["title"] == "bad":
+            raise RuntimeError("append-update failed: frontmatter")
+
+    monkeypatch.setattr(capture_worker.capture_save, "save_candidate", save)
+    fake_claude.outputs = [_envelope([{**CAND, "title": "bad"}, CAND])]
+    assert capture_worker.run_batch(SID, transcript, "demo", mock_config) == "saved:1"
+    assert capture_state.get_state(SID)["offset"] == transcript.stat().st_size
+
+
+def test_unexpected_error_is_logged_as_error(transcript, fake_claude, saves, mock_config, monkeypatch):
+    logged = []
+    monkeypatch.setattr(capture_worker.capture_state, "append_capture_log",
+                        lambda p, s, outcome, detail="": logged.append(outcome))
+    monkeypatch.setattr(capture_worker.capture_slice, "read_slice",
+                        lambda p, s: (_ for _ in ()).throw(FileNotFoundError("gone")))
+    assert capture_worker.run_batch(SID, transcript, "demo", mock_config) == "error"
+    assert logged == ["error"] and not capture_state.claim_is_live(SID)
+
+
+def test_lost_claim_stops_the_batch(transcript, fake_claude, saves, mock_config, monkeypatch):
+    monkeypatch.setattr(capture_worker.capture_state, "renew", lambda sid, token: False)
+    assert capture_worker.run_batch(SID, transcript, "demo", mock_config) == "claim-lost"
+    assert fake_claude.calls == []
+
+
+def test_claim_is_renewed_before_each_slice(transcript, fake_claude, saves, mock_config, monkeypatch):
+    renewed = []
+    real = capture_worker.capture_state.renew
+    monkeypatch.setattr(capture_worker.capture_state, "renew", lambda sid, token: renewed.append(1) or real(sid, token))
+    real_read = capture_worker.capture_slice.read_slice
+    monkeypatch.setattr(capture_worker.capture_slice, "read_slice", lambda p, s: real_read(p, s, max_bytes=400))
+    capture_worker.run_batch(SID, transcript, "demo", mock_config)
+    assert len(renewed) == 3
+
+
+def test_offset_stops_at_the_last_rendered_row(transcript, fake_claude, saves, mock_config, monkeypatch):
+    real = capture_worker.capture_slice.render_slice_upto
+    monkeypatch.setattr(capture_worker.capture_slice, "render_slice_upto", lambda rows: real(rows, max_chars=300))
+    monkeypatch.setattr(capture_worker, "MAX_SLICES_PER_RUN", 1)
+    capture_worker.run_batch(SID, transcript, "demo", mock_config)
+    first_line = len(transcript.read_bytes().split(b"\n")[0]) + 1
+    assert capture_state.get_state(SID)["offset"] == first_line
+
+
+def test_launch_clears_flush_only_after_spawning(transcript, popen, mock_config):
+    capture_state.set_state(SID, last_batch_at=time.time())
+    capture_state.set_flush(SID)
+    token = capture_state.claim(SID)
+    assert capture_worker.launch(SID, transcript, "demo", if_due=True, config=mock_config) is False
+    assert capture_state.has_flush(SID) is True  # a worker was running: the flush waits
+    capture_state.release(SID, token)
+    assert capture_worker.launch(SID, transcript, "demo", if_due=True, config=mock_config) is True
+    assert capture_state.has_flush(SID) is False
+
+
+def test_short_session_is_not_launched_and_waits_an_interval(tmp_path, popen, mock_config, monkeypatch):
+    root = tmp_path / "projects"
+    (root / "-w").mkdir(parents=True)
+    t = root / "-w" / f"{SID}.jsonl"
+    t.write_text(json.dumps(_row("one question")) + "\n")
+    monkeypatch.setattr(capture_worker, "_TRANSCRIPTS_ROOT", root)
+    assert capture_worker.launch(SID, t, "grader", if_due=False, config=mock_config) is False
+    assert popen == [] and capture_state.get_state(SID)["last_batch_at"] > 0
+    allow = {**mock_config, "auto_capture_headless_projects": ["grader"]}
+    assert capture_worker.launch(SID, t, "grader", if_due=False, config=allow) is True
+
+
+def test_eligible_counts_user_messages(transcript, mock_config):
+    assert capture_worker.eligible(transcript, "demo", mock_config) is True  # six messages

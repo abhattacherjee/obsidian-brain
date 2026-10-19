@@ -18,18 +18,21 @@ def _user(text, cwd="/nonexistent/demo"):
 
 
 @pytest.fixture
-def root(tmp_path, monkeypatch):
+def root(tmp_path, monkeypatch, mock_config):
     r = tmp_path / "projects"
     (r / "-demo").mkdir(parents=True)
     monkeypatch.setattr(capture_worker, "_TRANSCRIPTS_ROOT", r)
-    capture_state.installed_at()  # install time = now
+    (capture_state.capture_dir() / "installed_at").write_text(str(time.time() - 86_400))  # a day ago
     return r
+
+
+QUIET = 3600  # older than the 10-minute "still running" window
 
 
 def _transcript(root, sid, n=3, first="hello", age=0.0):
     path = root / "-demo" / f"{sid}.jsonl"
     path.write_text(_user(first) + "".join(_user(f"msg {i}") for i in range(n - 1)))
-    t = time.time() + 5 - age
+    t = time.time() - QUIET - age
     os.utime(path, (t, t))
     return path
 
@@ -53,6 +56,32 @@ def test_pending_skips_before_install(root):
     path = _transcript(root, SID)
     os.utime(path, (1.0, 1.0))
     assert capture_cli.pending_sessions(5) == []
+
+
+def test_pending_skips_a_session_still_being_written(root):
+    path = _transcript(root, SID)
+    t = time.time() - 60
+    os.utime(path, (t, t))
+    assert capture_cli.pending_sessions(5) == []
+
+
+def test_pending_caches_a_not_eligible_verdict(root, monkeypatch):
+    path = _transcript(root, SID, n=2)
+    assert capture_cli.pending_sessions(5) == []
+    assert capture_state.get_state(SID)["checked_size"] == path.stat().st_size
+    monkeypatch.setattr(capture_worker, "eligible", lambda *a: pytest.fail("parsed again"))
+    assert capture_cli.pending_sessions(5) == []  # same size: not parsed again
+    with path.open("a") as fh:
+        fh.write(_user("third"))
+    os.utime(path, (time.time() - QUIET, time.time() - QUIET))
+    monkeypatch.setattr(capture_worker, "eligible", lambda *a: True)
+    assert [s for s, _ in capture_cli.pending_sessions(5)] == [SID]  # grew: checked again
+
+
+def test_pending_takes_allowlisted_headless_sessions(root, mock_config):
+    _transcript(root, SID, n=1)
+    config = {**mock_config, "auto_capture_headless_projects": ["demo"]}
+    assert [s for s, _ in capture_cli.pending_sessions(5, config=config)] == [SID]
 
 
 def test_pending_skips_fully_processed(root):

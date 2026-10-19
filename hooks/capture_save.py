@@ -56,6 +56,27 @@ def _yaml_str(text: str) -> str:
     return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
+_HEADING_RE = re.compile(r"^(#{1,5})(?=\s)")
+_FENCE_RE = re.compile(r"^\s{0,3}(`{3,}|~{3,})")
+
+
+def _demote_headings(body: str) -> str:
+    """One level down, so a body's ``## Context`` cannot end its ``## Update`` section early.
+
+    Lines inside fenced code blocks (a shell ``# comment``) are left alone.
+    """
+    out, fence = [], None
+    for line in body.split("\n"):
+        m = _FENCE_RE.match(line)
+        if m:
+            mark = m.group(1)[0]
+            fence = None if fence == mark else (fence or mark)
+        elif fence is None:
+            line = _HEADING_RE.sub(r"#\1", line)
+        out.append(line)
+    return "\n".join(out)
+
+
 def _is_rejected(rel_path: str) -> bool:
     return _REJECTED in Path(rel_path).parts
 
@@ -107,7 +128,7 @@ def _frontmatter(c: Candidate, *, session_id: str, project: str, session_note: s
         "source_session": session_id,
         "source_session_note": f"[[{session_note}]]" if session_note else "",
         "project": project_tag,
-        "topic": _slug(c.get("topic") or "general", 40),
+        "topic": _slug(str(c.get("topic") or "general"), 40),
     }
     for key, value in values.items():
         front = front.replace("{{" + key + "}}", value)
@@ -148,7 +169,7 @@ def save_candidate(
         heading = f"## Update ({today}) — auto-capture {cid}"
         abs_path = str(Path(vault) / match)
         with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
-            rc = note_writer.run_append_update(vault, abs_path, f"{heading}\n\n**{title}**\n\n{body}\n",
+            rc = note_writer.run_append_update(vault, abs_path, f"{heading}\n\n**{title}**\n\n{_demote_headings(body)}\n",
                                                last_updated=today, add_tags_csv="claude/auto")
         if rc != 0:
             raise RuntimeError(f"append-update failed: {sink.getvalue().strip()}")

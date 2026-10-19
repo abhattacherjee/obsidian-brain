@@ -24,7 +24,7 @@ function world(on: On, hasCli = true): World {
     commands: [],
     hasCli,
     rows: [
-      { id: 'aaa', ts: '2026-10-18T10:41:00', type: 'insight', title: 'jsonl keeps rows', kind: 'new', status: 'active' },
+      { id: 'aaa', ts: 1792348860.5, type: 'insight', title: 'jsonl keeps rows', kind: 'new', status: 'active' },
       { id: 'bbb', ts: '2026-10-18T10:52:00', type: 'decision', title: 'old idea', kind: 'updated', status: 'rejected' },
     ],
   }
@@ -56,12 +56,12 @@ function world(on: On, hasCli = true): World {
 
 const START = { cwd: '/w', surface: 'terminal', isInteractive: true } as const
 
-test('session start sweeps and registers /captures', async ($, on) => {
+test('session start registers /captures and leaves the sweep to the SessionStart hook', async ($, on) => {
   const clock = mock.clock(on)
   const w = world(on)
   await $.session.start(START)
   await clock.settle()
-  expect(w.calls).toContainEqual(['sweep'])
+  expect(w.calls).toEqual([])
   expect(w.commands).toContain('captures')
 })
 
@@ -88,6 +88,16 @@ test('the timer launches if due', async ($, on) => {
   expect(w.calls).toContainEqual(['launch', sid, '--if-due'])
 })
 
+test('a second session start (/clear, resume) adds no second timer', async ($, on) => {
+  const clock = mock.clock(on)
+  const w = world(on)
+  await $.session.start(START)
+  await $.session.start(START)
+  w.calls = []
+  await clock.advance(60_000)
+  expect(w.calls.filter(c => c[0] === 'launch').length).toBe(1)
+})
+
 test('pane lists captures and Reject rejects', async ($, on) => {
   mock.clock(on)
   const w = world(on)
@@ -112,6 +122,9 @@ test('pane lists captures and Reject rejects', async ($, on) => {
     } as never)
     await $.command.run({ command: 'captures', args: '' } as never)
     expect(await ui.find({ text: 'jsonl keeps rows' })).toBeDefined()
+    const d = new Date(1792348860.5 * 1000) // row aaa's epoch-seconds ts, as the ledger writes it
+    const hhmm = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
+    expect(await ui.find({ type: 'Text', text: new RegExp(`^${hhmm}$`) })).toBeDefined()
     expect(await ui.find({ key: 'reject-aaa' })).toBeDefined()
     expect(await ui.find({ key: 'reject-bbb' })).toBeUndefined()
     expect(await ui.find({ type: 'Text', text: 'next batch in 6 min · 2 waiting for sweep' })).toBeDefined()
