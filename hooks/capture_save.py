@@ -36,6 +36,19 @@ _TEMPLATES = Path(__file__).resolve().parent.parent / "templates"
 _REJECTED = "_rejected"
 
 
+class TransientSaveError(OSError):
+    """A write that may work on retry: the note was locked, changed under us, or the write failed."""
+
+
+_TRANSIENT_MARKERS = ("another process is updating", "changed on disk", "write failed", "cannot create lock")
+
+
+def _writer_failed(what: str, output: str) -> Exception:
+    if any(m in output for m in _TRANSIENT_MARKERS):
+        return TransientSaveError(f"{what} failed: {output}")
+    return RuntimeError(f"{what} failed: {output}")
+
+
 class Candidate(TypedDict):
     type: str
     title: str
@@ -56,14 +69,21 @@ def _yaml_str(text: str) -> str:
     return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-_HEADING_RE = re.compile(r"^(#{1,5})(?=\s)")
+_HEADING_RE = re.compile(r"^(#{1,6})(?=\s)")
 _FENCE_RE = re.compile(r"^\s{0,3}(`{3,}|~{3,})")
 
 
-def _demote_headings(body: str) -> str:
-    """One level down, so a body's ``## Context`` cannot end its ``## Update`` section early.
+def end_marker(capture_id: str) -> str:
+    """The line that closes an update section; Reject removes through it."""
+    return f"<!-- /auto-capture {capture_id} -->"
 
-    Lines inside fenced code blocks (a shell ``# comment``) are left alone.
+
+def _demote_headings(body: str) -> str:
+    """Body headings sit under the ``## Update`` heading: at least ``###``, one level down.
+
+    Keeps the note's outline nested; ``end_marker`` is what bounds the
+    section for Reject. Lines inside fenced code blocks (a shell
+    ``# comment``) are left alone.
     """
     out, fence = [], None
     for line in body.split("\n"):
@@ -72,7 +92,7 @@ def _demote_headings(body: str) -> str:
             mark = m.group(1)[0]
             fence = None if fence == mark else (fence or mark)
         elif fence is None:
-            line = _HEADING_RE.sub(r"#\1", line)
+            line = _HEADING_RE.sub(lambda m: "#" * min(6, max(3, len(m.group(1)) + 1)), line)
         out.append(line)
     return "\n".join(out)
 
@@ -169,10 +189,10 @@ def save_candidate(
         heading = f"## Update ({today}) — auto-capture {cid}"
         abs_path = str(Path(vault) / match)
         with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
-            rc = note_writer.run_append_update(vault, abs_path, f"{heading}\n\n**{title}**\n\n{_demote_headings(body)}\n",
+            rc = note_writer.run_append_update(vault, abs_path, f"{heading}\n\n**{title}**\n\n{_demote_headings(body)}\n\n{end_marker(cid)}\n",
                                                last_updated=today, add_tags_csv="claude/auto")
         if rc != 0:
-            raise RuntimeError(f"append-update failed: {sink.getvalue().strip()}")
+            raise _writer_failed("append-update", sink.getvalue().strip())
         row.update(kind="updated", note_path=match, update_heading=heading)
     else:
         if session_note is None:
@@ -188,7 +208,7 @@ def save_candidate(
         with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
             rc = note_writer.run_write(vault, folder, filename, content)
         if rc != 0:
-            raise RuntimeError(f"write failed: {sink.getvalue().strip()}")
+            raise _writer_failed("write", sink.getvalue().strip())
         row.update(kind="new", note_path=f"{folder}/{filename}")
     capture_state.ledger_append(row)
     return row

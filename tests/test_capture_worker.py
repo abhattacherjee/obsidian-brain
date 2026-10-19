@@ -344,3 +344,16 @@ def test_short_session_is_not_launched_and_waits_an_interval(tmp_path, popen, mo
 
 def test_eligible_counts_user_messages(transcript, mock_config):
     assert capture_worker.eligible(transcript, "demo", mock_config) is True  # six messages
+
+
+def test_a_locked_note_is_retried_not_skipped(transcript, fake_claude, monkeypatch, mock_config):
+    monkeypatch.setattr(capture_worker.capture_save, "session_note_for", lambda *a: "")
+
+    def save(c, **kw):
+        raise capture_worker.capture_save._writer_failed("append-update", "another process is updating this note")
+
+    monkeypatch.setattr(capture_worker.capture_save, "save_candidate", save)
+    fake_claude.outputs = [_envelope([CAND])]
+    assert capture_worker.run_batch(SID, transcript, "demo", mock_config) == "save-failed"
+    st = capture_state.get_state(SID)
+    assert st["offset"] == 0 and st["pending"]["next"] == 0

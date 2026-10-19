@@ -159,3 +159,11 @@ def test_pending_skips_worker_cwd_dir(root):
     path = d / f"{SID}.jsonl"
     path.write_text("".join(_user(f"m {i}") for i in range(4)))
     assert capture_cli.pending_sessions(5) == []
+
+
+def test_adding_a_project_to_the_allowlist_reopens_a_cached_session(root, mock_config):
+    _transcript(root, SID, n=1)
+    assert capture_cli.pending_sessions(5, config=mock_config) == []
+    assert capture_state.get_state(SID)["project"] == "demo"
+    config = {**mock_config, "auto_capture_headless_projects": ["demo"]}
+    assert [s for s, _ in capture_cli.pending_sessions(5, config=config)] == [SID]

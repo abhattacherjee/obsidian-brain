@@ -156,12 +156,66 @@ def test_reject_refuses_when_the_note_changes_mid_reject(mock_config, tmp_vault,
                                        "note_path": "claude-insights/n.md", "update_heading": heading})
     real = capture_reject._remove_section
 
-    def remove_and_edit(text, h):
+    def remove_and_edit(text, h, marker=""):
         with note.open("a") as fh:  # the user saves the note in Obsidian right now
             fh.write("\nTyped by hand.\n")
-        return real(text, h)
+        return real(text, h, marker)
 
     monkeypatch.setattr(capture_reject, "_remove_section", remove_and_edit)
     with pytest.raises(RuntimeError, match="changed on disk"):
         capture_reject.reject(cid, mock_config)
     assert "Typed by hand." in note.read_text() and "Drop me." in note.read_text()
+
+
+def _update_via_save(mock_config, tmp_vault, monkeypatch, body, crlf=False):
+    import capture_save
+
+    note = tmp_vault / "claude-insights" / "2026-10-01-target-abcd.md"
+    base = NOTE + "\n## Later\n\nTail.\n"
+    note.write_bytes((base.replace("\n", "\r\n") if crlf else base).encode())
+    monkeypatch.setattr(capture_save, "find_match", lambda q, c: "claude-insights/2026-10-01-target-abcd.md")
+    row = capture_save.save_candidate({"type": "error-fix", "title": "Fix it", "body": body, "topic": "t"},
+                                      session_id=SID, project="demo", today="2026-10-18", config=mock_config)
+    return note, row
+
+
+def test_reject_removes_level_one_and_fenced_level_two_headings(mock_config, tmp_vault, monkeypatch):
+    body = "# Error\n\nBoom.\n\n```md\n## not a heading\n```\n\n## Fix\n\nDid it."
+    note, row = _update_via_save(mock_config, tmp_vault, monkeypatch, body)
+    text = note.read_text()
+    assert "### Error" in text and "\n## not a heading" in text  # fenced line untouched
+    capture_reject.reject(row["id"], mock_config)
+    text = note.read_text()
+    for gone in ("Boom.", "not a heading", "Did it.", "auto-capture"):
+        assert gone not in text
+    assert "Tail." in text
+
+
+def test_reject_keeps_crlf_line_endings(mock_config, tmp_vault, monkeypatch):
+    note, row = _update_via_save(mock_config, tmp_vault, monkeypatch, "## Error\n\nBoom.", crlf=True)
+    capture_reject.reject(row["id"], mock_config)
+    raw = note.read_bytes()
+    assert b"Boom." not in raw and b"Tail." in raw
+    assert b"\r\n" in raw and b"\n" not in raw.replace(b"\r\n", b"")
+
+
+def test_reject_legacy_update_without_marker_skips_fences(mock_config, tmp_vault):
+    note = tmp_vault / "claude-insights" / "old.md"
+    heading = "## Update (2026-10-17) — auto-capture eeeeeeeeeeee"
+    note.write_text(NOTE + "\n" + heading + "\n\n```\n## inside a fence\n```\nDrop.\n\n## Kept\n\nStay.\n")
+    cid = capture_state.ledger_append({"session_id": SID, "status": "active", "kind": "updated",
+                                       "note_path": "claude-insights/old.md", "update_heading": heading})
+    capture_reject.reject(cid, mock_config)
+    text = note.read_text()
+    assert "Drop." not in text and "inside a fence" not in text and "Stay." in text
+
+
+def test_reject_keeps_text_typed_after_the_update(mock_config, tmp_vault, monkeypatch):
+    import capture_save
+
+    note, row = _update_via_save(mock_config, tmp_vault, monkeypatch, "Boom.")
+    marker = capture_save.end_marker(row["id"])
+    note.write_text(note.read_text().replace(marker, marker + "\n\nTyped by hand after the update."))
+    capture_reject.reject(row["id"], mock_config)
+    text = note.read_text()
+    assert "Boom." not in text and "Typed by hand after the update." in text

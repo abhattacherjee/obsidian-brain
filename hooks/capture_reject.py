@@ -10,8 +10,10 @@ note it was added to, often a hand-written one, never moves.
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 
+import capture_save
 import capture_state
 import note_writer
 import obsidian_utils
@@ -27,16 +29,39 @@ def _contained(vault: Path, rel_path: str) -> Path:
     return target
 
 
-def _remove_section(text: str, heading: str) -> tuple[str, str]:
+_FENCE_RE = re.compile(r"^\s{0,3}(`{3,}|~{3,})")
+
+
+def _section_end(lines: list[str], start: int, marker: str) -> int:
+    """Index just past the section that opens at ``start``.
+
+    Through the capture's own end marker when it has one; otherwise (an
+    update written before the marker existed) up to the next ``## `` heading
+    outside a fenced code block.
+    """
+    if marker:
+        for i in range(start + 1, len(lines)):
+            if lines[i].strip() == marker:
+                return i + 1
+    fence = None
+    for i in range(start + 1, len(lines)):
+        m = _FENCE_RE.match(lines[i])
+        if m:
+            mark = m.group(1)[0]
+            fence = None if fence == mark else (fence or mark)
+        elif fence is None and lines[i].startswith("## "):
+            return i
+    return len(lines)
+
+
+def _remove_section(text: str, heading: str, marker: str = "") -> tuple[str, str]:
     """Split ``text`` into (text without the section, the section)."""
     lines = text.split("\n")
     try:
         start = lines.index(heading)
     except ValueError:
         return text, ""
-    end = start + 1
-    while end < len(lines) and not lines[end].startswith("## "):
-        end += 1
+    end = _section_end(lines, start, marker)
     section = "\n".join(lines[start:end]).strip("\n")
     kept = lines[:start] + lines[end:]
     while start > 0 and start < len(kept) and kept[start - 1] == "" and kept[start] == "":
@@ -69,7 +94,11 @@ def reject(capture_id: str, config: dict | None = None) -> dict:
             st = os.stat(note)
             with open(note, encoding="utf-8", newline="") as fh:
                 text = fh.read()
-            kept, section = _remove_section(text, row.get("update_heading", ""))
+            crlf = "\r\n" in text
+            kept, section = _remove_section(text.replace("\r\n", "\n") if crlf else text,
+                                            row.get("update_heading", ""), capture_save.end_marker(capture_id))
+            if crlf:
+                kept = kept.replace("\n", "\r\n")
             if section:
                 err = obsidian_utils.write_vault_note(str(vault), f"{folder}/{REJECTED_DIR}", dest.name, section + "\n")
                 if err:

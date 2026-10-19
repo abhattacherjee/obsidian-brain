@@ -807,7 +807,7 @@
           "files": [
             "hooks/capture_save.py"
           ],
-          "purpose": "Turns one candidate {type, title, body, topic} into a note. Runs /compress Step 3.5's dedup (curated types only, _rejected/ excluded, is_high_confidence_match); a match gets an '## Update (<date>) — auto-capture <id>' section via note_writer append-update, its body headings demoted one level (outside code fences) so Reject finds the section's end, anything else a new note from templates/<type>.md tagged claude/auto with source: auto-capture. Appends one ledger row either way."
+          "purpose": "Turns one candidate {type, title, body, topic} into a note. Runs /compress Step 3.5's dedup (curated types only, _rejected/ excluded, is_high_confidence_match); a match gets an '## Update (<date>) — auto-capture <id>' section via note_writer append-update, its body headings demoted to ### or below (outside code fences) and the section closed by an <!-- /auto-capture <id> --> marker, anything else a new note from templates/<type>.md tagged claude/auto with source: auto-capture. Appends one ledger row either way. A locked, changed or failed note write raises TransientSaveError (an OSError) so the worker retries it."
         },
         {
           "id": "capture-reject",
@@ -816,7 +816,7 @@
           "files": [
             "hooks/capture_reject.py"
           ],
-          "purpose": "Reject from the Captures pane: a new note moves to <insights>/_rejected/ and leaves the index; an update has only its section cut out, under note_writer's lock and stat re-check, saved as _rejected/<stem>-update-<id>.md. Idempotent, path-contained. recent_rejections() feeds the worker prompt so it stops capturing what was rejected."
+          "purpose": "Reject from the Captures pane: a new note moves to <insights>/_rejected/ and leaves the index; an update has only its section cut out, under note_writer's lock and stat re-check, through its end marker (or, for an older update, the next ## heading outside a code fence), CRLF notes kept CRLF, saved as _rejected/<stem>-update-<id>.md. Idempotent, path-contained. recent_rejections() feeds the worker prompt so it stops capturing what was rejected."
         },
         {
           "id": "capture-worker",

@@ -57,14 +57,17 @@ def pending_sessions(limit: int, exclude: str | None = None,
             state = capture_state.get_state(sid)
         except (OSError, ValueError):
             continue  # unreadable file, or a stem that is not a valid session id
-        if st.st_size <= state["offset"] or st.st_size == state["checked_size"]:
+        if st.st_size <= state["offset"]:
             continue
+        allow = config.get("auto_capture_headless_projects") or []
+        if st.st_size == state["checked_size"] and state["project"] not in allow:
+            continue  # judged not eligible at this size, and its project is still not listed
         if capture_state.claim_is_live(sid):
             continue
         project = state["project"] or capture_worker.project_for(path)
         if (capture_slice.first_user_text(path).startswith(capture_worker.SENTINEL)
                 or not capture_worker.eligible(path, project, config)):
-            capture_state.set_state(sid, checked_size=st.st_size)
+            capture_state.set_state(sid, checked_size=st.st_size, project=project)
             continue
         found.append((st.st_mtime, sid, path))
     found.sort()
