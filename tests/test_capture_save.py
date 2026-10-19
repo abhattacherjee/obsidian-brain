@@ -142,3 +142,9 @@ def test_find_match_returns_vault_relative_path(mock_config, tmp_vault, monkeypa
 def test_find_match_refuses_path_outside_vault(mock_config, monkeypatch):
     _fake_results(monkeypatch, [{"path": "/etc/passwd", "type": "claude-insight", "rank": -30.0}])
     assert capture_save.find_match("q", mock_config) is None
+
+
+def test_demote_keeps_a_longer_fence_intact():
+    body = "````md\n```\n# not a heading\n```\n````\n# Real"
+    out = capture_save._demote_headings(body)
+    assert "\n# not a heading\n" in out and out.endswith("### Real")

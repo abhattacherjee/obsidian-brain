@@ -219,3 +219,15 @@ def test_reject_keeps_text_typed_after_the_update(mock_config, tmp_vault, monkey
     capture_reject.reject(row["id"], mock_config)
     text = note.read_text()
     assert "Boom." not in text and "Typed by hand after the update." in text
+
+
+def test_reject_legacy_update_with_a_longer_fence(mock_config, tmp_vault):
+    note = tmp_vault / "claude-insights" / "fence.md"
+    heading = "## Update (2026-10-17) — auto-capture ffffffffffff"
+    body = "````md\n```\n## still code\n```\n````\nDrop.\n"
+    note.write_text(NOTE + "\n" + heading + "\n\n" + body + "\n## Kept\n\nStay.\n")
+    cid = capture_state.ledger_append({"session_id": SID, "status": "active", "kind": "updated",
+                                       "note_path": "claude-insights/fence.md", "update_heading": heading})
+    capture_reject.reject(cid, mock_config)
+    text = note.read_text()
+    assert "Drop." not in text and "still code" not in text and "## Kept" in text and "Stay." in text

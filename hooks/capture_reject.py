@@ -29,9 +29,6 @@ def _contained(vault: Path, rel_path: str) -> Path:
     return target
 
 
-_FENCE_RE = re.compile(r"^\s{0,3}(`{3,}|~{3,})")
-
-
 def _section_end(lines: list[str], start: int, marker: str) -> int:
     """Index just past the section that opens at ``start``.
 
@@ -45,11 +42,8 @@ def _section_end(lines: list[str], start: int, marker: str) -> int:
                 return i + 1
     fence = None
     for i in range(start + 1, len(lines)):
-        m = _FENCE_RE.match(lines[i])
-        if m:
-            mark = m.group(1)[0]
-            fence = None if fence == mark else (fence or mark)
-        elif fence is None and lines[i].startswith("## "):
+        fence, is_fence = capture_save.fence_step(fence, lines[i])
+        if not is_fence and fence is None and lines[i].startswith("## "):
             return i
     return len(lines)
 

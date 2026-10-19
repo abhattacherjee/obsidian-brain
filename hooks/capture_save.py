@@ -70,7 +70,24 @@ def _yaml_str(text: str) -> str:
 
 
 _HEADING_RE = re.compile(r"^(#{1,6})(?=\s)")
-_FENCE_RE = re.compile(r"^\s{0,3}(`{3,}|~{3,})")
+
+
+def fence_step(open_fence: tuple[str, int] | None, line: str) -> tuple[tuple[str, int] | None, bool]:
+    """CommonMark fence state after ``line``: ``(open fence, line is a fence line)``.
+
+    A fence opens on 3+ backticks or tildes and closes only on the same
+    character, at least as long, with nothing after it (note_writer's rule),
+    so a literal ```` ``` ```` inside a ```````` ```` ```````` block stays code.
+    """
+    m = note_writer._FENCE_RE.match(line.rstrip("\r\n"))
+    if not m:
+        return open_fence, False
+    marker = m.group("fence")
+    if open_fence is None:
+        return (marker[0], len(marker)), True
+    if marker[0] == open_fence[0] and len(marker) >= open_fence[1] and not m.group("info").strip():
+        return None, True
+    return open_fence, True
 
 
 def end_marker(capture_id: str) -> str:
@@ -87,11 +104,8 @@ def _demote_headings(body: str) -> str:
     """
     out, fence = [], None
     for line in body.split("\n"):
-        m = _FENCE_RE.match(line)
-        if m:
-            mark = m.group(1)[0]
-            fence = None if fence == mark else (fence or mark)
-        elif fence is None:
+        fence, is_fence = fence_step(fence, line)
+        if not is_fence and fence is None:
             line = _HEADING_RE.sub(lambda m: "#" * min(6, max(3, len(m.group(1)) + 1)), line)
         out.append(line)
     return "\n".join(out)
