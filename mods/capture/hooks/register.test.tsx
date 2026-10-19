@@ -43,7 +43,7 @@ function world(on: On, hasCli = true): World {
     w.calls.push(args)
     let out: unknown = { launched: false }
     if (args[0] === 'ledger-list') out = w.rows
-    if (args[0] === 'status') out = { next_batch_min: 6, pending_sweep: 2 }
+    if (args[0] === 'status') out = { next_batch_min: 6, pending_sweep: 2, vault: 'my vault' }
     if (args[0] === 'sweep') out = { launched: [] }
     if (args[0] === 'reject') {
       w.rows = w.rows.map(r => (r.id === args[1] ? { ...r, status: 'rejected' } : r))
@@ -98,41 +98,121 @@ test('a second session start (/clear, resume) adds no second timer', async ($, o
   expect(w.calls.filter(c => c[0] === 'launch').length).toBe(1)
 })
 
-test('pane lists captures and Reject rejects', async ($, on) => {
+function paneProps(surface: 'terminal' | 'desktop', bodyColumns = 72, bodyRows = 30) {
+  return {
+    plugin: PLUGIN,
+    surface,
+    component: 'Pane',
+    requestId: 'captures',
+    props: {
+      title: 'Captures',
+      isFocused: true,
+      bodyColumns,
+      placement: 'dock',
+      scroll: { offset: 0, bodyRows },
+      view: {},
+    },
+    viewport: { columns: bodyColumns + 4, rows: bodyRows + 10 },
+  } as never
+}
+
+async function openPane($: any, on: On) {
   mock.clock(on)
   const w = world(on)
   await $.session.start(START)
   await $.command.run({ command: 'captures', args: '' } as never)
+  return w
+}
+
+test('pane lists captures and Reject rejects, on both surfaces', async ($, on) => {
+  const w = await openPane($, on)
   for (const surface of SURFACES) {
     w.rows = w.rows.map(r => (r.id === 'aaa' ? { ...r, status: 'active' } : r))
-    const ui = await $.ui.mount({
-      plugin: PLUGIN,
-      surface,
-      component: 'Pane',
-      requestId: 'captures',
-      props: {
-        title: 'Captures',
-        isFocused: true,
-        bodyColumns: 120,
-        placement: 'dock',
-        scroll: { offset: 0, bodyRows: 30 },
-        view: {},
-      },
-      viewport: { columns: 140, rows: 40 },
-    } as never)
+    const ui = await $.ui.mount(paneProps(surface))
     await $.command.run({ command: 'captures', args: '' } as never)
-    expect(await ui.find({ text: 'jsonl keeps rows' })).toBeDefined()
+    expect(await ui.find({ text: /jsonl keeps rows/ })).toBeDefined()
     const d = new Date(1792348860.5 * 1000) // row aaa's epoch-seconds ts, as the ledger writes it
     const hhmm = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
     expect(await ui.find({ type: 'Text', text: new RegExp(`^${hhmm}$`) })).toBeDefined()
     expect(await ui.find({ key: 'reject-aaa' })).toBeDefined()
     expect(await ui.find({ key: 'reject-bbb' })).toBeUndefined()
-    expect(await ui.find({ type: 'Text', text: 'next batch in 6 min · 2 waiting for sweep' })).toBeDefined()
+    expect(await ui.find({ text: /next batch in 6 min/ })).toBeDefined()
+    expect(await ui.find({ text: /2 (sessions )?waiting for sweep/ })).toBeDefined()
     await ui.press({ key: 'reject-aaa' })
     expect(w.calls).toContainEqual(['reject', 'aaa'])
     expect(await ui.find({ key: 'reject-aaa' })).toBeUndefined()
     await ui.unmount()
   }
+})
+
+test('terminal rows keep fixed columns at narrow widths, so nothing wraps', async ($, on) => {
+  const w = await openPane($, on)
+  w.rows = [
+    { id: 'ccc', ts: 1792348860, type: 'error-fix', title: 'x'.repeat(200), kind: 'updated', status: 'active' },
+  ]
+  await $.command.run({ command: 'captures', args: '' } as never)
+  const ui = await $.ui.mount(paneProps('terminal', 60))
+  const title = await ui.find({ type: 'Text', text: /^x+…$/ })
+  expect(title).toBeDefined()
+  // 60 columns less time (5), type (7), kind (7) and three gaps.
+  expect(String(title!.text).length).toBe(60 - 5 - 7 - 7 - 3)
+  expect(await ui.find({ type: 'Text', text: 'error  ' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: 'updated' })).toBeDefined()
+  expect(await ui.find({ key: 'reject-ccc' })).toBeDefined()
+  expect(await ui.find({ text: /Reject update/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('terminal detail strip shows the selected row; focus moves the selection and Reject follows it', async ($, on) => {
+  const w = await openPane($, on)
+  w.rows = [
+    { id: 'n1', ts: 1792348860, type: 'insight', title: 'first', kind: 'new', status: 'active', note_path: 'claude-insights/a.md', summary: 'sum one' },
+    { id: 'n2', ts: 1792348800, type: 'decision', title: 'second', kind: 'new', status: 'active', note_path: 'claude-insights/b.md', summary: 'sum two' },
+  ]
+  await $.command.run({ command: 'captures', args: '' } as never)
+  const ui = await $.ui.mount(paneProps('terminal'))
+  expect(await ui.find({ text: /sum one/ })).toBeDefined()
+  expect(await ui.find({ type: 'Link', href: 'obsidian://open?vault=my%20vault&file=claude-insights%2Fa.md' })).toBeDefined()
+  expect(await ui.find({ key: 'reject-n1' })).toBeDefined()
+  await $.ui.focus({ component: 'Pane', requestId: 'captures', plugin: PLUGIN, element: 'row-n2', origin: { kind: 'person' } } as never)
+  expect(await ui.find({ text: /sum two/ })).toBeDefined()
+  expect(await ui.find({ key: 'reject-n1' })).toBeUndefined()
+  await ui.press({ key: 'reject-n2' })
+  expect(w.calls).toContainEqual(['reject', 'n2'])
+  await ui.unmount()
+})
+
+test('terminal draws only the rows that fit, so the footer stays on screen', async ($, on) => {
+  const w = await openPane($, on)
+  w.rows = Array.from({ length: 40 }, (_, i) => ({ id: `r${i}`, ts: 1792348860 - i, type: 'insight', title: `t${i}`, kind: 'new', status: 'active' }))
+  await $.command.run({ command: 'captures', args: '' } as never)
+  const ui = await $.ui.mount(paneProps('terminal', 72, 16))
+  expect(await ui.find({ key: 'row-r0' })).toBeDefined()
+  expect(await ui.find({ key: 'row-r9' })).toBeDefined()
+  expect(await ui.find({ key: 'row-r10' })).toBeUndefined()
+  expect(await ui.find({ text: /r reject · s scope/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('scope switches between this session, today and all projects', async ($, on) => {
+  const w = await openPane($, on)
+  const ui = await $.ui.mount(paneProps('desktop'))
+  w.calls = []
+  await ui.press({ key: 'scope-today' })
+  const today = w.calls.find(c => c[0] === 'ledger-list')!
+  expect(today[1]).toBe('--since')
+  const midnight = new Date()
+  midnight.setHours(0, 0, 0, 0)
+  expect(Number(today[2])).toBe(Math.floor(midnight.getTime() / 1000))
+  w.calls = []
+  await ui.press({ key: 'scope-all' })
+  expect(w.calls.find(c => c[0] === 'ledger-list')).toEqual(['ledger-list', '--limit', '100'])
+  await ui.unmount()
+  const term = await $.ui.mount(paneProps('terminal'))
+  w.calls = []
+  await term.press({ key: 'scope' }) // all → session
+  expect(w.calls.find(c => c[0] === 'ledger-list')).toEqual(['ledger-list', '--session', SID, '--limit', '50'])
+  await term.unmount()
 })
 
 test('without cli_path nothing runs and the status line says so', async ($, on) => {

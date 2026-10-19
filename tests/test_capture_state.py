@@ -102,6 +102,8 @@ def test_ledger_append_list_newest_first():
     assert [r["id"] for r in cs.ledger_list(session=SID)] == [b, a]
     assert [r["title"] for r in cs.ledger_list()] == ["c", "b", "a"]
     assert len(cs.ledger_list(limit=1)) == 1
+    assert [r["title"] for r in cs.ledger_list(since=2.0)] == ["c", "b"]
+    assert [r["title"] for r in cs.ledger_list(session=SID, since=2.0)] == ["b"]
     assert stat.S_IMODE((cs.capture_dir() / cs.LEDGER_NAME).stat().st_mode) == 0o600
 
 

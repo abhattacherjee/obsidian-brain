@@ -91,13 +91,16 @@ def write_cli_path() -> None:
 
 
 def status(session: str | None) -> dict:
+    config = obsidian_utils.load_config()
     next_min = None
     if session:
         last = capture_state.get_state(session)["last_batch_at"]
         if last:
-            interval = int(obsidian_utils.load_config().get("auto_capture_interval_minutes", 10))
+            interval = int(config.get("auto_capture_interval_minutes", 10))
             next_min = max(0, math.ceil(interval - (time.time() - last) / 60))
-    return {"next_batch_min": next_min, "pending_sweep": len(pending_sessions(1000, exclude=session))}
+    vault = str(config.get("vault_path") or "")
+    return {"next_batch_min": next_min, "pending_sweep": len(pending_sessions(1000, exclude=session)),
+            "vault": Path(vault).name if vault else ""}
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -117,6 +120,7 @@ def _parser() -> argparse.ArgumentParser:
     ll = sub.add_parser("ledger-list")
     ll.add_argument("--session")
     ll.add_argument("--limit", type=int, default=50)
+    ll.add_argument("--since", type=float)
     rj = sub.add_parser("reject")
     rj.add_argument("id")
     st = sub.add_parser("status")
@@ -138,7 +142,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.cmd == "sweep":
             out = {"launched": sweep(args.limit)}
         elif args.cmd == "ledger-list":
-            out = capture_state.ledger_list(args.session, args.limit)
+            out = capture_state.ledger_list(args.session, args.limit, args.since)
         elif args.cmd == "reject":
             out = capture_reject.reject(args.id)
         else:

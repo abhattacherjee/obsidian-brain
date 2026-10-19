@@ -32,6 +32,7 @@ def test_new_insight_uses_template_fields(mock_config, tmp_vault, no_match):
                                       session_note="2026-10-18-obsidian-brain-1a2b",
                                       today="2026-10-18", config=mock_config)
     assert row["kind"] == "new" and row["status"] == "active"
+    assert row["summary"] and "\n" not in row["summary"] and len(row["summary"]) <= capture_save.SUMMARY_CHARS
     name = row["note_path"].split("/", 1)[1]
     assert re.match(r"^\d{4}-\d{2}-\d{2}-[a-z0-9-]{1,50}-[0-9a-f]{4}\.md$", name)
     front, text = _front(tmp_vault / row["note_path"])

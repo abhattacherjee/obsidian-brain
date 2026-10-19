@@ -3,6 +3,7 @@
 import json
 import os
 import time
+from pathlib import Path
 
 import pytest
 
@@ -138,13 +139,22 @@ def test_cli_shapes(root, capsys, monkeypatch, mock_config):
     cid = capture_state.ledger_append({"session_id": SID, "title": "t", "status": "active"})
     rc, out = _run(capsys, "ledger-list", "--session", SID)
     assert rc == 0 and json.loads(out)[0]["id"] == cid
-    assert json.loads(_run(capsys, "status")[1]) == {"next_batch_min": None, "pending_sweep": 0}
+    assert json.loads(_run(capsys, "status")[1]) == {"next_batch_min": None, "pending_sweep": 0,
+                                                     "vault": Path(mock_config["vault_path"]).name}
 
 
 def test_cli_status_next_batch(root, capsys, mock_config):
     capture_state.set_state(SID, last_batch_at=time.time() - 4 * 60)
     out = json.loads(_run(capsys, "status", "--session", SID)[1])
     assert out["next_batch_min"] == 6
+    assert out["vault"] == Path(mock_config["vault_path"]).name
+
+
+def test_cli_ledger_list_since(root, capsys, mock_config):
+    capture_state.ledger_append({"session_id": SID, "title": "old", "ts": 100.0})
+    capture_state.ledger_append({"session_id": "other", "title": "new", "ts": 200.0})
+    out = json.loads(_run(capsys, "ledger-list", "--since", "150")[1])
+    assert [r["title"] for r in out] == ["new"]
 
 
 def test_cli_reject_unknown_and_usage(root, capsys, mock_config):

@@ -69,6 +69,7 @@ def _yaml_str(text: str) -> str:
     return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
+SUMMARY_CHARS = 200  # the pane's one-line preview of the body
 _HEADING_RE = re.compile(r"^(#{1,6})(?=\s)")
 
 
@@ -195,7 +196,7 @@ def save_candidate(
         raise ValueError("candidate has an empty body")
     cid = secrets.token_hex(6)
     row = {"id": cid, "session_id": session_id, "project": project, "type": c["type"],
-           "title": title, "status": "active"}
+           "title": title, "status": "active", "summary": " ".join(body.split())[:SUMMARY_CHARS]}
 
     match = find_match(f"{title}\n{body[:300]}", config)
     sink = io.StringIO()

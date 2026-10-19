@@ -835,7 +835,7 @@
           "files": [
             "hooks/capture_cli.py"
           ],
-          "purpose": "JSON CLI for the mod, hooks and workers: launch, run-batch, sweep, ledger-list, reject, status. sweep() launches batches for up to 3 transcripts since install with unread bytes, no live claim, no worker sentinel and an eligible() pass, oldest first. It skips transcripts written to within the last interval (still running) and caches a not-eligible verdict as checked_size until the file grows."
+          "purpose": "JSON CLI for the mod, hooks and workers: launch, run-batch, sweep, ledger-list (--session, --since), reject, status (next batch, sweep backlog, vault name). sweep() launches batches for up to 3 transcripts since install with unread bytes, no live claim, no worker sentinel and an eligible() pass, oldest first. It skips transcripts written to within the last interval (still running) and caches a not-eligible verdict as checked_size until the file grows."
         },
         {
           "id": "capture-mod",
@@ -845,7 +845,7 @@
             "mods/capture/hooks/register.tsx",
             "mods/capture/types/index.d.ts"
           ],
-          "purpose": "TypeScript hooks module loaded from hooks/hooks.json 'modules'. On a main-loop turn.complete and every 60 s (one timer per load) it runs 'launch <sid> --if-due'; at session.start it registers /captures (the SessionStart hook does the sweep). The Captures pane (terminal and Desktop) lists ledger-list rows with a Reject button and a 'next batch in N min · M waiting for sweep' footer. Errors show in the pane, never in the turn."
+          "purpose": "TypeScript hooks module loaded from hooks/hooks.json 'modules'. On a main-loop turn.complete and every 60 s (one timer per load) it runs 'launch <sid> --if-due'; at session.start it registers /captures (the SessionStart hook does the sweep). The Captures pane has three scopes (this session, today via ledger-list --since, all projects). On the terminal it draws fixed-width time/type/title/kind columns, only as many rows as fit, a detail strip for the row under the focus ring (path as an obsidian:// link, summary, Reject on hotkey r) and a key-hint footer; scope cycles on hotkey s. On Desktop it draws scope tabs and one card per capture with Open in Obsidian and Reject. Errors show in the pane, never in the turn."
         }
       ]
     },
@@ -1131,7 +1131,7 @@
           "name": "Capture state + ledger",
           "kind": "datastore",
           "files": [],
-          "purpose": "<secure dir>/capture/: <sid>.json state, <sid>.claim, <sid>.flush, installed_at, cli_path (where the mod finds capture_cli.py), worker.log, worker-cwd/ and the captures.jsonl ledger (one row per saved capture: id, session, project, type, title, kind new/updated, note_path, status active/rejected)."
+          "purpose": "<secure dir>/capture/: <sid>.json state, <sid>.claim, <sid>.flush, installed_at, cli_path (where the mod finds capture_cli.py), worker.log, worker-cwd/ and the captures.jsonl ledger (one row per saved capture: id, session, project, type, title, a 200-char summary, kind new/updated, note_path, status active/rejected)."
         }
       ]
     },

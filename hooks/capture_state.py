@@ -233,9 +233,11 @@ def _merged_rows() -> list[dict]:
     return list(merged.values())
 
 
-def ledger_list(session: str | None = None, limit: int = 200) -> list[dict]:
-    """Merged ledger rows, newest first, optionally for one session."""
-    rows = [r for r in _merged_rows() if session is None or r.get("session_id") == session]
+def ledger_list(session: str | None = None, limit: int = 200, since: float | None = None) -> list[dict]:
+    """Merged ledger rows, newest first, optionally for one session or from ``since`` (epoch s)."""
+    rows = [r for r in _merged_rows()
+            if (session is None or r.get("session_id") == session)
+            and (since is None or float(r.get("ts", 0) or 0) >= since)]
     rows.sort(key=lambda r: r.get("ts", 0), reverse=True)
     return rows[:limit]
 
