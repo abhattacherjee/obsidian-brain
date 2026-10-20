@@ -27,7 +27,8 @@ const TYPES: Record<string, { short: string; long: string; color: string }> = {
 // One of each per load, however often session.start (/clear, resume) or /captures runs.
 let tick: Timer | undefined
 let refresher: Timer | undefined
-let notSetUp = false
+// True at load: a status set before a reload outlives the module, so the first good call clears it.
+let notSetUp = true
 
 async function cliPath($: $): Promise<{ path: string } | { reason: string }> {
   const home = await $.env.get('HOME')

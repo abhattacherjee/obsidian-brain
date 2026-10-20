@@ -8,7 +8,7 @@ const SURFACES = ['terminal', 'desktop'] as const
 const SID = 'sid-1234'
 const RUN = { exitCode: 0, stderr: '', isStdoutTruncated: false, isStderrTruncated: false }
 
-type World = { calls: string[][]; rows: Record<string, unknown>[]; hasCli: boolean; commands: string[] }
+type World = { calls: string[][]; rows: Record<string, unknown>[]; hasCli: boolean; cliText: string; commands: string[] }
 
 // The engine's own answers, which nothing beneath the plugins gives in a test.
 function bottoms(on: On): void {
@@ -23,6 +23,7 @@ function world(on: On, hasCli = true, env = { HOME: '/home/me' } as Record<strin
     calls: [],
     commands: [],
     hasCli,
+    cliText: `${CLI}\n`,
     rows: [
       { id: 'aaa', ts: 1792348860.5, type: 'insight', title: 'jsonl keeps rows', kind: 'new', status: 'active' },
       { id: 'bbb', ts: '2026-10-18T10:52:00', type: 'decision', title: 'old idea', kind: 'updated', status: 'rejected' },
@@ -36,7 +37,7 @@ function world(on: On, hasCli = true, env = { HOME: '/home/me' } as Record<strin
   })
   on('fs.read', ($, e) => {
     if (!w.hasCli) throw new Error('ENOENT')
-    return { value: `${CLI}\n` }
+    return { value: w.cliText }
   })
   on('process.run', ($, e) => {
     const args = e.argv.slice(2)
@@ -284,6 +285,34 @@ test('a missing HOME shows its cause in the pane', async ($, on) => {
     await ui.unmount()
   }
   expect(w.calls.filter(c => c[0] === 'ledger-list')).toEqual([])
+})
+
+test('an empty cli_path shows its cause in the pane', async ($, on) => {
+  const w = await openPane($, on)
+  w.cliText = '  \n'
+  w.calls = []
+  const ui = await $.ui.mount(paneProps('desktop'))
+  await ui.press({ key: 'scope-today' })
+  expect(await ui.find({ type: 'Text', text: /cli_path is empty/ })).toBeDefined()
+  expect(w.calls).toEqual([])
+  await ui.unmount()
+})
+
+test('the first good call after a load clears a status left by an earlier load', async ($, on) => {
+  const clock = mock.clock(on)
+  const w = world(on)
+  const statuses: (string | undefined)[] = []
+  on('ui.status', ($, e) => {
+    statuses.push(e.text)
+    return { value: undefined }
+  })
+  const turn = { answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'answer' } as const
+  await $.turn.complete(turn)
+  await clock.settle()
+  await $.turn.complete({ ...turn, turnId: 't2' })
+  await clock.settle()
+  expect(w.calls.length).toBe(2)
+  expect(statuses).toEqual([undefined])
 })
 
 test('a failing CLI never breaks the turn', async ($, on) => {
