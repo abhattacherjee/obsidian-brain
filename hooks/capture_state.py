@@ -249,6 +249,12 @@ def ledger_get(capture_id: str) -> dict | None:
     return None
 
 
+def notes_created_by(session_id: str) -> set[str]:
+    """Vault-relative paths of every note ``session_id`` created through auto-capture (any status)."""
+    return {r["note_path"] for r in _merged_rows()
+            if r.get("kind") == "new" and r.get("session_id") == session_id and isinstance(r.get("note_path"), str)}
+
+
 def ledger_update(capture_id: str, **fields) -> dict:
     """Append a superseding row for ``capture_id``; return the merged row."""
     row = ledger_get(capture_id)
