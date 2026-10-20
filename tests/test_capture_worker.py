@@ -42,8 +42,8 @@ def fake_claude(monkeypatch):
         out = fake_claude.outputs.pop(0) if fake_claude.outputs else _envelope([])
         if isinstance(out, BaseException):
             raise out
-        rc, stdout = out if isinstance(out, tuple) else (0, out)
-        return subprocess.CompletedProcess(argv, rc, stdout, "")
+        rc, stdout, stderr = (out + ("",))[:3] if isinstance(out, tuple) else (0, out, "")
+        return subprocess.CompletedProcess(argv, rc, stdout, stderr)
 
     fake_claude.outputs = []
     fake_claude.calls = calls
@@ -82,7 +82,7 @@ def test_build_prompt_sentinel_and_placeholders():
 
 
 def test_worker_argv_has_no_tools_and_isolated_settings():
-    """#427: every built-in tool off (``--tools ""``), not a denylist that missed CronCreate, Skill, Agent..."""
+    """#427: every built-in tool off (``--tools ""``), not a denylist that missed CronCreate, Skill, SendMessage..."""
     argv = capture_worker.worker_argv()
     assert argv[:2] == ["claude", "-p"] and "sonnet" in argv
     assert argv[argv.index("--setting-sources") + 1] == "project"
@@ -120,8 +120,25 @@ def test_earlier_titles_byte_cap(mock_config):
         _ledger(SID, f"{i:02d} " + "é" * 1000, ts=float(i))  # 2 bytes a char: the cap counts bytes
     titles = capture_worker.earlier_titles(SID)
     assert all(len(t) == capture_worker.TITLE_MAX_CHARS for t in titles)
-    assert len(titles) == capture_worker.EARLIER_MAX_BYTES // len(titles[0].encode())  # 15 at 6000 / 399
-    assert sum(len(t.encode()) for t in titles) <= capture_worker.EARLIER_MAX_BYTES
+    line = len(f"  - {titles[0]}\n".encode())  # 402 bytes: the cap counts the rendered list, in bytes
+    assert len(titles) == capture_worker.EARLIER_MAX_BYTES // line
+    assert len((capture_worker._listed(titles) + "\n").encode()) <= capture_worker.EARLIER_MAX_BYTES
+
+
+def test_earlier_titles_fill_the_byte_cap_exactly(mock_config):
+    """30 rendered lines of exactly 200 bytes fill 6000 bytes: all 30 fit, a 31st does not."""
+    for i in range(31):
+        _ledger(SID, f"{i:03d}" + "t" * 192, ts=float(i))  # 195-char title -> "  - " + title + "\n" = 200 bytes
+    titles = capture_worker.earlier_titles(SID)
+    assert len(titles) == 30 and titles[0].startswith("030")
+    assert len((capture_worker._listed(titles) + "\n").encode()) == capture_worker.EARLIER_MAX_BYTES
+
+
+def test_empty_titles_do_not_use_up_the_count(mock_config):
+    for i in range(capture_worker.EARLIER_MAX_TITLES):
+        _ledger(SID, "   ", ts=100.0 + i)  # newest rows, all blank
+    _ledger(SID, "real one", ts=1.0)
+    assert capture_worker.earlier_titles(SID) == ["real one"]
 
 
 def test_build_prompt_lists_earlier_titles_as_data():
@@ -423,3 +440,14 @@ def test_a_locked_note_is_retried_not_skipped(transcript, fake_claude, monkeypat
     assert capture_worker.run_batch(SID, transcript, "demo", mock_config) == "save-failed"
     st = capture_state.get_state(SID)
     assert st["offset"] == 0 and st["pending"]["next"] == 0
+
+
+def test_worker_failure_keeps_stderr(transcript, fake_claude, saves, mock_config, monkeypatch):
+    logged = []
+    monkeypatch.setattr(capture_state, "append_capture_log", lambda *a: logged.append(a))
+    token = "ghp_" + "c" * 36
+    fake_claude.outputs = [(1, "", f"error: unknown option '--tools' {token}\n" + "x" * 500)]
+    assert capture_worker.run_batch(SID, transcript, "demo", mock_config) == "worker-failed"
+    detail = logged[-1][3]
+    assert detail.startswith("rc=1: error: unknown option '--tools'") and token not in detail
+    assert len(detail) <= len("rc=1: ") + 200

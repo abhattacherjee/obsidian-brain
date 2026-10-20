@@ -139,6 +139,7 @@ def strip_auto_updates(text: str) -> str:
 
 
 def _strip_frontmatter(text: str) -> str:
+    text = text.lstrip("\ufeff")  # a BOM must not hide the frontmatter from the strip
     if text.startswith("---\n"):
         end = text.find("\n---\n", 3)
         if end != -1:
@@ -201,6 +202,22 @@ def written_by(note: Path, session_id: str | None) -> bool:
     return bool(session_id) and obsidian_utils._peek_frontmatter_field(note, "source_session") == session_id
 
 
+def query_text(title: str, body: str) -> str:
+    """What a candidate (or an update section) is scored by."""
+    return f"{title}\n{body[:300]}"
+
+
+def original_vector(db: str, note: Path) -> dict:
+    """TF-IDF vector of ``note``'s title and original text; the one scorer find_match and split-updates share.
+
+    The title is the index's (frontmatter ``title`` or first H1). Raises
+    OSError/UnicodeDecodeError when the note cannot be read.
+    """
+    text = original_text(note)
+    title = (vault_index._parse_note(str(note)) or {}).get("title") or ""
+    return vault_index.compute_query_vector(db, f"{title}\n{text}")
+
+
 def find_match(query: str, config: dict, session_id: str | None = None) -> str | None:
     """Vault-relative path of a curated note that ``query`` clearly duplicates.
 
@@ -232,10 +249,9 @@ def find_match(query: str, config: dict, session_id: str | None = None) -> str |
     if top["rel_path"] is None:
         return None  # outside the vault
     try:
-        text = original_text(root / top["rel_path"])
+        note_vec = original_vector(db, root / top["rel_path"])
     except (OSError, UnicodeDecodeError):
         return None
-    note_vec = vault_index.compute_query_vector(db, f"{top.get('title') or ''}\n{text}")
     if not note_vec:
         return None
     top["tfidf_vector"] = note_vec
@@ -315,7 +331,11 @@ def save_candidate(
     row = {"id": cid, "session_id": session_id, "project": project, "type": c["type"],
            "title": title, "status": "active", "summary": summary_of(body)}
 
-    match = find_match(f"{title}\n{body[:300]}", config, session_id=session_id)
+    try:
+        match = find_match(query_text(title, body), config, session_id=session_id)
+    except Exception as exc:  # noqa: BLE001 -- a dedup that cannot run fails toward a new note, never a lost one
+        capture_state.append_capture_log(project, session_id, "match-failed", f"{type(exc).__name__}: {exc}"[:160])
+        match = None
     sink = io.StringIO()
     if match:
         heading = f"## Update ({today}) — auto-capture {cid}"

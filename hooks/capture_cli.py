@@ -2,8 +2,9 @@
 """capture_cli.py -- command line for auto-capture (#425).
 
 The Captures mod, the lifecycle hooks and detached workers all go through
-this one entry point. Every command prints JSON on stdout. Exit 0 is ok,
-2 is a usage error, 1 is a failed command (its error goes to stderr).
+this one entry point. Every command prints JSON on stdout, except
+split-updates, which prints a text report unless --json. Exit 0 is ok, 2 is
+a usage error, 1 is a failed command (its error goes to stderr).
 
     launch <sid> [--transcript P] [--project N] [--if-due]   {"launched": bool}
     run-batch <sid> <transcript> <project>                   {"outcome": str}
@@ -12,7 +13,9 @@ this one entry point. Every command prints JSON on stdout. Exit 0 is ok,
     reject <id>                                              the updated row
     status [--session SID]                                   {"next_batch_min": int|null, "pending_sweep": int}
     split-updates [--apply] [--json]                         text report (JSON with --json); exit 1 if a
-                                                             note failed, 2 on a config without a vault (#427)
+                                                             note, move or repair failed or the index is
+                                                             unreadable; 2 when nothing can run: no vault,
+                                                             or a dry run without an index (#427)
 """
 
 from __future__ import annotations
@@ -21,6 +24,7 @@ import argparse
 import json
 import math
 import os
+import sqlite3
 import sys
 import time
 from pathlib import Path
@@ -135,16 +139,29 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def split_updates(apply: bool, as_json: bool) -> int:
-    """The ``split-updates`` command: 0 ok, 1 when a note failed, 2 when the config has no vault."""
+    """The ``split-updates`` command.
+
+    0 ok (skips with nothing to do are listed, not failures); 1 when a note,
+    move or repair failed, or the run could not start (unreadable index or
+    ledger); 2 when nothing can run (no vault, or a dry run without an index).
+    """
+    def stop(code: int, message: str) -> int:
+        print(f"[obsidian-brain] capture split-updates: {message}", file=sys.stderr)
+        if as_json:
+            print(json.dumps({"error": message}))
+        return code
+
     try:
         report = capture_split.split_updates(obsidian_utils.load_config(), apply=apply)
     except capture_split.ConfigError as exc:
-        print(f"[obsidian-brain] capture split-updates: {exc}", file=sys.stderr)
-        return 2
+        return stop(2, str(exc))
+    except (capture_split.SplitError, OSError, sqlite3.Error, KeyError, ValueError) as exc:
+        return stop(1, f"{type(exc).__name__}: {exc}")
     print(json.dumps(report) if as_json else capture_split.format_report(report))
-    failed = [n for n in report["notes"] if n["error"]]
+    failed = [n for n in report["notes"] if n["error"] or n["errors"]]
     for n in failed:
-        print(f"[obsidian-brain] capture split-updates: {n['note']}: {n['error']}", file=sys.stderr)
+        for message in ([n["error"]] if n["error"] else []) + [f"{e['id']}: {e['error']}" for e in n["errors"]]:
+            print(f"[obsidian-brain] capture split-updates: {n['note']}: {message}", file=sys.stderr)
     return 1 if failed else 0
 
 
@@ -153,9 +170,9 @@ def main(argv: list[str] | None = None) -> int:
         args = _parser().parse_args(argv)
     except SystemExit as exc:
         return 0 if exc.code == 0 else 2
-    if args.cmd == "split-updates":
-        return split_updates(args.apply, args.json)
     try:
+        if args.cmd == "split-updates":
+            return split_updates(args.apply, args.json)  # its own error handling, exit codes and output
         if args.cmd == "launch":
             path = Path(args.transcript) if args.transcript else None
             out = {"launched": capture_worker.launch(args.sid, path, args.project, if_due=args.if_due)}

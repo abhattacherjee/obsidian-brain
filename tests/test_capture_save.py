@@ -246,6 +246,8 @@ def test_save_candidate_from_the_creating_session_makes_a_new_note(mock_config, 
     _filler(tmp_vault)
     first = capture_save.save_candidate(_cand(title=ZEBRA[0], body=ZEBRA[1]), session_id=SID, project="p",
                                         session_note="", config=mock_config)
+    note = tmp_vault / first["note_path"]  # drop source_session: only the ledger rule can see SID made it
+    note.write_text(re.sub(r"^source_session: .*\n", "", note.read_text(), flags=re.M))
     again = _cand(title=ZEBRA[0], body=ZEBRA[1] + " Rotation happens on write.")
     same = capture_save.save_candidate(again, session_id=SID, project="p", session_note="", config=mock_config)
     other = capture_save.save_candidate(again, session_id=OTHER, project="p", session_note="", config=mock_config)
@@ -393,5 +395,64 @@ def test_unreadable_note_does_not_match_the_same_session_rule(mock_config, tmp_v
     """A note whose frontmatter cannot be read is not the session's own; it still goes through the cosine floor."""
     _fake_results(monkeypatch, [{"path": "claude-insights/b.md", "type": "claude-insight", "rank": -30.0}],
                   vault=tmp_vault)
+    (tmp_vault / "claude-insights" / "b.md").write_text(
+        f"---\ntype: claude-insight\nsource_session: {SID}\n---\n\n# Note\n\nOriginal text.\n")
+    assert capture_save.find_match("q", mock_config, session_id=SID) is None  # readable: SID's own note
     monkeypatch.setattr(capture_save.obsidian_utils, "_peek_frontmatter_field", lambda path, field: None)
     assert capture_save.find_match("q", mock_config, session_id=SID) == "claude-insights/b.md"
+
+
+# --- #427 review fixes ---------------------------------------------------------
+
+def test_hub_with_auto_sections_still_takes_an_on_topic_update(mock_config, tmp_vault):
+    """AC3 inverse: an auto section on a note must not stop a refinement of its original fact."""
+    _filler(tmp_vault)
+    _note(tmp_vault, "hub.md", *ZEBRA, extra=_auto_section("a1b2c3d4e5f6", *PELICAN))
+    more = ("Zebra quokka ledger rotation backup",
+            "The zebra quokka ledger backup file dot one is replaced on each rotation at one hundred kilobytes.")
+    assert capture_save.find_match(_query(*more), mock_config, session_id=OTHER) == "claude-insights/hub.md"
+
+
+def _two_results(monkeypatch, tmp_vault, runner_up_rank):
+    """Top note at cosine ~0.371 (query {a:1}, note {a:1, b:2.5}); a runner-up at ``runner_up_rank``."""
+    _fake_results(monkeypatch, [{"path": "claude-insights/b.md", "type": "claude-insight", "rank": -30.0},
+                                {"path": "claude-insights/c.md", "type": "claude-insight", "rank": runner_up_rank}],
+                  vault=tmp_vault, guard=False)
+    monkeypatch.setattr(capture_save.vault_index, "compute_query_vector",
+                        lambda db, q: {"a": 1.0} if q == "q" else {"a": 1.0, "b": 2.5})
+
+
+def test_close_runner_up_needs_the_rescue_floor_not_the_threshold(mock_config, tmp_vault, monkeypatch):
+    _two_results(monkeypatch, tmp_vault, -10.0)  # far apart: the rank gap passes, 0.371 >= 0.35
+    assert capture_save.find_match("q", mock_config) == "claude-insights/b.md"
+    _two_results(monkeypatch, tmp_vault, -29.9)  # close: only a rescue (>= 0.40) could pass it
+    assert capture_save.find_match("q", mock_config) is None
+
+
+def test_find_match_error_saves_a_new_note_and_logs_it(mock_config, tmp_vault, monkeypatch):
+    def boom(*a, **k):
+        raise capture_save.vault_index.sqlite3.OperationalError("database is locked")
+    monkeypatch.setattr(capture_save, "find_match", boom)
+    logged = []
+    monkeypatch.setattr(capture_save.capture_state, "append_capture_log", lambda *a: logged.append(a))
+    row = capture_save.save_candidate(_cand(), session_id=SID, project="p", session_note="", config=mock_config)
+    assert row["kind"] == "new" and (tmp_vault / row["note_path"]).exists()
+    assert len(logged) == 1 and logged[0][2] == "match-failed" and "database is locked" in logged[0][3]
+
+
+def test_bom_note_frontmatter_is_stripped(tmp_vault):
+    note = tmp_vault / "claude-insights" / "bom.md"
+    note.write_bytes("\ufeff---\ntype: claude-insight\nproject: secretproject\n---\n\n# T\n\nBody.\n".encode())
+    text = capture_save.original_text(note)
+    assert "secretproject" not in text and "Body." in text and "\ufeff" not in text
+
+
+def test_one_scorer_for_find_match_and_split(mock_config, tmp_vault):
+    """split-updates and find_match score with the same original-text vector."""
+    _filler(tmp_vault)
+    hub = _note(tmp_vault, "hub.md", *ZEBRA, extra=_auto_section("a1b2c3d4e5f6", *PELICAN))
+    db = capture_save.vault_index.ensure_index(str(tmp_vault), ["claude-sessions", "claude-insights"],
+                                               db_path=capture_save.vault_index._default_db_path())
+    vec = capture_save.original_vector(db, hub)
+    assert vec == capture_save.vault_index.compute_query_vector(db, f"{ZEBRA[0]}\n{capture_save.original_text(hub)}")
+    assert "pelican" not in vec and "insight" not in vec

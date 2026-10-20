@@ -58,14 +58,18 @@ def _listed(titles) -> str:
 
 
 def earlier_titles(sid: str) -> list[str]:
-    """Titles of ``sid``'s captures (any status), newest first, within the count and byte caps."""
+    """Titles of ``sid``'s captures (any status), newest first, within the count and byte caps.
+
+    The byte cap counts the list as it is rendered into the prompt
+    (``"  - <title>\\n"`` per title), so the block itself stays within it.
+    """
     out, size = [], 0
-    for row in capture_state.ledger_list(session=sid, limit=EARLIER_MAX_TITLES):
+    for row in capture_state.ledger_list(session=sid, limit=10**9):
         title = _one_line(row.get("title"))
         if not title:
             continue
-        size += len(title.encode())
-        if size > EARLIER_MAX_BYTES:
+        size += len(f"  - {title}\n".encode())
+        if size > EARLIER_MAX_BYTES or len(out) == EARLIER_MAX_TITLES:
             break
         out.append(title)
     return out
@@ -92,7 +96,7 @@ def build_prompt(slice_text: str, project: str, rejections: list[str], earlier: 
 def worker_argv(model: str = "sonnet") -> list[str]:
     # --tools "" turns every built-in tool off. The old --disallowedTools
     # denylist left CronCreate, RemoteTrigger, Workflow, SendMessage,
-    # PushNotification, Skill and Agent callable (#427).
+    # PushNotification and Skill callable (#427).
     return ["claude", "-p", "--model", model, "--setting-sources", "project", "--strict-mcp-config",
             "--tools", "", "--output-format", "json"]
 
@@ -147,8 +151,9 @@ def _ask_worker(text: str, project: str, sid: str) -> list[dict]:
                                 cwd=str(_worker_cwd()))
     except (subprocess.TimeoutExpired, OSError) as exc:
         raise _BatchStop("worker-failed", type(exc).__name__)
-    if result.returncode != 0:
-        raise _BatchStop("worker-failed", f"rc={result.returncode}")
+    if result.returncode != 0:  # keep why: e.g. a claude too old for --tools fails every batch the same way
+        why = obsidian_utils.scrub_secrets(" ".join(str(result.stderr or "").split()))[:200]
+        raise _BatchStop("worker-failed", f"rc={result.returncode}: {why}" if why else f"rc={result.returncode}")
     try:
         return parse_candidates(result.stdout)
     except ValueError as exc:

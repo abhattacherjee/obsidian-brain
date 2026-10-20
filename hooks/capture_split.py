@@ -8,15 +8,19 @@ written. An active ``updated`` ledger row moves when:
 - ``same-session``: its note was created by the same session, through
   auto-capture (ledger) or by hand (frontmatter ``source_session``), or
 - ``low-cosine``: ``title + body[:300]`` scores below
-  ``auto_capture_update_min_cosine`` against the note's original text.
+  ``auto_capture_update_min_cosine`` against the note's original text, with
+  the same scorer ``find_match`` uses (``capture_save.original_vector``).
 
 A moved section becomes a new note in the insights folder and keeps its
 capture id: its ledger row gets ``kind=new``, the new ``note_path``,
-``split_from`` and ``split_heading``, so Reject still works on it. Per note,
-new notes and ledger rows are written before the source note is rewritten,
-so a crash leaves a duplicate, never a loss; the next ``--apply`` removes
-the section left behind (a "repair"). The dry run changes no note, ledger
-row or backup.
+``split_from`` and ``split_heading`` (and ``update_heading=None``), so Reject
+still works on it. Per move, the ledger row is written first, then the new
+note; the source note is rewritten once, last, without the moves that worked.
+A crash at any point leaves the section in the source, so nothing is lost,
+and the next ``--apply`` repairs it: a leftover section whose split note
+exists is removed, and one whose split note is missing is written to that
+note first. The dry run writes nothing, the index included: it needs an
+existing index and refuses without one.
 """
 
 from __future__ import annotations
@@ -26,6 +30,7 @@ import datetime
 import io
 import os
 import re
+import sqlite3
 from collections import Counter
 from pathlib import Path
 
@@ -39,14 +44,25 @@ from obsidian_utils import indexed_folders
 from tfidf import _cosine_similarity
 
 _DATE_RE = re.compile(r"\((\d{4}-\d{2}-\d{2})\)")
+UNTITLED = "Untitled capture"  # what save_candidate writes for an empty title
 
 
 class ConfigError(ValueError):
-    """The config has no usable vault."""
+    """Nothing can run: the config has no usable vault, or a dry run has no index to score with."""
+
+
+class SplitError(RuntimeError):
+    """The run cannot score safely (the index is unreadable); nothing was written."""
 
 
 def _norm(rel: str, root: Path) -> str | None:
     return capture_save._vault_rel(rel, root)
+
+
+def _title(row: dict) -> str:
+    """The row's title as save_candidate would have written it; a null or non-string title is ``UNTITLED``."""
+    title = row.get("title")
+    return " ".join(title.split()) if isinstance(title, str) and title.strip() else UNTITLED
 
 
 def _section(lines: list[str], heading: str, cid: str, title: str) -> tuple[int, int, str] | None:
@@ -90,26 +106,45 @@ def _created_at(ts) -> str | None:
         return None
 
 
-class _Scorer:
-    """Cosine of a section against its note's original text, using the index's term weights."""
+def _topic(source_text: str) -> str:
+    """The source note's topic, from its ``claude/topic/<x>`` tag (the templates have no ``topic:`` key)."""
+    text = source_text.lstrip("﻿")
+    if not text.startswith("---"):
+        return "general"
+    front = text.split("---", 2)[1] if text.count("---") >= 2 else ""
+    for tag in obsidian_utils._parse_note_tags(front):
+        if tag.startswith("claude/topic/") and tag[len("claude/topic/"):]:
+            return tag[len("claude/topic/"):]
+    return "general"
 
-    def __init__(self, config: dict):
+
+class _Scorer:
+    """Cosine of a section against its note's original text: find_match's scorer, on the index's term weights."""
+
+    def __init__(self, config: dict, apply: bool):
         db = vault_index._default_db_path()
-        # Reuse the index as it is: the dry run must not write anything, the index included.
-        self.db = db if os.path.isfile(db) else vault_index.ensure_index(config["vault_path"], indexed_folders(config))
+        if not os.path.isfile(db):
+            if not apply:  # the dry run writes nothing, the index included
+                raise ConfigError(f"index missing at {db}; run /vault-reindex first (the dry run never builds it)")
+            db = vault_index.ensure_index(config["vault_path"], indexed_folders(config))
+        try:  # fail before any write when the index cannot score
+            conn = vault_index._connect(db)
+            try:
+                conn.execute("SELECT COUNT(*) FROM notes").fetchone()
+                conn.execute("SELECT term, df FROM term_df LIMIT 1").fetchall()
+            finally:
+                conn.close()
+        except sqlite3.Error as exc:
+            raise SplitError(f"index unreadable at {db}: {exc}; run /vault-reindex") from exc
+        self.db = db
         self._notes: dict[str, dict] = {}
 
-    def note_vector(self, path: Path, text: str) -> dict:
+    def cosine(self, path: Path, title: str, body: str) -> float:
         key = str(path)
         if key not in self._notes:
-            parsed = vault_index._parse_note(key) or {}
-            original = capture_save.strip_auto_updates(capture_save._strip_frontmatter(text))
-            self._notes[key] = vault_index.compute_query_vector(self.db, f"{parsed.get('title') or ''}\n{original}")
-        return self._notes[key]
-
-    def cosine(self, path: Path, text: str, title: str, body: str) -> float:
-        note_vec = self.note_vector(path, text)
-        query_vec = vault_index.compute_query_vector(self.db, f"{title}\n{body[:300]}")
+            self._notes[key] = capture_save.original_vector(self.db, path)
+        note_vec = self._notes[key]
+        query_vec = vault_index.compute_query_vector(self.db, capture_save.query_text(title, body))
         if not note_vec or not query_vec:
             return 0.0  # find_match refuses an update it cannot score
         return _cosine_similarity(query_vec, note_vec)
@@ -119,10 +154,11 @@ def _plan_note(rel: str, text: str, rows: list[dict], repairs: list[dict], creat
                scorer: _Scorer, path: Path, threshold: float, vault: Path, root: Path) -> dict:
     """What would change in one note: moves, repairs, skips, and the updates that stay."""
     lines = text.split("\n")
-    out = {"note": rel, "moves": [], "repairs": [], "skipped": [], "kept": Counter()}
+    out = {"note": rel, "moves": [], "repairs": [], "skipped": [], "kept": Counter(), "errors": []}
     author = obsidian_utils._peek_frontmatter_field(path, "source_session") if rows else None  # wrote it by hand
     for row in rows:
-        found = _section(lines, row["update_heading"], row["id"], row.get("title", ""))
+        title = _title(row)
+        found = _section(lines, row["update_heading"], row["id"], title)
         if found is None:
             out["skipped"].append({"id": row["id"], "note": rel, "reason": "section-missing"})
             continue
@@ -130,45 +166,47 @@ def _plan_note(rel: str, text: str, rows: list[dict], repairs: list[dict], creat
         if (row.get("session_id"), rel) in created or (author and row.get("session_id") == author):
             reason, cos = "same-session", None
         else:
-            cos = scorer.cosine(path, text, row.get("title", ""), body)
+            cos = scorer.cosine(path, title, body)
             reason = "low-cosine" if cos < threshold else None
         if reason is None:
             out["kept"][row.get("session_id")] += 1
             continue
-        out["moves"].append({"id": row["id"], "reason": reason, "cosine": cos, "title": row.get("title", ""),
+        out["moves"].append({"id": row["id"], "reason": reason, "cosine": cos, "title": title,
                              "row": row, "body": body})
     for row in repairs:
-        if row["split_heading"] not in lines:
+        title = _title(row)
+        found = _section(lines, row["split_heading"], row["id"], title)
+        if found is None:
+            continue  # already gone: the split finished
+        new_rel = _norm(str(row.get("note_path") or ""), root)
+        if new_rel is None:
+            out["skipped"].append({"id": row["id"], "note": rel, "reason": "split-note-outside-vault"})
             continue
-        new_rel = _norm(row.get("note_path", ""), root)
-        if new_rel is None or not (vault / new_rel).is_file():
-            out["skipped"].append({"id": row["id"], "note": rel, "reason": "split-note-missing"})
-            continue  # removing the section now would lose it
-        out["repairs"].append({"id": row["id"], "heading": row["split_heading"]})
+        out["repairs"].append({"id": row["id"], "heading": row["split_heading"], "new_note": new_rel,
+                               "exists": (vault / new_rel).is_file(), "title": title, "row": row, "body": found[2]})
     return out
 
 
-def _write_split_note(move: dict, config: dict, source_text: str, sessions: dict) -> str:
-    """Write one moved section as a new note; return its vault-relative path."""
-    row = move["row"]
-    vault, folder = config["vault_path"], config.get("insights_folder", "claude-insights")
+def _note_content(row: dict, title: str, body: str, heading: str, config: dict, source_text: str,
+                  sessions: dict) -> str:
+    """The new note for one moved section."""
     ctype = row.get("type") if row.get("type") in capture_save.TYPES else "insight"
-    sid, project = row.get("session_id") or "", row.get("project") or ""
+    sid, project = str(row.get("session_id") or ""), str(row.get("project") or "")
     if sid not in sessions:
         sessions[sid] = capture_save.session_note_for(sid, project, config) if sid else ""
-    day = _day(row["update_heading"], row.get("ts"))
-    topic = obsidian_utils.parse_frontmatter_field(source_text, "topic") or "general"
-    cand = {"type": ctype, "title": move["title"], "body": move["body"], "topic": topic}
+    cand = {"type": ctype, "title": title, "body": body, "topic": _topic(source_text)}
     content = capture_save._frontmatter(cand, session_id=sid, project=project, session_note=sessions[sid],
-                                        today=day, created_at=_created_at(row.get("ts")))
-    content += f"\n# {move['title']}\n\n{move['body']}\n"
-    filename = capture_save.new_filename(vault, folder, day, move["title"])
+                                        today=_day(heading, row.get("ts")), created_at=_created_at(row.get("ts")))
+    return content + f"\n# {title}\n\n{body}\n"
+
+
+def _write_split_note(vault: str, rel: str, content: str) -> None:
+    folder, _, filename = rel.rpartition("/")
     sink = io.StringIO()
     with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
         rc = note_writer.run_write(vault, folder, filename, content)
     if rc != 0:
         raise RuntimeError(f"write failed: {sink.getvalue().strip()}")
-    return f"{folder}/{filename}"
 
 
 def _backup(path: Path, rel: str, state: dict) -> None:
@@ -182,8 +220,13 @@ def _backup(path: Path, rel: str, state: dict) -> None:
 
 
 def _apply_note(path: Path, rel: str, plan_args: tuple, config: dict, backup: dict, sessions: dict) -> dict:
-    """Re-plan one note under its lock and apply it; the source is rewritten once, last."""
-    out = {"note": rel, "moves": [], "repairs": [], "skipped": [], "kept": Counter(), "error": None}
+    """Re-plan one note under its lock and apply it; the source is rewritten once, last.
+
+    A move or repair that fails is reported alone; the source is still
+    rewritten without the ones that worked. Only moves whose note was written
+    stay in ``moves``.
+    """
+    out = {"note": rel, "moves": [], "repairs": [], "skipped": [], "kept": Counter(), "errors": [], "error": None}
     lock, err = note_writer._acquire_lock(path)
     if err:
         out["error"] = err
@@ -194,28 +237,47 @@ def _apply_note(path: Path, rel: str, plan_args: tuple, config: dict, backup: di
             raw = fh.read()
         crlf = "\r\n" in raw
         text = raw.replace("\r\n", "\n") if crlf else raw
-        out = _plan_note(rel, text, *plan_args)
-        out["error"] = None
+        out = {**_plan_note(rel, text, *plan_args), "error": None}
         if not out["moves"] and not out["repairs"]:
             return out
         _backup(path, rel, backup)
-        headings = [r["heading"] for r in out["repairs"]]
+        vault, folder = config["vault_path"], config.get("insights_folder", "claude-insights")
+        remove, done_repairs, done_moves = [], [], []
+        for rep in out["repairs"]:
+            try:
+                if not rep["exists"]:  # the ledger names it but it was never written (or was deleted)
+                    _write_split_note(vault, rep["new_note"], _note_content(
+                        rep["row"], rep["title"], rep["body"], rep["heading"], config, text, sessions))
+                remove.append(rep["heading"])
+                done_repairs.append(rep)
+            except Exception as exc:  # noqa: BLE001 -- this repair alone failed; the section stays
+                out["errors"].append({"id": rep["id"], "error": f"{type(exc).__name__}: {exc}"})
         for move in out["moves"]:
-            new_rel = _write_split_note(move, config, text, sessions)
-            row = move["row"]
-            capture_state.ledger_update(row["id"], kind="new", note_path=new_rel, update_heading=None,
-                                        split_from=rel, split_heading=row["update_heading"])
-            move["new_note"] = new_rel
-            headings.append(row["update_heading"])
-        kept = text
-        for heading in headings:
-            cid = capture_save.AUTO_HEADING_RE.match(heading)
-            kept, _ = capture_reject._remove_section(kept, heading, capture_save.end_marker(cid.group("id")) if cid else "")
-        if crlf:
-            kept = kept.replace("\n", "\r\n")
-        err = note_writer._atomic_rewrite(path, kept, (st.st_mtime_ns, st.st_size))
-        if err:
-            out["error"] = err
+            row, heading = move["row"], move["row"]["update_heading"]
+            try:
+                content = _note_content(row, move["title"], move["body"], heading, config, text, sessions)
+                new_rel = f"{folder}/{capture_save.new_filename(vault, folder, _day(heading, row.get('ts')), move['title'])}"
+                # The ledger first: a crash after it leaves a row that names the note, which the next run writes.
+                capture_state.ledger_update(row["id"], kind="new", note_path=new_rel, update_heading=None,
+                                            split_from=rel, split_heading=heading)
+                _write_split_note(vault, new_rel, content)
+                move["new_note"] = new_rel
+                remove.append(heading)
+                done_moves.append(move)
+            except Exception as exc:  # noqa: BLE001 -- this move alone failed; the section stays in the source
+                out["errors"].append({"id": row["id"], "error": f"{type(exc).__name__}: {exc}"})
+        out["moves"], out["repairs"] = done_moves, done_repairs
+        if remove:
+            kept = text
+            for heading in remove:
+                cid = capture_save.AUTO_HEADING_RE.match(heading)
+                kept, _ = capture_reject._remove_section(kept, heading,
+                                                         capture_save.end_marker(cid.group("id")) if cid else "")
+            if crlf:
+                kept = kept.replace("\n", "\r\n")
+            err = note_writer._atomic_rewrite(path, kept, (st.st_mtime_ns, st.st_size))
+            if err:
+                out["error"] = err
         return out
     except Exception as exc:  # noqa: BLE001 -- one bad note is reported; the run goes on
         out["error"] = f"{type(exc).__name__}: {exc}"
@@ -225,13 +287,18 @@ def _apply_note(path: Path, rel: str, plan_args: tuple, config: dict, backup: di
 
 
 def split_updates(config: dict, apply: bool = False) -> dict:
-    """Plan (and with ``apply``, carry out) the split; returns the report. Raises ConfigError."""
+    """Plan (and with ``apply``, carry out) the split; returns the report.
+
+    Raises ConfigError (no vault, or a dry run without an index) or
+    SplitError (unreadable index) before anything is written.
+    """
     vault_str = config.get("vault_path")
     if not vault_str or not Path(vault_str).is_dir():
         raise ConfigError(f"vault_path is not a directory: {vault_str!r}")
     vault = Path(vault_str)
     root = vault.resolve()
     threshold = capture_save.update_min_cosine(config)
+    scorer = _Scorer(config, apply)
     rows = capture_state.ledger_list(limit=10**9)
     rows.reverse()  # oldest first, so sections move in the order they were written
 
@@ -261,7 +328,6 @@ def split_updates(config: dict, apply: bool = False) -> dict:
             if rel and (vault / rel).is_file():
                 repairs.setdefault(rel, []).append(r)
 
-    scorer = _Scorer(config)
     backup: dict = {"dir": None}
     sessions: dict = {}
     notes = []
@@ -274,15 +340,14 @@ def split_updates(config: dict, apply: bool = False) -> dict:
             try:
                 with open(path, encoding="utf-8", newline="") as fh:
                     text = fh.read().replace("\r\n", "\n")
-                out = _plan_note(rel, text, *plan_args)
-                out["error"] = None
-            except (OSError, UnicodeDecodeError) as exc:
-                out = {"note": rel, "moves": [], "repairs": [], "skipped": [], "kept": Counter(),
+                out = {**_plan_note(rel, text, *plan_args), "error": None}
+            except Exception as exc:  # noqa: BLE001 -- reported per note, as --apply does
+                out = {"note": rel, "moves": [], "repairs": [], "skipped": [], "kept": Counter(), "errors": [],
                        "error": f"{type(exc).__name__}: {exc}"}
         skipped += out.pop("skipped")
         notes.append(out)
 
-    moves = [m for n in notes for m in n["moves"]]
+    moves = [m for n in notes for m in n["moves"]]  # under --apply, only the moves whose note was written
     reasons = Counter(m["reason"] for m in moves)
     totals = {
         "notes": sum(1 for n in notes if n["moves"] or n["repairs"]),
@@ -291,15 +356,15 @@ def split_updates(config: dict, apply: bool = False) -> dict:
         "low-cosine": reasons["low-cosine"],
         "repairs": sum(len(n["repairs"]) for n in notes),
         "skipped": len(skipped),
-        "failed": sum(1 for n in notes if n["error"]),
+        "failed": sum(1 for n in notes if n["error"] or n["errors"]),
         "max_kept_from_one_session": max((c for n in notes for c in n["kept"].values()), default=0),
     }
     for n in notes:
         n.pop("kept")
-        for m in n["moves"]:
-            m.pop("row")
-            m.pop("body")
-    report_notes = [n for n in notes if n["moves"] or n["repairs"] or n["error"]]
+        for item in (*n["moves"], *n["repairs"]):
+            item.pop("row", None)
+            item.pop("body", None)
+    report_notes = [n for n in notes if n["moves"] or n["repairs"] or n["error"] or n["errors"]]
     return {"apply": apply, "threshold": threshold, "notes": report_notes, "skipped": skipped, "totals": totals,
             "backup": str(backup["dir"]) if backup["dir"] else None}
 
@@ -315,6 +380,7 @@ def format_report(report: dict) -> str:
         if n["error"]:
             line += f" FAILED: {n['error']}"
         out.append(line)
+        out += [f"  failed {e['id']}: {e['error']} (the next --apply retries it)" for e in n["errors"]]
     for s in report["skipped"]:
         out.append(f"skipped {s['id']}: {s['reason']} ({s['note']})")
     t = report["totals"]
