@@ -18,7 +18,7 @@ function bottoms(on: On): void {
   on('session.id', () => ({ value: SID }))
 }
 
-function world(on: On, hasCli = true): World {
+function world(on: On, hasCli = true, env = { HOME: '/home/me' } as Record<string, string>): World {
   const w: World = {
     calls: [],
     commands: [],
@@ -29,7 +29,7 @@ function world(on: On, hasCli = true): World {
     ],
   }
   bottoms(on)
-  mock.env(on, { HOME: '/home/me' })
+  mock.env(on, env)
   on('command.register', ($, e) => {
     w.commands.push(e.name)
     return { value: { command: e.name } }
@@ -236,6 +236,54 @@ test('without cli_path nothing runs and the status line says so', async ($, on) 
   await clock.settle()
   expect(w.calls).toEqual([])
   expect(JSON.stringify(statuses)).toContain('capture: not set up')
+})
+
+test('the not-set-up status clears once a later call finds the CLI', async ($, on) => {
+  const clock = mock.clock(on)
+  const w = world(on, false)
+  const statuses: (string | undefined)[] = []
+  on('ui.status', ($, e) => {
+    statuses.push(e.text)
+    return { value: undefined }
+  })
+  const turn = { answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'answer' } as const
+  await $.turn.complete(turn)
+  await clock.settle()
+  expect(statuses).toEqual(['capture: not set up'])
+  w.hasCli = true
+  await $.turn.complete({ ...turn, turnId: 't2' })
+  await clock.settle()
+  expect(w.calls).toEqual([['launch', SID, '--if-due']])
+  expect(statuses).toEqual(['capture: not set up', undefined])
+  await $.turn.complete({ ...turn, turnId: 't3' })
+  await clock.settle()
+  expect(statuses).toEqual(['capture: not set up', undefined])
+})
+
+test('a failed cli_path read shows its cause in the pane', async ($, on) => {
+  const w = await openPane($, on)
+  w.hasCli = false
+  w.calls = []
+  for (const surface of SURFACES) {
+    const ui = await $.ui.mount(paneProps(surface))
+    await ui.press({ key: surface === 'terminal' ? 'scope' : 'scope-today' })
+    expect(await ui.find({ type: 'Text', text: /cannot read .*cli_path: \S/ })).toBeDefined()
+    await ui.unmount()
+  }
+  expect(w.calls).toEqual([])
+})
+
+test('a missing HOME shows its cause in the pane', async ($, on) => {
+  mock.clock(on)
+  const w = world(on, true, {})
+  await $.session.start(START)
+  await $.command.run({ command: 'captures', args: '' } as never)
+  for (const surface of SURFACES) {
+    const ui = await $.ui.mount(paneProps(surface))
+    expect(await ui.find({ type: 'Text', text: /HOME is not set/ })).toBeDefined()
+    await ui.unmount()
+  }
+  expect(w.calls.filter(c => c[0] === 'ledger-list')).toEqual([])
 })
 
 test('a failing CLI never breaks the turn', async ($, on) => {
