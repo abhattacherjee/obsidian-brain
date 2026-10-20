@@ -117,7 +117,7 @@ def test_reject_removes_a_whole_decision_update(mock_config, tmp_vault, monkeypa
 
     note = tmp_vault / "claude-insights" / "2026-10-01-hand-written-abcd.md"
     note.write_text(NOTE + "\n## Later\n\nTail.\n")
-    monkeypatch.setattr(capture_save, "find_match", lambda q, c: "claude-insights/2026-10-01-hand-written-abcd.md")
+    monkeypatch.setattr(capture_save, "find_match", lambda *a, **k: "claude-insights/2026-10-01-hand-written-abcd.md")
     body = "## Context\n\nWhy.\n\n## Decision\n\nWe chose X.\n\n```bash\n# keep this comment\n```"
     row = capture_save.save_candidate({"type": "decision", "title": "Pick X", "body": body, "topic": "t"},
                                       session_id=SID, project="demo", today="2026-10-18", config=mock_config)
@@ -173,7 +173,7 @@ def _update_via_save(mock_config, tmp_vault, monkeypatch, body, crlf=False):
     note = tmp_vault / "claude-insights" / "2026-10-01-target-abcd.md"
     base = NOTE + "\n## Later\n\nTail.\n"
     note.write_bytes((base.replace("\n", "\r\n") if crlf else base).encode())
-    monkeypatch.setattr(capture_save, "find_match", lambda q, c: "claude-insights/2026-10-01-target-abcd.md")
+    monkeypatch.setattr(capture_save, "find_match", lambda *a, **k: "claude-insights/2026-10-01-target-abcd.md")
     row = capture_save.save_candidate({"type": "error-fix", "title": "Fix it", "body": body, "topic": "t"},
                                       session_id=SID, project="demo", today="2026-10-18", config=mock_config)
     return note, row

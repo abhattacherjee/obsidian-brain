@@ -29,25 +29,6 @@ def _contained(vault: Path, rel_path: str) -> Path:
     return target
 
 
-def _section_end(lines: list[str], start: int, marker: str) -> int:
-    """Index just past the section that opens at ``start``.
-
-    Through the capture's own end marker when it has one; otherwise (an
-    update written before the marker existed) up to the next ``## `` heading
-    outside a fenced code block.
-    """
-    if marker:
-        for i in range(start + 1, len(lines)):
-            if lines[i].strip() == marker:
-                return i + 1
-    fence = None
-    for i in range(start + 1, len(lines)):
-        fence, is_fence = capture_save.fence_step(fence, lines[i])
-        if not is_fence and fence is None and lines[i].startswith("## "):
-            return i
-    return len(lines)
-
-
 def _remove_section(text: str, heading: str, marker: str = "") -> tuple[str, str]:
     """Split ``text`` into (text without the section, the section)."""
     lines = text.split("\n")
@@ -55,7 +36,7 @@ def _remove_section(text: str, heading: str, marker: str = "") -> tuple[str, str
         start = lines.index(heading)
     except ValueError:
         return text, ""
-    end = _section_end(lines, start, marker)
+    end = capture_save.section_end(lines, start, marker)
     section = "\n".join(lines[start:end]).strip("\n")
     kept = lines[:start] + lines[end:]
     while start > 0 and start < len(kept) and kept[start - 1] == "" and kept[start] == "":
