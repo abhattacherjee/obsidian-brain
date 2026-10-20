@@ -27,25 +27,33 @@ const TYPES: Record<string, { short: string; long: string; color: string }> = {
 // One of each per load, however often session.start (/clear, resume) or /captures runs.
 let tick: Timer | undefined
 let refresher: Timer | undefined
+// True at load: a status set before a reload outlives the module, so the first good call clears it.
+let notSetUp = true
 
-async function cliPath($: $): Promise<string | undefined> {
+async function cliPath($: $): Promise<{ path: string } | { reason: string }> {
   const home = await $.env.get('HOME')
-  if (!home) return undefined
+  if (!home) return { reason: 'HOME is not set' }
   try {
     const text: string = await $.fs.read(`${home}/.claude/obsidian-brain/capture/cli_path`)
-    return text.trim() || undefined
-  } catch {
-    return undefined
+    const path = text.trim()
+    return path ? { path } : { reason: 'cli_path is empty' }
+  } catch (err) {
+    return { reason: `cannot read ~/.claude/obsidian-brain/capture/cli_path: ${String((err as Error)?.message ?? err)}` }
   }
 }
 
 async function cli($: $, args: string[]): Promise<unknown> {
-  const path = await cliPath($)
-  if (!path) {
+  const found = await cliPath($)
+  if ('reason' in found) {
     $.ui.status('capture: not set up')
-    return undefined
+    notSetUp = true
+    throw new Error(found.reason)
   }
-  const ran = await $.process.run(['python3', path, ...args], { timeoutMs: 20_000 })
+  if (notSetUp) {
+    $.ui.status(undefined)
+    notSetUp = false
+  }
+  const ran = await $.process.run(['python3', found.path, ...args], { timeoutMs: 20_000 })
   if (ran.exitCode !== 0) throw new Error(`capture ${args[0]} exited ${ran.exitCode}: ${ran.stderr.slice(0, 200)}`)
   return JSON.parse(ran.stdout || 'null')
 }
