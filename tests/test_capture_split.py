@@ -483,3 +483,71 @@ def test_updates_on_a_note_the_session_wrote_by_hand_move(mock_config, vault):
     _update_row("fffffffffff1", S, rel, ZEBRA_MORE[0])
     _update_row("fffffffffff2", OTHER, rel, ZEBRA_MORE[0], date="2026-10-03")
     assert _moves(_split(mock_config)) == {"fffffffffff1": "same-session"}
+
+
+# --- #427 Codex survivors -------------------------------------------------------
+
+def _leave_leftover(mock_config, monkeypatch):
+    """A split whose source rewrite failed: row kind=new + split_from, section still in the source."""
+    with monkeypatch.context() as m:
+        m.setattr(capture_split.note_writer, "_atomic_rewrite", lambda *a, **k: "write failed")
+        _split(mock_config, apply=True)
+
+
+def test_reject_of_a_split_row_removes_the_leftover_section(mock_config, hand, monkeypatch):
+    _leave_leftover(mock_config, monkeypatch)
+    assert PELICAN[1] in hand.read_text()
+    new = hand.parent.parent / capture_state.ledger_get("bbbbbbbbbbb2")["note_path"]
+    capture_reject.reject("bbbbbbbbbbb2", mock_config)
+    assert not new.exists() and (hand.parent / "_rejected" / new.name).exists()
+    assert PELICAN[1] not in hand.read_text() and "bbbbbbbbbbb2" not in hand.read_text()
+    assert "A user-written update stays." in hand.read_text() and "bbbbbbbbbbb1" in hand.read_text()
+    report = _split(mock_config, apply=True)  # nothing left for a later run
+    assert report["totals"]["repairs"] == 0 and report["totals"]["failed"] == 0
+
+
+def test_reject_of_a_split_row_whose_note_was_never_written_keeps_the_section_in_rejected(mock_config, hand, monkeypatch):
+    with monkeypatch.context() as m:
+        m.setattr(capture_split.note_writer, "run_write", lambda *a, **k: 1)
+        _split(mock_config, apply=True)
+    row = capture_reject.reject("bbbbbbbbbbb2", mock_config)
+    assert PELICAN[1] not in hand.read_text()
+    assert PELICAN[1] in (hand.parent.parent / row["rejected_path"]).read_text()
+
+
+def test_repair_removes_the_leftover_of_an_already_rejected_split_row(mock_config, hand, monkeypatch):
+    """The other order: the row was rejected (by an older Reject) while its section was still in the source."""
+    _leave_leftover(mock_config, monkeypatch)
+    new = hand.parent.parent / capture_state.ledger_get("bbbbbbbbbbb2")["note_path"]
+    capture_state.ledger_update("bbbbbbbbbbb2", status="rejected")
+    new.unlink()  # gone with the rejection; the repair must not write it back
+    report = _split(mock_config, apply=True)
+    assert report["totals"]["repairs"] == 1 and report["totals"]["failed"] == 0
+    assert PELICAN[1] not in hand.read_text() and not new.exists()
+    assert capture_state.ledger_get("bbbbbbbbbbb2")["status"] == "rejected"
+
+
+def test_reject_rereads_the_row_under_the_lock(mock_config, hand, monkeypatch):
+    """A split --apply finishing between Reject's ledger read and its lock: Reject follows the fresh row."""
+    _index(mock_config["vault_path"])
+    real = capture_reject.note_writer._acquire_lock
+    state = {"split": False}
+
+    def split_first(path):
+        if not state["split"]:
+            state["split"] = True
+            capture_split.split_updates(mock_config, apply=True)
+        return real(path)
+
+    monkeypatch.setattr(capture_reject.note_writer, "_acquire_lock", split_first)
+    row = capture_reject.reject("bbbbbbbbbbb2", mock_config)
+    assert state["split"] and row["status"] == "rejected"
+    new = hand.parent.parent / row["note_path"]
+    assert not new.exists() and (hand.parent / "_rejected" / new.name).exists()  # the split note did not stay live
+    assert PELICAN[1] not in hand.read_text()
+
+
+def test_topic_survives_a_title_containing_three_dashes(mock_config, vault):
+    text = ('---\ntype: claude-insight\ntitle: "a---b"\ntags:\n  - claude/insight\n  - claude/topic/ledgers\n---\n\n# T\n')
+    assert capture_split._topic(text) == "ledgers"
+    assert capture_split._topic("# no frontmatter\n") == "general"

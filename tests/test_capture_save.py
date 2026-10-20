@@ -456,3 +456,10 @@ def test_one_scorer_for_find_match_and_split(mock_config, tmp_vault):
     vec = capture_save.original_vector(db, hub)
     assert vec == capture_save.vault_index.compute_query_vector(db, f"{ZEBRA[0]}\n{capture_save.original_text(hub)}")
     assert "pelican" not in vec and "insight" not in vec
+
+
+def test_auto_heading_quoted_in_a_fence_stays_original_text():
+    quoted = "## Update (2026-10-02) — auto-capture a1b2c3d4e5f6"
+    text = f"# T\n\nHow a section looks:\n\n```markdown\n{quoted}\n\nquoted body\n```\n\nAfter the fence.\n"
+    out = capture_save.strip_auto_updates(text)
+    assert quoted in out and "quoted body" in out and "After the fence." in out

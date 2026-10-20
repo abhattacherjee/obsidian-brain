@@ -37,6 +37,7 @@ from pathlib import Path
 import capture_reject
 import capture_save
 import capture_state
+import frontmatter
 import note_writer
 import obsidian_utils
 import vault_index
@@ -108,11 +109,11 @@ def _created_at(ts) -> str | None:
 
 def _topic(source_text: str) -> str:
     """The source note's topic, from its ``claude/topic/<x>`` tag (the templates have no ``topic:`` key)."""
-    text = source_text.lstrip("﻿")
-    if not text.startswith("---"):
+    _open, fm_lines, _close, _body, err = frontmatter.split_frontmatter(
+        frontmatter.split_lines_lf_crlf(source_text.lstrip("\ufeff")))
+    if err:  # only a line that is exactly ``---`` closes it, so a "a---b" title cannot cut it short
         return "general"
-    front = text.split("---", 2)[1] if text.count("---") >= 2 else ""
-    for tag in obsidian_utils._parse_note_tags(front):
+    for tag in obsidian_utils._parse_note_tags("".join(fm_lines)):
         if tag.startswith("claude/topic/") and tag[len("claude/topic/"):]:
             return tag[len("claude/topic/"):]
     return "general"
@@ -179,11 +180,12 @@ def _plan_note(rel: str, text: str, rows: list[dict], repairs: list[dict], creat
         if found is None:
             continue  # already gone: the split finished
         new_rel = _norm(str(row.get("note_path") or ""), root)
-        if new_rel is None:
+        if new_rel is None and row.get("status") != "rejected":
             out["skipped"].append({"id": row["id"], "note": rel, "reason": "split-note-outside-vault"})
             continue
         out["repairs"].append({"id": row["id"], "heading": row["split_heading"], "new_note": new_rel,
-                               "exists": (vault / new_rel).is_file(), "title": title, "row": row, "body": found[2]})
+                               "exists": bool(new_rel) and (vault / new_rel).is_file(), "title": title, "row": row,
+                               "body": found[2], "rejected": row.get("status") == "rejected"})
     return out
 
 
@@ -245,7 +247,7 @@ def _apply_note(path: Path, rel: str, plan_args: tuple, config: dict, backup: di
         remove, done_repairs, done_moves = [], [], []
         for rep in out["repairs"]:
             try:
-                if not rep["exists"]:  # the ledger names it but it was never written (or was deleted)
+                if not rep["exists"] and not rep["rejected"]:  # named by the ledger, never written (or deleted)
                     _write_split_note(vault, rep["new_note"], _note_content(
                         rep["row"], rep["title"], rep["body"], rep["heading"], config, text, sessions))
                 remove.append(rep["heading"])
@@ -313,6 +315,12 @@ def split_updates(config: dict, apply: bool = False) -> dict:
     by_note: dict[str, list[dict]] = {}
     repairs: dict[str, list[dict]] = {}
     for r in rows:
+        if (r.get("status") == "rejected" and r.get("kind") == "new" and r.get("split_from")
+                and isinstance(r.get("split_heading"), str)):
+            rel = _norm(str(r["split_from"]), root)  # its leftover section goes too; no note is written for it
+            if rel and (vault / rel).is_file():
+                repairs.setdefault(rel, []).append(r)
+            continue
         if r.get("status") != "active":
             continue
         if r.get("kind") == "updated" and isinstance(r.get("update_heading"), str):

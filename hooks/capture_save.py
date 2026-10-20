@@ -127,10 +127,11 @@ AUTO_HEADING_RE = re.compile(r"^## Update \([^)]*\) — auto-capture (?P<id>[0-9
 def strip_auto_updates(text: str) -> str:
     """``text`` without its auto-capture ``## Update`` sections; hand-written ones stay."""
     lines = text.replace("\r\n", "\n").split("\n")
-    out, i = [], 0
+    out, i, fence = [], 0, None
     while i < len(lines):
-        m = AUTO_HEADING_RE.match(lines[i])
-        if m:
+        fence, is_fence = fence_step(fence, lines[i])
+        m = None if is_fence or fence is not None else AUTO_HEADING_RE.match(lines[i])
+        if m:  # a heading quoted inside a code fence is text, not a section
             i = section_end(lines, i, end_marker(m.group("id")))
             continue
         out.append(lines[i])
