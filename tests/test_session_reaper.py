@@ -238,6 +238,7 @@ def reaper_env(tmp_path, monkeypatch):
     return {
         "home": home,
         "project": project,
+        "cwd": "/Users/abhishek/dev/claude_workspace/obsidian-brain",
         "project_jsonl_dir": project_jsonl_dir,
         "vault": vault,
         "sessions": sessions,
@@ -276,6 +277,7 @@ def test_reaper_writes_above_threshold_orphan(reaper_env):
         vault_path=str(reaper_env["vault"]),
         sessions_folder="claude-sessions",
         config=reaper_env["config"],
+        cwd=reaper_env["cwd"],
     )
 
     assert out.reaped == 1
@@ -317,12 +319,11 @@ def test_reaper_uses_canonical_project_name_not_worktree_variant(reaper_env, mon
     # Simulate a worktree-variant project being passed in (the cwd-basename).
     worktree_project = "obsidian-brain-issue-125-sessionend-reaper"
     # Patch the project_jsonl_dir to point to the existing reaper_env dir
-    # even though project name is different (the resolver heuristic won't find
-    # the worktree dir under the fake HOME, so we monkeypatch it directly).
+    # to isolate canonical note naming from transcript directory resolution.
     import hooks.obsidian_session_reaper as reaper_mod
     monkeypatch.setattr(
-        reaper_mod, "_resolve_project_jsonl_dir",
-        lambda p: reaper_env["project_jsonl_dir"],
+        reaper_mod, "_resolve_project_jsonl_dirs",
+        lambda cwd: [reaper_env["project_jsonl_dir"]],
     )
     # Patch canonical_project_name to return the canonical name regardless of cwd.
     monkeypatch.setattr(
@@ -339,6 +340,7 @@ def test_reaper_uses_canonical_project_name_not_worktree_variant(reaper_env, mon
         vault_path=str(reaper_env["vault"]),
         sessions_folder="claude-sessions",
         config=reaper_env["config"],
+        cwd=reaper_env["cwd"],
     )
 
     assert out.reaped == 1
@@ -381,6 +383,7 @@ def test_reaper_skips_already_written(reaper_env):
         vault_path=str(reaper_env["vault"]),
         sessions_folder="claude-sessions",
         config=reaper_env["config"],
+        cwd=reaper_env["cwd"],
     )
 
     assert out.reaped == 0
@@ -417,6 +420,7 @@ def test_reaper_skips_below_threshold(reaper_env):
         vault_path=str(reaper_env["vault"]),
         sessions_folder="claude-sessions",
         config=reaper_env["config"],
+        cwd=reaper_env["cwd"],
     )
 
     assert out.reaped == 0
@@ -448,6 +452,7 @@ def test_watermark_advances_on_success(reaper_env):
         vault_path=str(reaper_env["vault"]),
         sessions_folder="claude-sessions",
         config=reaper_env["config"],
+        cwd=reaper_env["cwd"],
     )
 
     assert out.reaped == 2
@@ -461,6 +466,7 @@ def test_watermark_advances_on_success(reaper_env):
         vault_path=str(reaper_env["vault"]),
         sessions_folder="claude-sessions",
         config=reaper_env["config"],
+        cwd=reaper_env["cwd"],
     )
     assert out2.reaped == 0
     assert out2.skipped_already_written == 0  # mtime <= watermark short-circuits
@@ -488,6 +494,7 @@ def test_watermark_advances_on_already_written_skip(reaper_env):
         vault_path=str(reaper_env["vault"]),
         sessions_folder="claude-sessions",
         config=reaper_env["config"],
+        cwd=reaper_env["cwd"],
     )
 
     assert out.skipped_already_written == 1
@@ -510,6 +517,7 @@ def test_watermark_advances_on_below_threshold_skip(reaper_env):
         vault_path=str(reaper_env["vault"]),
         sessions_folder="claude-sessions",
         config=reaper_env["config"],
+        cwd=reaper_env["cwd"],
     )
 
     assert out.skipped_below_threshold == 1
@@ -538,6 +546,7 @@ def test_watermark_honored_on_old_jsonl(reaper_env):
         vault_path=str(reaper_env["vault"]),
         sessions_folder="claude-sessions",
         config=reaper_env["config"],
+        cwd=reaper_env["cwd"],
     )
 
     assert out.reaped == 0
@@ -573,6 +582,7 @@ def test_canary_runs_once_per_invocation(reaper_env, monkeypatch):
         vault_path=str(reaper_env["vault"]),
         sessions_folder="claude-sessions",
         config=reaper_env["config"],
+        cwd=reaper_env["cwd"],
     )
     assert len(canary_calls) == 1
 
@@ -607,6 +617,7 @@ def test_canary_skipped_when_no_writes_needed(reaper_env, monkeypatch):
         vault_path=str(reaper_env["vault"]),
         sessions_folder="claude-sessions",
         config=reaper_env["config"],
+        cwd=reaper_env["cwd"],
     )
     assert canary_calls == []
 
@@ -631,6 +642,7 @@ def test_watermark_does_not_advance_on_permission_block(reaper_env, monkeypatch)
         vault_path=str(reaper_env["vault"]),
         sessions_folder="claude-sessions",
         config=reaper_env["config"],
+        cwd=reaper_env["cwd"],
     )
     assert out.skipped_permission_blocked is True
     assert out.reaped == 0
@@ -662,6 +674,7 @@ def test_watermark_does_not_advance_on_write_failure(reaper_env, monkeypatch):
         vault_path=str(reaper_env["vault"]),
         sessions_folder="claude-sessions",
         config=reaper_env["config"],
+        cwd=reaper_env["cwd"],
     )
     assert out.reaped == 0
     watermark_path = (reaper_env["home"] / ".claude" / "obsidian-brain" /
@@ -707,6 +720,7 @@ def test_timeout_advances_watermark_to_last_processed(reaper_env, monkeypatch):
         vault_path=str(reaper_env["vault"]),
         sessions_folder="claude-sessions",
         config=config,
+        cwd=reaper_env["cwd"],
     )
     assert out.timeout is True
     # At least one orphan should have been reaped before the timeout
@@ -744,6 +758,7 @@ def test_read_failure_does_not_advance_watermark(reaper_env, monkeypatch):
         vault_path=str(reaper_env["vault"]),
         sessions_folder="claude-sessions",
         config=reaper_env["config"],
+        cwd=reaper_env["cwd"],
     )
     assert out.reaped == 0
     # Watermark file was not created
@@ -826,7 +841,7 @@ def test_session_hint_invokes_reaper_by_default(reaper_env, monkeypatch):
     reap_calls = []
 
     def spy_reap(*args, **kwargs):
-        reap_calls.append(args)
+        reap_calls.append((args, kwargs))
         return reaper_mod.ReaperOutcome(
             reaped=1, skipped_below_threshold=0, skipped_already_written=0,
             skipped_permission_blocked=False, timeout=False, wall_ms=10.0,
@@ -848,6 +863,7 @@ def test_session_hint_invokes_reaper_by_default(reaper_env, monkeypatch):
     hint_mod._run()
 
     assert len(reap_calls) == 1
+    assert reap_calls[0][1]["cwd"] == json.loads(_make_hint_stdin(reaper_env))["cwd"]
 
 
 def test_session_hint_reaper_failure_does_not_propagate(reaper_env, monkeypatch):
@@ -900,55 +916,24 @@ def test_write_watermark_atomic_exception_cleanup(tmp_path, monkeypatch):
     assert len(tmp_files) == 0
 
 
-def test_resolve_project_jsonl_dir_no_projects_base(tmp_path, monkeypatch):
-    """When ~/.claude/projects doesn't exist, returns a NONEXISTENT sentinel path."""
-    from hooks.obsidian_session_reaper import _resolve_project_jsonl_dir
-
-    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
-    # No ~/.claude/projects dir created
-    result = _resolve_project_jsonl_dir("myproject")
-    assert "-NONEXISTENT-myproject" in result.name
-
-
-def test_resolve_project_jsonl_dir_oserror_iterdir(tmp_path, monkeypatch):
-    """An OSError from iterdir() returns the NONEXISTENT sentinel."""
-    from hooks.obsidian_session_reaper import _resolve_project_jsonl_dir
-    import hooks.obsidian_session_reaper as reaper_mod
-
-    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
-    base = tmp_path / ".claude" / "projects"
-    base.mkdir(parents=True)
-
-    # Make iterdir raise OSError
-    original_iterdir = base.iterdir
-
-    def boom_iterdir(self):
-        raise OSError("permission denied on iterdir")
-
-    monkeypatch.setattr(type(base), "iterdir", boom_iterdir)
-
-    result = _resolve_project_jsonl_dir("myproject")
-    assert "-NONEXISTENT-myproject" in result.name
-
-
-def test_resolve_project_jsonl_dir_no_candidates(tmp_path, monkeypatch):
-    """When no dirs match the project suffix, returns NONEXISTENT sentinel."""
-    from hooks.obsidian_session_reaper import _resolve_project_jsonl_dir
-
-    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
-    base = tmp_path / ".claude" / "projects"
-    base.mkdir(parents=True)
-    (base / "some-other-project").mkdir()
-
-    result = _resolve_project_jsonl_dir("myproject")
-    assert "-NONEXISTENT-myproject" in result.name
+@pytest.mark.parametrize("mode", ["missing", "no_candidates", "oserror", "empty"])
+def test_resolve_project_jsonl_dirs_empty(tmp_path, monkeypatch, mode):
+    from hooks.obsidian_session_reaper import _resolve_project_jsonl_dirs
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    if mode != "missing":
+        (tmp_path / ".claude" / "projects" / "unrelated").mkdir(parents=True)
+    if mode == "oserror":
+        def boom(self):
+            raise OSError("permission denied")
+        monkeypatch.setattr(Path, "is_dir", boom)
+    assert _resolve_project_jsonl_dirs("" if mode == "empty" else "/some/project") == []
 
 
 def test_build_existing_sid_set_missing_sessions_dir(tmp_path):
     """Returns empty set when the sessions folder doesn't exist."""
     from hooks.obsidian_session_reaper import _build_existing_sid_set
 
-    result = _build_existing_sid_set(str(tmp_path), "nonexistent-folder", "myproject")
+    result = _build_existing_sid_set(str(tmp_path), "nonexistent-folder")
     assert result == set()
 
 
@@ -957,15 +942,16 @@ def test_reap_orphaned_sessions_no_project_jsonl_dir(reaper_env, monkeypatch):
     from hooks.obsidian_session_reaper import _reap_orphaned_sessions
     import hooks.obsidian_session_reaper as reaper_mod
 
-    # Override _resolve_project_jsonl_dir to return a nonexistent path
-    monkeypatch.setattr(reaper_mod, "_resolve_project_jsonl_dir",
-                        lambda project: reaper_env["home"] / ".claude" / "projects" / "NONEXISTENT-x")
+    # Override _resolve_project_jsonl_dirs to return a nonexistent path
+    monkeypatch.setattr(reaper_mod, "_resolve_project_jsonl_dirs",
+                        lambda cwd: [])
 
     out = _reap_orphaned_sessions(
         project=reaper_env["project"],
         vault_path=str(reaper_env["vault"]),
         sessions_folder="claude-sessions",
         config=reaper_env["config"],
+        cwd=reaper_env["cwd"],
     )
 
     assert out.reaped == 0
@@ -1001,6 +987,7 @@ def test_reap_stage2_duration_threshold_skip(reaper_env, monkeypatch):
         vault_path=str(reaper_env["vault"]),
         sessions_folder="claude-sessions",
         config=config,
+        cwd=reaper_env["cwd"],
     )
 
     assert out.skipped_below_threshold >= 1
@@ -1038,6 +1025,7 @@ def test_reap_watermark_write_failed_logged(reaper_env, monkeypatch):
         vault_path=str(reaper_env["vault"]),
         sessions_folder="claude-sessions",
         config=reaper_env["config"],
+        cwd=reaper_env["cwd"],
     )
 
     assert "WATERMARK_WRITE_FAILED" in log_lines
@@ -1058,6 +1046,7 @@ def test_reap_orphaned_sessions_public_wrapper_exception(reaper_env, monkeypatch
         vault_path=str(reaper_env["vault"]),
         sessions_folder="claude-sessions",
         config=reaper_env["config"],
+        cwd=reaper_env["cwd"],
     )
 
     assert out.reaped == 0
@@ -1090,6 +1079,7 @@ def test_watermark_advances_past_fractional_mtime(reaper_env, monkeypatch):
         vault_path=str(reaper_env["vault"]),
         sessions_folder="claude-sessions",
         config=reaper_env["config"],
+        cwd=reaper_env["cwd"],
     )
     assert out.reaped == 1
 
@@ -1106,6 +1096,7 @@ def test_watermark_advances_past_fractional_mtime(reaper_env, monkeypatch):
         vault_path=str(reaper_env["vault"]),
         sessions_folder="claude-sessions",
         config=reaper_env["config"],
+        cwd=reaper_env["cwd"],
     )
     assert out2.skipped_already_written == 0  # not even checked — mtime gate skips it
     assert out2.reaped == 0
@@ -1185,6 +1176,7 @@ def test_reaper_does_not_skip_session_with_only_snapshot_note(reaper_env):
         vault_path=str(reaper_env["vault"]),
         sessions_folder="claude-sessions",
         config=reaper_env["config"],
+        cwd=reaper_env["cwd"],
     )
 
     assert out.reaped == 1, (
@@ -1205,7 +1197,7 @@ def test_build_existing_sid_set_full_sid_comparison(reaper_env):
     )
 
     sids = _build_existing_sid_set(
-        str(reaper_env["vault"]), "claude-sessions", reaper_env["project"]
+        str(reaper_env["vault"]), "claude-sessions"
     )
     assert full_sid in sids, "Full SID must be in the set"
     # 8-char prefix alone must not be a member (no prefix-only entries)
@@ -1246,6 +1238,7 @@ def test_reap_orphaned_sessions_public_wrapper_logs_reaper_crashed(
         vault_path=str(reaper_env["vault"]),
         sessions_folder="claude-sessions",
         config=reaper_env["config"],
+        cwd=reaper_env["cwd"],
     )
 
     # Outcome must still be a zero-outcome (never raises)
@@ -1263,44 +1256,19 @@ def test_reap_orphaned_sessions_public_wrapper_logs_reaper_crashed(
 
 
 # ---------------------------------------------------------------------------
-# N2 (R4): _build_existing_sid_set filters by project: frontmatter
-# ---------------------------------------------------------------------------
-
-
-def test_build_existing_sid_set_filters_by_project(reaper_env):
-    """Notes from a different project must NOT appear in the SID set for project X.
-
-    Regression guard: reaper for project Y must not see project X's notes as
-    already-written, avoiding false-positive skips on multi-project vaults.
-    """
-    from hooks.obsidian_session_reaper import _build_existing_sid_set
-
-    sid_x = "proj-x-01-1111-2222-3333-444444444444"
-    sid_y = "proj-y-01-1111-2222-3333-444444444444"
-    sessions = reaper_env["sessions"]
-
-    # Note for project X
-    (sessions / "note-project-x.md").write_text(
-        f"---\ntype: claude-session\nproject: project-x\nsession_id: {sid_x}\n---\n# X\n"
-    )
-    # Note for project Y
-    (sessions / "note-project-y.md").write_text(
-        f"---\ntype: claude-session\nproject: project-y\nsession_id: {sid_y}\n---\n# Y\n"
-    )
-
-    # Query for project Y — must only see Y's SID
-    sids_y = _build_existing_sid_set(str(reaper_env["vault"]), "claude-sessions", "project-y")
-    assert sid_y in sids_y, "project-y SID must be in the set"
-    assert sid_x not in sids_y, (
-        "project-x SID must NOT appear in project-y's existing-SID set (N2 regression)"
-    )
-
-    # Query for project X — must only see X's SID
-    sids_x = _build_existing_sid_set(str(reaper_env["vault"]), "claude-sessions", "project-x")
-    assert sid_x in sids_x, "project-x SID must be in the set"
-    assert sid_y not in sids_x, (
-        "project-y SID must NOT appear in project-x's existing-SID set (N2 regression)"
-    )
+# Session IDs deduplicate across all projects.
+@pytest.mark.parametrize("note_type", ["type: claude-session\n", ""])
+def test_reaper_cross_project_dedupe(reaper_env, note_type):
+    from hooks.obsidian_session_reaper import _reap_orphaned_sessions
+    sid = "cross-project-session"
+    _make_above_threshold_jsonl(reaper_env["project_jsonl_dir"] / f"{sid}.jsonl", sid)
+    (reaper_env["sessions"] / "other.md").write_text(
+        f"---\n{note_type}project: harden-repo\nsession_id: {sid}\n---\n")
+    out = _reap_orphaned_sessions("repo", str(reaper_env["vault"]),
+                                  "claude-sessions", reaper_env["config"], cwd=reaper_env["cwd"])
+    assert out.reaped == 0
+    assert out.skipped_already_written == 1
+    assert len(list(reaper_env["sessions"].glob("*.md"))) == 1
 
 
 def test_build_existing_sid_set_includes_notes_without_project_field(reaper_env):
@@ -1319,7 +1287,7 @@ def test_build_existing_sid_set_includes_notes_without_project_field(reaper_env)
     )
 
     sids = _build_existing_sid_set(
-        str(reaper_env["vault"]), "claude-sessions", "any-project"
+        str(reaper_env["vault"]), "claude-sessions"
     )
     assert sid_legacy in sids, (
         "Legacy note without project: frontmatter must still be counted (backward-compat)"
@@ -1344,7 +1312,7 @@ def test_reap_iterdir_oserror_returns_zero_outcome(reaper_env, monkeypatch):
     # `obsidian_utils` module (same object the from-import resolves from).
     import obsidian_utils as utils_mod  # bare, matches reaper's from-import target
 
-    # Stub _resolve_project_jsonl_dir to return a fake object whose iterdir() raises.
+    # Stub _resolve_project_jsonl_dirs to return a fake object whose iterdir() raises.
     class _UnreadableDir:
         def is_dir(self):
             return True
@@ -1352,7 +1320,7 @@ def test_reap_iterdir_oserror_returns_zero_outcome(reaper_env, monkeypatch):
         def iterdir(self):
             raise PermissionError("[Errno 13] Permission denied: '/fake/dir'")
 
-    monkeypatch.setattr(reaper_mod, "_resolve_project_jsonl_dir", lambda p: _UnreadableDir())
+    monkeypatch.setattr(reaper_mod, "_resolve_project_jsonl_dirs", lambda cwd: [_UnreadableDir()])
 
     # Spy on _append_reaper_log via the bare obsidian_utils module.
     logged: list[dict] = []
@@ -1369,6 +1337,7 @@ def test_reap_iterdir_oserror_returns_zero_outcome(reaper_env, monkeypatch):
         vault_path=str(reaper_env["vault"]),
         sessions_folder="claude-sessions",
         config=reaper_env["config"],
+        cwd=reaper_env["cwd"],
     )
 
     # Must return a zero-counter outcome (not raise)
@@ -1399,8 +1368,7 @@ def test_reaper_worktree_dedupe_uses_canonical_not_raw(reaper_env, monkeypatch):
     the reaper called with the raw worktree-variant cwd-basename must still detect it
     as already-written (skipped_already_written == 1), not write a duplicate.
 
-    This guards N8: _build_existing_sid_set must use effective_project (canonical),
-    not the raw project param.
+    Dedupe must find the canonical note regardless of the raw project param.
     """
     from hooks.obsidian_session_reaper import _reap_orphaned_sessions
     from hooks import obsidian_utils
@@ -1422,8 +1390,8 @@ def test_reaper_worktree_dedupe_uses_canonical_not_raw(reaper_env, monkeypatch):
     _make_above_threshold_jsonl(jsonl, sid, n_user_msgs=5)
 
     # Route raw worktree project dir to the fixture dir
-    monkeypatch.setattr(reaper_mod, "_resolve_project_jsonl_dir",
-                        lambda p: reaper_env["project_jsonl_dir"])
+    monkeypatch.setattr(reaper_mod, "_resolve_project_jsonl_dirs",
+                        lambda cwd: [reaper_env["project_jsonl_dir"]])
     # canonical_project_name() returns the canonical name
     monkeypatch.setattr(obsidian_utils, "canonical_project_name",
                         lambda cwd=None: canonical)
@@ -1433,12 +1401,13 @@ def test_reaper_worktree_dedupe_uses_canonical_not_raw(reaper_env, monkeypatch):
         vault_path=str(reaper_env["vault"]),
         sessions_folder="claude-sessions",
         config=reaper_env["config"],
+        cwd=reaper_env["cwd"],
     )
 
     assert out.skipped_already_written == 1, (
         f"Expected skipped_already_written=1 (dedupe hit canonical note); "
         f"got reaped={out.reaped}, skipped_already_written={out.skipped_already_written}. "
-        f"N8 regression: _build_existing_sid_set not using effective_project."
+        f"Canonical note was not found by the global SID lookup."
     )
     assert out.reaped == 0, (
         "Reaper must not write a duplicate note when canonical note already exists; "
@@ -1469,8 +1438,8 @@ def test_reaper_worktree_filename_uses_canonical_slug(reaper_env, monkeypatch):
     jsonl = reaper_env["project_jsonl_dir"] / f"{sid}.jsonl"
     _make_above_threshold_jsonl(jsonl, sid, n_user_msgs=5)
 
-    monkeypatch.setattr(reaper_mod, "_resolve_project_jsonl_dir",
-                        lambda p: reaper_env["project_jsonl_dir"])
+    monkeypatch.setattr(reaper_mod, "_resolve_project_jsonl_dirs",
+                        lambda cwd: [reaper_env["project_jsonl_dir"]])
     monkeypatch.setattr(obsidian_utils, "canonical_project_name",
                         lambda cwd=None: canonical)
 
@@ -1479,6 +1448,7 @@ def test_reaper_worktree_filename_uses_canonical_slug(reaper_env, monkeypatch):
         vault_path=str(reaper_env["vault"]),
         sessions_folder="claude-sessions",
         config=reaper_env["config"],
+        cwd=reaper_env["cwd"],
     )
 
     assert out.reaped == 1, (
@@ -1502,3 +1472,73 @@ def test_reaper_worktree_filename_uses_canonical_slug(reaper_env, monkeypatch):
         f"Filename {filename!r} must NOT contain worktree slug {worktree_slug!r}; "
         f"N9 regression: make_filename received raw worktree project."
     )
+
+
+def test_reaper_suffix_collision(reaper_env):
+    from hooks.obsidian_session_reaper import _reap_orphaned_sessions
+    wrong = reaper_env["home"] / ".claude" / "projects" / "-Users-x-dev-harden-repo"
+    wrong.mkdir()
+    _make_above_threshold_jsonl(wrong / "collision.jsonl", "collision")
+    out = _reap_orphaned_sessions("repo", str(reaper_env["vault"]), "claude-sessions",
+                                  reaper_env["config"], cwd="/Users/x/dev/repo")
+    assert out.reaped == 0
+    assert list(reaper_env["sessions"].glob("*.md")) == []
+
+
+@pytest.mark.parametrize("encoding", ["current", "legacy", "symlink", "both", "empty"])
+def test_reaper_cwd_encodings(reaper_env, tmp_path, encoding):
+    from hooks.obsidian_session_reaper import _reap_orphaned_sessions, _resolve_project_jsonl_dirs
+    cwd = str(tmp_path / "real_checkout")
+    Path(cwd).mkdir()
+    target = cwd
+    if encoding == "symlink":
+        link = tmp_path / "linked_checkout"
+        link.symlink_to(cwd, target_is_directory=True)
+        cwd = str(link)
+    names = [target.replace("/", "-").replace("_", "-")]
+    if encoding == "legacy":
+        names = [target.replace("/", "-")]
+    elif encoding == "both":
+        names.append(target.replace("/", "-"))
+    dirs = []
+    for i, name in enumerate(names):
+        folder = reaper_env["home"] / ".claude" / "projects" / name
+        folder.mkdir()
+        _make_above_threshold_jsonl(folder / f"encoding-{i}.jsonl", f"encoding-{i}")
+        dirs.append(folder)
+    if encoding == "empty":
+        cwd = ""
+        dirs = []
+    assert _resolve_project_jsonl_dirs(cwd) == sorted(dirs, key=lambda p: p.name)
+    out = _reap_orphaned_sessions(reaper_env["project"], str(reaper_env["vault"]),
+                                  "claude-sessions", reaper_env["config"], cwd=cwd)
+    assert out.reaped == len(dirs)
+
+
+@pytest.mark.parametrize("error", [None, OSError, FileNotFoundError])
+def test_reaper_default_cwd(reaper_env, monkeypatch, error):
+    from hooks.obsidian_session_reaper import _reap_orphaned_sessions
+    def getcwd():
+        if error:
+            raise error("cwd unavailable")
+        return reaper_env["cwd"]
+    monkeypatch.setattr(os, "getcwd", getcwd)
+    _make_above_threshold_jsonl(reaper_env["project_jsonl_dir"] / "fallback.jsonl", "fallback")
+    out = _reap_orphaned_sessions(reaper_env["project"], str(reaper_env["vault"]),
+                                  "claude-sessions", reaper_env["config"])
+    assert out.reaped == (0 if error else 1)
+    assert len(list(reaper_env["sessions"].glob("*.md"))) == out.reaped
+
+
+def test_public_wrapper_forwards_cwd(reaper_env, monkeypatch):
+    import hooks.obsidian_session_reaper as reaper
+    calls = []
+    sentinel = object()
+    def spy(*args, **kwargs):
+        calls.append(kwargs)
+        return sentinel
+    monkeypatch.setattr(reaper, "_reap_orphaned_sessions", spy)
+    assert reaper.reap_orphaned_sessions(
+        reaper_env["project"], str(reaper_env["vault"]), "claude-sessions",
+        reaper_env["config"], cwd=reaper_env["cwd"]) is sentinel
+    assert calls == [{"cwd": reaper_env["cwd"]}]

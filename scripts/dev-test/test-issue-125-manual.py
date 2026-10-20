@@ -51,8 +51,10 @@ def main():
     sentinel.write_text("ok\n")  # Cleanup precondition
 
     home = sandbox / "home"
-    # Use same slug as the real project so _resolve_project_jsonl_dir matches
+    # The reaper resolves the JSONL dir from the exact cwd encoding (#432),
+    # so pass a cwd whose current encoding is project_slug.
     project_name = "obsidian-brain"
+    project_cwd = "/Users/abhishek/dev/claude_workspace/obsidian-brain"
     project_slug = "-Users-abhishek-dev-claude-workspace-obsidian-brain"
     project_dir = home / ".claude" / "projects" / project_slug
     project_dir.mkdir(parents=True)
@@ -119,6 +121,7 @@ def main():
             vault_path=str(vault),
             sessions_folder="claude-sessions",
             config=config,
+            cwd=project_cwd,
         )
         print(f"  outcome = {out}")
 
@@ -183,6 +186,7 @@ def main():
             vault_path=str(vault),
             sessions_folder="claude-sessions",
             config=config,
+            cwd=project_cwd,
         )
         print(f"  outcome = {out2}")
 
@@ -234,6 +238,7 @@ def main():
                 vault_path=str(vault),
                 sessions_folder="claude-sessions",
                 config=config,
+                cwd=project_cwd,
             )
             print(f"  outcome = {out_perm}")
 
@@ -289,6 +294,7 @@ def main():
                 vault_path=str(vault),
                 sessions_folder="claude-sessions",
                 config=config,
+                cwd=project_cwd,
             )
             log_text2 = (home / ".claude" / "obsidian-brain-hook.log").read_text()
 

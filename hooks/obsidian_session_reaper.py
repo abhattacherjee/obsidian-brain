@@ -126,32 +126,31 @@ def _permission_canary(vault_path: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _resolve_project_jsonl_dir(project: str) -> Path:
-    """Map project name to ~/.claude/projects/<slug>/.
+def _resolve_project_jsonl_dirs(cwd: str) -> list[Path]:
+    """Return existing directories for exact cwd encodings, including realpath."""
+    from obsidian_utils import _cc_encoded_dirnames
 
-    Slug rule mirrors Claude Code's path encoding (full path with - separators).
-    For now we use a heuristic: find the dir whose name ends with -<project>
-    and is the shortest matching dir (i.e., canonical non-worktree path).
-    """
-    base = Path.home() / ".claude" / "projects"
-    if not base.is_dir():
-        return base / f"-NONEXISTENT-{project}"
+    if not cwd:
+        return []
     try:
-        candidates = sorted(
-            [d for d in base.iterdir() if d.is_dir() and d.name.endswith(f"-{project}")],
-            key=lambda d: len(d.name),
-        )
+        base = Path.home() / ".claude" / "projects"
+        if not base.is_dir():
+            return []
+        names = _cc_encoded_dirnames(cwd)
+        real_cwd = os.path.realpath(cwd)
+        if real_cwd != cwd:
+            names.update(_cc_encoded_dirnames(real_cwd))
+        return [base / name for name in sorted(names) if (base / name).is_dir()]
     except OSError:
-        return base / f"-NONEXISTENT-{project}"
-    return candidates[0] if candidates else base / f"-NONEXISTENT-{project}"
+        return []
 
 
 # ---------------------------------------------------------------------------
-# Helper: build set of already-written SIDs (8-char prefix) from vault
+# Helper: build set of already-written full SIDs from vault
 # ---------------------------------------------------------------------------
 
 
-def _build_existing_sid_set(vault_path: str, sessions_folder: str, project: str) -> set:
+def _build_existing_sid_set(vault_path: str, sessions_folder: str) -> set:
     """Set of full SIDs for which a ``claude-session`` vault note already exists.
 
     Reads ``session_id`` AND ``type`` frontmatter fields from each note (rather
@@ -164,9 +163,9 @@ def _build_existing_sid_set(vault_path: str, sessions_folder: str, project: str)
     Legacy notes without a ``type`` field are treated as ``claude-session`` for
     backward-compat (mirrors the same convention used elsewhere in obsidian_utils).
 
-    This is O(N) I/O where N is the count of existing session notes for this
-    project.  The lookup uses full SIDs to eliminate the collision risk of the
-    previous 8-char prefix set.
+    A session ID uniquely identifies one transcript, so a note in any project
+    means that session was logged. This is O(N) I/O over all session notes.
+    Full SIDs avoid collisions from the previous 8-char prefix set.
     """
     from obsidian_utils import _peek_frontmatter_fields
 
@@ -175,23 +174,16 @@ def _build_existing_sid_set(vault_path: str, sessions_folder: str, project: str)
         return set()
     sids: set = set()
     for note in sessions.glob("*.md"):
-        # ONE read + ONE parse per note, not three. This loop runs on the
-        # SessionStart hook inside reaper_max_runtime_seconds (5s) over every
-        # session note in the vault (~1000), so three single-field peeks meant
-        # reading and re-parsing the same bytes three times. Reading all three
-        # fields up front (rather than short-circuiting on `type`) is what
-        # makes that possible; the only visible difference is that an
-        # empty-but-present `project:`/`session_id:` on a non-session note now
-        # emits its corruption warning too.
-        fields = _peek_frontmatter_fields(note, ("type", "project", "session_id"))
+        # ONE read + ONE parse per note. This loop runs on the SessionStart
+        # hook inside reaper_max_runtime_seconds (5s) over every session note
+        # in the vault (~1000), so separate single-field peeks would read and
+        # re-parse the same bytes once per field. `project` is not read: the
+        # SID set is vault-wide (#432).
+        fields = _peek_frontmatter_fields(note, ("type", "session_id"))
         # Legacy notes without a `type` are treated as claude-session (see
         # this function's docstring).
         if (fields["type"] or "claude-session") != "claude-session":
             continue  # skip snapshots, insights, etc.
-        # Project filter: only count notes belonging to this project.
-        note_project = fields["project"]
-        if note_project and note_project != project:
-            continue
         raw_sid = fields["session_id"]
         if raw_sid:
             sids.add(raw_sid)
@@ -227,10 +219,11 @@ def _reap_orphaned_sessions(
     vault_path: str,
     sessions_folder: str,
     config: dict,
+    cwd: str | None = None,
 ) -> ReaperOutcome:
     """Main reaper loop — internal, directly testable.
 
-    Iterates JSONL files in the project's ~/.claude/projects/<slug>/ dir
+    Iterates JSONL files in all exact cwd-encoded project directories
     whose mtime > watermark, checks thresholds, deduplicates against vault,
     and writes reconstructed notes for orphaned sessions.
     """
@@ -258,8 +251,13 @@ def _reap_orphaned_sessions(
     watermark_path = Path.home() / ".claude" / "obsidian-brain" / f"reaper-watermark-{project}"
     watermark = _read_watermark(watermark_path)
 
-    project_jsonl_dir = _resolve_project_jsonl_dir(project)
-    if not project_jsonl_dir.is_dir():
+    if cwd is None:
+        try:
+            cwd = os.getcwd()
+        except OSError:
+            cwd = ""
+    project_jsonl_dirs = _resolve_project_jsonl_dirs(cwd)
+    if not project_jsonl_dirs:
         wall_ms = int((time.monotonic() - start_ts) * 1000)
         out = ReaperOutcome(
             reaped=0,
@@ -274,7 +272,8 @@ def _reap_orphaned_sessions(
 
     try:
         jsonls = sorted(
-            (p for p in project_jsonl_dir.iterdir() if p.suffix == ".jsonl"),
+            (p for directory in project_jsonl_dirs for p in directory.iterdir()
+             if p.suffix == ".jsonl" and p.is_file()),
             key=lambda p: _safe_mtime(p),
         )
     except OSError as exc:
@@ -297,20 +296,11 @@ def _reap_orphaned_sessions(
     # only once per reaper invocation instead of once per JSONL file.
     # Falls back to `project` param if canonical resolution returns "unknown"
     # (e.g., cwd deleted or not a git repo).
-    canonical = canonical_project_name()
+    canonical = canonical_project_name(cwd)
 
-    # effective_project is used for all VAULT-SIDE identifiers: frontmatter,
-    # dedupe set lookup, and filename slug.  This collapses worktree variants
-    # (e.g. "obsidian-brain-issue-125-...") to the canonical repo name so the
-    # reaper never creates duplicate notes with a different basename than what
-    # live SessionEnd would produce.
-    #
-    # NOTE: _resolve_project_jsonl_dir MUST keep using raw `project` (the
-    # cwd-basename → CC's path encoding).  Only vault-side identifiers use
-    # effective_project.
+    # Canonical naming keeps recovered notes consistent with live SessionEnd.
     effective_project = canonical if canonical and canonical != "unknown" else project
-
-    existing_sids = _build_existing_sid_set(vault_path, sessions_folder, effective_project)
+    existing_sids = _build_existing_sid_set(vault_path, sessions_folder)
 
     canary_done = False
     last_processed_mtime = watermark
@@ -437,6 +427,7 @@ def reap_orphaned_sessions(
     vault_path: str,
     sessions_folder: str,
     config: dict,
+    cwd: str | None = None,
 ) -> ReaperOutcome:
     """Scan for orphaned session JSONLs and write reconstructed vault notes.
 
@@ -452,13 +443,16 @@ def reap_orphaned_sessions(
         Loaded config dict from load_config().  Reads ``reaper_enabled`` and
         ``reaper_max_runtime_seconds`` keys (both optional, safe defaults).
 
+    cwd:
+        Session working directory; defaults to os.getcwd() when omitted.
+
     Returns
     -------
     ReaperOutcome
         Summary of the run.  Always returns; never raises.
     """
     try:
-        return _reap_orphaned_sessions(project, vault_path, sessions_folder, config)
+        return _reap_orphaned_sessions(project, vault_path, sessions_folder, config, cwd=cwd)
     except Exception as exc:
         from obsidian_utils import _append_reaper_log
         _append_reaper_log(

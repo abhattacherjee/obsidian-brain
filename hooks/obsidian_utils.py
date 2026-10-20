@@ -651,10 +651,10 @@ def _peek_frontmatter_fields(
 
     This is the only implementation; ``_peek_frontmatter_field`` is a
     one-field wrapper over it. It exists because
-    ``obsidian_session_reaper._build_existing_sid_set`` needs ``type``,
-    ``project`` and ``session_id`` from every session note on the SessionStart
-    hook: three single-field calls meant three uncached reads and three
-    parses of the same bytes, ~1000 notes deep, inside a 5-second budget.
+    ``obsidian_session_reaper._build_existing_sid_set`` needs ``type`` and
+    ``session_id`` from every session note on the SessionStart hook:
+    single-field calls meant one uncached read and parse of the same bytes
+    per field, ~1000 notes deep, inside a 5-second budget.
 
     The frontmatter block is located by ``frontmatter.split_frontmatter`` (via
     ``_read_frontmatter_region``), the same bounded, shape-checked scan the

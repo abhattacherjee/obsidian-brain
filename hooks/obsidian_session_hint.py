@@ -207,7 +207,7 @@ def _run() -> None:
     if config.get("reaper_enabled", True):
         try:
             import obsidian_session_reaper as _reaper_mod
-            _reaper_mod._reap_orphaned_sessions(project, vault_path, sessions_folder, config)
+            _reaper_mod._reap_orphaned_sessions(project, vault_path, sessions_folder, config, cwd=cwd)
         except Exception as exc:
             # Reaper is best-effort; never break SessionStart
             print(f"[obsidian-brain] reaper failed: {exc}", file=sys.stderr)

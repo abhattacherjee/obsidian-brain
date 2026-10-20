@@ -363,7 +363,7 @@ def _run_reaper(args: argparse.Namespace) -> int:
     project = Path(args.cwd).name or "unknown"
 
     # Stage the fixture under ~/.claude/projects/<slug>/ so the reaper's
-    # _resolve_project_jsonl_dir() can find it. Use the same staging logic as
+    # _resolve_project_jsonl_dirs() can find it. Use the same staging logic as
     # _run_sessionend but always stage (never skip) since the fixture needs to
     # live in the project dir for _reap_orphaned_sessions to pick it up.
     try:
@@ -409,7 +409,7 @@ def _run_reaper(args: argparse.Namespace) -> int:
 
     payload: dict = {}
     try:
-        result = _reap_orphaned_sessions(project, vault_path, sessions_folder, config)
+        result = _reap_orphaned_sessions(project, vault_path, sessions_folder, config, cwd=args.cwd)
         # Determine a single top-level outcome key for easy assertion.
         if result.skipped_permission_blocked:
             payload["outcome"] = "SKIPPED_PERMISSION_BLOCKED"
