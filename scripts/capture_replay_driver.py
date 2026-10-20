@@ -29,6 +29,25 @@ import capture_worker  # noqa: E402
 log = scratch / "replay.log"
 capture_state.append_capture_log = lambda p, s, outcome, detail="": log.open("a").write(f"{outcome} {detail}\n")
 
+# Model cost, from each worker's --output-format json envelope.
+costs = []
+_run = capture_worker.subprocess.run
+
+
+def _metered(*args, **kwargs):
+    result = _run(*args, **kwargs)
+    try:
+        costs.append(float(json.loads(result.stdout).get("total_cost_usd") or 0))
+    except (ValueError, TypeError, AttributeError):
+        costs.append(0.0)
+    return result
+
+
+capture_worker.subprocess.run = _metered
+# CAPTURE_REPLAY_NO_EARLIER=1 replays without the session's earlier titles in the prompt (the pre-#427 baseline).
+if os.environ.get("CAPTURE_REPLAY_NO_EARLIER") == "1":
+    capture_worker.earlier_titles = lambda sid: []
+
 sid = transcript.stem
 size = transcript.stat().st_size
 print(f"scratch={scratch} transcript={transcript.name} bytes={size}", flush=True)
@@ -47,6 +66,7 @@ for batch in range(1, 50):
 rows = capture_state.ledger_list(sid, 1000)
 print(json.dumps({"captures": len(rows),
                   "new": sum(r.get("kind") == "new" for r in rows),
-                  "updated": sum(r.get("kind") == "updated" for r in rows)}))
+                  "updated": sum(r.get("kind") == "updated" for r in rows),
+                  "worker_calls": len(costs), "cost_usd": round(sum(costs), 4)}))
 for r in rows:
     print(f"  {r.get('kind'):7} {r.get('type'):9} {r.get('title')}  ->  {r.get('note_path')}")
