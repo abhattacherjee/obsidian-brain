@@ -5,7 +5,8 @@ whole-note search matched, so a few notes grew into catch-alls. This applies
 the two rules ``capture_save.find_match`` now enforces to updates already
 written. An active ``updated`` ledger row moves when:
 
-- ``same-session``: its note was auto-created by the same session, or
+- ``same-session``: its note was created by the same session, through
+  auto-capture (ledger) or by hand (frontmatter ``source_session``), or
 - ``low-cosine``: ``title + body[:300]`` scores below
   ``auto_capture_update_min_cosine`` against the note's original text.
 
@@ -119,13 +120,14 @@ def _plan_note(rel: str, text: str, rows: list[dict], repairs: list[dict], creat
     """What would change in one note: moves, repairs, skips, and the updates that stay."""
     lines = text.split("\n")
     out = {"note": rel, "moves": [], "repairs": [], "skipped": [], "kept": Counter()}
+    author = obsidian_utils._peek_frontmatter_field(path, "source_session") if rows else None  # wrote it by hand
     for row in rows:
         found = _section(lines, row["update_heading"], row["id"], row.get("title", ""))
         if found is None:
             out["skipped"].append({"id": row["id"], "note": rel, "reason": "section-missing"})
             continue
         _, _, body = found
-        if (row.get("session_id"), rel) in created:
+        if (row.get("session_id"), rel) in created or (author and row.get("session_id") == author):
             reason, cos = "same-session", None
         else:
             cos = scorer.cosine(path, text, row.get("title", ""), body)

@@ -354,3 +354,44 @@ def test_good_threshold_is_used(value):
 def test_threshold_default_is_in_config_defaults():
     import obsidian_utils
     assert obsidian_utils._DEFAULTS["auto_capture_update_min_cosine"] == 0.35
+
+
+def _note_by(vault, name, sid, body_extra=""):
+    """A hand-written note whose frontmatter names the session that wrote it."""
+    path = vault / "claude-insights" / name
+    path.write_text(f"---\ntype: claude-insight\ndate: 2026-10-01\nsource_session: {sid}\ntags:\n  - claude/insight\n---\n\n"
+                    f"# {ZEBRA[0]}\n\n{ZEBRA[1]}\n{body_extra}")
+    return path
+
+
+def test_note_the_session_wrote_by_hand_is_skipped(mock_config, tmp_vault):
+    """No ledger row: the frontmatter source_session alone makes it the session's own note."""
+    _filler(tmp_vault)
+    _note_by(tmp_vault, "zebra.md", SID)
+    q = _query(*ZEBRA)
+    assert capture_save.find_match(q, mock_config, session_id=SID) is None
+    assert capture_save.find_match(q, mock_config, session_id=OTHER) == "claude-insights/zebra.md"
+
+
+def test_source_session_outside_the_frontmatter_does_not_count(mock_config, tmp_vault):
+    _filler(tmp_vault)
+    _note(tmp_vault, "zebra.md", *ZEBRA, extra=f"\nsource_session: {SID}\n")
+    assert capture_save.find_match(_query(*ZEBRA), mock_config, session_id=SID) == "claude-insights/zebra.md"
+
+
+def test_note_without_source_session_still_goes_through_the_cosine_floor(mock_config, tmp_vault):
+    _filler(tmp_vault)
+    _note(tmp_vault, "zebra.md", *ZEBRA)  # frontmatter, but no source_session
+    _note(tmp_vault, "osprey-hub.md", "Osprey lantern websocket retries",
+          "Osprey lantern websocket clients retry with exponential backoff capped at thirty seconds.",
+          extra=_auto_section("a1b2c3d4e5f6", *PELICAN))
+    assert capture_save.find_match(_query(*ZEBRA), mock_config, session_id=SID) == "claude-insights/zebra.md"
+    assert capture_save.find_match(_query(*PELICAN), mock_config, session_id=SID) is None
+
+
+def test_unreadable_note_does_not_match_the_same_session_rule(mock_config, tmp_vault, monkeypatch):
+    """A note whose frontmatter cannot be read is not the session's own; it still goes through the cosine floor."""
+    _fake_results(monkeypatch, [{"path": "claude-insights/b.md", "type": "claude-insight", "rank": -30.0}],
+                  vault=tmp_vault)
+    monkeypatch.setattr(capture_save.obsidian_utils, "_peek_frontmatter_field", lambda path, field: None)
+    assert capture_save.find_match("q", mock_config, session_id=SID) == "claude-insights/b.md"

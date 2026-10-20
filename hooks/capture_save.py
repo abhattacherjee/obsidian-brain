@@ -192,10 +192,20 @@ def original_text(note: Path) -> str:
     return strip_auto_updates(_strip_frontmatter(text))
 
 
+def written_by(note: Path, session_id: str | None) -> bool:
+    """True when ``note``'s frontmatter ``source_session`` is ``session_id`` (a note the session wrote by hand).
+
+    Read from the file, the source of truth; an unreadable note or one with
+    no frontmatter ``source_session`` is not the session's.
+    """
+    return bool(session_id) and obsidian_utils._peek_frontmatter_field(note, "source_session") == session_id
+
+
 def find_match(query: str, config: dict, session_id: str | None = None) -> str | None:
     """Vault-relative path of a curated note that ``query`` clearly duplicates.
 
-    #427: a note this session auto-created is never a match, and the top note
+    #427: a note this session created (auto-captured, or by hand per its
+    frontmatter ``source_session``) is never a match, and the top note
     is scored by its original text, so updates cannot snowball onto a hub.
     Anything that cannot be checked fails toward a new note.
     """
@@ -213,7 +223,8 @@ def find_match(query: str, config: dict, session_id: str | None = None) -> str |
     results = [r for r in results if not _is_rejected(r.get("path", ""))]
     for r in results:
         r["rel_path"] = _vault_rel(r.get("path", ""), root)
-    results = [r for r in results if r["rel_path"] is None or r["rel_path"] not in own]
+    results = [r for r in results if r["rel_path"] is None
+               or (r["rel_path"] not in own and not written_by(root / r["rel_path"], session_id))]
     results.sort(key=lambda r: r["rank"])
     if not results or results[0].get("type") not in _CURATED_NOTE_TYPES:
         return None  # updates only ever go into curated notes, never session notes

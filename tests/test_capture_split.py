@@ -322,3 +322,14 @@ def test_unreadable_note_in_dry_run_is_reported(mock_config, vault, capsys):
 def test_cli_apply_text_report(mock_config, hub, capsys):
     rc, out = _cli(capsys, "--apply")
     assert rc == 0 and "moved 3 sections from 1 note" in out.out and "backup: " in out.out
+
+
+def test_updates_on_a_note_the_session_wrote_by_hand_move(mock_config, vault):
+    """source_session in the frontmatter counts as the session's own note, even for an on-topic update."""
+    rel = "claude-insights/by-hand.md"
+    (vault / rel).write_text(_front().replace("topic: ledgers\n", f"topic: ledgers\nsource_session: {S}\n")
+                             + f"# {ZEBRA[0]}\n\n{ZEBRA[1]}\n" + _section("fffffffffff1", *ZEBRA_MORE)
+                             + _section("fffffffffff2", *ZEBRA_MORE, date="2026-10-03"))
+    _update_row("fffffffffff1", S, rel, ZEBRA_MORE[0])
+    _update_row("fffffffffff2", OTHER, rel, ZEBRA_MORE[0], date="2026-10-03")
+    assert _moves(capture_split.split_updates(mock_config)) == {"fffffffffff1": "same-session"}
