@@ -248,14 +248,15 @@ def session_note_for(session_id: str, project: str, config: dict) -> str:
     return obsidian_utils.resolve_source_session_note(name, session_id, vault, folder)
 
 
-def _frontmatter(c: Candidate, *, session_id: str, project: str, session_note: str, today: str) -> str:
+def _frontmatter(c: Candidate, *, session_id: str, project: str, session_note: str, today: str,
+                 created_at: str | None = None) -> str:
     template_name, _ = TYPES[c["type"]]
     template = (_TEMPLATES / template_name).read_text(encoding="utf-8")
     front = template.split("---", 2)[1]
     project_tag = _slug(project, 80)
     values = {
         "date": today,
-        "created_at": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+        "created_at": created_at or datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
         "source_session": session_id,
         "source_session_note": f"[[{session_note}]]" if session_note else "",
         "project": project_tag,
@@ -268,6 +269,15 @@ def _frontmatter(c: Candidate, *, session_id: str, project: str, session_note: s
     front = front.replace(f"project: {project_tag}\n", f"project: {project_tag}\nsource: auto-capture\n", 1)
     front = front.rstrip("\n") + "\n  - claude/auto\n"
     return f"---{front}---\n"
+
+
+def new_filename(vault: str, folder: str, day: str, title: str) -> str:
+    """``<day>-<slug>-<hash4>.md`` that does not exist yet in ``folder``."""
+    for _ in range(2):
+        filename = f"{day}-{_slug(title)}-{_hash4()}.md"
+        if not (Path(vault) / folder / filename).exists():
+            return filename
+    raise RuntimeError("could not find a free filename")
 
 
 def save_candidate(
@@ -310,12 +320,7 @@ def save_candidate(
             session_note = session_note_for(session_id, project, config)
         content = _frontmatter(c, session_id=session_id, project=project,
                                session_note=session_note, today=today) + f"\n# {title}\n\n{body}\n"
-        for _ in range(2):
-            filename = f"{today}-{_slug(title)}-{_hash4()}.md"
-            if not (Path(vault) / folder / filename).exists():
-                break
-        else:
-            raise RuntimeError("could not find a free filename")
+        filename = new_filename(vault, folder, today, title)
         with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
             rc = note_writer.run_write(vault, folder, filename, content)
         if rc != 0:

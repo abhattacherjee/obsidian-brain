@@ -3,7 +3,7 @@
   "displayName": "Obsidian Brain",
   "version": "3.8.1",
   "tagline": "A Claude Code plugin that turns an Obsidian vault into a persistent brain across sessions — auto-logging, curated knowledge capture, snapshot-on-compact, and fast cross-project recall, all via direct filesystem writes.",
-  "lastUpdated": "2026-10-18",
+  "lastUpdated": "2026-10-20",
   "repository": "https://github.com/abhattacherjee/obsidian-brain",
   "defaultBranch": "main",
   "techStack": {
@@ -789,7 +789,7 @@
           "files": [
             "hooks/capture_state.py"
           ],
-          "purpose": "Per-session capture state under <secure dir>/capture/: read offset, transcript path, project and last batch time (<sid>.json, 0600, atomic); O_EXCL claims with a 900 s TTL takeover; the PreCompact flush flag; installed_at (no backfill before first use); the flock-guarded captures.jsonl ledger (append, merged reads, update); and the 'Capture' line in the hook log."
+          "purpose": "Per-session capture state under <secure dir>/capture/: read offset, transcript path, project and last batch time (<sid>.json, 0600, atomic); O_EXCL claims with a 900 s TTL takeover; the PreCompact flush flag; installed_at (no backfill before first use); the flock-guarded captures.jsonl ledger (append, merged reads, update, notes_created_by); and the 'Capture' line in the hook log."
         },
         {
           "id": "capture-slice",
@@ -807,7 +807,7 @@
           "files": [
             "hooks/capture_save.py"
           ],
-          "purpose": "Turns one candidate {type, title, body, topic} into a note. Runs /compress Step 3.5's dedup (curated types only, _rejected/ excluded, is_high_confidence_match); a match gets an '## Update (<date>) — auto-capture <id>' section via note_writer append-update, its body headings demoted to ### or below (outside code fences) and the section closed by an <!-- /auto-capture <id> --> marker, anything else a new note from templates/<type>.md tagged claude/auto with source: auto-capture. Appends one ledger row either way. A locked, changed or failed note write raises TransientSaveError (an OSError) so the worker retries it."
+          "purpose": "Turns one candidate {type, title, body, topic} into a note. Runs /compress Step 3.5's dedup (curated types only, _rejected/ excluded, is_high_confidence_match) with two #427 rules: notes the candidate's own session auto-created (capture_state.notes_created_by) are skipped, and the top note is scored by its original text (strip_auto_updates: frontmatter and auto-capture update sections removed) against auto_capture_update_min_cosine (default 0.35); an empty query vector, unreadable note or empty original-text vector gives a new note; a match gets an '## Update (<date>) — auto-capture <id>' section via note_writer append-update, its body headings demoted to ### or below (outside code fences) and the section closed by an <!-- /auto-capture <id> --> marker, anything else a new note from templates/<type>.md tagged claude/auto with source: auto-capture. Appends one ledger row either way. A locked, changed or failed note write raises TransientSaveError (an OSError) so the worker retries it."
         },
         {
           "id": "capture-reject",
@@ -817,6 +817,15 @@
             "hooks/capture_reject.py"
           ],
           "purpose": "Reject from the Captures pane: a new note moves to <insights>/_rejected/ and leaves the index; an update has only its section cut out, under note_writer's lock and stat re-check, through its end marker (or, for an older update, the next ## heading outside a code fence), CRLF notes kept CRLF, saved as _rejected/<stem>-update-<id>.md. Idempotent, path-contained. recent_rejections() feeds the worker prompt so it stops capturing what was rejected."
+        },
+        {
+          "id": "capture-split",
+          "name": "capture_split.py",
+          "kind": "module",
+          "files": [
+            "hooks/capture_split.py"
+          ],
+          "purpose": "split-updates (#427): applies find_match's two rules to updates already written. An active 'updated' ledger row moves when its note was auto-created by the same session (same-session) or its title + body[:300] scores below auto_capture_update_min_cosine against the note's original text (low-cosine). Dry run by default: one line per note and totals, nothing written (the index DB is reused, not synced). --apply, per note under note_writer's lock: back up the note, write each section as a new insights note (type, session and topic kept, date from the update heading, no heading/bold title/end marker), supersede its ledger row (kind=new, note_path, split_from, split_heading, same id), then rewrite the source once with the stat re-check, CRLF kept. A crash leaves a duplicate, never a loss; the next --apply removes the leftover section (repair) only when the new note exists."
         },
         {
           "id": "capture-worker",
@@ -835,7 +844,7 @@
           "files": [
             "hooks/capture_cli.py"
           ],
-          "purpose": "JSON CLI for the mod, hooks and workers: launch, run-batch, sweep, ledger-list (--session, --since), reject, status (next batch, sweep backlog, vault name). sweep() launches batches for up to 3 transcripts since install with unread bytes, no live claim, no worker sentinel and an eligible() pass, oldest first. It skips transcripts written to within the last interval (still running) and caches a not-eligible verdict as checked_size until the file grows."
+          "purpose": "JSON CLI for the mod, hooks and workers: launch, run-batch, sweep, ledger-list (--session, --since), reject, status (next batch, sweep backlog, vault name), split-updates [--apply] [--json] (text report unless --json; exit 1 when a note failed, 2 when the config has no vault). sweep() launches batches for up to 3 transcripts since install with unread bytes, no live claim, no worker sentinel and an eligible() pass, oldest first. It skips transcripts written to within the last interval (still running) and caches a not-eligible verdict as checked_size until the file grows."
         },
         {
           "id": "capture-mod",
@@ -1131,7 +1140,7 @@
           "name": "Capture state + ledger",
           "kind": "datastore",
           "files": [],
-          "purpose": "<secure dir>/capture/: <sid>.json state, <sid>.claim, <sid>.flush, installed_at, cli_path (where the mod finds capture_cli.py), worker.log, worker-cwd/ and the captures.jsonl ledger (one row per saved capture: id, session, project, type, title, a 200-char summary, kind new/updated, note_path, status active/rejected)."
+          "purpose": "<secure dir>/capture/: <sid>.json state, <sid>.claim, <sid>.flush, installed_at, cli_path (where the mod finds capture_cli.py), worker.log, worker-cwd/ and the captures.jsonl ledger (one row per saved capture: id, session, project, type, title, a 200-char summary, kind new/updated, note_path, status active/rejected; a split update also carries split_from and split_heading) and split-backup-<UTC time>/ (0700) with a 0600 copy of each note split-updates --apply touched."
         }
       ]
     },
@@ -2069,6 +2078,38 @@
           "label": "ledger status=rejected"
         }
       ]
+    },
+    {
+      "id": "capture-split-updates",
+      "name": "Split snowballed updates",
+      "description": "capture_cli.py split-updates moves auto-capture updates that break the #427 rules to their own notes; dry run unless --apply.",
+      "steps": [
+        {
+          "from": "capture-cli",
+          "to": "capture-split",
+          "label": "split-updates [--apply] [--json]"
+        },
+        {
+          "from": "capture-split",
+          "to": "db-capture",
+          "label": "read merged ledger rows"
+        },
+        {
+          "from": "capture-split",
+          "to": "db-index",
+          "label": "term weights for the cosine (compute_query_vector)"
+        },
+        {
+          "from": "capture-split",
+          "to": "note-writer-cli",
+          "label": "--apply: lock, write new note, rewrite source with stat re-check"
+        },
+        {
+          "from": "capture-split",
+          "to": "db-capture",
+          "label": "--apply: backup, superseding row kind=new + split_from"
+        }
+      ]
     }
   ],
   "types": [
@@ -2393,7 +2434,7 @@
   "testing": {
     "unitSuite": {
       "tool": "pytest",
-      "fileCount": 111,
+      "fileCount": 121,
       "duration": "fast (stdlib, no network)",
       "environments": {
         "python": "3.12",

@@ -11,6 +11,8 @@ this one entry point. Every command prints JSON on stdout. Exit 0 is ok,
     ledger-list [--session SID] [--limit 50]                 [row, ...]
     reject <id>                                              the updated row
     status [--session SID]                                   {"next_batch_min": int|null, "pending_sweep": int}
+    split-updates [--apply] [--json]                         text report (JSON with --json); exit 1 if a
+                                                             note failed, 2 on a config without a vault (#427)
 """
 
 from __future__ import annotations
@@ -27,6 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import capture_reject  # noqa: E402
 import capture_slice  # noqa: E402
+import capture_split  # noqa: E402
 import capture_state  # noqa: E402
 import capture_worker  # noqa: E402
 import obsidian_utils  # noqa: E402
@@ -125,7 +128,24 @@ def _parser() -> argparse.ArgumentParser:
     rj.add_argument("id")
     st = sub.add_parser("status")
     st.add_argument("--session")
+    sp = sub.add_parser("split-updates")
+    sp.add_argument("--apply", action="store_true")
+    sp.add_argument("--json", action="store_true")
     return p
+
+
+def split_updates(apply: bool, as_json: bool) -> int:
+    """The ``split-updates`` command: 0 ok, 1 when a note failed, 2 when the config has no vault."""
+    try:
+        report = capture_split.split_updates(obsidian_utils.load_config(), apply=apply)
+    except capture_split.ConfigError as exc:
+        print(f"[obsidian-brain] capture split-updates: {exc}", file=sys.stderr)
+        return 2
+    print(json.dumps(report) if as_json else capture_split.format_report(report))
+    failed = [n for n in report["notes"] if n["error"]]
+    for n in failed:
+        print(f"[obsidian-brain] capture split-updates: {n['note']}: {n['error']}", file=sys.stderr)
+    return 1 if failed else 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -133,6 +153,8 @@ def main(argv: list[str] | None = None) -> int:
         args = _parser().parse_args(argv)
     except SystemExit as exc:
         return 0 if exc.code == 0 else 2
+    if args.cmd == "split-updates":
+        return split_updates(args.apply, args.json)
     try:
         if args.cmd == "launch":
             path = Path(args.transcript) if args.transcript else None
