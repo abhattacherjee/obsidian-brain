@@ -17,7 +17,7 @@ Rules:
 - An insight body is 2 to 8 sentences of plain markdown.
 - `topic` is one or two lowercase words, e.g. `testing`, `hooks`, `git`, `pricing`.
 - Do not use any tools. Answer from the transcript alone.
-- If a list of titles this session already captured appears below, skip a fact that is already in it. Write it again only when this part of the transcript adds something materially new, and then as its own self-contained note about the new part.
+- If a list of titles this session already captured appears below, use it only to avoid repeats: do not restate a fact a listed title already covers. When this part of the transcript adds something new to a listed fact, write a self-contained note about the new part. For anything not in the list, the bar stays as low as above.
 {{earlier}}{{rejections}}
 Reply with **only** a JSON array, no prose before or after it. Each element:
 
