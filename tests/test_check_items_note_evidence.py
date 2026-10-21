@@ -143,6 +143,20 @@ def test_note_cap_corroborated_ref_reaches_high(bucket):
     assert oid.assign_tier(citation, text, "DONE", "agent", cap) == "HIGH"
 
 
+@pytest.mark.parametrize("git_sha,citation_sha,item_sha", [
+    ("abcdef0", "1234567", "1234567"),
+    ("1234567", "1234567", "7654321"),
+    ("1234567" + "a" * 33, "1234567" + "b" * 33, "1234567" + "b" * 33),
+])
+def test_note_cap_unrelated_sha_caps(git_sha, citation_sha, item_sha):
+    # #339: a sha corroborates only when citation, item and git evidence
+    # sit on one prefix chain; two full shas that share 7 chars do not.
+    assert check_items_cli.note_cap_for(
+        _note_cap_bundle(commits=[git_sha + " fixed"]),
+        "p", "done " + citation_sha, "finish " + item_sha,
+    ) is True
+
+
 @pytest.mark.parametrize("git_sha,citation_sha", [
     ("123abcd", "123abcd" + "0" * 33), ("123abcd" + "0" * 33, "123abcd"),
 ])

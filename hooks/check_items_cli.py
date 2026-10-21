@@ -558,13 +558,13 @@ def note_cap_for(evidence, project, citation, item_text) -> bool:
     from open_item_dedup import CONFIDENCE_TIER_RULES
 
     def refs(text, pattern):
-        # Reuse the tier syntax, but reject partial issue/version matches.
-        # In particular, a word boundary accepts v3.4 within v3.4.1.
+        # Reuse the tier syntax, but reject a partial version match: the
+        # trailing \b in the version pattern accepts v3.4.1 inside v3.4.1.2.
+        # (`#\d+` is greedy, so it can never yield #31 out of #318; list
+        # membership below is exact, so issue refs need no extra check.)
         return [m.group(0) for m in re.finditer(pattern, text)
-                if not (m.group(0).startswith("#")
-                        and re.match(r"\d", text[m.end():]))
-                and not (m.group(0).startswith("v")
-                         and re.match(r"\.\d", text[m.end():]))]
+                if not (m.group(0).startswith("v")
+                        and re.match(r"\.\d", text[m.end():]))]
 
     for pattern in CONFIDENCE_TIER_RULES["HIGH"]["literal_ref_patterns"]:
         cited = refs(citation, pattern)
