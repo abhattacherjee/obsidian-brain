@@ -14,6 +14,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `scripts/capture-replay.sh <transcript> <project>`, a dev tool that replays capture over one transcript against a copy of the vault, for tuning the worker prompt. On the `claude-code-config-a838` transcript (1.9 MB) it saved 15 notes in 2 runs of 3 slices, including the `$6.28` Fable 5.1 cold-cache point and the stale statusline price table.
 
 ### Fixed
+- The SessionStart reaper no longer writes a second note for another project's session (#432). It used to find a project's transcript folder by name suffix, so a session started in a folder named `repo` scanned `harden-repo`'s transcripts. Now:
+  - It looks only in the folders Claude Code makes from the session's own cwd. It tries every encoding Claude Code has used, and the realpath of a symlinked cwd.
+  - It skips any session ID that already has a session note in the sessions folder, whatever its `project:`.
+  - Before writing, it checks the cwd the transcript itself recorded. A transcript from another checkout whose path maps to the same folder name (`/w/a.b` and `/w/a-b`) is skipped (`SKIPPED_OTHER_CWD`), and one with no recorded cwd is never written (`SKIPPED_NO_CWD`).
+  - It skips transcripts written to in the last `reaper_min_idle_minutes` (default 30, allowed 0 to 1440). Those most likely belong to a session that is still running.
+  - Its watermark is keyed by the cwd, not the folder name, so two checkouts with the same name no longer share one.
+  - The reaper log now says why nothing was scanned (`NO_CWD`, `NO_TRANSCRIPT_DIR`, `RESOLVE_FAILED`), flags a bad `reaper_min_idle_minutes` (`BAD_CONFIG`), and counts skipped recent transcripts (`skipped_recent=`).
 - The Captures pane's "capture: not set up" status no longer sticks after one failed `cli_path` read. It clears on the next call that finds the CLI, and the pane's problem line shows the cause (`HOME is not set`, `cli_path is empty`, or the read error) (#430).
 - `scrub_secrets()` now redacts `sk-`, `sk-ant-` and `sk-proj-` API keys, `github_pat_` tokens and Slack `xox*` tokens (#379).
 - `/compress` dedup no longer counts an OR-fallback search hit as a duplicate when it shares only one term with the query (#382). An OR-fallback hit must now share at least `min(2, query terms)` terms (`MIN_OR_FALLBACK_TERM_OVERLAP`). The AND path is unchanged.

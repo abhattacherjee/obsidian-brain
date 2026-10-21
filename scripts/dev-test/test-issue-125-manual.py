@@ -51,8 +51,10 @@ def main():
     sentinel.write_text("ok\n")  # Cleanup precondition
 
     home = sandbox / "home"
-    # Use same slug as the real project so _resolve_project_jsonl_dir matches
+    # The reaper resolves the JSONL dir from the exact cwd encoding (#432),
+    # so pass a cwd whose current encoding is project_slug.
     project_name = "obsidian-brain"
+    project_cwd = "/Users/abhishek/dev/claude_workspace/obsidian-brain"
     project_slug = "-Users-abhishek-dev-claude-workspace-obsidian-brain"
     project_dir = home / ".claude" / "projects" / project_slug
     project_dir.mkdir(parents=True)
@@ -68,6 +70,8 @@ def main():
         "sessions_folder": "claude-sessions",
         "min_messages": 3,
         "min_duration_minutes": 2,
+        # Fixture JSONLs are written just now; turn off the recent-transcript skip (#432).
+        "reaper_min_idle_minutes": 0,
         "reaper_enabled": True,
         "reaper_max_runtime_seconds": 30,
     }
@@ -119,6 +123,7 @@ def main():
             vault_path=str(vault),
             sessions_folder="claude-sessions",
             config=config,
+            cwd=project_cwd,
         )
         print(f"  outcome = {out}")
 
@@ -154,7 +159,9 @@ def main():
                     f"{n.name}: claude/reconstructed tag present")
 
         # A8: watermark file was written
-        wm_path = home / ".claude" / "obsidian-brain" / f"reaper-watermark-{project_name}"
+        # The watermark is keyed by the cwd (#432); ask the reaper for its path.
+        from obsidian_session_reaper import _watermark_path
+        wm_path = _watermark_path(project_name, project_cwd)
         _assert(wm_path.exists(), "watermark file written after first run")
 
         # A9: watermark value is positive (> 0)
@@ -183,6 +190,7 @@ def main():
             vault_path=str(vault),
             sessions_folder="claude-sessions",
             config=config,
+            cwd=project_cwd,
         )
         print(f"  outcome = {out2}")
 
@@ -234,6 +242,7 @@ def main():
                 vault_path=str(vault),
                 sessions_folder="claude-sessions",
                 config=config,
+                cwd=project_cwd,
             )
             print(f"  outcome = {out_perm}")
 
@@ -272,7 +281,8 @@ def main():
             fresh_sid2 = "bbbbcccc-dddd-eeee-ffff-000000000000"
             shutil.copy(above_src, project_dir / f"{fresh_sid2}.jsonl")
             # Remove watermark so all files appear new (including already-processed)
-            wm_path2 = home / ".claude" / "obsidian-brain" / f"reaper-watermark-{project_name}"
+            from obsidian_session_reaper import _watermark_path as _wm
+            wm_path2 = _wm(project_name, project_cwd)
             wm_path2.unlink(missing_ok=True)
             # Remove existing vault notes so dedupe set is empty
             for n in sessions.glob("*.md"):
@@ -289,6 +299,7 @@ def main():
                 vault_path=str(vault),
                 sessions_folder="claude-sessions",
                 config=config,
+                cwd=project_cwd,
             )
             log_text2 = (home / ".claude" / "obsidian-brain-hook.log").read_text()
 

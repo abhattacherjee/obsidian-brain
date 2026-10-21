@@ -651,10 +651,10 @@ def _peek_frontmatter_fields(
 
     This is the only implementation; ``_peek_frontmatter_field`` is a
     one-field wrapper over it. It exists because
-    ``obsidian_session_reaper._build_existing_sid_set`` needs ``type``,
-    ``project`` and ``session_id`` from every session note on the SessionStart
-    hook: three single-field calls meant three uncached reads and three
-    parses of the same bytes, ~1000 notes deep, inside a 5-second budget.
+    ``obsidian_session_reaper._build_existing_sid_set`` needs ``type`` and
+    ``session_id`` from every session note on the SessionStart hook:
+    single-field calls meant one uncached read and parse of the same bytes
+    per field, ~1000 notes deep, inside a 5-second budget.
 
     The frontmatter block is located by ``frontmatter.split_frontmatter`` (via
     ``_read_frontmatter_region``), the same bounded, shape-checked scan the
@@ -1478,12 +1478,15 @@ def _cc_encoded_dirnames(path: str) -> set[str]:
     ``-Users-me-dev-claude_workspace-obsidian-brain`` (older: '_' kept) and
     ``-Users-me-dev-claude-workspace-obsidian-brain`` (current: '_' -> '-')
     for one directory; hidden worktree dirs show up with '.' folded to '-'.
+    Today CC folds every non-ASCII-alphanumeric character to '-', including
+    spaces, '~', '@', and '+'.
 
     So rather than commit to one scheme and mis-reject a directory that is
     genuinely ours, enumerate every observed combination and treat them all as
     belonging to `path`.
 
-    Over-generating is NOT free, which is why this is only a PRE-FILTER. A
+    Over-generating is NOT free, which is why other callers use this as a PRE-FILTER.
+    The reaper checks each transcript's recorded cwd before writing. A
     generated variant can collide with a genuinely different directory: cwd
     ``/Users/x/dev/a_b`` folds to the same candidate as an unrelated repo at
     ``/Users/x/dev/a-b``, so a candidate here can keep the WRONG directory.
@@ -1494,7 +1497,7 @@ def _cc_encoded_dirnames(path: str) -> set[str]:
     """
     if not path:
         return set()
-    variants: set[str] = set()
+    variants: set[str] = {re.sub(r"[^A-Za-z0-9]", "-", path)}
     for fold_dot in (False, True):
         for fold_underscore in (False, True):
             enc = path.replace("/", "-")

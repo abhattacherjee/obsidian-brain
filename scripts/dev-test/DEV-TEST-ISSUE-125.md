@@ -198,7 +198,7 @@ watermark (so the orphan is retried on the next session).
 - [ ] **3b.** Save the current watermark:
 
   ```bash
-  WM_PATH=~/.claude/obsidian-brain/reaper-watermark-obsidian-brain
+  WM_PATH=$(ls ~/.claude/obsidian-brain/reaper-watermark-obsidian-brain-* | head -1)  # keyed by a cwd hash since #432
   cp "$WM_PATH" /tmp/wm.bak
   cat /tmp/wm.bak   # note the current timestamp
   ```
@@ -231,7 +231,7 @@ watermark (so the orphan is retried on the next session).
 - [ ] **3g.** Verify the watermark did NOT advance:
 
   ```bash
-  diff <(cat ~/.claude/obsidian-brain/reaper-watermark-obsidian-brain) /tmp/wm.bak
+  diff <(cat "$WM_PATH") /tmp/wm.bak
   ```
 
   Expected: no diff output (watermark unchanged — orphan will be retried).
@@ -303,7 +303,7 @@ reaper activity, even with orphans present.
 - [ ] **5a.** Inspect the watermark file:
 
   ```bash
-  WM_PATH=~/.claude/obsidian-brain/reaper-watermark-obsidian-brain
+  WM_PATH=$(ls ~/.claude/obsidian-brain/reaper-watermark-obsidian-brain-* | head -1)  # keyed by a cwd hash since #432
   ls -la "$WM_PATH"
   cat "$WM_PATH"
   # Convert to human-readable date:
@@ -319,9 +319,9 @@ reaper activity, even with orphans present.
   should have already done this). Compare values:
 
   ```bash
-  cat ~/.claude/obsidian-brain/reaper-watermark-obsidian-brain
+  cat "$WM_PATH"
   # should be a larger epoch value than before Phase 1
-  date -r "$(cat ~/.claude/obsidian-brain/reaper-watermark-obsidian-brain)"
+  date -r "$(cat "$WM_PATH")"
   ```
 
   Expected: the converted date is later than the `$KILLED_SID` session's start time.
