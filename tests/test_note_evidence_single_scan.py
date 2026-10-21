@@ -10,6 +10,54 @@ import open_item_dedup as oid
 from obsidian_utils import match_items_against_evidence
 
 
+def _develop_second_pass(vault_path, sessions_folder, project, max_sessions):
+    """Inline copy of origin/develop's collect_open_items(), so the oracle
+    shares no code with the helper under test."""
+    sessions_dir = os.path.join(vault_path, sessions_folder)
+    all_files = sorted(os.listdir(sessions_dir), reverse=True)
+    results = []
+    matched = 0
+    for fname in all_files:
+        if not fname.endswith('.md'):
+            continue
+        fpath = os.path.join(sessions_dir, fname)
+        try:
+            with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
+                lines = f.readlines()
+        except OSError:
+            continue
+        project_match = False
+        is_session = True
+        type_field_seen = False
+        for line in lines[:20]:
+            stripped = line.strip()
+            if stripped.startswith('project:'):
+                val = stripped.split(':', 1)[1].strip().strip('"').strip("'")
+                if val == project:
+                    project_match = True
+            elif stripped.startswith('type:'):
+                type_field_seen = True
+                tval = stripped.split(':', 1)[1].strip().strip('"').strip("'")
+                is_session = (tval == 'claude-session')
+        if not project_match or (type_field_seen and not is_session):
+            continue
+        matched += 1
+        in_section = False
+        for line_num, line in enumerate(lines, 1):
+            stripped = line.strip()
+            if stripped == '## Open Questions / Next Steps':
+                in_section = True
+                continue
+            if in_section:
+                if stripped.startswith('## '):
+                    break
+                if stripped.startswith('- [ ] '):
+                    results.append((fpath, line_num, stripped[6:]))
+        if matched >= max_sessions:
+            break
+    return results
+
+
 def _old_two_pass(vault_path, sessions_folder, project, max_sessions=10):
     """The pre-#342 gather_note_completion_evidence(), kept as the oracle.
 
@@ -63,7 +111,7 @@ def _old_two_pass(vault_path, sessions_folder, project, max_sessions=10):
         if matched >= max_sessions:
             break
 
-    items = oid.collect_open_items(vault_path, sessions_folder, project, max_sessions)
+    items = _develop_second_pass(vault_path, sessions_folder, project, max_sessions)
     if not items:
         return []
     results = []
@@ -88,7 +136,7 @@ def _old_two_pass(vault_path, sessions_folder, project, max_sessions=10):
 
 
 def _note(sessions, name, *, project="demo", date=None, type_="claude-session",
-          summary="Worked on things.", items=()):
+          summary="Worked on things.", items=(), extra=()):
     fm = ["---"]
     if type_ is not None:
         fm.append(f"type: {type_}")
@@ -96,7 +144,7 @@ def _note(sessions, name, *, project="demo", date=None, type_="claude-session",
     if date is not None:
         fm.append(f"date: {date}")
     fm.append("---")
-    body = "\n".join(f"- [ ] {i}" for i in items)
+    body = "\n".join([f"- [ ] {i}" for i in items] + list(extra))
     (sessions / name).write_text(
         "\n".join(fm) + f"\n\n## Summary\n{summary}\n\n"
         f"## Open Questions / Next Steps\n{body}\n\n## Notes\n- [ ] not an item\n",
@@ -115,7 +163,8 @@ def _vault(tmp_path):
     _note(sessions, "2026-03-05-c.md", type_="claude-snapshot", date="2026-03-05",
           items=["fix parser_crash.py"])
     _note(sessions, "2026-03-04-d.md", date="2026-03-04",
-          items=["fix parser_crash.py", "tidy docs_index.md"])
+          items=["fix parser_crash.py", "tidy docs_index.md"],
+          extra=["- [x] done thing", "  - [ ] nested parser_crash.py"])
     _note(sessions, "2026-03-03-e.md", type_=None, date="2026-03-03",
           items=["add cache_layer.py"])
     _note(sessions, "2026-03-02-f.md", date=None, items=["fix parser_crash.py"])
@@ -139,9 +188,23 @@ def test_gather_matches_two_pass_output(tmp_path):
     flagged = {(os.path.basename(r["file"]), r["text"]) for r in full}
     assert flagged == {
         ("2026-03-04-d.md", "fix parser_crash.py"),
+        ("2026-03-04-d.md", "nested parser_crash.py"),
         ("2026-03-03-e.md", "add cache_layer.py"),
         ("2026-03-01-g.md", "fix parser_crash.py"),
         ("2026-02-28-h.md", "add cache_layer.py"),
+    }
+    # Exact (basename, line, text), with line numbers found independently in
+    # the fixture files (1-based), not taken from the code under test.
+    sessions_dir = vault / "claude-sessions"
+
+    def _line_of(name, text):
+        lines = (sessions_dir / name).read_text(encoding="utf-8").split("\n")
+        hits = [i + 1 for i, ln in enumerate(lines) if ln.strip() == f"- [ ] {text}"]
+        assert len(hits) == 1, (name, text, hits)
+        return hits[0]
+
+    assert {(os.path.basename(r["file"]), r["line"], r["text"]) for r in full} == {
+        (n, _line_of(n, t), t) for n, t in flagged
     }
     # max_sessions=4 stops after 2026-03-01-g.md, so 2026-02-28-h.md drops out.
     window = oid.gather_note_completion_evidence(str(vault), "claude-sessions", "demo", 4)
