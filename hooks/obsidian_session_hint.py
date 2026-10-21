@@ -169,12 +169,11 @@ def _run() -> None:
         print(f"[obsidian-brain] SessionStart outcome=SKIPPED_CODEX_HOST reason={codex_reason}", file=sys.stderr)
         return
 
-    cwd = hook_input.get("cwd", os.getcwd())
+    cwd = hook_input.get("cwd") or os.getcwd()
 
     # 2. Derive project name (needed for bootstrap before vault config).
-    # Cwd-based project name (NOT canonical) — used for CC's path-encoded
-    # JSONL/bootstrap directory lookups. Frontmatter project is canonical;
-    # see canonical_project_name().
+    # The reaper resolves transcript folders from cwd. This basename names
+    # the watermark slug, bootstrap file, and log entries.
     project = get_project_name(cwd)
 
     # 2a. Guard first: when both the monorepo and standalone plugins are
@@ -207,7 +206,7 @@ def _run() -> None:
     if config.get("reaper_enabled", True):
         try:
             import obsidian_session_reaper as _reaper_mod
-            _reaper_mod._reap_orphaned_sessions(project, vault_path, sessions_folder, config, cwd=cwd)
+            _reaper_mod.reap_orphaned_sessions(project, vault_path, sessions_folder, config, cwd=cwd)
         except Exception as exc:
             # Reaper is best-effort; never break SessionStart
             print(f"[obsidian-brain] reaper failed: {exc}", file=sys.stderr)

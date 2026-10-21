@@ -366,9 +366,9 @@ def _run_reaper(args: argparse.Namespace) -> int:
     project = Path(args.cwd).name or "unknown"
 
     # Stage the fixture under ~/.claude/projects/<slug>/ so the reaper's
-    # _resolve_project_jsonl_dirs() can find it. Use the same staging logic as
-    # _run_sessionend but always stage (never skip) since the fixture needs to
-    # live in the project dir for _reap_orphaned_sessions to pick it up.
+    # _resolve_project_jsonl_dirs() can find it from --cwd. A --jsonl that is
+    # already under ~/.claude/projects/ is used in place, so the reaper finds
+    # it only when its folder is one of --cwd's encodings (#432).
     try:
         staged_jsonl = _stage_fixture_under_projects(args.jsonl, args.cwd)
     except OSError as exc:

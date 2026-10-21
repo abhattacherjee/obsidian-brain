@@ -19,6 +19,7 @@ Python stdlib only (no pip dependencies).
 
 from __future__ import annotations
 
+import hashlib
 import math
 import os
 import sys
@@ -126,8 +127,18 @@ def _permission_canary(vault_path: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
+class _ResolvedDirs(list):
+    """List retaining a swallowed resolver error for diagnostic logging."""
+
+    error: OSError | None = None
+
+
 def _resolve_project_jsonl_dirs(cwd: str) -> list[Path]:
-    """Return existing directories for exact cwd encodings, including realpath."""
+    """Try _cc_encoded_dirnames variants of cwd and realpath(cwd).
+
+    Paths differing only in folded characters share candidate names.
+    An empty list means nothing to scan.
+    """
     from obsidian_utils import _cc_encoded_dirnames
 
     if not cwd:
@@ -141,8 +152,10 @@ def _resolve_project_jsonl_dirs(cwd: str) -> list[Path]:
         if real_cwd != cwd:
             names.update(_cc_encoded_dirnames(real_cwd))
         return [base / name for name in sorted(names) if (base / name).is_dir()]
-    except OSError:
-        return []
+    except OSError as exc:
+        result = _ResolvedDirs()
+        result.error = exc
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -195,13 +208,14 @@ def _build_existing_sid_set(vault_path: str, sessions_folder: str) -> set:
 # ---------------------------------------------------------------------------
 
 
-def _log_summary(project: str, out: ReaperOutcome) -> None:
+def _log_summary(project: str, out: ReaperOutcome, skipped_recent: int = 0) -> None:
     from obsidian_utils import _append_reaper_log
 
     detail = (
         f"reaped={out.reaped} "
         f"skipped_existing={out.skipped_already_written} "
         f"skipped_below={out.skipped_below_threshold} "
+        f"skipped_recent={skipped_recent} "
         f"canary_blocked={out.skipped_permission_blocked} "
         f"timeout={out.timeout} "
         f"wall_ms={out.wall_ms}"
@@ -225,7 +239,8 @@ def _reap_orphaned_sessions(
 
     Iterates JSONL files in all exact cwd-encoded project directories
     whose mtime > watermark, checks thresholds, deduplicates against vault,
-    and writes reconstructed notes for orphaned sessions.
+    and writes reconstructed notes for orphaned sessions. Stops at transcripts
+    younger than reaper_min_idle_minutes without moving the watermark past them.
     """
     from obsidian_utils import (
         _append_reaper_log,
@@ -248,8 +263,13 @@ def _reap_orphaned_sessions(
     start_ts = time.monotonic()
     max_runtime = config.get("reaper_max_runtime_seconds", 5)
 
-    watermark_path = Path.home() / ".claude" / "obsidian-brain" / f"reaper-watermark-{project}"
-    watermark = _read_watermark(watermark_path)
+    idle = config.get("reaper_min_idle_minutes", 30)
+    if (isinstance(idle, bool) or not isinstance(idle, (int, float))
+            or not 0 <= idle <= 1440 or not math.isfinite(idle)):
+        _append_reaper_log(project=project, sid=None, event="BAD_CONFIG",
+                           detail=f"reaper_min_idle_minutes={repr(idle)[:60]}")
+        idle = 30
+    min_idle_s = idle * 60
 
     if cwd is None:
         try:
@@ -258,6 +278,10 @@ def _reap_orphaned_sessions(
             cwd = ""
     project_jsonl_dirs = _resolve_project_jsonl_dirs(cwd)
     if not project_jsonl_dirs:
+        error = getattr(project_jsonl_dirs, "error", None)
+        event = "NO_CWD" if not cwd else "RESOLVE_FAILED" if error else "NO_TRANSCRIPT_DIR"
+        detail = f"{type(error).__name__}: {error}" if error else repr(cwd)[:60]
+        _append_reaper_log(project=project, sid=None, event=event, detail=detail)
         wall_ms = int((time.monotonic() - start_ts) * 1000)
         out = ReaperOutcome(
             reaped=0,
@@ -269,6 +293,13 @@ def _reap_orphaned_sessions(
         )
         _log_summary(project, out)
         return out
+
+    # Old basename watermarks are ignored; vault-wide SID dedupe makes the
+    # initial full rescan with a missing (zero) watermark safe.
+    cwd_hash = hashlib.sha256(os.path.realpath(cwd).encode()).hexdigest()[:12]
+    watermark_path = (Path.home() / ".claude" / "obsidian-brain" /
+                      f"reaper-watermark-{slugify(project) or 'x'}-{cwd_hash}")
+    watermark = _read_watermark(watermark_path)
 
     try:
         jsonls = sorted(
@@ -292,10 +323,9 @@ def _reap_orphaned_sessions(
         _log_summary(project, out)
         return out
 
-    # Hoist canonical_project_name() before the loop — spawns git rev-parse
-    # only once per reaper invocation instead of once per JSONL file.
+    # Resolve canonical note naming before the loop.
     # Falls back to `project` param if canonical resolution returns "unknown"
-    # (e.g., cwd deleted or not a git repo).
+    # (only when cwd cannot be determined; non-git dirs use their basename).
     canonical = canonical_project_name(cwd)
 
     # Canonical naming keeps recovered notes consistent with live SessionEnd.
@@ -312,16 +342,12 @@ def _reap_orphaned_sessions(
     n_perm_blocked = False
     did_timeout = False
 
-    # A transcript written to in the last reaper_min_idle_minutes most likely
-    # belongs to a session that is still running (a concurrent session in the
-    # same cwd), not an orphan. Its own SessionEnd will write the note (#432).
-    try:
-        min_idle_s = max(0.0, float(config.get("reaper_min_idle_minutes", 30))) * 60
-    except (TypeError, ValueError):
-        min_idle_s = 30 * 60.0
+    # Recent transcripts likely belong to running sessions; their SessionEnd
+    # will write the note (#432).
+    n_recent = 0
     now = time.time()
 
-    for jsonl in jsonls:
+    for index, jsonl in enumerate(jsonls):
         if time.monotonic() - start_ts >= max_runtime:
             did_timeout = True
             break
@@ -333,8 +359,7 @@ def _reap_orphaned_sessions(
             # jsonls is sorted by mtime, so every later file is recent too.
             # Stop without advancing the watermark past it, so a session that
             # really is orphaned gets reaped on a later SessionStart.
-            _append_reaper_log(project=project, sid=jsonl.stem[:8],
-                               event="SKIPPED_RECENT")
+            n_recent = len(jsonls) - index
             break
 
         sid = jsonl.stem
@@ -347,13 +372,10 @@ def _reap_orphaned_sessions(
         try:
             messages = read_transcript(str(jsonl))
             user_msgs = extract_user_messages(messages)
-            # Use empty cwd — we don't know the original working directory
-            # for an orphaned/reconstructed session.
-            metadata = extract_session_metadata(messages, "")
-            # Override the extractor's "unknown" project with effective_project
-            # so worktree variants (e.g. obsidian-brain-issue-125-...) collapse
-            # to the canonical repo name.  effective_project is hoisted above the
-            # loop and matches the project name used for dedupe + filename slug.
+            # The resolved cwd supplies project_path and the git branch fallback.
+            metadata = extract_session_metadata(messages, cwd)
+            # Keep the frontmatter project consistent with the filename slug.
+            # effective_project is resolved above; SID dedupe is vault-wide.
             metadata["project"] = effective_project
         except Exception as exc:
             _append_reaper_log(project=project, sid=sid_short,
@@ -403,6 +425,7 @@ def _reap_orphaned_sessions(
         err = write_vault_note(vault_path, sessions_folder, filename, content)
         if err is None:
             n_reaped += 1
+            existing_sids.add(sid)
             _append_reaper_log(project=project, sid=sid_short, event="REAPED_OK")
             last_processed_mtime = max(last_processed_mtime, mtime)
         else:
@@ -429,7 +452,7 @@ def _reap_orphaned_sessions(
         timeout=did_timeout,
         wall_ms=wall_ms,
     )
-    _log_summary(project, out)
+    _log_summary(project, out, n_recent)
     return out
 
 
@@ -450,14 +473,15 @@ def reap_orphaned_sessions(
     Parameters
     ----------
     project:
-        Canonical project slug (from obsidian_utils.canonical_project_name()).
+        Cwd basename from the hint (get_project_name(cwd)).
     vault_path:
         Absolute path to the user's Obsidian vault root.
     sessions_folder:
         Vault sub-folder name for session notes (e.g. "claude-sessions").
     config:
-        Loaded config dict from load_config().  Reads ``reaper_enabled`` and
-        ``reaper_max_runtime_seconds`` keys (both optional, safe defaults).
+        Loaded config dict from load_config(). Reads
+        ``reaper_max_runtime_seconds``, ``reaper_min_idle_minutes``,
+        ``min_messages``, and ``min_duration_minutes`` (optional, safe defaults).
 
     cwd:
         Session working directory; defaults to os.getcwd() when omitted.
