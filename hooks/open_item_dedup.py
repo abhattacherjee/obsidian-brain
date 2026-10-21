@@ -406,25 +406,30 @@ def collect_open_items(
             continue
 
         matched += 1
-
-        # Find ## Open Questions / Next Steps and collect - [ ] items
-        in_section = False
-        for line_num, line in enumerate(lines, 1):
-            stripped = line.strip()
-            if stripped == '## Open Questions / Next Steps':
-                in_section = True
-                continue
-            if in_section:
-                if stripped.startswith('## '):
-                    break  # next section
-                if stripped.startswith('- [ ] '):
-                    item_text = stripped[6:]  # after "- [ ] "
-                    results.append((fpath, line_num, item_text))
+        results.extend(_open_items_in(fpath, lines))
 
         if matched >= max_sessions:
             break
 
     return results
+
+
+def _open_items_in(fpath: str, lines: list[str]) -> list[tuple[str, int, str]]:
+    """The `- [ ]` items under `## Open Questions / Next Steps` in one note."""
+    items: list[tuple[str, int, str]] = []
+    in_section = False
+    for line_num, line in enumerate(lines, 1):
+        stripped = line.strip()
+        if stripped == '## Open Questions / Next Steps':
+            in_section = True
+            continue
+        if in_section:
+            if stripped.startswith('## '):
+                break  # next section
+            if stripped.startswith('- [ ] '):
+                item_text = stripped[6:]  # after "- [ ] "
+                items.append((fpath, line_num, item_text))
+    return items
 
 
 _NOTE_EVIDENCE_WINDOW = 10  # mirrors obsidian_utils._OPEN_ITEM_EVIDENCE_WINDOW
@@ -457,11 +462,12 @@ def gather_note_completion_evidence(
     # Single pass, newest-first: apply the SAME project/type filter
     # collect_open_items() uses (first 20 frontmatter lines, quote-stripped,
     # no `type:` field means legacy session) while also picking up `date:`.
-    # Building the evidence pool and the per-note date map here (rather than
-    # re-deriving them from a second scan) guarantees both cover exactly the
-    # same note set collect_open_items() will read below.
+    # The open items, the evidence pool and the per-note date map all come
+    # from this one pass, so each note is read once (#342) and all three
+    # cover exactly the note set collect_open_items() would read.
     evidence_pool: list[tuple[str, str, str]] = []  # (date, title, summary_text)
     date_by_path: dict[str, str] = {}
+    items: list[tuple[str, int, str]] = []
     matched = 0
 
     for fname in all_files:
@@ -499,6 +505,7 @@ def gather_note_completion_evidence(
             continue
 
         matched += 1
+        items.extend(_open_items_in(fpath, lines))
         # An item whose source note has no date: is never flagged --
         # "strictly newer" is undefined without one. Simply don't record it.
         if note_date:
@@ -527,7 +534,6 @@ def gather_note_completion_evidence(
         if matched >= max_sessions:
             break
 
-    items = collect_open_items(vault_path, sessions_folder, project, max_sessions)
     if not items:
         return []
 

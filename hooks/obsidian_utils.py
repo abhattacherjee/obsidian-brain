@@ -5515,15 +5515,15 @@ def build_context_brief(
                             ev_summary, [(fpath, line_num, item_text)]
                         )
                         for c in matched:
-                            # BH-001: confidence >= 3 alone only means a
-                            # distinctive token (e.g. a branch/file name) was
-                            # co-mentioned — it does NOT mean the newer
-                            # session reports the item DONE. A session that
-                            # merely mentions the same branch/file (even to
-                            # say it's still in progress) must not flag the
-                            # item. Require completion language too.
-                            if c.get("confidence", 0) < 3:
-                                continue
+                            # BH-001: a match alone only means a distinctive
+                            # token (e.g. a branch/file name) was co-mentioned
+                            # — it does NOT mean the newer session reports
+                            # the item DONE. A session that merely mentions
+                            # the same branch/file (even to say it's still in
+                            # progress) must not flag the item. Require
+                            # completion language too. No confidence floor
+                            # here: match_items_against_evidence() already
+                            # drops score < 3 before returning (#342).
                             if not c.get("has_completion_phrase"):
                                 continue
                             if best is None or c["confidence"] > best["confidence"]:

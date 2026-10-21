@@ -14,6 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `scripts/capture-replay.sh <transcript> <project>`, a dev tool that replays capture over one transcript against a copy of the vault, for tuning the worker prompt. On the `claude-code-config-a838` transcript (1.9 MB) it saved 15 notes in 2 runs of 3 slices, including the `$6.28` Fable 5.1 cold-cache point and the stale statusline price table.
 
 ### Fixed
+- `/check-items` reads each session note once when it gathers note-completion evidence, not twice. `/recall` drops an unreachable `confidence < 3` check (#342).
+- The test suite fails at collection when a test node id is longer than 4,096 characters, and names the test. pytest puts the id in `PYTEST_CURRENT_TEST`, and a huge one made subprocesses fail with E2BIG on Linux (#412).
 - `/check-items` gathers note-completion evidence for repo-backed projects and caps each notes-bearing verdict at MED unless its citation and item share a git-corroborated literal ref, including cached verdicts (#339).
 - `/check-items` prefilter matches note-completion evidence against any group member by normalized text or source file and line, preserving matches when the representative is rephrased (#341).
 - `/retro` now picks the prior retro by its `created_at` time (falling back to `date`, then filename, and naming the key in the Scope line) instead of filename order, which was random within a day (#329).
