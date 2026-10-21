@@ -70,6 +70,8 @@ def main():
         "sessions_folder": "claude-sessions",
         "min_messages": 3,
         "min_duration_minutes": 2,
+        # Fixture JSONLs are written just now; turn off the recent-transcript skip (#432).
+        "reaper_min_idle_minutes": 0,
         "reaper_enabled": True,
         "reaper_max_runtime_seconds": 30,
     }

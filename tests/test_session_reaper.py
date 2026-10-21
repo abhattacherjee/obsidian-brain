@@ -8,6 +8,7 @@ Subsequent tasks (7–18) add canary, log, main-loop, and wiring tests.
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 import time
@@ -233,6 +234,9 @@ def reaper_env(tmp_path, monkeypatch):
         "min_duration_minutes": 2,
         "reaper_enabled": True,
         "reaper_max_runtime_seconds": 5,
+        # Fixtures are written just now; the recent-transcript guard has its
+        # own tests below.
+        "reaper_min_idle_minutes": 0,
     }
 
     return {
@@ -1542,3 +1546,28 @@ def test_public_wrapper_forwards_cwd(reaper_env, monkeypatch):
         reaper_env["project"], str(reaper_env["vault"]), "claude-sessions",
         reaper_env["config"], cwd=reaper_env["cwd"]) is sentinel
     assert calls == [{"cwd": reaper_env["cwd"]}]
+
+
+@pytest.mark.parametrize("idle_cfg", [None, "not-a-number"])
+def test_reaper_skips_recent_transcript(reaper_env, idle_cfg):
+    """A transcript written to in the last 30 minutes belongs to a session that
+    is probably still running. It is not reaped and the watermark does not move
+    past it; an older orphan before it is still reaped (#432)."""
+    from hooks.obsidian_session_reaper import _reap_orphaned_sessions
+    import time as _time
+    config = dict(reaper_env["config"])
+    del config["reaper_min_idle_minutes"]
+    if idle_cfg is not None:
+        config["reaper_min_idle_minutes"] = idle_cfg
+    old = reaper_env["project_jsonl_dir"] / "old-orphan.jsonl"
+    _make_above_threshold_jsonl(old, "old-orphan")
+    old_mtime = _time.time() - 2 * 3600
+    os.utime(old, (old_mtime, old_mtime))
+    _make_above_threshold_jsonl(reaper_env["project_jsonl_dir"] / "live.jsonl", "live")
+    out = _reap_orphaned_sessions(reaper_env["project"], str(reaper_env["vault"]),
+                                  "claude-sessions", config, cwd=reaper_env["cwd"])
+    assert out.reaped == 1
+    notes = [p.read_text() for p in reaper_env["sessions"].glob("*.md")]
+    assert len(notes) == 1 and "old-orphan" in notes[0]
+    wm = reaper_env["home"] / ".claude" / "obsidian-brain" / f"reaper-watermark-{reaper_env['project']}"
+    assert int(wm.read_text()) == math.ceil(old_mtime)

@@ -312,6 +312,15 @@ def _reap_orphaned_sessions(
     n_perm_blocked = False
     did_timeout = False
 
+    # A transcript written to in the last reaper_min_idle_minutes most likely
+    # belongs to a session that is still running (a concurrent session in the
+    # same cwd), not an orphan. Its own SessionEnd will write the note (#432).
+    try:
+        min_idle_s = max(0.0, float(config.get("reaper_min_idle_minutes", 30))) * 60
+    except (TypeError, ValueError):
+        min_idle_s = 30 * 60.0
+    now = time.time()
+
     for jsonl in jsonls:
         if time.monotonic() - start_ts >= max_runtime:
             did_timeout = True
@@ -320,6 +329,13 @@ def _reap_orphaned_sessions(
         mtime = _safe_mtime(jsonl)
         if mtime <= watermark:
             continue
+        if now - mtime < min_idle_s:
+            # jsonls is sorted by mtime, so every later file is recent too.
+            # Stop without advancing the watermark past it, so a session that
+            # really is orphaned gets reaped on a later SessionStart.
+            _append_reaper_log(project=project, sid=jsonl.stem[:8],
+                               event="SKIPPED_RECENT")
+            break
 
         sid = jsonl.stem
         sid_short = sid[:8]

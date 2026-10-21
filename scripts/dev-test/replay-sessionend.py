@@ -349,6 +349,9 @@ def _run_reaper(args: argparse.Namespace) -> int:
     except (json.JSONDecodeError, OSError) as exc:
         print(f"ERROR: cannot read config: {exc}", file=sys.stderr)
         return 2
+    # The staged fixture is written just now; a replay must not hit the
+    # reaper's skip for transcripts that look like a running session (#432).
+    config["reaper_min_idle_minutes"] = 0
 
     vault_path = config.get("vault_path", "")
     # Default must match obsidian_utils._DEFAULTS["sessions_folder"] == "claude-sessions".
