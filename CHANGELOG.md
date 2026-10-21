@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The SessionStart reaper no longer writes a second note for another project's session (#432). It used to find a project's transcript folder by name suffix, so a session started in a folder named `repo` scanned `harden-repo`'s transcripts. Now:
   - It looks only in the folders Claude Code makes from the session's own cwd. It tries every encoding Claude Code has used, and the realpath of a symlinked cwd.
   - It skips any session ID that already has a session note in the sessions folder, whatever its `project:`.
+  - Before writing, it checks the cwd the transcript itself recorded. A transcript from another checkout whose path maps to the same folder name (`/w/a.b` and `/w/a-b`) is skipped (`SKIPPED_OTHER_CWD`), and one with no recorded cwd is never written (`SKIPPED_NO_CWD`).
   - It skips transcripts written to in the last `reaper_min_idle_minutes` (default 30, allowed 0 to 1440). Those most likely belong to a session that is still running.
   - Its watermark is keyed by the cwd, not the folder name, so two checkouts with the same name no longer share one.
   - The reaper log now says why nothing was scanned (`NO_CWD`, `NO_TRANSCRIPT_DIR`, `RESOLVE_FAILED`), flags a bad `reaper_min_idle_minutes` (`BAD_CONFIG`), and counts skipped recent transcripts (`skipped_recent=`).

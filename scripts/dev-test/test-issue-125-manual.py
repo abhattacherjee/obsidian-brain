@@ -159,7 +159,9 @@ def main():
                     f"{n.name}: claude/reconstructed tag present")
 
         # A8: watermark file was written
-        wm_path = home / ".claude" / "obsidian-brain" / f"reaper-watermark-{project_name}"
+        # The watermark is keyed by the cwd (#432); ask the reaper for its path.
+        from obsidian_session_reaper import _watermark_path
+        wm_path = _watermark_path(project_name, project_cwd)
         _assert(wm_path.exists(), "watermark file written after first run")
 
         # A9: watermark value is positive (> 0)
@@ -279,7 +281,8 @@ def main():
             fresh_sid2 = "bbbbcccc-dddd-eeee-ffff-000000000000"
             shutil.copy(above_src, project_dir / f"{fresh_sid2}.jsonl")
             # Remove watermark so all files appear new (including already-processed)
-            wm_path2 = home / ".claude" / "obsidian-brain" / f"reaper-watermark-{project_name}"
+            from obsidian_session_reaper import _watermark_path as _wm
+            wm_path2 = _wm(project_name, project_cwd)
             wm_path2.unlink(missing_ok=True)
             # Remove existing vault notes so dedupe set is empty
             for n in sessions.glob("*.md"):
