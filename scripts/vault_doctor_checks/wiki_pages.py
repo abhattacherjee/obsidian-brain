@@ -13,7 +13,8 @@
 - ``orphan``: no vault note links ``[[<page>]]`` except the page itself and
   the wiki's own ``index.md``, ``index-<project>.md`` and ``log-<year>.md``
   at the wiki root. Only pages whose ``updated`` date is inside ``--days``
-  are checked (default: all).
+  are checked (default: all). Reported only when the check is named with
+  ``--check wiki-pages``, not in the default sweep (#438).
 - ``page-unreadable``: the page or its staleness check could not be read.
   An unreadable page is shown even under ``--project`` (its project is
   unknown).
@@ -62,12 +63,16 @@ if str(_HOOKS_DIR) not in sys.path:
 
 NAME = "wiki-pages"
 DESCRIPTION = (
-    "Report stale, broken-source, orphan, auto-filed and reviewed-stale wiki "
-    "pages, and rebuild a drifted wiki index"
+    "Report stale, broken-source, auto-filed and reviewed-stale wiki pages "
+    "(orphan pages only under --check), and rebuild a drifted wiki index"
 )
 # Staleness and drift are undated; --days limits only the orphan scan.
 DEFAULT_WINDOW_DAYS = 9999
 OPT_IN = False
+# The dispatcher passes explicit=True when this check is named with --check.
+# `orphan` rows are reported only then (#438): pages are reached through the
+# wiki index and /vault-ask lookup, so "no inbound link" is the normal state.
+SCAN_EXPLICIT = True
 
 # ``[[name]]``, ``[[name|alias]]``, ``[[name#heading]]``, ``[[folder/name]]``.
 _WIKILINK_RE = re.compile(r"\[\[([^\[\]|#]{1,300})(?:[|#][^\[\]]{0,300})?\]\]")
@@ -254,6 +259,7 @@ def scan(
     insights_folder: str,
     days: int,
     project: str | None = None,
+    explicit: bool = False,
 ) -> list:
     import vault_index
     import wiki
@@ -310,7 +316,7 @@ def scan(
             issues.append(_row(page, proj, "auto-filed",
                                f"filed automatically by {meta.get('caller') or 'an unnamed caller'}"))
         updated = _parse_date(meta.get("updated"))
-        if updated is None or updated >= cutoff:
+        if explicit and (updated is None or updated >= cutoff):
             if links is None:
                 links = _linked_stems(vault, wiki_root)
             if not (links.get(page.stem, set()) - {page}):

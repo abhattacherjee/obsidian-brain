@@ -174,6 +174,12 @@ def _run_scan(mod, cfg: dict, days: int, project: str | None, args=None) -> list
             # No default: a declared flag without an argparse attribute must
             # raise AttributeError (contract violation), not be dropped.
             extra_kwargs[flag] = getattr(args, flag)
+    if getattr(mod, "SCAN_EXPLICIT", False):
+        # True only when the user named this check with --check (#438), so a
+        # check can keep review-list rows out of the default sweep.
+        extra_kwargs["explicit"] = bool(
+            args is not None and getattr(args, "check", None) == getattr(mod, "NAME", None)
+        )
     return mod.scan(
         cfg["vault"],
         cfg["sessions_folder"],

@@ -30,7 +30,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import Issue, Result
+from . import Issue, Result, session_is_live
 
 NAME = "source-sessions"
 DESCRIPTION = "Detect and repair stale source_session backlinks"
@@ -801,6 +801,11 @@ def scan(
                         current_sid, cache=jsonl_anywhere_cache
                     )
                     if jsonl_path is not None:
+                        if session_is_live(current_sid, str(jsonl_path)):
+                            # Still running (#438): the session note is
+                            # written at SessionEnd, so its absence now is
+                            # expected. Auto-capture notes cite live sessions.
+                            continue
                         issues.append(
                             Issue(
                                 check=NAME,
