@@ -6,9 +6,9 @@ Issue: https://github.com/abhattacherjee/obsidian-brain/issues/122
 
 from __future__ import annotations
 
-import datetime
 import errno
 import os
+import re
 import textwrap
 from pathlib import Path
 
@@ -1140,27 +1140,36 @@ def test_gather_session_evidence_retro_not_in_other_buckets(tmp_vault: Path) -> 
 
 
 @pytest.mark.parametrize(("rows", "tier", "expected"), [
-    ([("zzzz", "2026-05-03T01:00:00Z", "2026-05-03"),
+    pytest.param([("zzzz", "2026-05-03T01:00:00Z", "2026-05-03"),
       ("aaaa", "2026-05-03T03:00:00+00:00", "2026-05-03"),
       ("mmmm", "2026-05-03T02:00:00", "2026-05-03")],
-     "created_at", ["zzzz", "mmmm", "aaaa"]),
-    ([("2026-05-03-zzzz", "2026-05-03T01:00:00Z", "2026-05-03"),
+     "created_at", ["zzzz", "mmmm", "aaaa"], id="naive-as-utc"),
+    pytest.param([("2026-05-03-zzzz", "2026-05-03T01:00:00Z", "2026-05-03"),
       ("2026-05-02-aaaa", "2026-05-03T01:55:08+00:00", "2026-05-02")],
-     "created_at", ["zzzz", "aaaa"]),
-    ([("2026-05-02-aaaa", "2026-05-02T23:00:00-06:00", "2026-05-02"),
+     "created_at", ["zzzz", "aaaa"], id="timestamp-over-filename-date"),
+    pytest.param([("2026-05-02-aaaa", "2026-05-02T23:00:00-06:00", "2026-05-02"),
       ("2026-05-03-zzzz", "2026-05-03T01:00:00+00:00", "2026-05-03")],
-     "created_at", ["zzzz", "aaaa"]),
-    ([("2026-05-03-cccc", "2026-05-03T12:00:00Z", "2026-05-03"),
+     "created_at", ["zzzz", "aaaa"], id="timezone-instant"),
+    pytest.param([("2026-05-03-cccc", "2026-05-03T12:00:00Z", "2026-05-03"),
       ("2026-05-01-aaaa", "2026-05-01T12:00:00Z", "2026-05-01"),
       ("2026-05-02-bbbb", "2026-05-02T12:00:00Z", "2026-05-02")],
-     "created_at", ["aaaa", "bbbb", "cccc"]),
-    ([("aaaa", "2026-05-03T12:00:00Z", "2026-05-03")],
-     "created_at", ["aaaa"]),
-    ([("aaaa", "", "2026-05-04"), ("zzzz", "not-a-date", "2026-05-03"),
+     "created_at", ["aaaa", "bbbb", "cccc"], id="calendar-dates"),
+    pytest.param([("aaaa", "2026-05-03T12:00:00Z", "2026-05-03")],
+     "created_at", ["aaaa"], id="single-retro"),
+    pytest.param([("aaaa", "", "2026-05-04"), ("zzzz", "not-a-date", "2026-05-03"),
       ("mmmm", "2026-05-03T12:00:00Z", "2026-05-03")],
-     "date", ["mmmm", "zzzz", "aaaa"]),
-    ([("zzzz", "", "2026-05-04"), ("aaaa", "not-a-date", "invalid")],
-     "filename", ["aaaa", "zzzz"]),
+     "date", ["mmmm", "zzzz", "aaaa"], id="date-fallback"),
+    pytest.param([("zzzz", "", "2026-05-04"), ("aaaa", "not-a-date", "invalid")],
+     "filename", ["aaaa", "zzzz"], id="filename-fallback"),
+    pytest.param([
+        ("aaaa", "2026-05-01T23:00:00Z", "2026-05-01"),
+        ("zzzz", "2026-05-02T01:00:00Z", "2026-05-02")],
+        "created_at", ["aaaa", "zzzz"], id="date-before-time-of-day"),
+    pytest.param([
+        ("aaaa", "2026-05-03T02:00:00Z", "2026-05-03"),
+        ("mmmm", "2026-05-03T01:00:00Z", "2026-05-03"),
+        ("zzzz", "2026-05-03T03:00:00Z", "2026-05-03")],
+        "created_at", ["mmmm", "aaaa", "zzzz"], id="neither-filename-direction"),
 ])
 def test_prior_retro_order(tmp_vault: Path, rows, tier, expected) -> None:
     for name, created_at, date in rows:
@@ -1177,23 +1186,21 @@ def test_prior_retro_order(tmp_vault: Path, rows, tier, expected) -> None:
     assert [r["stem"].rsplit("-", 1)[-1] for r in bundle["retros"]] == expected
 
 
-@pytest.mark.parametrize("reverse", [False, True])
-def test_equal_retro_instants_break_ties_by_stem(tmp_vault: Path, reverse: bool) -> None:
-    rows = [("zzzz", "2026-05-02T23:00:00-06:00"), ("aaaa", "2026-05-03T05:00:00Z")]
-    for suffix, stamp in reversed(rows) if reverse else rows:
-        _make_insight(
-            tmp_vault / "claude-insights", filename=f"2026-05-03-retro-{suffix}.md",
-            note_type="claude-retro", sid="SID-A", created_at=stamp,
-        )
-    bundle = obsidian_utils.gather_session_evidence(
-        str(tmp_vault), "claude-sessions", "claude-insights", "SID-A", "obsidian-brain",
-    )
-    assert bundle["prior_retro_key"] == "created_at"
-    assert bundle["retros"][-1]["stem"].endswith("zzzz")
+@pytest.mark.parametrize(("created_at", "tier"), [
+    pytest.param("2026-05-03T05:00:00Z", "created_at", id="equal-instants"),
+    pytest.param("", "date", id="equal-dates"),
+])
+def test_equal_retro_times_break_ties_by_stem(created_at: str, tier: str) -> None:
+    retros = [
+        {"stem": "zzzz", "created_at": created_at, "date": "2026-05-03"},
+        {"stem": "aaaa", "created_at": "2026-05-02T23:00:00-06:00", "date": "2026-05-03"},
+    ]
+    ordered, key = obsidian_utils._retro_order(retros)
+    assert key == tier
+    assert [r["stem"] for r in ordered] == ["aaaa", "zzzz"]
 
 
-@pytest.mark.parametrize("typed", [False, True])
-def test_insight_time_fields(tmp_vault: Path, monkeypatch: pytest.MonkeyPatch, typed: bool) -> None:
+def test_insight_time_fields(tmp_vault: Path) -> None:
     path = _make_insight(
         tmp_vault / "claude-insights", filename="insight.md",
         note_type="claude-insight", sid="SID-A", created_at="2026-05-03T12:00:00+00:00",
@@ -1202,22 +1209,35 @@ def test_insight_time_fields(tmp_vault: Path, monkeypatch: pytest.MonkeyPatch, t
     assert reason is None
     assert meta["created_at"] == "2026-05-03T12:00:00+00:00"
     assert meta["date"] == "2026-05-03"
-    if typed:
-        meta["created_at"] = datetime.datetime.fromisoformat(meta["created_at"])
-        meta["date"] = datetime.date.fromisoformat(meta["date"])
-        monkeypatch.setattr(obsidian_utils, "read_note_metadata_detailed", lambda _: (meta, None))
     bundle = obsidian_utils.gather_session_evidence(
         str(tmp_vault), "claude-sessions", "claude-insights", "SID-A", "obsidian-brain",
     )
-    assert bundle["insights"][0]["created_at"] == str(meta["created_at"])
+    assert bundle["insights"][0]["created_at"] == meta["created_at"]
     assert bundle["insights"][0]["date"] == "2026-05-03"
     assert bundle["prior_retro_key"] == ""
 
 
 def test_retro_skill_names_order_key() -> None:
     skill = (Path(__file__).resolve().parents[1] / "skills/retro/SKILL.md").read_text()
-    assert "ascending filename order = most recent" not in skill
-    assert "prior_retro_key" in skill
+    for prefix in ("**Prior-retro scoping (#285).**", "- **`Prior retros` / `Scope` (#285):**"):
+        prose = next((line for line in skill.splitlines()
+                      if line.startswith(prefix)), None)
+        assert prose is not None, f"Missing prose site: {prefix}"
+        assert "prior_retro_key" in prose
+        assert "filename order" not in prose
+
+
+def test_retro_skill_crash_fallback_bundle_keys(tmp_vault: Path) -> None:
+    bundle = obsidian_utils.gather_session_evidence(
+        str(tmp_vault), "claude-sessions", "claude-insights", "unknown", "obsidian-brain",
+    )
+    skill = (Path(__file__).resolve().parents[1] / "skills/retro/SKILL.md").read_text()
+    fallback = next((block for block in re.findall(
+        r"print\(json\.dumps\(\{(.*?)\}\)\)", skill, re.DOTALL,
+    ) if "evidence helper crashed" in block), None)
+    assert fallback is not None
+    keys = set(re.findall(r"^  ['\"]([^'\"]+)['\"]:", fallback, re.MULTILINE))
+    assert keys == set(bundle) | {"_ctx"}
 
 
 def test_retro_order_empty() -> None:
