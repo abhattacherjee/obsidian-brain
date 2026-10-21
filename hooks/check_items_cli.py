@@ -446,10 +446,12 @@ def note_evidence_only_for(evidence: dict, project: str) -> bool:
 
     Extracted to module level (F12, #318 fix round 4) so BOTH producers of
     a classification record use the identical predicate and cannot drift
-    apart: run_classifier's per-project stamp (fresh sub-agent + L2
-    synthetic verdicts) and skills/check-items/SKILL.md Step 6's
-    cache-merge block (replayed verdicts for known_unchanged groups) — the
-    second of which had NO note_evidence_only key at all until F12, so a
+    apart. Since #339 both producers (run_classifier's per-verdict stamp
+    for fresh sub-agent + L2 synthetic verdicts, and skills/check-items/
+    SKILL.md Step 6's cache-merge block for replayed known_unchanged
+    verdicts) call note_cap_for per verdict; note_cap_for calls this
+    predicate as its notes-only fast path. The cache-merge block had NO
+    note_evidence_only key at all until F12, so a
     cached DONE citation sharing a literal ref with the item text could
     reach HIGH and get auto-checked on every re-run after the first.
 
@@ -502,7 +504,8 @@ def note_evidence_only_for(evidence: dict, project: str) -> bool:
     return not has_git_evidence
 
 
-def note_cap_for(evidence, project, citation, item_text) -> bool:
+def note_cap_for(evidence: dict, project: str, citation: object,
+                 item_text: object) -> bool:
     """True when this verdict must be capped at MED because of note evidence.
 
     #339: the per-VERDICT replacement for #318's per-project flag, so
@@ -1035,7 +1038,12 @@ def run_classifier(stdin_json: str, output_path: str) -> int:
             record = merged_by_id[gid]
             record["note_evidence_only"] = note_cap_for(
                 evidence, g.get("project", ""),
-                record.get("evidence_citation"), record.get("canonical_text"),
+                # #339 (C-001): item text is the group's OWN text, never the
+                # record's canonical_text. canonical_text is classifier
+                # model output; a model could put a git-corroborated ref in
+                # both it and its citation and uncap an item whose real
+                # text lacks the ref. Same source as SKILL.md Step 6.
+                record.get("evidence_citation"), g.get("representative", ""),
             )
 
     ordered = [merged_by_id[g["group_id"]] for g in groups if g["group_id"] in merged_by_id]

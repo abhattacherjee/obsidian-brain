@@ -231,7 +231,10 @@ def assign_tier(evidence_citation, item_text, classification=None,
     `note_evidence_only` is optional and defaults to False (appended last,
     same backward-compat rule). See #318 fix round 2 (F7) below: this is
     THE enforcing guard for a note-completion citation, not the citation-
-    shape regex check that follows it.
+    shape regex check that follows it. Since #339 the flag is stamped per
+    verdict by check_items_cli.note_cap_for: notes-only projects always
+    cap; projects with notes and git evidence cap unless a ref shared by
+    the citation and item text is git-corroborated.
 
     Spec § Confidence tiers (lines 324-332).
     """
