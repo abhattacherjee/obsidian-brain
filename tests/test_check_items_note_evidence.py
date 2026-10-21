@@ -10,6 +10,12 @@ the item done. `/recall` already computes exactly this signal as
 gather_note_completion_evidence() is the same signal, restated as a
 git-free /check-items evidence source.
 
+#339 update: note evidence is now gathered for EVERY project, repo-backed
+or not, and the MED cap is decided per verdict by
+check_items_cli.note_cap_for (a git-corroborated shared ref lifts it), not
+per project. Tests below written for the notes-only design still hold for
+the notes-only fast path inside note_cap_for.
+
 Fixture conventions follow tests/test_recall_stale_openitem_flag.py (the
 `contradicted_by` reference implementation) and
 tests/test_check_items_evidence_gaps.py (the deep_analysis_pipeline /
@@ -18,8 +24,10 @@ subprocess.run-mocking pattern for a repo-less project).
 
 from __future__ import annotations
 
+import ast
 import json as _json
 import os
+from pathlib import Path
 import time as _time
 from unittest.mock import MagicMock, patch
 
@@ -28,6 +36,242 @@ import pytest
 import check_items_cli
 import check_items_prefilter
 import open_item_dedup as oid
+
+
+# #339: exercise the cap with unrelated git evidence so the legacy
+# notes-only shortcut cannot hide a bypass in per-verdict corroboration.
+def _note_cap_bundle(**buckets):
+    return {"p": {"note_completions": [{"text": "finish #318"}],
+                  "commits": ["abcdef0 unrelated work"], **buckets}}
+
+
+@pytest.mark.parametrize("citation,text,project", [
+    (None, "finish #318", "p"), ("", "finish #318", "p"),
+    ("  ", "finish #318", "p"), ("done #318", None, "p"),
+    ("done #318", "", "p"), ("done #318", "  ", "p"),
+    ("done #318", "finish #318", ""),
+])
+def test_note_cap_missing_citation_caps(citation, text, project):
+    assert check_items_cli.note_cap_for(
+        _note_cap_bundle(commits=["abcdef0 fixed #318"]), project, citation, text,
+    )
+
+
+@pytest.mark.parametrize("bucket", [
+    {"merged_prs": "#318"}, {"merged_prs": ["#318"]},
+    {"merged_prs": [None]}, {"merged_prs": [{}]},
+    {"closed_issues": ["#318"]}, {"tags": "v3.4"},
+    {"releases": [None]}, {"changelog_excerpt": ["#318"]},
+    # bool is an int subclass; a string number is not an int either.
+    {"merged_prs": [{"number": True, "title": "fixed #318"}]},
+    {"merged_prs": [{"number": "318", "title": "x"}]},
+])
+def test_note_cap_malformed_bucket_caps(bucket):
+    # A valid matching commit must not mask a malformed sibling bucket.
+    assert check_items_cli.note_cap_for(
+        _note_cap_bundle(commits=["abcdef0 fixed #318"], **bucket),
+        "p", "done #318", "finish #318",
+    )
+
+
+def test_note_cap_any_corroborated_shared_ref_suffices():
+    # Intended (#339): citation and item share #318 AND #999, only #999 is in
+    # git. One corroborated shared ref is enough; every ref need not be.
+    cap = check_items_cli.note_cap_for(
+        _note_cap_bundle(commits=["abcdef0 fixed #999"]),
+        "p", "done #318 and #999", "finish #318 and #999",
+    )
+    assert cap is False
+
+
+@pytest.mark.parametrize("buckets", [{}, {
+    "commits": [], "tags": [], "releases": [], "merged_prs": [],
+    "closed_issues": [], "changelog_excerpt": "",
+}])
+def test_note_cap_empty_git_buckets_caps(buckets):
+    evidence = {"p": {"note_completions": [{"text": "finish #318"}], **buckets}}
+    assert check_items_cli.note_cap_for(evidence, "p", "done #318", "finish #318")
+
+
+def test_note_cap_fts_mentions_never_corroborates():
+    assert check_items_cli.note_cap_for(
+        _note_cap_bundle(fts_mentions={"finish #318": 7}),
+        "p", "done #318", "finish #318",
+    )
+
+
+def test_note_cap_note_text_never_corroborates():
+    assert check_items_cli.note_cap_for(_note_cap_bundle(), "p", "done #318", "finish #318")
+
+
+def test_note_cap_changed_paths_never_corroborates():
+    assert check_items_cli.note_cap_for(
+        _note_cap_bundle(changed_paths=["fix-#318.py"]), "p", "done #318", "finish #318",
+    )
+
+
+@pytest.mark.parametrize("git_ref,citation_ref,item_ref", [
+    ("#31", "#318", "#318"), ("#318", "#31", "#31"),
+    ("#318", "#318", "#31"), ("#318", "#31", "#318"),
+])
+def test_note_cap_issue_ref_boundary(git_ref, citation_ref, item_ref):
+    assert check_items_cli.note_cap_for(
+        _note_cap_bundle(commits=["abcdef0 fixed " + git_ref]),
+        "p", "done " + citation_ref, "finish " + item_ref,
+    )
+
+
+@pytest.mark.parametrize("git_ref,citation_ref,item_ref", [
+    ("v3.4", "v3.4.1", "v3.4.1"), ("v3.4.1", "v3.4", "v3.4"),
+    ("v3.4.1", "v3.4.1", "v3.4"), ("v3.4.1.2", "v3.4.1", "v3.4.1"),
+])
+def test_note_cap_version_boundary(git_ref, citation_ref, item_ref):
+    assert check_items_cli.note_cap_for(
+        _note_cap_bundle(tags=[git_ref]), "p", "released " + citation_ref, "ship " + item_ref,
+    )
+
+
+@pytest.mark.parametrize("git_ref,citation_ref", [("123abc", "123abc7"), ("123abc7", "123abc")])
+def test_note_cap_short_sha_rejected(git_ref, citation_ref):
+    assert check_items_cli.note_cap_for(
+        _note_cap_bundle(commits=[git_ref + " fixed"]),
+        "p", "done " + citation_ref, "finish " + citation_ref,
+    )
+
+
+_PARAPHRASED_CITATIONS = [
+    "Session note says #318 is complete", "Reported complete in session (#318)",
+    "Reported done in session 2026-02-01 (#318)",
+]
+
+
+@pytest.mark.parametrize("citation", _PARAPHRASED_CITATIONS)
+def test_note_cap_uncorroborated_ref_repo_backed_is_med(citation):
+    """The cap is about MISSING git corroboration of #318, not wording: git
+    here holds only unrelated work."""
+    cap = check_items_cli.note_cap_for(_note_cap_bundle(), "p", citation, "finish #318")
+    assert cap is True
+    assert oid.assign_tier(citation, "finish #318", "DONE", "agent", cap) == "MED"
+
+
+@pytest.mark.parametrize("citation", _PARAPHRASED_CITATIONS)
+def test_note_cap_paraphrased_citation_with_git_corroboration_is_uncapped(citation):
+    """Control: the same paraphrased wording is uncapped once git corroborates
+    #318, so wording is irrelevant to the cap."""
+    cap = check_items_cli.note_cap_for(
+        _note_cap_bundle(commits=["abcdef0 fixed #318"]), "p", citation, "finish #318",
+    )
+    assert cap is False
+
+
+@pytest.mark.parametrize("bucket", [
+    {"commits": ["abcdef0 fixed #318"]}, {"tags": ["v3.4"]},
+    {"releases": ["v3.4 release"]}, {"merged_prs": [{"number": 318, "title": "fixed"}]},
+    {"closed_issues": [{"number": 318, "title": "fixed"}]},
+    {"changelog_excerpt": "Fixed #318"},
+])
+def test_note_cap_corroborated_ref_reaches_high(bucket):
+    ref = "v3.4" if "tags" in bucket or "releases" in bucket else "#318"
+    citation, text = "shipped " + ref, "finish " + ref
+    cap = check_items_cli.note_cap_for(_note_cap_bundle(**bucket), "p", citation, text)
+    assert cap is False
+    assert oid.assign_tier(citation, text, "DONE", "agent", cap) == "HIGH"
+
+
+@pytest.mark.parametrize("git_sha,citation_sha,item_sha", [
+    ("abcdef0", "1234567", "1234567"),
+    ("1234567", "1234567", "7654321"),
+    ("1234567" + "a" * 33, "1234567" + "b" * 33, "1234567" + "b" * 33),
+])
+def test_note_cap_unrelated_sha_caps(git_sha, citation_sha, item_sha):
+    # #339: a sha corroborates only when citation, item and git evidence
+    # sit on one prefix chain; two full shas that share 7 chars do not.
+    assert check_items_cli.note_cap_for(
+        _note_cap_bundle(commits=[git_sha + " fixed"]),
+        "p", "done " + citation_sha, "finish " + item_sha,
+    ) is True
+
+
+@pytest.mark.parametrize("git_sha,citation_sha", [
+    ("123abcd", "123abcd" + "0" * 33), ("123abcd" + "0" * 33, "123abcd"),
+])
+def test_note_cap_sha_prefix_both_directions(git_sha, citation_sha):
+    assert check_items_cli.note_cap_for(
+        _note_cap_bundle(commits=[git_sha + " fixed"]),
+        "p", "done " + citation_sha, "finish " + citation_sha,
+    ) is False
+
+
+@pytest.mark.parametrize("notes", [None, [], ""])
+def test_note_cap_no_notes_unchanged(notes):
+    evidence = {"p": {"commits": ["abcdef0 fixed #318"], "note_completions": notes}}
+    assert check_items_cli.note_cap_for(evidence, "p", None, None) is False
+    cap = check_items_cli.note_cap_for(evidence, "p", "done #318", "finish #318")
+    assert oid.assign_tier("done #318", "finish #318", "DONE", "agent", cap) == "HIGH"
+
+
+def test_cache_merge_uses_note_cap_for():
+    skill = (Path(__file__).resolve().parents[1] / "skills/check-items/SKILL.md").read_text()
+    cache = skill.split("# Merge cached classifications", 1)[1].split("out =", 1)[0]
+    assert "from check_items_cli import note_cap_for" in skill
+    assert '"note_evidence_only": note_cap_for(' in cache
+    assert 'g.get("_cached_evidence_citation"), g.get("representative", "")' in cache
+
+
+def test_cache_merge_passes_citation_before_item_text():
+    """C-009: argument ORDER matters (citation, then item text), and the item
+    text must be the group's own representative, not model output."""
+    skill = (Path(__file__).resolve().parents[1] / "skills/check-items/SKILL.md").read_text()
+    blocks = [b.split("PYEOF", 1)[0] for b in skill.split("python3 << 'PYEOF'\n")[1:]]
+    block = next(b for b in blocks if "note_cap_for(" in b)
+    calls = [n for n in ast.walk(ast.parse(block))
+             if isinstance(n, ast.Call) and getattr(n.func, "id", "") == "note_cap_for"]
+    assert len(calls) == 1
+    args = [ast.unparse(a) for a in calls[0].args]
+    assert args[2] == "g.get('_cached_evidence_citation')", args
+    assert args[3] == "g.get('representative', '')", args
+
+
+def test_note_cap_classifier_stamps_each_verdict(tmp_path):
+    """#339: two verdicts in one project must not share a memoised cap."""
+    groups = [{"group_id": str(n), "project": "p", "representative": f"finish #{n}"}
+              for n in (318, 339)]
+    results = [{"group_id": str(n), "classification": "DONE", "confidence": "HIGH",
+                "canonical_text": f"finish #{n}", "evidence_citation": f"fixed #{n}",
+                "action_required": None, "note_evidence_only": False}
+               for n in (318, 339)]
+    payload = {"groups": groups, "evidence": _note_cap_bundle(
+        commits=["abcdef0 fixed #318"],
+    )}
+    out = tmp_path / "verdicts.json"
+    with patch.object(check_items_cli, "_dispatch_classifier_chunk", return_value=(0, results)):
+        # Disable only the evidence-presence prefilter so both mocked agent
+        # records reach the real merge/stamp path.
+        with patch.dict(os.environ, {"CHECK_ITEMS_PREFILTER": "off"}):
+            assert check_items_cli.run_classifier(_json.dumps(payload), str(out)) == 0
+    records = _json.loads(out.read_text())
+    assert [r["note_evidence_only"] for r in records] == [False, True]
+
+
+def test_note_cap_classifier_ignores_model_canonical_text(tmp_path):
+    """#339 (C-001): the cap keys on the group's own text, never on the
+    classifier's canonical_text. A model that writes a git-corroborated ref
+    into both its citation and its canonical_text must not uncap an item
+    whose real text lacks that ref."""
+    groups = [{"group_id": "1", "project": "p",
+               "representative": "finish the exporter"}]
+    results = [{"group_id": "1", "classification": "DONE", "confidence": "HIGH",
+                "canonical_text": "finish #318", "evidence_citation": "fixed #318",
+                "action_required": None, "note_evidence_only": False}]
+    payload = {"groups": groups, "evidence": _note_cap_bundle(
+        commits=["abcdef0 fixed #318"],
+    )}
+    out = tmp_path / "verdicts.json"
+    with patch.object(check_items_cli, "_dispatch_classifier_chunk", return_value=(0, results)):
+        with patch.dict(os.environ, {"CHECK_ITEMS_PREFILTER": "off"}):
+            assert check_items_cli.run_classifier(_json.dumps(payload), str(out)) == 0
+    records = _json.loads(out.read_text())
+    assert [r["note_evidence_only"] for r in records] == [True]
 
 
 def _session(path, date, project, summary="Did some work.", open_items=None):
@@ -221,6 +465,91 @@ def test_prefilter_rule_zero_requires_an_actual_match():
     ) is False
 
 
+@pytest.mark.parametrize("member_key", ["instances", "members"])
+def test_rule_zero_member_only_text_match(member_key):
+    # #341: a later member can retain the checkbox phrasing after merging.
+    group = {"representative": "prepare delivery", member_key: [
+        {"text": "unrelated task"}, {"text": "- [ ] Wire up  the foo exporter"},
+    ]}
+    assert check_items_prefilter.has_classifiable_evidence(
+        group, {"note_completion_items": ["wire up the foo exporter"]},
+    ) is True
+
+
+@pytest.mark.parametrize("member_key", ["instances", "members"])
+@pytest.mark.parametrize("line,expected", [(42, True), (43, False)])
+def test_rule_zero_source_key_with_rephrased_representative(member_key, line, expected):
+    # #341: same file alone is insufficient; identity includes the exact line.
+    group = {"representative": "prepare delivery", member_key: [
+        {"file": "/vault/sessions/source.md", "line": line, "text": "new phrasing"},
+    ]}
+    assert check_items_prefilter.has_classifiable_evidence(group, {
+        "note_completion_items": ["wire up the foo exporter"],
+        "note_completion_keys": [["source.md", 42]],
+    }) is expected
+
+
+@pytest.mark.parametrize("member_key", ["instances", "members"])
+def test_rule_zero_source_key_requires_same_file(member_key):
+    # #341: an equal line in a DIFFERENT file is not the same source item.
+    group = {"representative": "prepare delivery", member_key: [
+        {"file": "/vault/sessions/other.md", "line": 42, "text": "new phrasing"},
+    ]}
+    assert check_items_prefilter.has_classifiable_evidence(group, {
+        "note_completion_items": ["wire up the foo exporter"],
+        "note_completion_keys": [["source.md", 42]],
+    }) is False
+
+
+def test_rule_zero_empty_item_text_never_matches():
+    # Guard: a blank note item normalises to "" and must not match a member
+    # or representative whose text is also blank.
+    group = {"representative": "   ", "members": [{"text": ""}, {"text": "  "}]}
+    assert check_items_prefilter.has_classifiable_evidence(
+        group, {"note_completion_items": ["", "   "]},
+    ) is False
+
+
+@pytest.mark.parametrize("key", [["", 42], ["source.md", None], ["", None]])
+def test_rule_zero_empty_key_parts_never_match(key):
+    # Guard: a key with an empty file or None line must not match a member
+    # with the same empty file / None line.
+    group = {"representative": "prepare delivery", "members": [
+        {"file": "" if key[0] == "" else "source.md", "line": 42 if key[1] else None,
+         "text": "new phrasing"},
+        {"text": "other"},
+    ]}
+    assert check_items_prefilter.has_classifiable_evidence(
+        group, {"note_completion_keys": [key]},
+    ) is False
+
+
+@pytest.mark.parametrize("evidence", [{}, {
+    "note_completion_items": [], "note_completion_keys": [],
+}])
+def test_rule_zero_empty_notes_do_not_fire(evidence):
+    group = {"representative": "prepare delivery", "members": [
+        {"file": "source.md", "line": 42, "text": "wire up the foo exporter"},
+    ]}
+    assert check_items_prefilter.has_classifiable_evidence(group, evidence) is False
+
+
+def test_bridge_note_completion_keys_use_basenames():
+    # #341: note matching preserves full source paths; the bridge must strip them.
+    bridged = check_items_cli._bridge_project_evidence({"p": {"note_completions": [
+        {"file": "/vault/sessions/source.md", "line": 42, "text": "old phrasing"},
+        {"file": "other.md", "line": 7, "text": "another task"},
+    ]}}, "p")
+    assert bridged["note_completion_keys"] == [["source.md", 42], ["other.md", 7]]
+    # Shape B must also recognise evidence consisting solely of source keys.
+    flat = {"note_completion_keys": bridged["note_completion_keys"]}
+    assert check_items_cli._bridge_project_evidence(flat, "p") is flat
+    assert check_items_prefilter.has_classifiable_evidence({
+        "representative": "prepare delivery",
+        "instances": [{"file": "source.md", "line": 42}],
+    }, flat) is True
+
+
 def test_note_completion_citation_reaches_med_not_high():
     """Pin MED explicitly: the tier lift is from LOW, and the HIGH-trust cap
     on _HIGH_TRUST_SOURCES still applies -- it never reaches HIGH.
@@ -372,6 +701,9 @@ def test_evidence_pool_covers_a_wider_max_sessions(tmp_path):
 # verbatim. The real fix is `note_evidence_only`: DATA check_items_cli
 # derives from the evidence bundle's own shape (which no model wording can
 # influence), threaded into assign_tier as an unconditional MED cap.
+# #339: this section describes the original per-project design. Note
+# evidence is now gathered for every project and the cap is per verdict
+# (check_items_cli.note_cap_for); the notes-only case is its fast path.
 # ---------------------------------------------------------------------------
 
 _OFF_TEMPLATE_BYPASS_CITATIONS = [
@@ -395,32 +727,8 @@ def test_note_evidence_only_caps_every_off_template_bypass_at_med(citation):
     assert tier == "MED", (citation, tier)
 
 
-def test_repo_backed_project_never_gets_note_completions(tmp_path):
-    """#318 I3 ruling, REPLACES test_off_template_citation_still_reaches_high_with_git_evidence
-    (deliberately removed -- it pinned the exact behaviour this closes).
-
-    gather_note_completion_evidence() used to run unconditionally for
-    EVERY project inside deep_analysis_pipeline's evidence loop, outside
-    the `if repo_path:` block. note_evidence_only_for() (the MED cap) is a
-    per-PROJECT flag derived from the evidence bundle's shape, not
-    per-verdict -- so a repo-backed project's bundle carrying
-    note_completions ALONGSIDE any git-derived key (even an empty one,
-    which deep_analysis_pipeline sets on every git-command failure branch)
-    still read as "has git evidence", note_evidence_only_for() returned
-    False, and a note-derived citation sharing a literal #N with the item
-    text could reach HIGH and get auto-checked -- the exact bypass the old
-    (now-removed) test pinned as "the pre-existing behaviour, unchanged".
-
-    gather_note_completion_evidence() now runs ONLY in the `else:` branch
-    of `if repo_path:`, so a repo-backed project's bundle can never carry
-    note_completions at all -- the safety property is now unconditional
-    rather than dependent on which git commands happened to fail. The
-    fixture DELIBERATELY includes a real note-completion candidate (a
-    strictly-newer session reporting the item done) so this proves the
-    absence is caused by repo_path being truthy, not by no candidate
-    existing (see test_pipeline_attaches_note_completions_for_repo_less_project
-    below for the repo-less positive control, unaffected by this change).
-    """
+def test_repo_backed_project_carries_note_completions(tmp_path):
+    """#339 restores notes on repos; per-verdict corroboration enforces MED."""
     vault, sessions = _vault(tmp_path)
     insights_dir = vault / "insights"
     insights_dir.mkdir()
@@ -461,22 +769,12 @@ def test_repo_backed_project_never_gets_note_completions(tmp_path):
         data = _json.load(f)
 
     assert result.startswith("OK:"), result
-    assert "note_completions" not in data["evidence"].get("git-proj", {}), (
-        f"repo-backed project must never carry note_completions in its "
-        f"bundle: {data['evidence']}"
-    )
+    assert data["evidence"]["git-proj"]["note_completions"], data["evidence"]
     assert data["evidence_gaps"]["projects_without_repo"] == []
 
 
 def test_bundle_note_completions_only_flags_note_evidence_only(tmp_path):
-    """F7 bundle-level test, via check_items_cli.run_classifier(): a project
-    whose evidence bundle is note_completions-ONLY (no git-derived bucket)
-    is stamped note_evidence_only=True on its output record; a project
-    whose bundle ALSO carries a git-derived bucket (commits) is stamped
-    False, even though it too carries note_completions. Both groups have no
-    classifiable evidence for their own canonical text, so both take the L2
-    synthetic path -- exercising the "stamp synthetic records too" half of
-    the fix without needing to mock a claude -p subprocess dispatch."""
+    """#339 synthetic records cap even when unrelated git evidence exists."""
     stdin_payload = {
         "groups": [
             {
@@ -516,7 +814,11 @@ def test_bundle_note_completions_only_flags_note_evidence_only(tmp_path):
     by_id = {r["group_id"]: r for r in records}
 
     assert by_id["ob-0001"]["note_evidence_only"] is True, by_id["ob-0001"]
-    assert by_id["ob-0002"]["note_evidence_only"] is False, by_id["ob-0002"]
+    # ob-0002 caps only via note_cap_for's missing-citation fail-closed path
+    # (the synthetic record has no evidence_citation). The uncorroborated-
+    # shared-ref path on a notes+git project is covered by
+    # test_note_cap_classifier_stamps_each_verdict (#339 verdict is True).
+    assert by_id["ob-0002"]["note_evidence_only"] is True, by_id["ob-0002"]
 
 
 def test_step7_wiring_threads_note_evidence_only_into_assign_tier():
@@ -561,6 +863,9 @@ def test_step7_wiring_threads_note_evidence_only_into_assign_tier():
 # predicate to check_items_cli.note_evidence_only_for() so both producers
 # (run_classifier's per-project stamp, and SKILL.md Step 6's cache-merge)
 # use the identical logic and cannot drift apart.
+# #339: both producers now call note_cap_for per verdict (it uses
+# note_evidence_only_for as its notes-only fast path); note evidence is
+# gathered for every project.
 # ---------------------------------------------------------------------------
 
 

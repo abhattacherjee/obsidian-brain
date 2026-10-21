@@ -299,17 +299,18 @@ NEEDS-ACTION, STALE, ACTIVE, or REVIEW. Cite the specific evidence you used.
 - DONE — the action is complete. Cite at least one of: merged PR title,
   commit sha, closed issue body, release note, or an insight note that
   explicitly marks the item done.
-  A `note_completions` entry is a valid DONE citation for a project with no
-  git repo: it means a STRICTLY NEWER session summary reports the item done.
+  A `note_completions` entry is a valid DONE citation for any project:
+  it means a STRICTLY NEWER session summary reports the item done.
   Each entry carries a `contradicted_by` date (YYYY-MM-DD) and a
   `contradicted_by_title` (the newer session's title/first summary line).
   Build the citation from EXACTLY those two fields:
   `reported done in session <contradicted_by> (<contradicted_by_title>)`
   — this is the ONLY shape the tier rules recognise as a MED-tier
   note-completion citation; anything else reads as a plain citation with
-  no special handling. (The guarantee that this source never reaches HIGH
-  is enforced in code from the evidence bundle's own shape, not from your
-  wording — do not rely on phrasing to keep it capped.)
+  no special handling. (The guarantee that note evidence never reaches
+  HIGH on its own is enforced in code, per verdict, by git corroboration
+  (#339) — not by your wording, so do not rely on phrasing to keep it
+  capped.)
 - NEEDS-ACTION — the fix is shipped, but the literal action is an
   external command this tool cannot run (e.g. `gh issue close`, token
   rotation, manual verification). Set `action_required` to a
@@ -445,10 +446,12 @@ def note_evidence_only_for(evidence: dict, project: str) -> bool:
 
     Extracted to module level (F12, #318 fix round 4) so BOTH producers of
     a classification record use the identical predicate and cannot drift
-    apart: run_classifier's per-project stamp (fresh sub-agent + L2
-    synthetic verdicts) and skills/check-items/SKILL.md Step 6's
-    cache-merge block (replayed verdicts for known_unchanged groups) — the
-    second of which had NO note_evidence_only key at all until F12, so a
+    apart. Since #339 both producers (run_classifier's per-verdict stamp
+    for fresh sub-agent + L2 synthetic verdicts, and skills/check-items/
+    SKILL.md Step 6's cache-merge block for replayed known_unchanged
+    verdicts) call note_cap_for per verdict; note_cap_for calls this
+    predicate as its notes-only fast path. The cache-merge block had NO
+    note_evidence_only key at all until F12, so a
     cached DONE citation sharing a literal ref with the item text could
     reach HIGH and get auto-checked on every re-run after the first.
 
@@ -499,6 +502,88 @@ def note_evidence_only_for(evidence: dict, project: str) -> bool:
         not _is_empty(proj.get(k)) for k in _GIT_DERIVED_EVIDENCE_KEYS
     )
     return not has_git_evidence
+
+
+def note_cap_for(evidence: dict, project: str, citation: object,
+                 item_text: object) -> bool:
+    """True when this verdict must be capped at MED because of note evidence.
+
+    #339: the per-VERDICT replacement for #318's per-project flag, so
+    note_completions can be gathered for repo-backed projects again. Data
+    we control decides, never the classifier's own wording:
+
+    - a notes-only project (note_evidence_only_for) always caps;
+    - a project with no non-empty note_completions never caps here
+      (unchanged pre-#339 behaviour; #297's source allowlist still applies);
+    - otherwise HIGH needs a literal ref (sha / #N / vX.Y, the same
+      patterns assign_tier uses) present in the citation, the item text
+      AND the git corroboration corpus (commits, tags, releases, merged
+      PR and closed issue "#N title" lines, changelog). fts_mentions,
+      changed_paths and note_completions never corroborate: fts keys are
+      item text, so they would back every item.
+
+    Fails closed (True) on a missing citation or item text, or on a
+    malformed corroboration bucket, whenever notes are present.
+    """
+    if note_evidence_only_for(evidence, project):
+        return True
+    proj = evidence.get(project) or {}
+    if _is_empty(proj.get("note_completions")):
+        return False
+    if not isinstance(citation, str) or not citation.strip():
+        return True
+    if not isinstance(item_text, str) or not item_text.strip():
+        return True
+
+    # Validate every corroboration bucket before accepting any ref. Neither
+    # vault mentions, changed paths nor notes establish git provenance.
+    corpus = []
+    for key in ("commits", "tags", "releases", "merged_prs", "closed_issues"):
+        bucket = proj.get(key, [])
+        if not isinstance(bucket, list):
+            return True
+        for entry in bucket:
+            if key in ("merged_prs", "closed_issues"):
+                if (not isinstance(entry, dict)
+                        or type(entry.get("number")) is not int
+                        or not isinstance(entry.get("title"), str)):
+                    return True
+                corpus.append(f"#{entry['number']} {entry['title']}")
+            elif isinstance(entry, str):
+                corpus.append(entry)
+            else:
+                return True
+    changelog = proj.get("changelog_excerpt", "")
+    if not isinstance(changelog, str):
+        return True
+    corpus.append(changelog)
+
+    from open_item_dedup import CONFIDENCE_TIER_RULES
+
+    def refs(text, pattern):
+        # Reuse the tier syntax, but reject a partial version match: the
+        # trailing \b in the version pattern accepts v3.4.1 inside v3.4.1.2.
+        # (`#\d+` is greedy, so it can never yield #31 out of #318; list
+        # membership below is exact, so issue refs need no extra check.)
+        return [m.group(0) for m in re.finditer(pattern, text)
+                if not (m.group(0).startswith("v")
+                        and re.match(r"\.\d", text[m.end():]))]
+
+    for pattern in CONFIDENCE_TIER_RULES["HIGH"]["literal_ref_patterns"]:
+        cited = refs(citation, pattern)
+        items = refs(item_text, pattern)
+        supported = refs("\n".join(corpus), pattern)
+        for ref in cited:
+            if re.fullmatch(r"[0-9a-f]{7,40}", ref):
+                # Short and full shas must all belong to one prefix chain.
+                for item in items:
+                    for support in supported:
+                        longest = max((ref, item, support), key=len)
+                        if all(longest.startswith(v) for v in (ref, item, support)):
+                            return False
+            elif ref in items and ref in supported:
+                return False
+    return True
 
 
 def _bridge_project_evidence(evidence: dict, project: str) -> dict:
@@ -562,9 +647,15 @@ def _bridge_project_evidence(evidence: dict, project: str) -> dict:
             # #318: note_completions entries (gather_note_completion_evidence)
             # carry pre-resolved item text, not a bucket to text-join like the
             # zones above -- has_classifiable_evidence's Rule 0 compares each
-            # entry directly against a group's canonical text.
+            # entry against the group's representative and members (#341).
             "note_completion_items": [
                 r.get("text", "") for r in (proj.get("note_completions") or [])
+            ],
+            # #341: preserve source identity when semantic merging rephrases
+            # the representative; members may carry only the basename.
+            "note_completion_keys": [
+                [os.path.basename(r.get("file", "")), r.get("line")]
+                for r in (proj.get("note_completions") or [])
             ],
         }
 
@@ -582,7 +673,7 @@ def _bridge_project_evidence(evidence: dict, project: str) -> dict:
     # Shape B: already _text-suffixed at top level (test fixtures / simplified payloads)
     _TEXT_KEYS = {"commits_text", "merged_prs_text", "closed_issues_text",
                   "releases_text", "changelog_excerpt", "fts_mentions_text",
-                  "note_completion_items"}
+                  "note_completion_items", "note_completion_keys"}
     if _TEXT_KEYS.intersection(evidence.keys()):
         return evidence
 
@@ -939,29 +1030,21 @@ def run_classifier(stdin_json: str, output_path: str) -> int:
     for s in synthetic:
         merged_by_id[s["group_id"]] = s
 
-    # -------------------------------------------------------------------
-    # F7 (#318 fix round 2, CRITICAL): stamp note_evidence_only per project
-    # onto every record -- sub-agent AND synthetic alike. This is DATA WE
-    # CONTROL (the evidence bundle's own keys), not text a model composes,
-    # so it can't be bypassed by off-template wording the way fix round 1's
-    # citation-shape regex could. If a project's evidence bundle contains
-    # ONLY note_completions (no git-derived bucket at all), no citation for
-    # any item in it can legitimately be HIGH -- Step 7 threads this flag
-    # into assign_tier(), which caps at MED unconditionally when it's set,
-    # regardless of what the classifier actually wrote. Computed once per
-    # project via a project -> bool memo, not once per group.
-    # -------------------------------------------------------------------
-    _note_only_by_project: dict[str, bool] = {}
-
-    def _note_evidence_only(project: str) -> bool:
-        if project not in _note_only_by_project:
-            _note_only_by_project[project] = note_evidence_only_for(evidence, project)
-        return _note_only_by_project[project]
-
+    # #339: the historical key is now per verdict, including synthetic
+    # records. Git corroboration, not model-declared provenance, gates HIGH.
     for g in groups:
         gid = g.get("group_id")
         if gid in merged_by_id:
-            merged_by_id[gid]["note_evidence_only"] = _note_evidence_only(g.get("project", ""))
+            record = merged_by_id[gid]
+            record["note_evidence_only"] = note_cap_for(
+                evidence, g.get("project", ""),
+                # #339 (C-001): item text is the group's OWN text, never the
+                # record's canonical_text. canonical_text is classifier
+                # model output; a model could put a git-corroborated ref in
+                # both it and its citation and uncap an item whose real
+                # text lacks the ref. Same source as SKILL.md Step 6.
+                record.get("evidence_citation"), g.get("representative", ""),
+            )
 
     ordered = [merged_by_id[g["group_id"]] for g in groups if g["group_id"] in merged_by_id]
 
