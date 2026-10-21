@@ -381,6 +381,56 @@ def test_prefilter_rule_zero_requires_an_actual_match():
     ) is False
 
 
+@pytest.mark.parametrize("member_key", ["instances", "members"])
+def test_rule_zero_member_only_text_match(member_key):
+    # #341: a later member can retain the checkbox phrasing after merging.
+    group = {"representative": "prepare delivery", member_key: [
+        {"text": "unrelated task"}, {"text": "- [ ] Wire up  the foo exporter"},
+    ]}
+    assert check_items_prefilter.has_classifiable_evidence(
+        group, {"note_completion_items": ["wire up the foo exporter"]},
+    ) is True
+
+
+@pytest.mark.parametrize("member_key", ["instances", "members"])
+@pytest.mark.parametrize("line,expected", [(42, True), (43, False)])
+def test_rule_zero_source_key_with_rephrased_representative(member_key, line, expected):
+    # #341: same file alone is insufficient; identity includes the exact line.
+    group = {"representative": "prepare delivery", member_key: [
+        {"file": "/vault/sessions/source.md", "line": line, "text": "new phrasing"},
+    ]}
+    assert check_items_prefilter.has_classifiable_evidence(group, {
+        "note_completion_items": ["wire up the foo exporter"],
+        "note_completion_keys": [["source.md", 42]],
+    }) is expected
+
+
+@pytest.mark.parametrize("evidence", [{}, {
+    "note_completion_items": [], "note_completion_keys": [],
+}])
+def test_rule_zero_empty_notes_do_not_fire(evidence):
+    group = {"representative": "prepare delivery", "members": [
+        {"file": "source.md", "line": 42, "text": "wire up the foo exporter"},
+    ]}
+    assert check_items_prefilter.has_classifiable_evidence(group, evidence) is False
+
+
+def test_bridge_note_completion_keys_use_basenames():
+    # #341: note matching preserves full source paths; the bridge must strip them.
+    bridged = check_items_cli._bridge_project_evidence({"p": {"note_completions": [
+        {"file": "/vault/sessions/source.md", "line": 42, "text": "old phrasing"},
+        {"file": "other.md", "line": 7, "text": "another task"},
+    ]}}, "p")
+    assert bridged["note_completion_keys"] == [["source.md", 42], ["other.md", 7]]
+    # Shape B must also recognise evidence consisting solely of source keys.
+    flat = {"note_completion_keys": bridged["note_completion_keys"]}
+    assert check_items_cli._bridge_project_evidence(flat, "p") is flat
+    assert check_items_prefilter.has_classifiable_evidence({
+        "representative": "prepare delivery",
+        "instances": [{"file": "source.md", "line": 42}],
+    }, flat) is True
+
+
 def test_note_completion_citation_reaches_med_not_high():
     """Pin MED explicitly: the tier lift is from LOW, and the HIGH-trust cap
     on _HIGH_TRUST_SOURCES still applies -- it never reaches HIGH.

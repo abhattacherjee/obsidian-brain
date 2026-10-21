@@ -108,10 +108,10 @@ def has_classifiable_evidence(group: dict, evidence: dict) -> bool:
     """Return True if the group has plausible completion evidence.
 
     Zone-aware rules (first match wins):
-      0. Note-completion match (#318): canonical_text (normalised) matches
-         one of evidence's note_completion_items verbatim — a strictly-newer
-         session's own summary already reported this exact item done. The
-         only rule that works with no git repo.
+      0. Note-completion match (#318, #341): representative or member text
+         (normalised) matches note_completion_items, or a member's source
+         (basename, line) matches note_completion_keys. A strictly-newer
+         session's own summary already reported this exact item done.
       1. Ref shortcut: REF_PATTERN matches #N or commit-sha in canonical_text.
       2. Completion-zone overlap: any content-token from canonical_text
          appears in (merged_prs_text + closed_issues_text + releases_text +
@@ -126,11 +126,11 @@ def has_classifiable_evidence(group: dict, evidence: dict) -> bool:
 
     Args:
         group: Group dict carrying canonical text under 'representative' or
-               'canonical_text'. If neither is present (or both empty),
-               returns False.
+               'canonical_text', plus optional 'instances' / 'members'.
         evidence: Dict with optional keys: commits_text, merged_prs_text,
                   closed_issues_text, releases_text, changelog_excerpt,
-                  fts_mentions_text, note_completion_items. Any missing key
+                  fts_mentions_text, note_completion_items,
+                  note_completion_keys. Any missing key
                   is treated as empty.
 
     Returns:
@@ -144,12 +144,23 @@ def has_classifiable_evidence(group: dict, evidence: dict) -> bool:
     # own tokens — the producer already required an independent completion
     # phrase in a different, later note — so it is safe as a standalone
     # classifiable trigger. Compared on normalised text because the group's
-    # canonical phrasing may differ from the raw checkbox line.
+    # canonical phrasing may differ from the raw checkbox line. #341: semantic
+    # merging can also rephrase the representative entirely, so retain each
+    # member's source identity and original text as independent match routes.
     _note_items = evidence.get("note_completion_items") or []
+    _note_keys = evidence.get("note_completion_keys") or []
+    _members = (group.get("instances") or []) + (group.get("members") or [])
+    if _note_keys:
+        _keys = {(os.path.basename(file), line) for file, line in _note_keys
+                 if file and line is not None}
+        if any((os.path.basename(m.get("file") or ""), m.get("line")) in _keys
+               for m in _members):
+            return True
     if _note_items:
         from open_item_dedup import _normalize_item_text
-        _canon = _normalize_item_text(canonical_text)
-        if _canon and any(_normalize_item_text(t) == _canon for t in _note_items):
+        _texts = {_normalize_item_text(t) for t in _note_items} - {""}
+        if any(_normalize_item_text(t) in _texts for t in
+               [canonical_text] + [m.get("text") or "" for m in _members]):
             return True
 
     # Rule 1: explicit issue/PR/commit-sha reference

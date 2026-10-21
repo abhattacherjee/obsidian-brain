@@ -644,9 +644,15 @@ def _bridge_project_evidence(evidence: dict, project: str) -> dict:
             # #318: note_completions entries (gather_note_completion_evidence)
             # carry pre-resolved item text, not a bucket to text-join like the
             # zones above -- has_classifiable_evidence's Rule 0 compares each
-            # entry directly against a group's canonical text.
+            # entry against the group's representative and members (#341).
             "note_completion_items": [
                 r.get("text", "") for r in (proj.get("note_completions") or [])
+            ],
+            # #341: preserve source identity when semantic merging rephrases
+            # the representative; members may carry only the basename.
+            "note_completion_keys": [
+                [os.path.basename(r.get("file", "")), r.get("line")]
+                for r in (proj.get("note_completions") or [])
             ],
         }
 
@@ -664,7 +670,7 @@ def _bridge_project_evidence(evidence: dict, project: str) -> dict:
     # Shape B: already _text-suffixed at top level (test fixtures / simplified payloads)
     _TEXT_KEYS = {"commits_text", "merged_prs_text", "closed_issues_text",
                   "releases_text", "changelog_excerpt", "fts_mentions_text",
-                  "note_completion_items"}
+                  "note_completion_items", "note_completion_keys"}
     if _TEXT_KEYS.intersection(evidence.keys()):
         return evidence
 
