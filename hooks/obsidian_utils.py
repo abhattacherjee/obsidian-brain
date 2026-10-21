@@ -3432,6 +3432,36 @@ def fetch_snapshot_summaries(
     return results
 
 
+def _retro_order(retros: list[dict]) -> tuple[list[dict], str]:
+    """Order retros oldest first by the strongest key all entries supply."""
+    if not retros:
+        return [], ""
+    for tier in ("created_at", "date"):
+        keys = []
+        for retro in retros:
+            value = str(retro.get(tier, "") or "")
+            try:
+                if tier == "created_at":
+                    key = datetime.datetime.fromisoformat(
+                        value[:-1] + "+00:00" if value.endswith("Z") else value
+                    )
+                    if key.tzinfo is None:
+                        key = key.replace(tzinfo=datetime.timezone.utc)
+                else:
+                    if len(value) != 10:
+                        break
+                    key = datetime.date.fromisoformat(value)
+                    if key.isoformat() != value:
+                        break
+            except ValueError:
+                break
+            keys.append(key)
+        else:
+            ordered = sorted(zip(keys, retros), key=lambda pair: (pair[0], pair[1]["stem"]))
+            return [retro for _, retro in ordered], tier
+    return sorted(retros, key=lambda retro: retro["stem"]), "filename"
+
+
 def gather_session_evidence(
     vault_path: str,
     sessions_folder: str,
@@ -3474,9 +3504,11 @@ def gather_session_evidence(
     Snapshots are returned sorted ascending by stem (YYYY-MM-DD-... prefix),
     which gives correct chronological order including across-midnight sessions.
     Pre-spec snapshots (hhmmss == '??????') sort before all post-spec ones.
-    Insights/decisions/error-fixes/retros are returned sorted ascending by
-    filename. File-read failures are captured in `discovery_errors` and
-    never raised.
+    Insights/decisions/error-fixes are returned sorted ascending by filename.
+    Retros are oldest first by the strongest common key: created_at (aware
+    instants, naive values treated as UTC), date, then filename. The selected
+    tier is named in `prior_retro_key` (empty when there are no retros).
+    File-read failures are captured in `discovery_errors` and never raised.
 
     Used by /retro to ground retrospective analysis in the full session
     arc (pre-compact + post-compact) rather than just the active conversation.
@@ -3489,6 +3521,7 @@ def gather_session_evidence(
         "decisions": [],
         "error_fixes": [],
         "retros": [],
+        "prior_retro_key": "",
         "discovery_errors": [],
     }
     if isinstance(also_session_ids, str):
@@ -3646,7 +3679,10 @@ def gather_session_evidence(
                 "title": title,
                 "body": body,
                 "session_id": meta.get("source_session", ""),
+                "created_at": str(meta.get("created_at", "") or ""),
+                "date": str(meta.get("date", "") or ""),
             })
+    bundle["retros"], bundle["prior_retro_key"] = _retro_order(bundle["retros"])
     return bundle
 
 

@@ -6,6 +6,7 @@ Issue: https://github.com/abhattacherjee/obsidian-brain/issues/122
 
 from __future__ import annotations
 
+import datetime
 import errno
 import os
 import textwrap
@@ -29,6 +30,7 @@ def test_gather_session_evidence_unknown_sid_returns_empty(tmp_vault: Path) -> N
         session_id="unknown",
         project="obsidian-brain",
     )
+    assert bundle["prior_retro_key"] == ""
     assert bundle["session_id"] == "unknown"
     assert bundle["session_ids"] == []
     assert bundle["snapshots"] == []
@@ -144,8 +146,8 @@ INSIGHT_TEMPLATE = """\
 type: {note_type}
 source_session: {sid}
 project: {project}
-date: 2026-05-03
----
+date: {date}
+{created_at_line}---
 
 # {title}
 
@@ -162,12 +164,15 @@ def _make_insight(
     title: str = "Test Title",
     body: str = "Test body content.",
     project: str = "obsidian-brain",
+    created_at: str = "",
+    date: str = "2026-05-03",
 ) -> Path:
     path = insights_dir / filename
     _write(
         path,
         INSIGHT_TEMPLATE.format(
-            note_type=note_type, sid=sid, title=title, body=body, project=project
+            note_type=note_type, sid=sid, title=title, body=body, project=project,
+            date=date, created_at_line=f"created_at: {created_at}\n" if created_at else "",
         ),
     )
     return path
@@ -1132,3 +1137,100 @@ def test_gather_session_evidence_retro_not_in_other_buckets(tmp_vault: Path) -> 
     assert [i["path"] for i in bundle["insights"]] == [str(ins)]
     assert bundle["decisions"] == []
     assert bundle["error_fixes"] == []
+
+
+@pytest.mark.parametrize(("rows", "tier", "expected"), [
+    ([("zzzz", "2026-05-03T01:00:00Z", "2026-05-03"),
+      ("aaaa", "2026-05-03T03:00:00+00:00", "2026-05-03"),
+      ("mmmm", "2026-05-03T02:00:00", "2026-05-03")],
+     "created_at", ["zzzz", "mmmm", "aaaa"]),
+    ([("2026-05-03-zzzz", "2026-05-03T01:00:00Z", "2026-05-03"),
+      ("2026-05-02-aaaa", "2026-05-03T01:55:08+00:00", "2026-05-02")],
+     "created_at", ["zzzz", "aaaa"]),
+    ([("2026-05-02-aaaa", "2026-05-02T23:00:00-06:00", "2026-05-02"),
+      ("2026-05-03-zzzz", "2026-05-03T01:00:00+00:00", "2026-05-03")],
+     "created_at", ["zzzz", "aaaa"]),
+    ([("2026-05-03-cccc", "2026-05-03T12:00:00Z", "2026-05-03"),
+      ("2026-05-01-aaaa", "2026-05-01T12:00:00Z", "2026-05-01"),
+      ("2026-05-02-bbbb", "2026-05-02T12:00:00Z", "2026-05-02")],
+     "created_at", ["aaaa", "bbbb", "cccc"]),
+    ([("aaaa", "2026-05-03T12:00:00Z", "2026-05-03")],
+     "created_at", ["aaaa"]),
+    ([("aaaa", "", "2026-05-04"), ("zzzz", "not-a-date", "2026-05-03"),
+      ("mmmm", "2026-05-03T12:00:00Z", "2026-05-03")],
+     "date", ["mmmm", "zzzz", "aaaa"]),
+    ([("zzzz", "", "2026-05-04"), ("aaaa", "not-a-date", "invalid")],
+     "filename", ["aaaa", "zzzz"]),
+])
+def test_prior_retro_order(tmp_vault: Path, rows, tier, expected) -> None:
+    for name, created_at, date in rows:
+        stem = (name[:10] + "-retro-" + name[11:]
+                if name.startswith("2026-") else f"2026-05-03-retro-{name}")
+        _make_insight(
+            tmp_vault / "claude-insights", filename=f"{stem}.md",
+            note_type="claude-retro", sid="SID-A", created_at=created_at, date=date,
+        )
+    bundle = obsidian_utils.gather_session_evidence(
+        str(tmp_vault), "claude-sessions", "claude-insights", "SID-A", "obsidian-brain",
+    )
+    assert bundle["prior_retro_key"] == tier
+    assert [r["stem"].rsplit("-", 1)[-1] for r in bundle["retros"]] == expected
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_equal_retro_instants_break_ties_by_stem(tmp_vault: Path, reverse: bool) -> None:
+    rows = [("zzzz", "2026-05-02T23:00:00-06:00"), ("aaaa", "2026-05-03T05:00:00Z")]
+    for suffix, stamp in reversed(rows) if reverse else rows:
+        _make_insight(
+            tmp_vault / "claude-insights", filename=f"2026-05-03-retro-{suffix}.md",
+            note_type="claude-retro", sid="SID-A", created_at=stamp,
+        )
+    bundle = obsidian_utils.gather_session_evidence(
+        str(tmp_vault), "claude-sessions", "claude-insights", "SID-A", "obsidian-brain",
+    )
+    assert bundle["prior_retro_key"] == "created_at"
+    assert bundle["retros"][-1]["stem"].endswith("zzzz")
+
+
+@pytest.mark.parametrize("typed", [False, True])
+def test_insight_time_fields(tmp_vault: Path, monkeypatch: pytest.MonkeyPatch, typed: bool) -> None:
+    path = _make_insight(
+        tmp_vault / "claude-insights", filename="insight.md",
+        note_type="claude-insight", sid="SID-A", created_at="2026-05-03T12:00:00+00:00",
+    )
+    meta, reason = obsidian_utils.read_note_metadata_detailed(str(path))
+    assert reason is None
+    assert meta["created_at"] == "2026-05-03T12:00:00+00:00"
+    assert meta["date"] == "2026-05-03"
+    if typed:
+        meta["created_at"] = datetime.datetime.fromisoformat(meta["created_at"])
+        meta["date"] = datetime.date.fromisoformat(meta["date"])
+        monkeypatch.setattr(obsidian_utils, "read_note_metadata_detailed", lambda _: (meta, None))
+    bundle = obsidian_utils.gather_session_evidence(
+        str(tmp_vault), "claude-sessions", "claude-insights", "SID-A", "obsidian-brain",
+    )
+    assert bundle["insights"][0]["created_at"] == str(meta["created_at"])
+    assert bundle["insights"][0]["date"] == "2026-05-03"
+    assert bundle["prior_retro_key"] == ""
+
+
+def test_retro_skill_names_order_key() -> None:
+    skill = (Path(__file__).resolve().parents[1] / "skills/retro/SKILL.md").read_text()
+    assert "ascending filename order = most recent" not in skill
+    assert "prior_retro_key" in skill
+
+
+def test_retro_order_empty() -> None:
+    assert obsidian_utils._retro_order([]) == ([], "")
+
+
+@pytest.mark.parametrize("date", ["", "20260503", "2026-W18-7", "2026-02-30"])
+def test_retro_order_requires_calendar_date(date: str) -> None:
+    retros = [
+        {"stem": "zzzz", "created_at": "", "date": "2026-05-01"},
+        {"stem": "aaaa", "created_at": "invalid", "date": date},
+    ]
+    ordered, tier = obsidian_utils._retro_order(retros)
+    assert tier == "filename"
+    assert [r["stem"] for r in ordered] == ["aaaa", "zzzz"]
+    assert [r["stem"] for r in retros] == ["zzzz", "aaaa"]
