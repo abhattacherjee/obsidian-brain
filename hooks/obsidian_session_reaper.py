@@ -76,6 +76,15 @@ class ReaperOutcome:
 # ---------------------------------------------------------------------------
 
 
+def _watermark_path(project: str, cwd: str) -> Path:
+    """Return the checkout-specific watermark location."""
+    from obsidian_utils import slugify
+
+    digest = hashlib.sha256(os.path.realpath(cwd).encode()).hexdigest()[:12]
+    return (Path.home() / ".claude" / "obsidian-brain" /
+            f"reaper-watermark-{slugify(project) or 'x'}-{digest}")
+
+
 def _read_watermark(path: Path) -> int:
     """Returns epoch seconds; 0 if missing or corrupt."""
     try:
@@ -137,6 +146,7 @@ def _resolve_project_jsonl_dirs(cwd: str) -> list[Path]:
     """Try _cc_encoded_dirnames variants of cwd and realpath(cwd).
 
     Paths differing only in folded characters share candidate names.
+    The reaper checks each transcript's recorded cwd before writing.
     An empty list means nothing to scan.
     """
     from obsidian_utils import _cc_encoded_dirnames
@@ -208,7 +218,8 @@ def _build_existing_sid_set(vault_path: str, sessions_folder: str) -> set:
 # ---------------------------------------------------------------------------
 
 
-def _log_summary(project: str, out: ReaperOutcome, skipped_recent: int = 0) -> None:
+def _log_summary(project: str, out: ReaperOutcome, skipped_recent: int = 0,
+                 skipped_other_cwd: int = 0, skipped_no_cwd: int = 0) -> None:
     from obsidian_utils import _append_reaper_log
 
     detail = (
@@ -216,6 +227,8 @@ def _log_summary(project: str, out: ReaperOutcome, skipped_recent: int = 0) -> N
         f"skipped_existing={out.skipped_already_written} "
         f"skipped_below={out.skipped_below_threshold} "
         f"skipped_recent={skipped_recent} "
+        f"skipped_other_cwd={skipped_other_cwd} "
+        f"skipped_no_cwd={skipped_no_cwd} "
         f"canary_blocked={out.skipped_permission_blocked} "
         f"timeout={out.timeout} "
         f"wall_ms={out.wall_ms}"
@@ -296,9 +309,7 @@ def _reap_orphaned_sessions(
 
     # Old basename watermarks are ignored; vault-wide SID dedupe makes the
     # initial full rescan with a missing (zero) watermark safe.
-    cwd_hash = hashlib.sha256(os.path.realpath(cwd).encode()).hexdigest()[:12]
-    watermark_path = (Path.home() / ".claude" / "obsidian-brain" /
-                      f"reaper-watermark-{slugify(project) or 'x'}-{cwd_hash}")
+    watermark_path = _watermark_path(project, cwd)
     watermark = _read_watermark(watermark_path)
 
     try:
@@ -345,20 +356,25 @@ def _reap_orphaned_sessions(
     # Recent transcripts likely belong to running sessions; their SessionEnd
     # will write the note (#432).
     n_recent = 0
+    n_other_cwd = 0
+    n_no_cwd = 0
+    stopped_mtime = None
     now = time.time()
 
     for index, jsonl in enumerate(jsonls):
+        mtime = _safe_mtime(jsonl)
         if time.monotonic() - start_ts >= max_runtime:
+            stopped_mtime = mtime
             did_timeout = True
             break
 
-        mtime = _safe_mtime(jsonl)
         if mtime <= watermark:
             continue
         if now - mtime < min_idle_s:
             # jsonls is sorted by mtime, so every later file is recent too.
             # Stop without advancing the watermark past it, so a session that
             # really is orphaned gets reaped on a later SessionStart.
+            stopped_mtime = mtime
             n_recent = len(jsonls) - index
             break
 
@@ -372,14 +388,38 @@ def _reap_orphaned_sessions(
         try:
             messages = read_transcript(str(jsonl))
             user_msgs = extract_user_messages(messages)
-            # The resolved cwd supplies project_path and the git branch fallback.
-            metadata = extract_session_metadata(messages, cwd)
+            # Preserve the pre-PR git branch fallback to the process cwd.
+            metadata = extract_session_metadata(messages, "")
+            metadata["project_path"] = cwd
             # Keep the frontmatter project consistent with the filename slug.
             # effective_project is resolved above; SID dedupe is vault-wide.
             metadata["project"] = effective_project
         except Exception as exc:
             _append_reaper_log(project=project, sid=sid_short,
                                event="READ_FAILED", detail=str(exc))
+            continue
+
+        # Folder names are lossy (/w/a.b and /w/a-b share -w-a-b), so check
+        # the cwd the transcript itself recorded before writing (#432). Read
+        # it from the whole transcript: on real data 517 of 4360 transcripts
+        # have no cwd in their first 64 KB (_transcript_cwd's window), and all
+        # 517 have one further in.
+        recorded_cwd = next(
+            (m["cwd"] for m in messages
+             if isinstance(m, dict) and isinstance(m.get("cwd"), str) and m["cwd"]),
+            None,
+        )
+        if recorded_cwd is None:
+            # Cannot be attributed to this checkout: never write it.
+            n_no_cwd += 1
+            _append_reaper_log(project=project, sid=sid_short, event="SKIPPED_NO_CWD")
+            last_processed_mtime = max(last_processed_mtime, mtime)
+            continue
+        if os.path.realpath(recorded_cwd) != os.path.realpath(cwd):
+            n_other_cwd += 1
+            _append_reaper_log(project=project, sid=sid_short,
+                               event="SKIPPED_OTHER_CWD", detail=recorded_cwd[:60])
+            last_processed_mtime = max(last_processed_mtime, mtime)
             continue
 
         min_msgs = config.get("min_messages", 3)
@@ -438,7 +478,11 @@ def _reap_orphaned_sessions(
             # Use math.ceil so the watermark advances past sub-second mtime
             # fragments — prevents re-reading files whose fractional mtime would
             # still satisfy `mtime > watermark` on the next run.
-            _write_watermark_atomic(watermark_path, math.ceil(last_processed_mtime))
+            # Rounding must leave the stopped transcript eligible for retry.
+            value = math.ceil(last_processed_mtime)
+            if stopped_mtime is not None and value >= stopped_mtime:
+                value = math.floor(last_processed_mtime)
+            _write_watermark_atomic(watermark_path, value)
         except OSError as exc:
             _append_reaper_log(project=project, sid=None,
                                event="WATERMARK_WRITE_FAILED", detail=str(exc))
@@ -452,7 +496,7 @@ def _reap_orphaned_sessions(
         timeout=did_timeout,
         wall_ms=wall_ms,
     )
-    _log_summary(project, out, n_recent)
+    _log_summary(project, out, n_recent, n_other_cwd, n_no_cwd)
     return out
 
 

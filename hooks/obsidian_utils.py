@@ -1486,8 +1486,7 @@ def _cc_encoded_dirnames(path: str) -> set[str]:
     belonging to `path`.
 
     Over-generating is NOT free, which is why other callers use this as a PRE-FILTER.
-    The reaper uses these candidates directly (see its resolver docstring),
-    so the collision caveat applies there too. A
+    The reaper checks each transcript's recorded cwd before writing. A
     generated variant can collide with a genuinely different directory: cwd
     ``/Users/x/dev/a_b`` folds to the same candidate as an unrelated repo at
     ``/Users/x/dev/a-b``, so a candidate here can keep the WRONG directory.

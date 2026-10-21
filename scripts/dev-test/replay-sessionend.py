@@ -329,7 +329,7 @@ def _run_sessionend(args: argparse.Namespace) -> int:
 
 def _run_reaper(args: argparse.Namespace) -> int:
     try:
-        from obsidian_session_reaper import _reap_orphaned_sessions  # type: ignore
+        from obsidian_session_reaper import _reap_orphaned_sessions, _watermark_path  # type: ignore
     except ImportError:
         print("reaper module not yet implemented (#125)", file=sys.stderr)
         return 2
@@ -381,7 +381,7 @@ def _run_reaper(args: argparse.Namespace) -> int:
 
     # Set watermark to 0 so the staged fixture (mtime > 0) always passes the
     # watermark check. Write it under the same HOME-relative path the reaper uses.
-    watermark_path = Path(os.path.expanduser("~/.claude")) / "obsidian-brain" / f"reaper-watermark-{project}"
+    watermark_path = _watermark_path(project, args.cwd)
     watermark_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     watermark_path.write_text("0")
 
