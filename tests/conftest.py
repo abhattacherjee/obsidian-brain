@@ -21,6 +21,22 @@ _REPO_ROOT = os.path.join(os.path.dirname(__file__), "..")
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, os.path.abspath(_REPO_ROOT))
 
+# pytest puts each running test's node id in the PYTEST_CURRENT_TEST env var.
+# Linux caps one env string at 128 KB (MAX_ARG_STRLEN), so a huge id makes
+# every subprocess the test starts fail with E2BIG (PR #410). Catch it at
+# collection, far below that cap, with the test named (#412).
+_MAX_NODEID_LEN = 4096
+
+
+def pytest_collection_modifyitems(config, items):
+    for item in items:
+        if len(item.nodeid) > _MAX_NODEID_LEN:
+            raise pytest.UsageError(
+                f"test node id is {len(item.nodeid)} characters, over the "
+                f"{_MAX_NODEID_LEN} limit (#412): {item.nodeid[:200]}... "
+                "Give its parametrize case a short ids= value."
+            )
+
 
 @pytest.fixture(autouse=True)
 def _reset_session_resolution_state():
