@@ -70,10 +70,20 @@ def _link_from_session(env, page: Path, form: str = "[[{stem}]]") -> None:
           body="see " + form.format(stem=page.stem))
 
 
-def _scan(env, days=9999, project=None, explicit=True):
-    # explicit=True is `--check wiki-pages`, the run that reports orphan rows.
+def _scan(env, days=9999, project=None):
     return wp.scan(str(env["vault"]), "claude-sessions", "claude-insights", days,
-                   project=project, explicit=explicit)
+                   project=project)
+
+
+def _change_source(env, name="i1"):
+    _note(env["vault"], "claude-insights", name, "claude-insight", body="changed body")
+
+
+def _newer_note(env, name="i9"):
+    # Dated after the page and sharing the question's topic word, so
+    # wiki.stale reports "newer: <name>" for it.
+    _note(env["vault"], "claude-insights", name, "claude-insight",
+          body="zebracorn ranking revisited", date="2026-10-05")
 
 
 def _classes(issues, page=None):
@@ -141,48 +151,6 @@ def test_reviewed_fresh_page_has_no_rows(env):
     assert _scan(env) == []
 
 
-# --- auto-filed ---------------------------------------------------------------
-
-
-def test_auto_filed_page_is_listed(env):
-    page = _file(env, filed_by="auto", caller="ship")
-    _link_from_session(env, page)
-    assert _classes(_scan(env), page) == ["auto-filed"]
-
-
-# --- orphan -------------------------------------------------------------------
-
-
-def test_orphan_when_nothing_links_the_page(env):
-    page = _file(env)
-    assert _classes(_scan(env), page) == ["orphan"]
-
-
-@pytest.mark.parametrize("form", ["[[{stem}|alias]]", "[[{stem}#Heading]]", "[[claude-wiki/queries/2026/{stem}]]"])
-def test_alias_heading_and_path_links_count(env, form):
-    page = _file(env)
-    _link_from_session(env, page, form)
-    assert _scan(env) == []
-
-
-def test_index_and_log_links_do_not_count(env):
-    page = _file(env)
-    # index.md and log-2026.md already link the page; it is still an orphan.
-    assert f"[[{page.stem}]]" in (env["vault"] / "claude-wiki" / "index.md").read_text()
-    assert _classes(_scan(env), page) == ["orphan"]
-
-
-def test_orphan_check_respects_days(env):
-    page = _file(env)
-    old = page.read_text().replace('updated: "2026-10-02"', 'updated: "2020-01-01"')
-    page.write_text(old)
-    # Re-render the index so index-drift does not join the rows.
-    vault_index.ensure_index(str(env["vault"]), FOLDERS, db_path=env["ctx"]["db"])
-    wiki.rebuild_wiki_index(env["ctx"])
-    assert "orphan" not in _classes(_scan(env, days=30), page)
-    assert "orphan" in _classes(_scan(env, days=99999), page)
-
-
 # --- index-drift --------------------------------------------------------------
 
 
@@ -237,7 +205,8 @@ def test_apply_skips_when_the_wiki_lock_is_held(env, tmp_path):
 
 
 def test_report_only_rows_are_unresolved(env):
-    page = _file(env)
+    _file(env)
+    _change_source(env)
     rows = _scan(env)
     assert rows and all(r.extra.get("unresolved") and r.confidence == 0.0 for r in rows)
     assert all(r.status == "unresolved" for r in wp.apply(rows, "unused"))
@@ -283,7 +252,8 @@ def test_unreadable_page_is_shown_even_under_project(env):
 
 def test_project_filter_limits_page_rows(env):
     page = _file(env)
-    assert _classes(_scan(env, project="demo"), page) == ["orphan"]
+    _change_source(env)
+    assert _classes(_scan(env, project="demo"), page) == ["stale"]
     assert _scan(env, project="nomatch") == []
 
 
@@ -327,13 +297,6 @@ def test_leftover_index_file_is_drift_but_a_user_file_is_not(env):
     (w / "index-old.md").write_text('---\ntype: "claude-wiki-index"\n---\n# old\n')
     rows = _scan(env)
     assert _classes(rows) == ["index-drift"] and rows[0].extra["files"]["extra"] == ["index-old.md"]
-
-
-def test_a_self_link_does_not_save_a_page_from_orphan(env):
-    page = _file(env)
-    page.write_text(page.read_text() + f"\nSee also [[{page.stem}]].\n")
-    vault_index.ensure_index(str(env["vault"]), FOLDERS, db_path=env["ctx"]["db"])
-    assert "orphan" in _classes(_scan(env), page)
 
 
 # --- review fixes (#399) ------------------------------------------------------
@@ -398,21 +361,6 @@ def test_unreadable_year_folder_crashes_the_check(env):
         year.chmod(0o700)
 
 
-@pytest.mark.parametrize("form", ["| [[{stem}\\|alias]] | x |", "[[{stem}.md]]", "[[{stem}.md\\|alias]]"])
-def test_table_alias_and_md_links_count(env, form):
-    page = _file(env)
-    _link_from_session(env, page, form)
-    assert _scan(env) == []
-
-
-def test_odd_backslash_links_do_not_crash(env):
-    page = _file(env)
-    _note(env["vault"], "claude-sessions", "s-odd", "claude-session", body="[[a\\\\b]] [[\\]] [[x\\]]")
-    assert _classes(_scan(env), page) == ["orphan"]
-    links = wp._linked_stems(env["vault"], env["vault"] / "claude-wiki")
-    assert "a\\\\b" in links and "x" in links and "" not in links
-
-
 def test_memory_backed_page_with_deleted_memory_file_is_broken_source(env, tmp_path, monkeypatch):
     store = tmp_path / "home" / ".claude" / "projects" / "proj" / "memory"
     store.mkdir(parents=True)
@@ -430,15 +378,6 @@ def test_memory_backed_page_with_deleted_memory_file_is_broken_source(env, tmp_p
     assert "missing: memory:proj/x.md" in rows[0].reason
 
 
-def test_split_index_links_do_not_save_a_page_from_orphan(env, monkeypatch):
-    monkeypatch.setattr(wiki, "INDEX_SPLIT", 0)
-    page = _file(env)
-    w = env["vault"] / "claude-wiki"
-    assert f"[[{page.stem}]]" in (w / "index-demo.md").read_text()
-    assert "[[index-demo]]" in (w / "index.md").read_text()
-    assert _classes(_scan(env)) == ["orphan"]
-
-
 def test_stale_crash_on_one_page_does_not_hide_the_next(env, monkeypatch):
     a = _file(env, question="alpha zebracorn question?")
     b = _file(env, question="beta zebracorn question?")
@@ -450,15 +389,10 @@ def test_stale_crash_on_one_page_does_not_hide_the_next(env, monkeypatch):
         return real(db, page, roots, **kw)
 
     monkeypatch.setattr(wiki, "stale", flaky)
+    _change_source(env)
     rows = _scan(env)
     assert "page-unreadable" in _classes(rows, a) and "kaput" in [r for r in rows if r.note_path == str(a)][0].reason
-    assert _classes(rows, b) == ["orphan"]
-
-
-def test_session_note_named_index_still_counts_as_a_link(env):
-    page = _file(env)
-    _note(env["vault"], "claude-sessions", "index", "claude-session", body=f"see [[{page.stem}]]")
-    assert _scan(env) == []
+    assert _classes(rows, b) == ["stale"]
 
 
 def test_apply_backs_up_and_removes_a_leftover_index_file(env, tmp_path):
@@ -541,7 +475,7 @@ def test_a_vault_that_is_not_the_configured_one_is_skipped(env, tmp_path, capsys
     before = _note_paths(db)
     assert str(page) in before
     other = _other_vault(tmp_path)
-    got = wp.scan(str(other), "claude-sessions", "claude-insights", 9999, explicit=True)
+    got = wp.scan(str(other), "claude-sessions", "claude-insights", 9999)
     assert got == [] and _note_paths(db) == before
     err = capsys.readouterr().err
     assert (f"[wiki-pages] skipped: --vault {other} is not the configured vault {env['vault']}; "
@@ -550,7 +484,7 @@ def test_a_vault_that_is_not_the_configured_one_is_skipped(env, tmp_path, capsys
 
 @pytest.mark.parametrize("form", ["symlink", "trailing-slash", "tilde"])
 def test_the_configured_vault_by_another_spelling_is_not_skipped(env, tmp_path, monkeypatch, form):
-    page = _file(env)
+    _file(env)
     _note(env["vault"], "claude-insights", "i1", "claude-insight", body="changed body")
     vault = str(env["vault"])
     if form == "symlink":
@@ -567,7 +501,7 @@ def test_the_configured_vault_by_another_spelling_is_not_skipped(env, tmp_path, 
         cfg = dict(env["cfg"], vault_path=f"~/{rel}")
         (tmp_path / ".claude" / "obsidian-brain-config.json").write_text(json.dumps(cfg))
         passed = vault
-    rows = wp.scan(passed, "claude-sessions", "claude-insights", 9999, explicit=True)
+    rows = wp.scan(passed, "claude-sessions", "claude-insights", 9999)
     assert "stale" in [i.extra["signal_class"] for i in rows]
 
 
@@ -575,7 +509,8 @@ def test_a_config_without_vault_path_scans_the_given_vault(env, capsys):
     cfg = {k: v for k, v in env["cfg"].items() if k != "vault_path"}
     (env["home"] / ".claude" / "obsidian-brain-config.json").write_text(json.dumps(cfg))
     page = _file(env)
-    assert _classes(_scan(env), page) == ["orphan"]
+    _change_source(env)
+    assert _classes(_scan(env), page) == ["stale"]
     assert "skipped" not in capsys.readouterr().err
 
 
@@ -608,18 +543,7 @@ def test_no_memory_listing_when_no_page_cites_memory(env, monkeypatch):
     assert _scan(env) == [] and calls == []
 
 
-# --- orphan rows only when the check is named (#438) --------------------------
-
-
-def test_default_sweep_hides_orphan_rows(env):
-    page = _file(env)
-    assert _classes(_scan(env, explicit=True), page) == ["orphan"]
-    assert _classes(_scan(env, explicit=False), page) == []
-
-
-def test_default_sweep_still_reports_auto_filed(env):
-    page = _file(env, filed_by="auto", caller="ship")
-    assert "auto-filed" in _classes(_scan(env, explicit=False), page)
+# --- the dispatcher's explicit flag (#438) -----------------------------------
 
 
 def test_dispatcher_passes_explicit_only_when_this_check_is_named():
@@ -645,14 +569,61 @@ def test_dispatcher_passes_explicit_only_when_this_check_is_named():
     assert seen[-1] is False
 
 
-def test_real_wiki_pages_module_gets_explicit_from_the_dispatcher(monkeypatch):
-    import argparse
-    import vault_doctor
+# --- only rows a person can act on (#440) -------------------------------------
 
-    assert wp.SCAN_EXPLICIT is True
-    seen = []
-    monkeypatch.setattr(wp, "scan", lambda *_a, **kw: seen.append(kw["explicit"]) or [])
-    cfg = {"vault": "v", "sessions_folder": "s", "insights_folder": "i"}
-    for check, want in (("wiki-pages", True), (None, False)):
-        vault_doctor._run_scan(wp, cfg, 7, None, args=argparse.Namespace(check=check))
-        assert seen[-1] is want, check
+
+def test_newer_note_alone_gives_no_row(env):
+    page = _file(env)
+    _newer_note(env)
+    vault_index.ensure_index(str(env["vault"]), FOLDERS, db_path=env["ctx"]["db"])
+    roots = [str(env["vault"] / f) for f in FOLDERS]
+    # Positive control: wiki.stale still reports the newer note (/vault-ask uses it).
+    assert "newer: i9" in wiki.stale(env["ctx"]["db"], page, roots)["reasons"]
+    assert _scan(env) == []
+
+
+def test_newer_reason_is_left_out_of_a_stale_row(env):
+    page = _file(env)
+    _newer_note(env)
+    _change_source(env)
+    rows = [r for r in _scan(env) if r.note_path == str(page)]
+    assert [r.extra["signal_class"] for r in rows] == ["stale"]
+    assert rows[0].extra["reasons"] == ["changed: i1"]
+    assert "newer:" not in rows[0].reason
+
+
+def test_reviewed_page_with_only_a_newer_note_gives_no_row(env):
+    page = _file(env)
+    _mark_reviewed(page)
+    _newer_note(env)
+    assert _scan(env) == []
+
+
+def test_newer_reason_is_left_out_of_a_reviewed_stale_row(env):
+    page = _file(env)
+    _mark_reviewed(page)
+    _newer_note(env)
+    _change_source(env)
+    rows = [r for r in _scan(env) if r.note_path == str(page)]
+    assert [r.extra["signal_class"] for r in rows] == ["reviewed-stale"]
+    assert rows[0].extra["reasons"] == ["changed: i1"]
+
+
+def test_unverifiable_source_still_gives_a_stale_row(env):
+    page = _file(env)
+    page.write_text(page.read_text().replace("sources_fingerprint:", "old_fingerprint:"))
+    rows = [r for r in _scan(env) if r.note_path == str(page)]
+    assert [r.extra["signal_class"] for r in rows] == ["stale"]
+    assert all(x.startswith("unverifiable:") for x in rows[0].extra["reasons"])
+
+
+def test_auto_filed_unlinked_page_gives_no_row(env):
+    page = _file(env, filed_by="auto", caller="ship")
+    assert "auto" in page.read_text()
+    assert _scan(env) == []
+
+
+def test_wiki_pages_does_not_ask_for_the_explicit_flag():
+    # Nothing in the check depends on --check any more, so the dispatcher
+    # must not pass explicit= to it.
+    assert getattr(wp, "SCAN_EXPLICIT", False) is False

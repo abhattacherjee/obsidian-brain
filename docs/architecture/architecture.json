@@ -3,7 +3,7 @@
   "displayName": "Obsidian Brain",
   "version": "3.8.1",
   "tagline": "A Claude Code plugin that turns an Obsidian vault into a persistent brain across sessions — auto-logging, curated knowledge capture, snapshot-on-compact, and fast cross-project recall, all via direct filesystem writes.",
-  "lastUpdated": "2026-10-21",
+  "lastUpdated": "2026-10-22",
   "repository": "https://github.com/abhattacherjee/obsidian-brain",
   "defaultBranch": "main",
   "techStack": {
@@ -772,7 +772,7 @@
           "files": [
             "scripts/vault_doctor_checks/wiki_pages.py"
           ],
-          "purpose": "Health of the LLM wiki's pages under <wiki_folder>/queries/ (#396). Default sweep (OPT_IN False); DEFAULT_WINDOW_DAYS 9999. Reads the config file at call time from Path.home(): a missing file means the defaults; a corrupt config, an invalid wiki_folder or a queries/ folder (or subfolder) that cannot be read raises (crashed check, exit 2); a wiki that is turned off, a folder that does not exist, or an empty wiki (no indexed pages, no index.md, no index-*.md typed claude-wiki-index) reports nothing. A vault path that is not the configured vault_path (--vault or OBSIDIAN_BRAIN_VAULT; compared after expanduser and resolve) is skipped with one stderr line, because the check syncs the shared index of the configured vault. Lists the pages first, so an unreadable folder raises before the sync can drop its rows, then syncs the vault index (ensure_index on indexed_folders(strict=True)). Lists memory files at most once per scan, on the first page that cites memory, and passes the listing to every wiki.stale call. Sets SCAN_EXPLICIT = True: orphan rows appear only under --check wiki-pages, not in the default sweep. Per page: stale (any wiki.stale reason except missing:), broken-source (missing: reasons), reviewed-stale (replaces stale for reviewed pages), auto-filed (filed_by: auto), orphan (no vault note links [[page]] except the page itself and the wiki's own index.md, index-<project>.md and log-<year>.md at the wiki root; [[stem\\|alias]] table links and [[stem.md]] count; only pages whose updated date is inside --days) and page-unreadable (shown even under --project). These rows are report-only: extra.unresolved, confidence 0.0, so --min-confidence above 0.0 hides every row except index-drift. Once for the wiki: index-drift (confidence 1.0) when the index files differ from wiki.render_wiki_index; apply backs up index.md and index-*.md under <backup_root>/wiki-pages/<stamp>/ and calls rebuild_wiki_index under the note_writer lock (<wiki_folder>/..wiki.ob-lock), skipped if the lock is held; an error result keeps backup_path when the backup was taken."
+          "purpose": "Health of the LLM wiki's pages under <wiki_folder>/queries/ (#396). Default sweep (OPT_IN False); DEFAULT_WINDOW_DAYS 9999. Reads the config file at call time from Path.home(): a missing file means the defaults; a corrupt config, an invalid wiki_folder or a queries/ folder (or subfolder) that cannot be read raises (crashed check, exit 2); a wiki that is turned off, a folder that does not exist, or an empty wiki (no indexed pages, no index.md, no index-*.md typed claude-wiki-index) reports nothing. A vault path that is not the configured vault_path (--vault or OBSIDIAN_BRAIN_VAULT; compared after expanduser and resolve) is skipped with one stderr line, because the check syncs the shared index of the configured vault. Lists the pages first, so an unreadable folder raises before the sync can drop its rows, then syncs the vault index (ensure_index on indexed_folders(strict=True)). Lists memory files at most once per scan, on the first page that cites memory, and passes the listing to every wiki.stale call. Drops wiki.stale's newer: reasons before building rows (#440): they come from a loose top-5 OR search, and /vault-ask still uses them to refresh; a page whose only reasons are newer: gets no row. Per page: stale (changed: or unverifiable: reasons), broken-source (missing: reasons), reviewed-stale (replaces stale for reviewed pages) and page-unreadable (shown even under --project). No row for filed_by: auto or for pages no note links to (#440). These rows are report-only: extra.unresolved, confidence 0.0, so --min-confidence above 0.0 hides every row except index-drift. Once for the wiki: index-drift (confidence 1.0) when the index files differ from wiki.render_wiki_index; apply backs up index.md and index-*.md under <backup_root>/wiki-pages/<stamp>/ and calls rebuild_wiki_index under the note_writer lock (<wiki_folder>/..wiki.ob-lock), skipped if the lock is held; an error result keeps backup_path when the backup was taken."
         }
       ]
     },
@@ -1917,7 +1917,7 @@
     {
       "id": "doctor-wiki-pages",
       "name": "/vault-doctor wiki-pages check",
-      "description": "Reports stale, broken, orphan, auto-filed and reviewed-stale wiki pages; rebuilds a drifted wiki index on fix (#396).",
+      "description": "Reports stale, broken and reviewed-stale wiki pages (no newer-note, auto-filed or orphan rows, #440); rebuilds a drifted wiki index on fix (#396).",
       "steps": [
         {
           "from": "sk-vault-doctor",
