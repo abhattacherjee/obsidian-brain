@@ -70,8 +70,10 @@ def _link_from_session(env, page: Path, form: str = "[[{stem}]]") -> None:
           body="see " + form.format(stem=page.stem))
 
 
-def _scan(env, days=9999, project=None):
-    return wp.scan(str(env["vault"]), "claude-sessions", "claude-insights", days, project=project)
+def _scan(env, days=9999, project=None, explicit=True):
+    # explicit=True is `--check wiki-pages`, the run that reports orphan rows.
+    return wp.scan(str(env["vault"]), "claude-sessions", "claude-insights", days,
+                   project=project, explicit=explicit)
 
 
 def _classes(issues, page=None):
@@ -539,7 +541,7 @@ def test_a_vault_that_is_not_the_configured_one_is_skipped(env, tmp_path, capsys
     before = _note_paths(db)
     assert str(page) in before
     other = _other_vault(tmp_path)
-    got = wp.scan(str(other), "claude-sessions", "claude-insights", 9999)
+    got = wp.scan(str(other), "claude-sessions", "claude-insights", 9999, explicit=True)
     assert got == [] and _note_paths(db) == before
     err = capsys.readouterr().err
     assert (f"[wiki-pages] skipped: --vault {other} is not the configured vault {env['vault']}; "
@@ -565,7 +567,7 @@ def test_the_configured_vault_by_another_spelling_is_not_skipped(env, tmp_path, 
         cfg = dict(env["cfg"], vault_path=f"~/{rel}")
         (tmp_path / ".claude" / "obsidian-brain-config.json").write_text(json.dumps(cfg))
         passed = vault
-    rows = wp.scan(passed, "claude-sessions", "claude-insights", 9999)
+    rows = wp.scan(passed, "claude-sessions", "claude-insights", 9999, explicit=True)
     assert "stale" in [i.extra["signal_class"] for i in rows]
 
 
@@ -604,3 +606,53 @@ def test_no_memory_listing_when_no_page_cites_memory(env, monkeypatch):
     monkeypatch.setattr(wiki, "_memory_listing", lambda: calls.append(1) or ([], [], "claude-code"))
     _link_from_session(env, _file(env))
     assert _scan(env) == [] and calls == []
+
+
+# --- orphan rows only when the check is named (#438) --------------------------
+
+
+def test_default_sweep_hides_orphan_rows(env):
+    page = _file(env)
+    assert _classes(_scan(env, explicit=True), page) == ["orphan"]
+    assert _classes(_scan(env, explicit=False), page) == []
+
+
+def test_default_sweep_still_reports_auto_filed(env):
+    page = _file(env, filed_by="auto", caller="ship")
+    assert "auto-filed" in _classes(_scan(env, explicit=False), page)
+
+
+def test_dispatcher_passes_explicit_only_when_this_check_is_named():
+    import argparse
+    import vault_doctor
+
+    seen = []
+
+    class Mod:
+        NAME = "wiki-pages"
+        SCAN_EXPLICIT = True
+
+        @staticmethod
+        def scan(*_a, **kw):
+            seen.append(kw["explicit"])
+            return []
+
+    cfg = {"vault": "v", "sessions_folder": "s", "insights_folder": "i"}
+    for check, want in (("wiki-pages", True), (None, False), ("source-sessions", False)):
+        vault_doctor._run_scan(Mod, cfg, 7, None, args=argparse.Namespace(check=check))
+        assert seen[-1] is want, check
+    vault_doctor._run_scan(Mod, cfg, 7, None, args=None)
+    assert seen[-1] is False
+
+
+def test_real_wiki_pages_module_gets_explicit_from_the_dispatcher(monkeypatch):
+    import argparse
+    import vault_doctor
+
+    assert wp.SCAN_EXPLICIT is True
+    seen = []
+    monkeypatch.setattr(wp, "scan", lambda *_a, **kw: seen.append(kw["explicit"]) or [])
+    cfg = {"vault": "v", "sessions_folder": "s", "insights_folder": "i"}
+    for check, want in (("wiki-pages", True), (None, False)):
+        vault_doctor._run_scan(wp, cfg, 7, None, args=argparse.Namespace(check=check))
+        assert seen[-1] is want, check

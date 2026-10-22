@@ -23,7 +23,7 @@ import tempfile
 import traceback
 from pathlib import Path
 
-from . import Issue, Result
+from . import Issue, Result, session_is_live
 
 NAME = "snapshot-migration"
 DESCRIPTION = "Migrate pre-spec snapshots to first-class format"
@@ -262,6 +262,9 @@ def scan(vault_path, sessions_folder, insights_folder, days, project=None):
         # Scope ``snapshots:`` anchor detection to the frontmatter block only
         fm_parts = sess_text.split("---\n", 2)
         if len(fm_parts) >= 3 and re.search(r"(?m)^snapshots:", fm_parts[1]):
+            continue
+        if session_is_live(sid):
+            # Still running (#438): SessionEnd writes the snapshots: list.
             continue
         wikilinks = sorted(f"[[{stem}]]" for stem in stems)
         issues.append(Issue(

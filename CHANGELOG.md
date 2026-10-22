@@ -14,6 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `scripts/capture-replay.sh <transcript> <project>`, a dev tool that replays capture over one transcript against a copy of the vault, for tuning the worker prompt. On the `claude-code-config-a838` transcript (1.9 MB) it saved 15 notes in 2 runs of 3 slices, including the `$6.28` Fable 5.1 cold-cache point and the stale statusline price table.
 
 ### Fixed
+- `/vault-doctor` no longer reports sessions that are still running (#438). Auto-capture writes notes during a session, but the session note only lands at SessionEnd, so `source-sessions` flagged every capture as `missing-session-note`. It and the snapshot list checks now skip a session whose transcript was written in the last 60 minutes and that has no SessionEnd in the hook log.
+- Context snapshots escape `[[` in copied message text, so a bash test or a quoted note link no longer becomes a link to a note that does not exist. The `source_session_note` backlink names the session note by the session's first-seen date, as SessionEnd does, so it no longer breaks for a session that crosses midnight (#438).
+- `/vault-doctor` reports wiki `orphan` pages only under `--check wiki-pages`. Pages are reached through the wiki index, so "no inbound link" is normal (#438).
 - `/check-items` reads each session note once when it gathers note-completion evidence, not twice. `/recall` drops an unreachable `confidence < 3` check (#342).
 - The test suite fails at collection when a test node id is longer than 4,096 characters, and names the test. pytest puts the id in `PYTEST_CURRENT_TEST`, and a huge one made subprocesses fail with E2BIG on Linux (#412).
 - `/check-items` gathers note-completion evidence for repo-backed projects and caps each notes-bearing verdict at MED unless its citation and item share a git-corroborated literal ref, including cached verdicts (#339).

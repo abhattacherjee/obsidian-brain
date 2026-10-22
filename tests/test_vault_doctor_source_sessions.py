@@ -2619,3 +2619,45 @@ def test_scan_does_not_skip_note_with_literal_in_non_tags_list(doctor_vault, mon
         "local note with the literal in a non-tags list must STAY in the "
         "audit — whole-block scan regression"
     )
+
+
+# ---------------------------------------------------------------------------
+# #438 — a session that is still running has no session note yet
+# ---------------------------------------------------------------------------
+
+def _live_orphan_insight(doctor_vault, monkeypatch):
+    """An insight citing a session whose transcript was written a minute ago."""
+    vault = doctor_vault["vault"]
+    monkeypatch.setenv("HOME", str(doctor_vault["home"]))
+    sid = "55555555-5555-5555-5555-555555555555"
+    now = time.time()
+    _write_jsonl(doctor_vault["jsonl_dir"] / f"{sid}.jsonl",
+                 datetime.fromtimestamp(now - 600, tz=timezone.utc).isoformat(), now - 60)
+    day = datetime.fromtimestamp(now, tz=timezone.utc).strftime("%Y-%m-%d")
+    insight = _write_insight(vault / "claude-insights", date=day, slug="live-capture",
+                             project=doctor_vault["project"], src_sid=sid,
+                             src_note_basename=f"{day}-proj1-5555", mtime=now - 120)
+    return sid, insight
+
+
+def _scan_flags(doctor_vault, insight):
+    issues = ss.scan(vault_path=str(doctor_vault["vault"]), sessions_folder="claude-sessions",
+                     insights_folder="claude-insights", days=10000,
+                     project=doctor_vault["project"])
+    return [i for i in issues if i.note_path == str(insight)]
+
+
+def test_scan_skips_missing_note_for_a_live_session(doctor_vault, monkeypatch):
+    _sid, insight = _live_orphan_insight(doctor_vault, monkeypatch)
+    assert _scan_flags(doctor_vault, insight) == []
+
+
+def test_scan_reports_missing_note_once_session_end_is_logged(doctor_vault, monkeypatch):
+    sid, insight = _live_orphan_insight(doctor_vault, monkeypatch)
+    log = doctor_vault["home"] / ".claude" / "obsidian-brain-hook.log.1"
+    ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    log.write_text(f"{ts} SessionEnd project=proj1 sid={sid[:8]} "
+                   "outcome=SKIPPED_BELOW_THRESHOLD msgs=1\n", encoding="utf-8")
+    flagged = _scan_flags(doctor_vault, insight)
+    assert len(flagged) == 1
+    assert flagged[0].extra.get("signal_class") == "missing-session-note"

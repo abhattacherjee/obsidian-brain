@@ -24,8 +24,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 try:
     from obsidian_utils import (  # noqa: E402
         is_capture_worker,
+        _first_seen_date,
         _hook_payload_codex_reason,
         claim_hook_run,
+        escape_wikilinks,
         extract_assistant_messages,
         extract_session_metadata,
         extract_user_messages,
@@ -124,7 +126,10 @@ def _build_snapshot_body(
             sections.append(f"**Assistant:** {clean}")
             sections.append("")
 
-    return "\n".join(sections)
+    # The body is built from message text, which can hold `[[` (bash tests,
+    # quoted note links). Unescaped, Obsidian turns them into links to notes
+    # that do not exist (#438). The session note path escapes the same way.
+    return escape_wikilinks("\n".join(sections))
 
 
 def _build_snapshot_note(
@@ -136,10 +141,9 @@ def _build_snapshot_note(
 ) -> str:
     """Construct full snapshot note with YAML frontmatter.
 
-    ``date_str`` is optional; if omitted, today() is used. Callers that also
-    construct a filename should pass their pre-computed ``date_str`` so the
-    backlink stem and the actual filename can never skew across a midnight
-    clock tick inside a single _run() invocation.
+    ``date_str`` is the snapshot's own ``date:``; if omitted, today() is
+    used. The ``source_session_note`` backlink does not use it: it names the
+    parent by ``_first_seen_date(session_id)``, the date SessionEnd uses.
     """
     if date_str is None:
         date_str = datetime.date.today().isoformat()
@@ -147,7 +151,10 @@ def _build_snapshot_note(
     project_slug = slugify(project)
     # Derive the parent session note's filename stem via the same helper the
     # session log uses, so the backlink can never drift from the real file.
-    parent_filename = make_filename(date_str, project_slug, session_id)
+    # Name the parent by the session's first-seen date, as SessionEnd does,
+    # not by today: a session that crosses midnight would otherwise link a
+    # note that never exists (#438, same drift #101 fixed elsewhere).
+    parent_filename = make_filename(_first_seen_date(session_id), project_slug, session_id)
     parent_stem = parent_filename[:-3] if parent_filename.endswith(".md") else parent_filename
 
     tags = [
@@ -272,9 +279,9 @@ def _run() -> None:
     metadata = extract_session_metadata(messages, cwd)
 
     # 5. Build snapshot note.
-    # Compute date_str + hhmmss together so the frontmatter backlink stem
-    # (which embeds date_str) and the filename (which embeds both) share the
-    # same single source of truth — no midnight-rollover skew inside one run.
+    # Compute date_str + hhmmss together so the snapshot's `date:` and its
+    # filename (which embeds both) share one clock read — no midnight-rollover
+    # skew inside one run. The parent backlink uses _first_seen_date (#438).
     now = datetime.datetime.now()
     date_str = now.date().isoformat()
     hhmmss = now.strftime("%H%M%S")
