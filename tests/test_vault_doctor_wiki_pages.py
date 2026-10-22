@@ -619,8 +619,14 @@ def test_unverifiable_source_still_gives_a_stale_row(env):
 
 def test_auto_filed_unlinked_page_gives_no_row(env):
     page = _file(env, filed_by="auto", caller="ship")
-    assert "auto" in page.read_text()
+    assert 'filed_by: "auto"\n' in page.read_text()
     assert _scan(env) == []
+
+
+def test_auto_filed_page_with_a_changed_source_still_gets_a_stale_row(env):
+    page = _file(env, filed_by="auto", caller="ship")
+    _change_source(env)
+    assert _classes(_scan(env), page) == ["stale"]
 
 
 def test_wiki_pages_does_not_ask_for_the_explicit_flag():
