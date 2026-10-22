@@ -643,3 +643,16 @@ def test_dispatcher_passes_explicit_only_when_this_check_is_named():
         assert seen[-1] is want, check
     vault_doctor._run_scan(Mod, cfg, 7, None, args=None)
     assert seen[-1] is False
+
+
+def test_real_wiki_pages_module_gets_explicit_from_the_dispatcher(monkeypatch):
+    import argparse
+    import vault_doctor
+
+    assert wp.SCAN_EXPLICIT is True
+    seen = []
+    monkeypatch.setattr(wp, "scan", lambda *_a, **kw: seen.append(kw["explicit"]) or [])
+    cfg = {"vault": "v", "sessions_folder": "s", "insights_folder": "i"}
+    for check, want in (("wiki-pages", True), (None, False)):
+        vault_doctor._run_scan(wp, cfg, 7, None, args=argparse.Namespace(check=check))
+        assert seen[-1] is want, check

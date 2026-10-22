@@ -88,6 +88,26 @@ def test_session_end_within_the_slack_ends_liveness():
     assert session_is_live(SID) is False
 
 
+def test_session_end_just_outside_the_slack_does_not_end_liveness():
+    # 301 s before the transcript write: older than END_SLACK_SECONDS, so it
+    # belongs to an earlier run. Fails if the slack is widened.
+    _transcript(age_s=60)
+    ts = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=60 + 301)
+    _log_session_end(ts=ts.isoformat(timespec="seconds"))
+    assert session_is_live(SID) is True
+
+
+def test_sid_prefix_inside_another_field_does_not_end_liveness():
+    _transcript(age_s=60)
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+    p = Path.home() / ".claude" / "obsidian-brain-hook.log"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with open(p, "a", encoding="utf-8") as fh:
+        fh.write(f"{now} SessionEnd project=66666666x sid=77777777 "
+                 "outcome=OK_RAW_NOTE_ONLY msgs=9\n")
+    assert session_is_live(SID) is True
+
+
 def test_session_end_with_an_unparseable_time_ends_liveness():
     _transcript(age_s=60)
     _log_session_end(ts="garbage")

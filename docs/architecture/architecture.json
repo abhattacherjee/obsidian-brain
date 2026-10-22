@@ -178,7 +178,7 @@
           "files": [
             "hooks/obsidian_context_snapshot.py"
           ],
-          "purpose": "PreCompact: uses the payload's transcript path before inherited Codex markers and skips Codex rollouts with SKIPPED_CODEX_HOST stderr telemetry. For Claude, saves a context snapshot before compression. Gates on snapshot_on_compact/snapshot_on_clear, scrubs secrets, and writes a snapshot note backlinked to its parent session. Stderr-only telemetry (no hook-log line). Sets the capture flush flag so the next turn end runs a batch whatever the interval."
+          "purpose": "PreCompact: uses the payload's transcript path before inherited Codex markers and skips Codex rollouts with SKIPPED_CODEX_HOST stderr telemetry. For Claude, saves a context snapshot before compression. Gates on snapshot_on_compact/snapshot_on_clear, scrubs secrets, and writes a snapshot note backlinked to its parent session. The body escapes [[ via escape_wikilinks; source_session_note names the parent by _first_seen_date(session_id), the date SessionEnd uses. Stderr-only telemetry (no hook-log line). Sets the capture flush flag so the next turn end runs a batch whatever the interval."
         },
         {
           "id": "hook-session-reaper",
@@ -654,7 +654,7 @@
           "files": [
             "scripts/vault_doctor_checks/__init__.py"
           ],
-          "purpose": "Auto-discovers checks via pkgutil; defines the Issue/Result dataclasses and the scan/apply module contract; all_checks() excludes OPT_IN=True checks; broken modules are warned-and-skipped, never fatal."
+          "purpose": "Auto-discovers checks via pkgutil; defines the Issue/Result dataclasses and the scan/apply module contract; all_checks() excludes OPT_IN=True checks; broken modules are warned-and-skipped, never fatal. Also holds session_is_live(sid) (#438): a session is live when its transcript ~/.claude/projects/*/<sid>.jsonl was written in the last 60 minutes and ~/.claude/obsidian-brain-hook.log (and .log.1) has no SessionEnd line for the sid logged after that write (300 s clock-skew slack); unknown or missing transcripts are not live. Checks that name SCAN_EXPLICIT = True get scan(explicit=True) from the dispatcher only when the check is named with --check."
         },
         {
           "id": "check-source-sessions",
@@ -663,7 +663,7 @@
           "files": [
             "scripts/vault_doctor_checks/source_sessions.py"
           ],
-          "purpose": "UUID-first stale source_session backlink detector across insights/decisions/error-fixes/retros. Skips imported notes; preserves mtime on repair so fixed notes do not re-enter the window; apply() raises on non uuid-basename-stale signal_class (conf 0.99)."
+          "purpose": "UUID-first stale source_session backlink detector across insights/decisions/error-fixes/retros. Skips imported notes; preserves mtime on repair so fixed notes do not re-enter the window; apply() raises on non uuid-basename-stale signal_class (conf 0.99). Skips sessions that session_is_live reports as still running."
         },
         {
           "id": "check-crossed-source-session",
@@ -690,7 +690,7 @@
           "files": [
             "scripts/vault_doctor_checks/snapshot_integrity.py"
           ],
-          "purpose": "Five sub-checks: orphan snapshots, broken backlinks, stale/missing session snapshot-lists, and summary-status mismatch. Project-blind sid-collision detection routes colliding sids to unresolved before any parent-based fix."
+          "purpose": "Five sub-checks: orphan snapshots, broken backlinks, stale/missing session snapshot-lists, and summary-status mismatch. Project-blind sid-collision detection routes colliding sids to unresolved before any parent-based fix. Skips sessions that session_is_live reports as still running."
         },
         {
           "id": "check-snapshot-migration",
@@ -699,7 +699,7 @@
           "files": [
             "scripts/vault_doctor_checks/snapshot_migration.py"
           ],
-          "purpose": "Ordered legacy-format migrations (filename HHMMSS, missing status/backlink, session snapshot-list). Tracks renamed paths/stems, re-checks collisions before os.rename, and rolls back a rename only if zero vault-wide wikilink rewrites succeeded."
+          "purpose": "Ordered legacy-format migrations (filename HHMMSS, missing status/backlink, session snapshot-list). Tracks renamed paths/stems, re-checks collisions before os.rename, and rolls back a rename only if zero vault-wide wikilink rewrites succeeded. Skips sessions that session_is_live reports as still running."
         },
         {
           "id": "check-project-canonicalization",
@@ -772,7 +772,7 @@
           "files": [
             "scripts/vault_doctor_checks/wiki_pages.py"
           ],
-          "purpose": "Health of the LLM wiki's pages under <wiki_folder>/queries/ (#396). Default sweep (OPT_IN False); DEFAULT_WINDOW_DAYS 9999. Reads the config file at call time from Path.home(): a missing file means the defaults; a corrupt config, an invalid wiki_folder or a queries/ folder (or subfolder) that cannot be read raises (crashed check, exit 2); a wiki that is turned off, a folder that does not exist, or an empty wiki (no indexed pages, no index.md, no index-*.md typed claude-wiki-index) reports nothing. A vault path that is not the configured vault_path (--vault or OBSIDIAN_BRAIN_VAULT; compared after expanduser and resolve) is skipped with one stderr line, because the check syncs the shared index of the configured vault. Lists the pages first, so an unreadable folder raises before the sync can drop its rows, then syncs the vault index (ensure_index on indexed_folders(strict=True)). Lists memory files at most once per scan, on the first page that cites memory, and passes the listing to every wiki.stale call. Per page: stale (any wiki.stale reason except missing:), broken-source (missing: reasons), reviewed-stale (replaces stale for reviewed pages), auto-filed (filed_by: auto), orphan (no vault note links [[page]] except the page itself and the wiki's own index.md, index-<project>.md and log-<year>.md at the wiki root; [[stem\\|alias]] table links and [[stem.md]] count; only pages whose updated date is inside --days) and page-unreadable (shown even under --project). These rows are report-only: extra.unresolved, confidence 0.0, so --min-confidence above 0.0 hides every row except index-drift. Once for the wiki: index-drift (confidence 1.0) when the index files differ from wiki.render_wiki_index; apply backs up index.md and index-*.md under <backup_root>/wiki-pages/<stamp>/ and calls rebuild_wiki_index under the note_writer lock (<wiki_folder>/..wiki.ob-lock), skipped if the lock is held; an error result keeps backup_path when the backup was taken."
+          "purpose": "Health of the LLM wiki's pages under <wiki_folder>/queries/ (#396). Default sweep (OPT_IN False); DEFAULT_WINDOW_DAYS 9999. Reads the config file at call time from Path.home(): a missing file means the defaults; a corrupt config, an invalid wiki_folder or a queries/ folder (or subfolder) that cannot be read raises (crashed check, exit 2); a wiki that is turned off, a folder that does not exist, or an empty wiki (no indexed pages, no index.md, no index-*.md typed claude-wiki-index) reports nothing. A vault path that is not the configured vault_path (--vault or OBSIDIAN_BRAIN_VAULT; compared after expanduser and resolve) is skipped with one stderr line, because the check syncs the shared index of the configured vault. Lists the pages first, so an unreadable folder raises before the sync can drop its rows, then syncs the vault index (ensure_index on indexed_folders(strict=True)). Lists memory files at most once per scan, on the first page that cites memory, and passes the listing to every wiki.stale call. Sets SCAN_EXPLICIT = True: orphan rows appear only under --check wiki-pages, not in the default sweep. Per page: stale (any wiki.stale reason except missing:), broken-source (missing: reasons), reviewed-stale (replaces stale for reviewed pages), auto-filed (filed_by: auto), orphan (no vault note links [[page]] except the page itself and the wiki's own index.md, index-<project>.md and log-<year>.md at the wiki root; [[stem\\|alias]] table links and [[stem.md]] count; only pages whose updated date is inside --days) and page-unreadable (shown even under --project). These rows are report-only: extra.unresolved, confidence 0.0, so --min-confidence above 0.0 hides every row except index-drift. Once for the wiki: index-drift (confidence 1.0) when the index files differ from wiki.render_wiki_index; apply backs up index.md and index-*.md under <backup_root>/wiki-pages/<stamp>/ and calls rebuild_wiki_index under the note_writer lock (<wiki_folder>/..wiki.ob-lock), skipped if the lock is held; an error result keeps backup_path when the backup was taken."
         }
       ]
     },
