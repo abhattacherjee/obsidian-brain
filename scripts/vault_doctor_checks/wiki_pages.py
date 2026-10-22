@@ -3,18 +3,12 @@
 ``/vault-ask`` files answers as pages under ``<vault>/<wiki_folder>/queries/``
 (see ``hooks/wiki.py``). This check reports, per page:
 
-- ``stale``: ``wiki.stale`` found a reason other than a missing source
-  (a changed source, a newer note, an unverifiable fingerprint). Reviewed
-  pages get ``reviewed-stale`` instead.
+- ``stale``: ``wiki.stale`` found a changed source or an unverifiable
+  fingerprint. Reviewed pages get ``reviewed-stale`` instead.
 - ``broken-source``: a cited source is gone (a ``missing:`` reason).
-- ``reviewed-stale``: the page is marked reviewed and ``wiki.stale`` found any
-  reason. ``/vault-ask`` never refreshes these on its own.
-- ``auto-filed``: ``filed_by: auto``, listed so a person can review it.
-- ``orphan``: no vault note links ``[[<page>]]`` except the page itself and
-  the wiki's own ``index.md``, ``index-<project>.md`` and ``log-<year>.md``
-  at the wiki root. Only pages whose ``updated`` date is inside ``--days``
-  are checked (default: all). Reported only when the check is named with
-  ``--check wiki-pages``, not in the default sweep (#438).
+- ``reviewed-stale``: the page is marked reviewed and ``wiki.stale`` found a
+  reason other than ``newer:``. ``/vault-ask`` never refreshes these on its
+  own.
 - ``page-unreadable``: the page or its staleness check could not be read.
   An unreadable page is shown even under ``--project`` (its project is
   unknown).
@@ -27,6 +21,15 @@ and once for the wiki:
   freshly set-up wiki (no pages, no index files) has no drift.
 
 Every other row is report-only (``unresolved``, confidence 0.0).
+
+The check reports only rows a person can act on (#440). It drops
+``wiki.stale``'s ``newer:`` reasons: they come from a loose search (any one
+word of the question, top 5 hits) that flags almost every page on an active
+vault, and ``/vault-ask`` still uses them to refresh the page the next time
+the question is asked. A page whose only reasons are ``newer:`` gets no row.
+It does not list pages filed by a skill (``filed_by: auto`` stays in the
+frontmatter for Dataview) or pages no note links to (pages are reached
+through the wiki index, so that is the normal state).
 
 The wiki folder comes from the config file, because ``scan`` receives only
 the sessions and insights folders. The file is read at call time from
@@ -50,7 +53,6 @@ from __future__ import annotations
 import datetime as _dt
 import json
 import os
-import re
 import shutil
 import sys
 from pathlib import Path
@@ -63,20 +65,14 @@ if str(_HOOKS_DIR) not in sys.path:
 
 NAME = "wiki-pages"
 DESCRIPTION = (
-    "Report stale, broken-source, auto-filed and reviewed-stale wiki pages "
-    "(orphan pages only under --check), and rebuild a drifted wiki index"
+    "Report stale, broken-source and reviewed-stale wiki pages, and rebuild "
+    "a drifted wiki index"
 )
-# Staleness and drift are undated; --days limits only the orphan scan.
+# Staleness and drift are undated, so --days changes nothing here.
 DEFAULT_WINDOW_DAYS = 9999
 OPT_IN = False
-# The dispatcher passes explicit=True when this check is named with --check.
-# `orphan` rows are reported only then (#438): pages are reached through the
-# wiki index and /vault-ask lookup, so "no inbound link" is the normal state.
-SCAN_EXPLICIT = True
-
-# ``[[name]]``, ``[[name|alias]]``, ``[[name#heading]]``, ``[[folder/name]]``.
-_WIKILINK_RE = re.compile(r"\[\[([^\[\]|#]{1,300})(?:[|#][^\[\]]{0,300})?\]\]")
-_WIKI_OWN_FILES = re.compile(r"^(index(-.+)?|log-\d{4})\.md$")
+# wiki.stale reasons the doctor leaves out (#440); /vault-ask still uses them.
+_HINT_PREFIX = "newer:"
 
 
 def _read_config() -> dict:
@@ -140,37 +136,6 @@ def _row(page, project: str, code: str, detail: str, **extra) -> Issue:
     return Issue(check=NAME, note_path=str(page), project=project, current_source="",
                  proposed_source="", reason=f"{code}: {detail}", confidence=0.0,
                  extra={"signal_class": code, "unresolved": True, **extra})
-
-
-def _linked_stems(vault: Path, wiki_root: Path) -> dict:
-    """``{stem: set of linking files}`` for every wikilink in the vault, minus
-    links from the wiki's own index and log files."""
-    links: dict = {}
-    for f in vault.rglob("*.md"):
-        if f.parent == wiki_root and _WIKI_OWN_FILES.match(f.name):
-            continue
-        try:
-            text = f.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
-        for target in _WIKILINK_RE.findall(text):
-            target = target.strip()
-            if target.endswith("\\"):
-                # A table cell escapes the alias pipe: [[stem\|alias]].
-                target = target[:-1]
-            stem = target.rsplit("/", 1)[-1]
-            if stem.endswith(".md"):
-                stem = stem[:-3]
-            if stem:
-                links.setdefault(stem, set()).add(f)
-    return links
-
-
-def _parse_date(value) -> _dt.date | None:
-    try:
-        return _dt.date.fromisoformat(str(value or "")[:10])
-    except ValueError:
-        return None
 
 
 def _is_wiki_index(f: Path) -> bool:
@@ -259,7 +224,6 @@ def scan(
     insights_folder: str,
     days: int,
     project: str | None = None,
-    explicit: bool = False,
 ) -> list:
     import vault_index
     import wiki
@@ -274,9 +238,7 @@ def scan(
     pages = _pages(wiki_root / "queries")
     vault_index.ensure_index(ctx["vault"], ctx["folders"], db_path=ctx["db"])
     roots = [str(vault / f) for f in ctx["folders"]]
-    cutoff = _dt.date.today() - _dt.timedelta(days=days)
     needle = (project or "").strip().lower()
-    links = None
     memory_listing = None  # listed once, when the first page cites memory
     issues: list = []
 
@@ -300,6 +262,7 @@ def scan(
         except Exception as exc:  # noqa: BLE001 -- one bad page must not hide the rest
             issues.append(_row(page, proj, "page-unreadable", f"staleness check failed: {exc}"))
             reasons = []
+        reasons = [r for r in reasons if not r.startswith(_HINT_PREFIX)]
         missing = [r for r in reasons if r.startswith("missing:")]
         if missing:
             issues.append(_row(page, proj, "broken-source", "; ".join(missing), reasons=missing))
@@ -312,15 +275,6 @@ def scan(
             other = [r for r in reasons if not r.startswith("missing:")]
             if other:
                 issues.append(_row(page, proj, "stale", "; ".join(other), reasons=other))
-        if meta.get("filed_by") == "auto":
-            issues.append(_row(page, proj, "auto-filed",
-                               f"filed automatically by {meta.get('caller') or 'an unnamed caller'}"))
-        updated = _parse_date(meta.get("updated"))
-        if explicit and (updated is None or updated >= cutoff):
-            if links is None:
-                links = _linked_stems(vault, wiki_root)
-            if not (links.get(page.stem, set()) - {page}):
-                issues.append(_row(page, proj, "orphan", "no vault note links this page"))
 
     drift = _index_drift(ctx, wiki_root)
     if any(drift.values()):
