@@ -773,6 +773,10 @@ def _sync(conn: sqlite3.Connection, vault_path: str, folders: list[str]) -> dict
         if not folder_path.is_dir():
             continue
         for md_file in folder_path.rglob("*.md"):
+            # #425: notes rejected from the Captures pane live in _rejected/
+            # and must never come back into search (or the dedup pool).
+            if "_rejected" in md_file.relative_to(folder_path).parts:
+                continue
             disk_files[str(md_file)] = md_file
 
     # Get indexed files
@@ -1401,6 +1405,23 @@ def rebuild_index(
         pass
 
     return stats
+
+
+def remove_note(db_path: str, note_path: str) -> None:
+    """Drop one note (absolute path, as indexed) from the index, if present (#425)."""
+    if not os.path.isfile(db_path):
+        return
+    conn = _connect(db_path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        if conn.execute("SELECT 1 FROM notes WHERE path = ?", (note_path,)).fetchone():
+            _delete_note(conn, note_path)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def index_note(db_path: str, note_path: str) -> bool:

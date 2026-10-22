@@ -72,6 +72,13 @@
       "source": "synthetic",
       "expected_match": false,
       "note": "Off-topic outrank synthetic. Generic phrase designed to surface unrelated or low-rank results. No genuine match expected; strength gate or delta gate should reject."
+    },
+    {
+      "id": "replay-382-sentry-single-term",
+      "query": "using sentry mcp to automate the entire workflow to update sentry settings instead of relying on me to navigate via UI",
+      "source": "replay",
+      "expected_match": false,
+      "note": "#382 (2026-09-30, fantasy-football-advisor): AND query returned 0 rows, OR fallback ranked a cross-topic session note -25.08 vs -24.62 with shared_terms ['sentry'] only. Must never be a high-confidence match; closed by MIN_OR_FALLBACK_TERM_OVERLAP."
     }
   ]
 }

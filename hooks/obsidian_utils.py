@@ -651,10 +651,10 @@ def _peek_frontmatter_fields(
 
     This is the only implementation; ``_peek_frontmatter_field`` is a
     one-field wrapper over it. It exists because
-    ``obsidian_session_reaper._build_existing_sid_set`` needs ``type``,
-    ``project`` and ``session_id`` from every session note on the SessionStart
-    hook: three single-field calls meant three uncached reads and three
-    parses of the same bytes, ~1000 notes deep, inside a 5-second budget.
+    ``obsidian_session_reaper._build_existing_sid_set`` needs ``type`` and
+    ``session_id`` from every session note on the SessionStart hook:
+    single-field calls meant one uncached read and parse of the same bytes
+    per field, ~1000 notes deep, inside a 5-second budget.
 
     The frontmatter block is located by ``frontmatter.split_frontmatter`` (via
     ``_read_frontmatter_region``), the same bounded, shape-checked scan the
@@ -1478,12 +1478,15 @@ def _cc_encoded_dirnames(path: str) -> set[str]:
     ``-Users-me-dev-claude_workspace-obsidian-brain`` (older: '_' kept) and
     ``-Users-me-dev-claude-workspace-obsidian-brain`` (current: '_' -> '-')
     for one directory; hidden worktree dirs show up with '.' folded to '-'.
+    Today CC folds every non-ASCII-alphanumeric character to '-', including
+    spaces, '~', '@', and '+'.
 
     So rather than commit to one scheme and mis-reject a directory that is
     genuinely ours, enumerate every observed combination and treat them all as
     belonging to `path`.
 
-    Over-generating is NOT free, which is why this is only a PRE-FILTER. A
+    Over-generating is NOT free, which is why other callers use this as a PRE-FILTER.
+    The reaper checks each transcript's recorded cwd before writing. A
     generated variant can collide with a genuinely different directory: cwd
     ``/Users/x/dev/a_b`` folds to the same candidate as an unrelated repo at
     ``/Users/x/dev/a-b``, so a candidate here can keep the WRONG directory.
@@ -1494,7 +1497,7 @@ def _cc_encoded_dirnames(path: str) -> set[str]:
     """
     if not path:
         return set()
-    variants: set[str] = set()
+    variants: set[str] = {re.sub(r"[^A-Za-z0-9]", "-", path)}
     for fold_dot in (False, True):
         for fold_underscore in (False, True):
             enc = path.replace("/", "-")
@@ -2250,7 +2253,29 @@ _DEFAULTS: dict = {
     "snapshot_on_clear": True,
     "optional_deps_prompted": False,
     "optional_deps_declined": [],
+    "auto_capture_enabled": True,  # #425: background capture of insights/decisions/error fixes
+    "auto_capture_interval_minutes": 10,  # #425: minimum gap between mid-session capture batches
+    # #427: cosine a candidate needs against a note's original text (auto-capture updates removed) to update it
+    "auto_capture_update_min_cosine": 0.35,
+    # #425: projects whose sessions are captured below the 3-user-message gate (headless runs)
+    "auto_capture_headless_projects": ["openclaw"],
 }
+
+# #425: set on every `claude -p` this plugin starts, so the child session's
+# hooks (and the capture sweep) never treat a worker as a real session.
+WORKER_ENV_VAR = "OBSIDIAN_BRAIN_WORKER"
+
+
+def is_capture_worker() -> bool:
+    """True when this process runs inside a `claude -p` the plugin started."""
+    return os.environ.get(WORKER_ENV_VAR) == "1"
+
+
+def worker_env() -> dict:
+    """A copy of the environment with the worker guard set, for `claude -p` children."""
+    env = dict(os.environ)
+    env[WORKER_ENV_VAR] = "1"
+    return env
 
 
 # ---------------------------------------------------------------------------
@@ -3407,6 +3432,36 @@ def fetch_snapshot_summaries(
     return results
 
 
+def _retro_order(retros: list[dict]) -> tuple[list[dict], str]:
+    """Order retros oldest first by the strongest key all entries supply."""
+    if not retros:
+        return [], ""
+    for tier in ("created_at", "date"):
+        keys = []
+        for retro in retros:
+            value = str(retro.get(tier, "") or "")
+            try:
+                if tier == "created_at":
+                    key = datetime.datetime.fromisoformat(
+                        value[:-1] + "+00:00" if value.endswith("Z") else value
+                    )
+                    if key.tzinfo is None:
+                        key = key.replace(tzinfo=datetime.timezone.utc)
+                else:
+                    if len(value) != 10:
+                        break
+                    key = datetime.date.fromisoformat(value)
+                    if key.isoformat() != value:
+                        break
+            except ValueError:
+                break
+            keys.append(key)
+        else:
+            ordered = sorted(zip(keys, retros), key=lambda pair: (pair[0], pair[1]["stem"]))
+            return [retro for _, retro in ordered], tier
+    return sorted(retros, key=lambda retro: retro["stem"]), "filename"
+
+
 def gather_session_evidence(
     vault_path: str,
     sessions_folder: str,
@@ -3449,9 +3504,11 @@ def gather_session_evidence(
     Snapshots are returned sorted ascending by stem (YYYY-MM-DD-... prefix),
     which gives correct chronological order including across-midnight sessions.
     Pre-spec snapshots (hhmmss == '??????') sort before all post-spec ones.
-    Insights/decisions/error-fixes/retros are returned sorted ascending by
-    filename. File-read failures are captured in `discovery_errors` and
-    never raised.
+    Insights/decisions/error-fixes are returned sorted ascending by filename.
+    Retros are oldest first by the strongest common key: created_at (aware
+    instants, naive values treated as UTC), date, then filename. The selected
+    tier is named in `prior_retro_key` (empty when there are no retros).
+    File-read failures are captured in `discovery_errors` and never raised.
 
     Used by /retro to ground retrospective analysis in the full session
     arc (pre-compact + post-compact) rather than just the active conversation.
@@ -3464,6 +3521,7 @@ def gather_session_evidence(
         "decisions": [],
         "error_fixes": [],
         "retros": [],
+        "prior_retro_key": "",
         "discovery_errors": [],
     }
     if isinstance(also_session_ids, str):
@@ -3621,7 +3679,10 @@ def gather_session_evidence(
                 "title": title,
                 "body": body,
                 "session_id": meta.get("source_session", ""),
+                "created_at": str(meta.get("created_at", "") or ""),
+                "date": str(meta.get("date", "") or ""),
             })
+    bundle["retros"], bundle["prior_retro_key"] = _retro_order(bundle["retros"])
     return bundle
 
 
@@ -4288,6 +4349,7 @@ def generate_snapshot_summary(
             result = subprocess.run(
                 ["claude", "-p", "--model", model],
                 input=prompt, capture_output=True, text=True, timeout=attempt_timeout,
+                env=worker_env(),
             )
             if result.returncode == 0 and result.stdout.strip():
                 return result.stdout.strip(), None
@@ -4353,6 +4415,7 @@ def generate_theme_names(
             result = subprocess.run(
                 ["claude", "-p", "--model", model],
                 input=prompt, capture_output=True, text=True, timeout=attempt_timeout,
+                env=worker_env(),
             )
         except FileNotFoundError:
             return None, "haiku_subprocess_error"
@@ -4506,6 +4569,7 @@ Rate this session 1-10. 1-3: trivial (config, interrupted). 4-6: standard work. 
                 capture_output=True,
                 text=True,
                 timeout=attempt_timeout,
+                env=worker_env(),
             )
             if result.returncode == 0 and result.stdout.strip():
                 summary_text = result.stdout.strip()
@@ -4556,6 +4620,10 @@ Rate this session 1-10. 1-3: trivial (config, interrupted). 4-6: standard work. 
 
 _SECRET_PATTERNS = [
     (re.compile(r'gh[ps]_[A-Za-z0-9_]{36,}'), '[REDACTED:github-token]'),
+    # #379: bare provider tokens — Anthropic/OpenAI keys, GitHub fine-grained PATs, Slack.
+    (re.compile(r'\bsk-(?:ant-|proj-)?[A-Za-z0-9_\-]{20,}'), '[REDACTED:api-key]'),
+    (re.compile(r'\bgithub_pat_[A-Za-z0-9_]{22,}'), '[REDACTED:github-token]'),
+    (re.compile(r'\bxox[abprs]-[A-Za-z0-9-]{10,}'), '[REDACTED:slack-token]'),
     (re.compile(r'AKIA[0-9A-Z]{16}'), '[REDACTED:aws-key]'),
     (re.compile(r'(?i)(password|passwd|secret|token|api[_-]?key)\s*[=:]\s*\S+'), r'\1=[REDACTED]'),
     (re.compile(r'-----BEGIN [A-Z ]+-----'), '[REDACTED:pem-header]'),
@@ -5447,15 +5515,15 @@ def build_context_brief(
                             ev_summary, [(fpath, line_num, item_text)]
                         )
                         for c in matched:
-                            # BH-001: confidence >= 3 alone only means a
-                            # distinctive token (e.g. a branch/file name) was
-                            # co-mentioned — it does NOT mean the newer
-                            # session reports the item DONE. A session that
-                            # merely mentions the same branch/file (even to
-                            # say it's still in progress) must not flag the
-                            # item. Require completion language too.
-                            if c.get("confidence", 0) < 3:
-                                continue
+                            # BH-001: a match alone only means a distinctive
+                            # token (e.g. a branch/file name) was co-mentioned
+                            # — it does NOT mean the newer session reports
+                            # the item DONE. A session that merely mentions
+                            # the same branch/file (even to say it's still in
+                            # progress) must not flag the item. Require
+                            # completion language too. No confidence floor
+                            # here: match_items_against_evidence() already
+                            # drops score < 3 before returning (#342).
                             if not c.get("has_completion_phrase"):
                                 continue
                             if best is None or c["confidence"] > best["confidence"]:
@@ -6950,6 +7018,7 @@ def generate_summaries_batch(
                 capture_output=True,
                 text=True,
                 timeout=attempt_timeout,
+                env=worker_env(),
             )
             if result.returncode == 0 and result.stdout.strip():
                 stdout_text = result.stdout.strip()

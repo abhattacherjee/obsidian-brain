@@ -414,3 +414,29 @@ class TestReaperSessionsFolderDefault:
             f"Expected recorded path to contain '/claude-sessions/' (correct default); "
             f"got {recorded_path!r}. N10 regression: default was 'sessions' not 'claude-sessions'."
         )
+
+
+def test_replay_resets_checkout_watermark(isolated_home, monkeypatch):
+    """Replay resets the same helper path that the reaper reads."""
+    import obsidian_session_reaper as reaper
+    cwd = str(isolated_home / "checkout")
+    path = isolated_home / "custom-watermark"
+    path.write_text("9999999999")
+    calls = []
+    def watermark(project, recorded_cwd):
+        calls.append((project, recorded_cwd))
+        return path
+    monkeypatch.setattr(reaper, "_watermark_path", watermark)
+    observed = []
+    original_read = reaper._read_watermark
+    def read_watermark(candidate):
+        observed.append(candidate.read_text())
+        return original_read(candidate)
+    monkeypatch.setattr(reaper, "_read_watermark", read_watermark)
+    result = replay.main([
+        "--jsonl", str(_FIXTURES / "d2cc7e46-long-617min-full.jsonl"),
+        "--cwd", cwd, "--mode", "reaper", "--dry-run", "--json",
+    ])
+    assert result == 0
+    assert calls == [("checkout", cwd), ("checkout", cwd)]
+    assert observed == ["0"]

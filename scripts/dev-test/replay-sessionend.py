@@ -329,7 +329,7 @@ def _run_sessionend(args: argparse.Namespace) -> int:
 
 def _run_reaper(args: argparse.Namespace) -> int:
     try:
-        from obsidian_session_reaper import _reap_orphaned_sessions  # type: ignore
+        from obsidian_session_reaper import _reap_orphaned_sessions, _watermark_path  # type: ignore
     except ImportError:
         print("reaper module not yet implemented (#125)", file=sys.stderr)
         return 2
@@ -349,6 +349,9 @@ def _run_reaper(args: argparse.Namespace) -> int:
     except (json.JSONDecodeError, OSError) as exc:
         print(f"ERROR: cannot read config: {exc}", file=sys.stderr)
         return 2
+    # The staged fixture is written just now; a replay must not hit the
+    # reaper's skip for transcripts that look like a running session (#432).
+    config["reaper_min_idle_minutes"] = 0
 
     vault_path = config.get("vault_path", "")
     # Default must match obsidian_utils._DEFAULTS["sessions_folder"] == "claude-sessions".
@@ -363,9 +366,9 @@ def _run_reaper(args: argparse.Namespace) -> int:
     project = Path(args.cwd).name or "unknown"
 
     # Stage the fixture under ~/.claude/projects/<slug>/ so the reaper's
-    # _resolve_project_jsonl_dir() can find it. Use the same staging logic as
-    # _run_sessionend but always stage (never skip) since the fixture needs to
-    # live in the project dir for _reap_orphaned_sessions to pick it up.
+    # _resolve_project_jsonl_dirs() can find it from --cwd. A --jsonl that is
+    # already under ~/.claude/projects/ is used in place, so the reaper finds
+    # it only when its folder is one of --cwd's encodings (#432).
     try:
         staged_jsonl = _stage_fixture_under_projects(args.jsonl, args.cwd)
     except OSError as exc:
@@ -378,7 +381,7 @@ def _run_reaper(args: argparse.Namespace) -> int:
 
     # Set watermark to 0 so the staged fixture (mtime > 0) always passes the
     # watermark check. Write it under the same HOME-relative path the reaper uses.
-    watermark_path = Path(os.path.expanduser("~/.claude")) / "obsidian-brain" / f"reaper-watermark-{project}"
+    watermark_path = _watermark_path(project, args.cwd)
     watermark_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     watermark_path.write_text("0")
 
@@ -409,7 +412,7 @@ def _run_reaper(args: argparse.Namespace) -> int:
 
     payload: dict = {}
     try:
-        result = _reap_orphaned_sessions(project, vault_path, sessions_folder, config)
+        result = _reap_orphaned_sessions(project, vault_path, sessions_folder, config, cwd=args.cwd)
         # Determine a single top-level outcome key for easy assertion.
         if result.skipped_permission_blocked:
             payload["outcome"] = "SKIPPED_PERMISSION_BLOCKED"

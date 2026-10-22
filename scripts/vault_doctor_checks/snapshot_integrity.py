@@ -21,7 +21,7 @@ import sys
 import traceback
 from pathlib import Path
 
-from . import Issue, Result
+from . import Issue, Result, session_is_live
 
 NAME = "snapshot-integrity"
 DESCRIPTION = "Snapshot orphans, broken backlinks, stale lists, status/summary mismatches"
@@ -210,6 +210,9 @@ def scan(vault_path: str, sessions_folder: str, insights_folder: str,
         parent_session = sessions_by_id.get(sid)
 
         if not parent_session:
+            if session_is_live(sid):
+                # Still running (#438): SessionEnd writes the parent later.
+                continue
             issues.append(Issue(
                 check="snapshot-orphan",
                 note_path=snap["path"],
@@ -285,8 +288,10 @@ def scan(vault_path: str, sessions_folder: str, insights_folder: str,
             # Inline YAML list parsed as string; skip stale detection (treat as missing).
             in_frontmatter = []
 
-        # Missing list
+        # Missing list. A running session gets its list at SessionEnd (#438).
         if on_disk and not in_frontmatter:
+            if session_is_live(sid):
+                continue
             issues.append(Issue(
                 check="session-snapshot-list-missing",
                 note_path=sess["path"],

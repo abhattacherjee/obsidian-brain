@@ -26,6 +26,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 try:
     import obsidian_utils  # noqa: E402  — used for _first_seen_date qualified call
     from obsidian_utils import (  # noqa: E402
+        is_capture_worker,
         _append_sessionend_log,
         build_raw_fallback,
         claim_hook_run,
@@ -206,12 +207,31 @@ def main() -> None:
     sys.exit(0)
 
 
+def _launch_capture(hook_input: dict, session_id: str) -> None:
+    """#425: capture at exit -- start a detached batch for the session's unprocessed tail."""
+    if not session_id:
+        return
+    try:
+        import capture_worker
+
+        cwd = hook_input.get("cwd") or ""
+        project = obsidian_utils.canonical_project_name(cwd) if cwd else None
+        capture_worker.launch(session_id, hook_input.get("transcript_path") or None,
+                              None if project == "unknown" else project, if_due=False)
+    except Exception as exc:  # capture never changes SessionEnd's own outcome
+        print(f"[obsidian-brain] capture launch failed: {exc}", file=sys.stderr)
+
+
 def _run() -> None:
     global _LAST_PROJECT, _LAST_SESSION_ID
     # Reset so a stale value from a prior invocation in the same process does
     # not bleed into this run's EXCEPTION telemetry.
     _LAST_PROJECT = "unknown"
     _LAST_SESSION_ID = "unknown"
+
+    # #425: a capture worker's own `claude -p` session is never logged.
+    if is_capture_worker():
+        return
 
     # 1. Read hook input from stdin
     try:
@@ -498,6 +518,7 @@ def _run() -> None:
         # accumulate stale cache files on any SessionEnd outcome — including
         # threshold skips, missing config, auto_log_disabled, or errors.
         _cleanup_session_cache(session_id)
+        _launch_capture(hook_input, session_id)
 
 
 if __name__ == "__main__":

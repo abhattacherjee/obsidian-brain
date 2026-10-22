@@ -167,6 +167,7 @@ print(json.dumps({
   'decisions': [],
   'error_fixes': [],
   'retros': [],
+  'prior_retro_key': '',
   'discovery_errors': [f'evidence helper crashed (exit={rc}): {errmsg[:500]}'],
   '_ctx': {'session_id': 'unknown', 'hash': 'unknown', 'project': 'unknown', 'session_note_name': 'unknown', 'resolved_source_session_note': ''},
 }))
@@ -179,7 +180,7 @@ rm -f "$_OB_BUNDLE" "$_OB_ERR"
 
 The canonical block above ships with zero trailing arguments, so the common no-compact-boundary case is correct by copying it verbatim — do not append a literal placeholder string. When a compact boundary IS detected and a prior id recovered, append it as a shell-quoted positional argument after the closing `'`, one argument per recovered id (per the "Detect a compact boundary" step above); the script rejects any argument that is not a bare hex-and-dash id, so a stray or malformed token fails loudly (see the "Helper crash / partial failure" handling below) rather than being silently dropped.
 
-Parse the JSON output. The bundle has these fields: `session_id` (the primary id exactly as passed — may be `"unknown"`), `session_ids` (the ordered, de-duplicated ids **actually scanned** — may be non-empty even when `session_id` is `"unknown"`), `snapshots`, `insights`, `decisions`, `error_fixes`, `retros`, `discovery_errors`, and `_ctx` (the cached `get_session_context()` result reused by Step 5).
+Parse the JSON output. The bundle has these fields: `session_id` (the primary id exactly as passed — may be `"unknown"`), `session_ids` (the ordered, de-duplicated ids **actually scanned** — may be non-empty even when `session_id` is `"unknown"`), `snapshots`, `insights`, `decisions`, `error_fixes`, `retros`, `prior_retro_key`, `discovery_errors`, and `_ctx` (the cached `get_session_context()` result reused by Step 5).
 
 **Unresolved-session fallback.** If `bundle["session_ids"] == []` AND `bundle["discovery_errors"] == []`, print:
 
@@ -207,7 +208,7 @@ Then proceed with whatever evidence was collected (possibly none).
 
 **Discovery errors.** If `bundle["discovery_errors"]` is non-empty, remember the list — it will be surfaced after the preview in Step 6.
 
-**Prior-retro scoping (#285).** If `bundle["retros"]` is non-empty, take the **last** entry (ascending filename order = most recent) and scope this retro to the arc **after** it — the work this retrospective covers picks up where that prior retro left off. A `claude-retro` entry is a **boundary marker**, not evidence: it is deliberately excluded from the "every `RELEVANT` snapshot must surface in the analysis" coverage rule that governs snapshots in Step 3.0 below. Do not mine a prior retro's own body for content to fold into this one's findings — use it only to know where to stop looking backward.
+**Prior-retro scoping (#285).** If `bundle["retros"]` is non-empty, take the **last** entry (most recent, ordered by the key named in `bundle["prior_retro_key"]`: `created_at`, else `date`, else `filename`) and scope this retro to the arc **after** it — the work this retrospective covers picks up where that prior retro left off. A `claude-retro` entry is a **boundary marker**, not evidence: it is deliberately excluded from the "every `RELEVANT` snapshot must surface in the analysis" coverage rule that governs snapshots in Step 3.0 below. Do not mine a prior retro's own body for content to fold into this one's findings — use it only to know where to stop looking backward.
 
 ### Step 3 — Analyze the session honestly
 
@@ -291,7 +292,7 @@ Draft the note body using this exact structure:
 - **Coverage:** every `RELEVANT` snapshot must be represented in the analysis. If a `RELEVANT` snapshot genuinely yielded no distinct dead-ends beyond the live buffer, say so explicitly in "What Didn't Work" (e.g. `- [[stem]]: no distinct dead-ends beyond the live buffer`) rather than silently omitting it.
 - **`Sessions scanned` (#184):** render this line only when `bundle["session_ids"]` has more than one entry — omit it entirely for a single-id scan. List each id from `bundle["session_ids"]` in order, labelling the one matching `bundle["_ctx"]["session_id"]` `(current)` and the rest `(pre-compact)`.
 - **`(pre-compact arc)` marker (#184):** for each snapshot listed under `Snapshots — RELEVANT` or `Snapshots — excluded as earlier-arc`, append ` (pre-compact arc)` when that snapshot's `session_id` field differs from `bundle["_ctx"]["session_id"]`; omit the marker when it matches (the common, single-arc case).
-- **`Prior retros` / `Scope` (#285):** these follow the existing zero-count omission rule below, and are **not** among the two always-rendered `Snapshots —` lines — omit both when `bundle["retros"]` is empty. When non-empty, `Prior retros` lists every entry in `bundle["retros"]`; `Scope` names only the **last** one (most recent) per the Step 3a prior-retro-scoping rule, with a short phrase for what is not being re-litigated (e.g. "the auth refactor already covered in that retro").
+- **`Prior retros` / `Scope` (#285):** these follow the existing zero-count omission rule below, and are **not** among the two always-rendered `Snapshots —` lines — omit both when `bundle["retros"]` is empty. When non-empty, `Prior retros` lists every entry in `bundle["retros"]`; `Scope` names only the **last** one per the Step 3a prior-retro-scoping rule and states the key: `Scope: after [[<stem>]] (most recent by <prior_retro_key>)`. When `bundle["prior_retro_key"]` is not `created_at`, explicitly say that a fallback key was used. Follow this with a short phrase for what is not being re-litigated (e.g. "the auth refactor already covered in that retro").
 - Omit any list line whose count is 0 (no `... : 0 file(s)` zero-count noise) — **except** the two `Snapshots —` lines: whenever `bundle["snapshots"]` was non-empty, render BOTH lines even at count 0, so an all-excluded session is never indistinguishable from a no-snapshot one.
 - Omit the entire `## Evidence Consulted` section if the empty-bundle fallback fired in Step 3a.
 - Wikilinks (`[[stem]]`) preserve Obsidian backlinks and round-trip through the FTS index.

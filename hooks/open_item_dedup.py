@@ -231,7 +231,10 @@ def assign_tier(evidence_citation, item_text, classification=None,
     `note_evidence_only` is optional and defaults to False (appended last,
     same backward-compat rule). See #318 fix round 2 (F7) below: this is
     THE enforcing guard for a note-completion citation, not the citation-
-    shape regex check that follows it.
+    shape regex check that follows it. Since #339 the flag is stamped per
+    verdict by check_items_cli.note_cap_for: notes-only projects always
+    cap; projects with notes and git evidence cap unless a ref shared by
+    the citation and item text is git-corroborated.
 
     Spec § Confidence tiers (lines 324-332).
     """
@@ -247,12 +250,10 @@ def assign_tier(evidence_citation, item_text, classification=None,
     # / no template at all, just "#318 is done") that all skip the regex and
     # fall through to the HIGH literal-ref loop -- persuading a model to
     # reproduce a literal string is not enforcement. `note_evidence_only` is
-    # DATA WE CONTROL: check_items_cli stamps it from the evidence bundle's
-    # own keys (whether the project's evidence is note_completions-only, no
-    # git-derived bucket at all), so it cannot be defeated by wording. If
-    # true, no citation for this item can legitimately be HIGH regardless of
-    # what the model wrote — cap at MED unconditionally, before anything
-    # else runs.
+    # DATA WE CONTROL: #339's note_cap_for() now stamps it per verdict,
+    # requiring a shared literal ref in citation, item and git corpus when
+    # notes are present. A notes-only project always caps. If true, cap at
+    # MED unconditionally, before the literal-ref checks below run.
     if note_evidence_only:
         return "MED"
 
@@ -405,25 +406,30 @@ def collect_open_items(
             continue
 
         matched += 1
-
-        # Find ## Open Questions / Next Steps and collect - [ ] items
-        in_section = False
-        for line_num, line in enumerate(lines, 1):
-            stripped = line.strip()
-            if stripped == '## Open Questions / Next Steps':
-                in_section = True
-                continue
-            if in_section:
-                if stripped.startswith('## '):
-                    break  # next section
-                if stripped.startswith('- [ ] '):
-                    item_text = stripped[6:]  # after "- [ ] "
-                    results.append((fpath, line_num, item_text))
+        results.extend(_open_items_in(fpath, lines))
 
         if matched >= max_sessions:
             break
 
     return results
+
+
+def _open_items_in(fpath: str, lines: list[str]) -> list[tuple[str, int, str]]:
+    """The `- [ ]` items under `## Open Questions / Next Steps` in one note."""
+    items: list[tuple[str, int, str]] = []
+    in_section = False
+    for line_num, line in enumerate(lines, 1):
+        stripped = line.strip()
+        if stripped == '## Open Questions / Next Steps':
+            in_section = True
+            continue
+        if in_section:
+            if stripped.startswith('## '):
+                break  # next section
+            if stripped.startswith('- [ ] '):
+                item_text = stripped[6:]  # after "- [ ] "
+                items.append((fpath, line_num, item_text))
+    return items
 
 
 _NOTE_EVIDENCE_WINDOW = 10  # mirrors obsidian_utils._OPEN_ITEM_EVIDENCE_WINDOW
@@ -456,11 +462,12 @@ def gather_note_completion_evidence(
     # Single pass, newest-first: apply the SAME project/type filter
     # collect_open_items() uses (first 20 frontmatter lines, quote-stripped,
     # no `type:` field means legacy session) while also picking up `date:`.
-    # Building the evidence pool and the per-note date map here (rather than
-    # re-deriving them from a second scan) guarantees both cover exactly the
-    # same note set collect_open_items() will read below.
+    # The open items, the evidence pool and the per-note date map all come
+    # from this one pass, so each note is read once (#342) and all three
+    # cover exactly the note set collect_open_items() would read.
     evidence_pool: list[tuple[str, str, str]] = []  # (date, title, summary_text)
     date_by_path: dict[str, str] = {}
+    items: list[tuple[str, int, str]] = []
     matched = 0
 
     for fname in all_files:
@@ -498,6 +505,7 @@ def gather_note_completion_evidence(
             continue
 
         matched += 1
+        items.extend(_open_items_in(fpath, lines))
         # An item whose source note has no date: is never flagged --
         # "strictly newer" is undefined without one. Simply don't record it.
         if note_date:
@@ -526,7 +534,6 @@ def gather_note_completion_evidence(
         if matched >= max_sessions:
             break
 
-    items = collect_open_items(vault_path, sessions_folder, project, max_sessions)
     if not items:
         return []
 
@@ -1570,32 +1577,19 @@ def deep_analysis_pipeline(
             if fts_mentions:
                 proj_evidence["fts_mentions"] = fts_mentions
 
-        else:
-            # #318 I3 ruling: note-completion evidence is gathered ONLY when
-            # there is no repo, not unconditionally for every project. This
-            # used to run outside the `if repo_path:` block above, so a
-            # repo-backed project's bundle carried note_completions
-            # ALONGSIDE git-derived keys -- note_evidence_only_for() (the MED
-            # cap) is a per-PROJECT flag, not per-verdict, so any git key
-            # being present at all (even an empty one) flips it False and a
-            # paraphrased note citation sharing a literal ref with the item
-            # text could reach HIGH and get auto-checked. Scoping this to
-            # repo-less projects makes the safety property unconditional: a
-            # note-derived verdict can never reach HIGH, full stop. This
-            # trades away the note-completion signal on repo-backed
-            # projects entirely (live dogfood found 6 of 7 real hits there)
-            # -- restoring it needs per-verdict provenance, not a per-project
-            # flag, and is a follow-up issue, not this branch.
-            try:
-                _note_done = gather_note_completion_evidence(
-                    vault_path, sessions_folder, project,
-                )
-            except OSError as exc:
-                print(f"[obsidian-brain] note-completion scan failed for "
-                      f"{project}: {exc}", file=sys.stderr)
-                _note_done = []
-            if _note_done:
-                proj_evidence["note_completions"] = _note_done
+        # #318 I3 / #339: gather notes for every project. Per-verdict git
+        # corroboration now enforces the safety property: an unsupported
+        # note-derived verdict cannot reach HIGH, even with git evidence.
+        try:
+            _note_done = gather_note_completion_evidence(
+                vault_path, sessions_folder, project,
+            )
+        except OSError as exc:
+            print(f"[obsidian-brain] note-completion scan failed for "
+                  f"{project}: {exc}", file=sys.stderr)
+            _note_done = []
+        if _note_done:
+            proj_evidence["note_completions"] = _note_done
 
         if proj_evidence:
             evidence[project] = proj_evidence

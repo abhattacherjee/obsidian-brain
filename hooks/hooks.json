@@ -41,5 +41,8 @@
         ]
       }
     ]
-  }
+  },
+  "modules": [
+    "../mods/capture/hooks/register.tsx"
+  ]
 }

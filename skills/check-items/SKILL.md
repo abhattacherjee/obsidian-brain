@@ -536,7 +536,7 @@ echo "evidence_path=$evidence_path"
 echo "gaps_path=$gaps_path"
 ```
 
-`deep_analysis_pipeline` gathers per-project evidence for every project in `merged_by_proj`. For a project with a resolved local git repo, evidence is git-derived: commits, merged PRs, closed issues, releases, FTS-indexed vault mentions, and tags/changed paths folded in from recent commits. For a project with no local repo, `gather_note_completion_evidence()` (#318) is the only evidence source: it flags an item when a strictly newer session's own `## Summary` reports it done (mirroring `/recall`'s `contradicted_by` signal), gated on the same completion-phrase guard the heuristic classifier uses so a bare co-mention can never fabricate DONE evidence. Both write into the same per-project bucket (`note_completions` alongside the git-derived keys) — Step 6's classifier and Step 7's `assign_tier` treat a project whose ONLY real evidence is `note_completions` as capped at tier MED regardless of citation wording, via `note_evidence_only_for()` (`hooks/check_items_cli.py`), never HIGH.
+`deep_analysis_pipeline` gathers per-project evidence for every project in `merged_by_proj`. Projects with a resolved local git repo carry commits, tags, releases, merged PRs, closed issues, changed paths, changelog excerpts and FTS-indexed vault mentions. Every project also gathers `note_completions` (#318, #339): a strictly newer session's own `## Summary` must report an item done, with the completion-phrase guard rejecting bare co-mentions. Step 6 stamps the per-verdict MED cap via `note_cap_for()` (`hooks/check_items_cli.py`). When notes are present, HIGH requires a literal ref shared by the citation, item text and git corroboration corpus; vault mentions, changed paths and notes never corroborate it. Step 7's `assign_tier` consumes the existing `note_evidence_only` key.
 
 ## Step 6 — Classify (Stage 4) with fallback chain
 
@@ -564,7 +564,7 @@ sys.path.insert(0, _ob_hooks())
 from open_item_dedup import (
     classify_groups_with_agent, classify_groups_heuristic, get_last_classifier_mode
 )
-from check_items_cli import note_evidence_only_for
+from check_items_cli import note_cap_for
 
 scope_path = os.environ["SCOPE_PATH"]
 merged_path = os.environ["MERGED_PATH"]
@@ -610,7 +610,10 @@ for g in all_merged:
             "action_required": g.get("_cached_action_required"),
             "project": g.get("project"),
             "classifier_source": "cache",
-            "note_evidence_only": note_evidence_only_for(evidence, g.get("project", "")),
+            "note_evidence_only": note_cap_for(
+                evidence, g.get("project", ""),
+                g.get("_cached_evidence_citation"), g.get("representative", ""),
+            ),
         })
 
 out = os.path.join(os.path.dirname(scope_path), "classifications.json")
