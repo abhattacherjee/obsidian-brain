@@ -9,6 +9,8 @@
 #   ./scripts/commit-preflight.sh --docs-only  # Skip tests for docs changes
 #   ./scripts/commit-preflight.sh --skip-tests "reason"  # Skip with reason
 #   ./scripts/commit-preflight.sh --auto       # Auto-detect if tests needed
+#   ./scripts/commit-preflight.sh --allow-empty  # For `git commit --allow-empty`
+#                                                # (refuses if anything is staged or modified)
 #
 # Installed by /harden-repo
 # Lint/test commands customized for this project during installation.
@@ -32,6 +34,7 @@ fi
 SKIP_TESTS=false
 SKIP_REASON=""
 AUTO_DETECT=false
+ALLOW_EMPTY=false
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -49,9 +52,13 @@ while [[ $# -gt 0 ]]; do
             AUTO_DETECT=true
             shift
             ;;
+        --allow-empty)
+            ALLOW_EMPTY=true
+            shift
+            ;;
         *)
             echo "Unknown option: $1"
-            echo "Usage: $0 [--docs-only | --skip-tests \"reason\" | --auto]"
+            echo "Usage: $0 [--docs-only | --skip-tests \"reason\" | --auto | --allow-empty]"
             exit 1
             ;;
     esac
@@ -62,19 +69,69 @@ echo ""
 
 # Get staged files
 STAGED_FILES=$(git diff --cached --name-only 2>/dev/null || echo "")
+# Count non-empty lines: `echo "" | wc -l` would count an empty list as 1.
+STAGED_COUNT=$(printf '%s' "$STAGED_FILES" | grep -c '' || true)
 
-if [ -z "$STAGED_FILES" ]; then
+if [ "$ALLOW_EMPTY" = true ]; then
+    # An empty commit has nothing to scan or test (#116). Ask git directly:
+    # the `|| echo ""` above turns a git failure into an empty list, which
+    # must not read as "nothing staged" here. Two checks, because the hook
+    # only checks the token's expiry and HEAD: an empty index alone would let
+    # `git commit -a` or `git commit -m x <path>` commit modified tracked
+    # files with no scan or test.
+    INDEX_STATE=0
+    git diff --cached --quiet 2>/dev/null || INDEX_STATE=$?
+    case "$INDEX_STATE" in
+        0)
+            ;;
+        1)
+            echo "❌ --allow-empty is for a commit with nothing staged, but files are staged:"
+            echo "$STAGED_FILES" | head -10 | sed 's/^/   /'
+            echo "   Unstage them, or run preflight without --allow-empty."
+            rm -f "$TOKEN_FILE"
+            exit 1
+            ;;
+        *)
+            echo "❌ Could not read the git index (git exited $INDEX_STATE)."
+            rm -f "$TOKEN_FILE"
+            exit 1
+            ;;
+    esac
+    TREE_STATE=0
+    git diff --quiet 2>/dev/null || TREE_STATE=$?
+    case "$TREE_STATE" in
+        0)
+            ;;
+        1)
+            echo "❌ --allow-empty needs a clean working tree: tracked files have unstaged changes, and 'git commit -a' or a pathspec would commit them unchecked:"
+            git diff --name-only | head -10 | sed 's/^/   /'
+            echo "   Commit or stash them, or run preflight without --allow-empty."
+            rm -f "$TOKEN_FILE"
+            exit 1
+            ;;
+        *)
+            echo "❌ Could not read the working tree (git exited $TREE_STATE)."
+            rm -f "$TOKEN_FILE"
+            exit 1
+            ;;
+    esac
+    echo "📭 Nothing staged: preflight for 'git commit --allow-empty'"
+    echo ""
+    SKIP_TESTS=true
+    SKIP_REASON="empty commit (--allow-empty)"
+    AUTO_DETECT=false
+elif [ -z "$STAGED_FILES" ]; then
     echo "⚠️  No staged files. Stage files first with 'git add'"
+    echo "   (For an empty commit, run: $0 --allow-empty)"
     exit 1
+else
+    echo "📁 Staged files:"
+    echo "$STAGED_FILES" | head -10
+    if [ "$STAGED_COUNT" -gt 10 ]; then
+        echo "   ... and $((STAGED_COUNT - 10)) more"
+    fi
+    echo ""
 fi
-
-echo "📁 Staged files:"
-echo "$STAGED_FILES" | head -10
-TOTAL=$(echo "$STAGED_FILES" | wc -l | tr -d ' ')
-if [ "$TOTAL" -gt 10 ]; then
-    echo "   ... and $((TOTAL - 10)) more"
-fi
-echo ""
 
 # Auto-detect if tests are needed
 if [ "$AUTO_DETECT" = true ]; then
@@ -204,7 +261,7 @@ if [ "$SKIP_TESTS" = true ]; then
     "created": $TIMESTAMP,
     "expires": $((TIMESTAMP + TOKEN_EXPIRY_SECONDS)),
     "head": "$TOKEN_HEAD",
-    "staged_files": $(echo "$STAGED_FILES" | wc -l | tr -d ' '),
+    "staged_files": $STAGED_COUNT,
     "checks_run": "$SKIP_CHECKS_RUN",
     "skip_reason": "$(echo "$SKIP_REASON" | sed 's/\\/\\\\/g; s/"/\\"/g')"
 }
@@ -294,7 +351,7 @@ TOKEN_DATA=$(cat <<EOF
     "created": $TIMESTAMP,
     "expires": $((TIMESTAMP + TOKEN_EXPIRY_SECONDS)),
     "head": "$TOKEN_HEAD",
-    "staged_files": $(echo "$STAGED_FILES" | wc -l | tr -d ' '),
+    "staged_files": $STAGED_COUNT,
     "checks_run": "${CHECKS_RUN%,}"
 }
 EOF

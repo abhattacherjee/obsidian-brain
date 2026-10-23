@@ -12,6 +12,8 @@ Every public function catches its own errors and logs to stderr.
 
 from __future__ import annotations
 
+import contextlib
+import copy
 import datetime
 import fnmatch
 import glob
@@ -2137,83 +2139,180 @@ def _get_session_id_fast(allow_env: bool = True) -> str:
 _UNCACHEABLE_SIDS = frozenset({"", "unknown"})
 
 
+# In-process memo of the per-session cache files (#447). The cache file is
+# the truth; this is a parsed copy keyed by the file's (st_ino, st_mtime_ns,
+# st_size), so a rewrite by another process changes the key and forces a
+# re-read. Without it every cache_get parsed the whole file (2-3 MB on a
+# large vault), once per note, which made /retro and /recall O(N^2).
+#   path -> (stat_key or None for "file absent", parsed dict)
+_CACHE_MEMO: dict[str, tuple[tuple | None, dict]] = {}
+# Keys set inside cache_deferred() and not yet written, per cache file. They
+# are laid over every re-read of the file, so a rewrite by another process
+# mid-block cannot hide them from cache_get or drop them from the flush.
+_CACHE_DIRTY: dict[str, dict] = {}
+_cache_defer_depth = 0
+_cache_lock = threading.RLock()
+
+
+def _cache_stat_key(st: os.stat_result) -> tuple:
+    return (st.st_ino, st.st_mtime_ns, st.st_size)
+
+
+def _cache_load(cache_path: str, *, warn_corrupt: bool = False) -> dict:
+    """Return the memoised dict for *cache_path*, re-reading the file only
+    when its stat key changed. The dict is shared with the memo: callers
+    copy what they return and own what they store. A missing or corrupt file
+    reads as {} (with a stderr note for corrupt when *warn_corrupt*)."""
+    try:
+        key = _cache_stat_key(os.stat(cache_path))
+    except OSError:
+        key = None
+    memo = _CACHE_MEMO.get(cache_path)
+    if memo is not None and memo[0] == key:
+        return memo[1]
+    data: dict = {}
+    if key is not None:
+        try:
+            with open(cache_path, 'r') as f:
+                # Key from the open file, not the earlier stat: a rename by
+                # another process in between must not pair new content with
+                # the old key (or the reverse).
+                key = _cache_stat_key(os.fstat(f.fileno()))
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                data = loaded
+        except OSError:
+            key = None
+        except json.JSONDecodeError as exc:
+            if warn_corrupt:
+                print(f"[obsidian-brain] cache corrupted, resetting: {exc}", file=sys.stderr)
+            # Memoised as "absent" (key None), which never matches while the
+            # file exists: the next read parses (and reports) it again, as
+            # before the memo. The next cache_set rewrites it.
+            key = None
+    data.update(_CACHE_DIRTY.get(cache_path, {}))
+    _CACHE_MEMO[cache_path] = (key, data)
+    return data
+
+
+def _cache_write(cache_path: str, data: dict) -> bool:
+    """Write *data* atomically and memoise it under the new file's stat key.
+    On failure the memo entry is dropped, so the next read goes back to the
+    file. Returns True on success."""
+    _ensure_secure_dir()
+    fd, tmp = tempfile.mkstemp(prefix='.ob-cache-', suffix='.json.tmp', dir=_SECURE_DIR)
+    try:
+        with os.fdopen(fd, 'w') as f:
+            json.dump(data, f)
+            f.flush()
+            # Key from the temp file before the rename: a write by another
+            # process after the rename must not be mistaken for ours.
+            key = _cache_stat_key(os.fstat(f.fileno()))
+        os.replace(tmp, cache_path)
+    except OSError as exc:
+        print(f"[obsidian-brain] cache write failed: {exc}", file=sys.stderr)
+        _CACHE_MEMO.pop(cache_path, None)
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return False
+    _CACHE_MEMO[cache_path] = (key, data)
+    return True
+
+
+def _cache_flush(cache_path: str) -> None:
+    """Write the keys deferred for *cache_path* over the file's current
+    content, in one write."""
+    dirty = _CACHE_DIRTY.get(cache_path)
+    if not dirty:
+        _CACHE_DIRTY.pop(cache_path, None)
+        return
+    data = _cache_load(cache_path, warn_corrupt=True)  # dirty keys laid over
+    _CACHE_DIRTY.pop(cache_path, None)
+    _cache_write(cache_path, data)
+
+
+@contextlib.contextmanager
+def cache_deferred():
+    """Batch cache_set writes: inside the block cache_set updates the memo
+    and marks the key pending; the outermost exit writes each touched cache
+    file once, merged over whatever is on disk by then. Nesting is allowed.
+    Pending keys are flushed on exit even when the block raises, because
+    outside a block each cache_set would already have been written."""
+    global _cache_defer_depth
+    with _cache_lock:
+        _cache_defer_depth += 1
+    try:
+        yield
+    finally:
+        with _cache_lock:
+            _cache_defer_depth -= 1
+            if _cache_defer_depth == 0:
+                for path in list(_CACHE_DIRTY):
+                    _cache_flush(path)
+
+
 def cache_get(session_id: str, key: str):
     """Read a key from the session cache. Returns None on miss, and always
-    for an uncacheable id (see _UNCACHEABLE_SIDS)."""
+    for an uncacheable id (see _UNCACHEABLE_SIDS). The file is parsed once
+    per process while it is unchanged (see _CACHE_MEMO); the value returned
+    is a copy, so mutating it cannot change what the next call sees."""
     if session_id in _UNCACHEABLE_SIDS:
         return None
     cache_path = f"{_CACHE_PREFIX}{session_id}.json"
-    try:
-        with open(cache_path, 'r') as f:
-            data = json.load(f)
-        return data.get(key)
-    except (OSError, json.JSONDecodeError):
-        return None
+    with _cache_lock:
+        value = _cache_load(cache_path).get(key)
+        return copy.deepcopy(value)
 
 
 def cache_set(session_id: str, key: str, value) -> None:
     """Write a key to the session cache. Atomic write. No-op for an
-    uncacheable id (see _UNCACHEABLE_SIDS)."""
+    uncacheable id (see _UNCACHEABLE_SIDS). Inside cache_deferred() the
+    write waits for the block's exit.
+
+    The value is stored as its JSON round-trip, so a later cache_get returns
+    exactly what a fresh parse of the file would (tuples as lists, int dict
+    keys as strings), and a caller mutating *value* afterwards cannot reach
+    the memo."""
     if session_id in _UNCACHEABLE_SIDS:
         return
-    _ensure_secure_dir()
+    stored = json.loads(json.dumps(value))
     cache_path = f"{_CACHE_PREFIX}{session_id}.json"
-    try:
-        with open(cache_path, 'r') as f:
-            data = json.load(f)
-    except (OSError, json.JSONDecodeError) as exc:
-        if isinstance(exc, json.JSONDecodeError):
-            print(f"[obsidian-brain] cache corrupted, resetting: {exc}", file=sys.stderr)
-        data = {}
-
-    data[key] = value
-
-    fd, tmp = tempfile.mkstemp(prefix='.ob-cache-', suffix='.json.tmp', dir=_SECURE_DIR)
-    try:
-        with os.fdopen(fd, 'w') as f:
-            json.dump(data, f)
-        os.replace(tmp, cache_path)
-    except OSError as exc:
-        print(f"[obsidian-brain] cache write failed: {exc}", file=sys.stderr)
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
+    with _cache_lock:
+        data = _cache_load(cache_path, warn_corrupt=True)
+        data[key] = stored
+        if _cache_defer_depth > 0:
+            _CACHE_DIRTY.setdefault(cache_path, {})[key] = stored
+            return
+        _cache_write(cache_path, data)
 
 
 def cache_invalidate(session_id: str, *keys: str) -> None:
     """Remove specific keys from cache. No keys = clear all. No-op for an
-    uncacheable id, which never has a cache (see _UNCACHEABLE_SIDS)."""
+    uncacheable id, which never has a cache (see _UNCACHEABLE_SIDS). Inside
+    cache_deferred() the pending keys are written first."""
     if session_id in _UNCACHEABLE_SIDS:
         return
     cache_path = f"{_CACHE_PREFIX}{session_id}.json"
-    if not keys:
-        try:
-            os.unlink(cache_path)
-        except OSError:
-            pass
-        return
+    with _cache_lock:
+        _cache_flush(cache_path)
+        if not keys:
+            _CACHE_MEMO.pop(cache_path, None)
+            try:
+                os.unlink(cache_path)
+            except OSError:
+                pass
+            return
 
-    try:
-        with open(cache_path, 'r') as f:
-            data = json.load(f)
-    except (OSError, json.JSONDecodeError):
-        return
-
-    for k in keys:
-        data.pop(k, None)
-
-    _ensure_secure_dir()
-    fd, tmp = tempfile.mkstemp(prefix='.ob-cache-', suffix='.json.tmp', dir=_SECURE_DIR)
-    try:
-        with os.fdopen(fd, 'w') as f:
-            json.dump(data, f)
-        os.replace(tmp, cache_path)
-    except OSError:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
+        if not os.path.exists(cache_path):
+            return
+        data = _cache_load(cache_path)
+        if not any(k in data for k in keys):
+            return
+        for k in keys:
+            data.pop(k, None)
+        _cache_write(cache_path, data)
 
 
 # ---------------------------------------------------------------------------
@@ -3034,6 +3133,78 @@ def read_note_metadata(file_path: str) -> dict | None:
     return read_note_metadata_detailed(file_path)[0]
 
 
+def _indexed_rows_under(folder: Path) -> dict | None:
+    """Index rows for notes under *folder*, keyed by path string (#447).
+
+    A read-only query: no ensure_index, no sync, no write, so a scan that
+    uses it never pays for (or races) an index update. Returns None when
+    the index cannot answer: vault_index unavailable, no DB file, or any
+    sqlite3.Error (missing table, locked, corrupt). None means "scan every
+    note", never "nothing matched". The #192 guard's RuntimeError (a test
+    reaching the production DB) is deliberately not caught.
+
+    Rows are only a hint. Use _fresh_index_row to decide whether one may
+    stand in for reading the note.
+    """
+    if _vault_index is None:
+        return None
+    db_path = _vault_index._default_db_path()
+    if not os.path.isfile(db_path):
+        return None
+    # Range on the path primary key: every row whose path starts with
+    # "<folder>/". "0" is the character after "/", so the range ends just
+    # past that prefix. A LIKE would need escaping for "%" and "_".
+    prefix = str(folder) + os.sep
+    hi = str(folder) + chr(ord(os.sep) + 1)
+    try:
+        conn = _vault_index._connect(db_path)
+        try:
+            rows = conn.execute(
+                "SELECT path, mtime, type, project, source_session FROM notes "
+                "WHERE path >= ? AND path < ?",
+                (prefix, hi),
+            ).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        print(f"[obsidian-brain] index pre-filter unavailable "
+              f"({type(exc).__name__}); scanning every note", file=sys.stderr)
+        return None
+    return {row["path"]: row for row in rows}
+
+
+def _fresh_index_row(indexed: dict | None, note_path: Path):
+    """The index row for *note_path* if it may stand in for the note's own
+    frontmatter, else None (#447).
+
+    It may only when the note is indexed and its on-disk mtime still
+    matches the indexed one, by the same comparison _sync uses
+    (vault_index.mtime_unchanged). A note edited, created or broken since
+    the last sync fails that and goes through the full read, so a stale row
+    can never hide it.
+
+    One more case is excluded: a note of _FRONTMATTER_MAX_CHARS bytes or
+    more. Only there can read_note_metadata_detailed (which reads a capped
+    prefix) report "frontmatter exceeds ..." for a note the index (which
+    reads the whole file) parsed, and that report must still reach /retro.
+    Bytes bound characters from above, so a smaller file cannot hit the cap.
+    """
+    if indexed is None:
+        return None
+    row = indexed.get(str(note_path))
+    if row is None:
+        return None
+    try:
+        st = note_path.stat()
+    except OSError:
+        return None
+    if st.st_size >= _FRONTMATTER_MAX_CHARS:
+        return None
+    if not _vault_index.mtime_unchanged(st.st_mtime, row["mtime"]):
+        return None
+    return row
+
+
 # WHY A MEMO: date-agnostic discovery is the only correct way to find a snapshot
 # written before midnight for a session whose note is dated the next day (#70),
 # but it means reading every snapshot's frontmatter instead of globbing one
@@ -3462,6 +3633,8 @@ def _retro_order(retros: list[dict]) -> tuple[list[dict], str]:
     return sorted(retros, key=lambda retro: retro["stem"]), "filename"
 
 
+# One cache write for the whole scan, not one per note read (#447).
+@cache_deferred()
 def gather_session_evidence(
     vault_path: str,
     sessions_folder: str,
@@ -3599,7 +3772,14 @@ def gather_session_evidence(
             "claude-error-fix": bundle["error_fixes"],
             "claude-retro": bundle["retros"],
         }
+        # The listing stays (it is the truth for which notes exist); the
+        # index only lets a note it proves irrelevant skip the metadata read
+        # (#447). None = no index: read every note, as before.
+        indexed = _indexed_rows_under(insights_path)
         for note_path in sorted(insights_path.glob("*.md")):
+            row = _fresh_index_row(indexed, note_path)
+            if row is not None and row["source_session"] not in id_set:
+                continue
             meta, reason = read_note_metadata_detailed(str(note_path))
             if meta is None:
                 # Record WHY. The old code re-probed the file and only logged
@@ -5087,6 +5267,8 @@ def find_unsummarized_notes(
 _OPEN_ITEM_EVIDENCE_WINDOW = 10
 
 
+# One cache write for the whole scan, not one per note read (#447).
+@cache_deferred()
 def build_context_brief(
     vault_path: str,
     sessions_folder: str,
@@ -5128,7 +5310,18 @@ def build_context_brief(
     session_files: list[tuple[str, str, dict]] = []  # (filename, path, metadata)
     if sessions_dir.is_dir():
         md_files = [f for f in sessions_dir.iterdir() if f.suffix == '.md']
+        # Notes the index proves irrelevant (a snapshot, or another project)
+        # skip the metadata read (#447); everything else is read as before.
+        indexed = _indexed_rows_under(sessions_dir)
         for f in sorted(md_files, key=_safe_sort_key, reverse=True):
+            row = _fresh_index_row(indexed, f)
+            if row is not None:
+                row_project = row["project"] or ''
+                if row["type"] == 'claude-snapshot' or (
+                    row_project.lower() != project.lower()
+                    and slugify(row_project) != slugify(project)
+                ):
+                    continue
             meta = read_note_metadata(str(f))
             if not meta:
                 continue

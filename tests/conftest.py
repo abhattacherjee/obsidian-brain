@@ -74,6 +74,11 @@ def _reset_session_resolution_state():
         # the same tmp_path prefix to a re-run and the memo would then answer
         # from the previous test's file set. Clearing is one dict op.
         "_snapshot_index_cache",
+        # #447: in-process memo of the session cache files. Keyed by path and
+        # the file's stat, so a stale entry cannot answer for a changed file;
+        # cleared anyway so no test starts with another test's parse.
+        "_CACHE_MEMO",
+        "_CACHE_DIRTY",
     ):
         getattr(obsidian_utils, name).clear()
     yield
