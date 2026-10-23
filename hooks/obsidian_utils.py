@@ -12,6 +12,8 @@ Every public function catches its own errors and logs to stderr.
 
 from __future__ import annotations
 
+import contextlib
+import copy
 import datetime
 import fnmatch
 import glob
@@ -2137,83 +2139,180 @@ def _get_session_id_fast(allow_env: bool = True) -> str:
 _UNCACHEABLE_SIDS = frozenset({"", "unknown"})
 
 
+# In-process memo of the per-session cache files (#447). The cache file is
+# the truth; this is a parsed copy keyed by the file's (st_ino, st_mtime_ns,
+# st_size), so a rewrite by another process changes the key and forces a
+# re-read. Without it every cache_get parsed the whole file (2-3 MB on a
+# large vault), once per note, which made /retro and /recall O(N^2).
+#   path -> (stat_key or None for "file absent", parsed dict)
+_CACHE_MEMO: dict[str, tuple[tuple | None, dict]] = {}
+# Keys set inside cache_deferred() and not yet written, per cache file. They
+# are laid over every re-read of the file, so a rewrite by another process
+# mid-block cannot hide them from cache_get or drop them from the flush.
+_CACHE_DIRTY: dict[str, dict] = {}
+_cache_defer_depth = 0
+_cache_lock = threading.RLock()
+
+
+def _cache_stat_key(st: os.stat_result) -> tuple:
+    return (st.st_ino, st.st_mtime_ns, st.st_size)
+
+
+def _cache_load(cache_path: str, *, warn_corrupt: bool = False) -> dict:
+    """Return the memoised dict for *cache_path*, re-reading the file only
+    when its stat key changed. The dict is shared with the memo: callers
+    copy what they return and own what they store. A missing or corrupt file
+    reads as {} (with a stderr note for corrupt when *warn_corrupt*)."""
+    try:
+        key = _cache_stat_key(os.stat(cache_path))
+    except OSError:
+        key = None
+    memo = _CACHE_MEMO.get(cache_path)
+    if memo is not None and memo[0] == key:
+        return memo[1]
+    data: dict = {}
+    if key is not None:
+        try:
+            with open(cache_path, 'r') as f:
+                # Key from the open file, not the earlier stat: a rename by
+                # another process in between must not pair new content with
+                # the old key (or the reverse).
+                key = _cache_stat_key(os.fstat(f.fileno()))
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                data = loaded
+        except OSError:
+            key = None
+        except json.JSONDecodeError as exc:
+            if warn_corrupt:
+                print(f"[obsidian-brain] cache corrupted, resetting: {exc}", file=sys.stderr)
+            # Memoised as "absent" (key None), which never matches while the
+            # file exists: the next read parses (and reports) it again, as
+            # before the memo. The next cache_set rewrites it.
+            key = None
+    data.update(_CACHE_DIRTY.get(cache_path, {}))
+    _CACHE_MEMO[cache_path] = (key, data)
+    return data
+
+
+def _cache_write(cache_path: str, data: dict) -> bool:
+    """Write *data* atomically and memoise it under the new file's stat key.
+    On failure the memo entry is dropped, so the next read goes back to the
+    file. Returns True on success."""
+    _ensure_secure_dir()
+    fd, tmp = tempfile.mkstemp(prefix='.ob-cache-', suffix='.json.tmp', dir=_SECURE_DIR)
+    try:
+        with os.fdopen(fd, 'w') as f:
+            json.dump(data, f)
+            f.flush()
+            # Key from the temp file before the rename: a write by another
+            # process after the rename must not be mistaken for ours.
+            key = _cache_stat_key(os.fstat(f.fileno()))
+        os.replace(tmp, cache_path)
+    except OSError as exc:
+        print(f"[obsidian-brain] cache write failed: {exc}", file=sys.stderr)
+        _CACHE_MEMO.pop(cache_path, None)
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return False
+    _CACHE_MEMO[cache_path] = (key, data)
+    return True
+
+
+def _cache_flush(cache_path: str) -> None:
+    """Write the keys deferred for *cache_path* over the file's current
+    content, in one write."""
+    dirty = _CACHE_DIRTY.get(cache_path)
+    if not dirty:
+        _CACHE_DIRTY.pop(cache_path, None)
+        return
+    data = _cache_load(cache_path, warn_corrupt=True)  # dirty keys laid over
+    _CACHE_DIRTY.pop(cache_path, None)
+    _cache_write(cache_path, data)
+
+
+@contextlib.contextmanager
+def cache_deferred():
+    """Batch cache_set writes: inside the block cache_set updates the memo
+    and marks the key pending; the outermost exit writes each touched cache
+    file once, merged over whatever is on disk by then. Nesting is allowed.
+    Pending keys are flushed on exit even when the block raises, because
+    outside a block each cache_set would already have been written."""
+    global _cache_defer_depth
+    with _cache_lock:
+        _cache_defer_depth += 1
+    try:
+        yield
+    finally:
+        with _cache_lock:
+            _cache_defer_depth -= 1
+            if _cache_defer_depth == 0:
+                for path in list(_CACHE_DIRTY):
+                    _cache_flush(path)
+
+
 def cache_get(session_id: str, key: str):
     """Read a key from the session cache. Returns None on miss, and always
-    for an uncacheable id (see _UNCACHEABLE_SIDS)."""
+    for an uncacheable id (see _UNCACHEABLE_SIDS). The file is parsed once
+    per process while it is unchanged (see _CACHE_MEMO); the value returned
+    is a copy, so mutating it cannot change what the next call sees."""
     if session_id in _UNCACHEABLE_SIDS:
         return None
     cache_path = f"{_CACHE_PREFIX}{session_id}.json"
-    try:
-        with open(cache_path, 'r') as f:
-            data = json.load(f)
-        return data.get(key)
-    except (OSError, json.JSONDecodeError):
-        return None
+    with _cache_lock:
+        value = _cache_load(cache_path).get(key)
+        return copy.deepcopy(value)
 
 
 def cache_set(session_id: str, key: str, value) -> None:
     """Write a key to the session cache. Atomic write. No-op for an
-    uncacheable id (see _UNCACHEABLE_SIDS)."""
+    uncacheable id (see _UNCACHEABLE_SIDS). Inside cache_deferred() the
+    write waits for the block's exit.
+
+    The value is stored as its JSON round-trip, so a later cache_get returns
+    exactly what a fresh parse of the file would (tuples as lists, int dict
+    keys as strings), and a caller mutating *value* afterwards cannot reach
+    the memo."""
     if session_id in _UNCACHEABLE_SIDS:
         return
-    _ensure_secure_dir()
+    stored = json.loads(json.dumps(value))
     cache_path = f"{_CACHE_PREFIX}{session_id}.json"
-    try:
-        with open(cache_path, 'r') as f:
-            data = json.load(f)
-    except (OSError, json.JSONDecodeError) as exc:
-        if isinstance(exc, json.JSONDecodeError):
-            print(f"[obsidian-brain] cache corrupted, resetting: {exc}", file=sys.stderr)
-        data = {}
-
-    data[key] = value
-
-    fd, tmp = tempfile.mkstemp(prefix='.ob-cache-', suffix='.json.tmp', dir=_SECURE_DIR)
-    try:
-        with os.fdopen(fd, 'w') as f:
-            json.dump(data, f)
-        os.replace(tmp, cache_path)
-    except OSError as exc:
-        print(f"[obsidian-brain] cache write failed: {exc}", file=sys.stderr)
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
+    with _cache_lock:
+        data = _cache_load(cache_path, warn_corrupt=True)
+        data[key] = stored
+        if _cache_defer_depth > 0:
+            _CACHE_DIRTY.setdefault(cache_path, {})[key] = stored
+            return
+        _cache_write(cache_path, data)
 
 
 def cache_invalidate(session_id: str, *keys: str) -> None:
     """Remove specific keys from cache. No keys = clear all. No-op for an
-    uncacheable id, which never has a cache (see _UNCACHEABLE_SIDS)."""
+    uncacheable id, which never has a cache (see _UNCACHEABLE_SIDS). Inside
+    cache_deferred() the pending keys are written first."""
     if session_id in _UNCACHEABLE_SIDS:
         return
     cache_path = f"{_CACHE_PREFIX}{session_id}.json"
-    if not keys:
-        try:
-            os.unlink(cache_path)
-        except OSError:
-            pass
-        return
+    with _cache_lock:
+        _cache_flush(cache_path)
+        if not keys:
+            _CACHE_MEMO.pop(cache_path, None)
+            try:
+                os.unlink(cache_path)
+            except OSError:
+                pass
+            return
 
-    try:
-        with open(cache_path, 'r') as f:
-            data = json.load(f)
-    except (OSError, json.JSONDecodeError):
-        return
-
-    for k in keys:
-        data.pop(k, None)
-
-    _ensure_secure_dir()
-    fd, tmp = tempfile.mkstemp(prefix='.ob-cache-', suffix='.json.tmp', dir=_SECURE_DIR)
-    try:
-        with os.fdopen(fd, 'w') as f:
-            json.dump(data, f)
-        os.replace(tmp, cache_path)
-    except OSError:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
+        if not os.path.exists(cache_path):
+            return
+        data = _cache_load(cache_path)
+        if not any(k in data for k in keys):
+            return
+        for k in keys:
+            data.pop(k, None)
+        _cache_write(cache_path, data)
 
 
 # ---------------------------------------------------------------------------
@@ -3462,6 +3561,8 @@ def _retro_order(retros: list[dict]) -> tuple[list[dict], str]:
     return sorted(retros, key=lambda retro: retro["stem"]), "filename"
 
 
+# One cache write for the whole scan, not one per note read (#447).
+@cache_deferred()
 def gather_session_evidence(
     vault_path: str,
     sessions_folder: str,
@@ -5087,6 +5188,8 @@ def find_unsummarized_notes(
 _OPEN_ITEM_EVIDENCE_WINDOW = 10
 
 
+# One cache write for the whole scan, not one per note read (#447).
+@cache_deferred()
 def build_context_brief(
     vault_path: str,
     sessions_folder: str,
