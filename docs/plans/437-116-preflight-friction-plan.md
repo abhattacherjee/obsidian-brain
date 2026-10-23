@@ -13,7 +13,8 @@ File: `tests/test_security.py`.
    - one slow sample then a fast one: passes, `check` ran twice;
    - a fast first sample: passes, `check` ran once;
    - slow every time: fails, and the message names both samples.
-5. A planted slow path: copy the hooks, add `time.sleep(3.5)` at the top of `prevent-direct-push.py`'s `main()`, and run the stall test's real check through the helper. It must still fail.
+5. Added during the build: the first full preflight failed the growth sweep on both runs at a load average of ~93 on 12 CPUs, and the case passed 3 of 3 alone. So `_fail_timing(msg)` skips, with the load and CPU count in the reason, when both runs missed, the load average is above `os.cpu_count()`, and `CI` is unset. Otherwise it fails. Tests cover: overload skips locally, CI still fails, normal load fails, and an unreadable load average fails.
+6. A planted slow path: copy the hooks, add `time.sleep(3.5)` at the top of `prevent-direct-push.py`'s `main()`, and run the stall test's real check through the helper. It must still fail.
 
 ## Task 2: `commit-preflight.sh --allow-empty` (#116)
 
@@ -34,7 +35,7 @@ Files: `scripts/commit-preflight.sh`, `tests/test_security.py`, `scripts/dev-tes
 
 ## Task 3: carry `--allow-empty` upstream
 
-File a harden-repo issue: the template `templates/scripts/commit-preflight.sh` has no `--allow-empty`, so #418's template swap would drop it. The new tests here then fail, which is the signal.
+Filed as harden-repo#160 (the known content-binding limit is harden-repo#81): the template `templates/scripts/commit-preflight.sh` has no `--allow-empty`, so #418's template swap would drop it. The new tests here then fail, which is the signal.
 
 ## Failure modes
 
