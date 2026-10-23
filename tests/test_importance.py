@@ -244,7 +244,16 @@ def _importance(db, path):
     return _execute(db, "SELECT importance FROM notes WHERE path=?", (path,))[0][0]
 
 
-@pytest.mark.parametrize("kind", vault_index.CURATED_IMPORTANCE_TYPES)
+def test_importance_spec_values():
+    assert vault_index.IMPORTANCE_AUTO_CAPTURE == 3
+    assert vault_index.IMPORTANCE_HAND_SAVED == 6
+    assert vault_index.DEFAULT_IMPORTANCE == 5
+    assert vault_index.CURATED_IMPORTANCE_TYPES == (
+        "claude-insight", "claude-decision", "claude-error-fix",
+    )
+
+
+@pytest.mark.parametrize("kind", ["claude-insight", "claude-decision", "claude-error-fix"])
 @pytest.mark.parametrize("source, expected", [("auto-capture", 3), ("manual", 6), (None, 6)])
 def test_curated_derivation(kind, source, expected):
     assert vault_index._derive_importance({"type": kind, "source": source}, 9) == expected
@@ -408,7 +417,8 @@ def _run(*args):
 def test_script_dry_run_and_apply(db, legacy):
     proc = _run("--db", db)
     assert proc.returncode == 0, proc.stderr
-    for text in ("dry run", "scanned: 4", "changed: 2", "unreadable: 2", "by_value:", "from_to:"):
+    for text in ("dry run", "scanned: 4", "changed: 2", "unreadable: 2", "by_value: {'3': 1, '6': 1}",
+                 "from_to: {'5->3': 1, '5->6': 1}"):
         assert text in proc.stdout
     assert [_importance(db, p) for p in legacy] == [5] * 5
     proc = _run("--db", db, "--apply")
@@ -426,3 +436,55 @@ def test_script_bad_flag():
     proc = _run("--bad-flag")
     assert proc.returncode == 2
     assert "usage: importance_backfill.py" in proc.stderr
+
+
+@pytest.mark.parametrize("raw, expected", [
+    ("06", 6), ("010", 10), ("00", None), ("1e1", None), ("True", None), (True, None),
+])
+def test_frontmatter_importance_edge_cases(raw, expected):
+    assert vault_index._frontmatter_importance(raw) == expected
+
+
+@pytest.mark.parametrize("source", ["auto", "Auto-Capture", "auto-capture-x", "auto capture", ""])
+def test_near_miss_source_is_hand_saved(source):
+    assert vault_index._derive_importance(
+        {"type": "claude-insight", "source": source}, None,
+    ) == 6
+
+
+def test_full_rebuild_derives_importance(tmp_path):
+    folder = "curated"
+    notes = tmp_path / folder
+    notes.mkdir()
+    auto = _note(notes, "auto.md", extra="source: auto-capture\n")
+    hand = _note(notes, "hand.md")
+    db_path = str(tmp_path / "rebuild.db")
+    vault_index.rebuild_index(str(tmp_path), [folder], db_path=db_path, full=True)
+    assert _importance(db_path, auto) == 3
+    assert _importance(db_path, hand) == 6
+
+
+def test_backfill_other_curated_types(db, tmp_path):
+    decision = _note(tmp_path, "decision.md", "claude-decision", "source: auto-capture\n")
+    error_fix = _note(tmp_path, "error-fix.md", "claude-error-fix")
+    retro = _note(tmp_path, "retro.md", "claude-retro")
+    for path in (decision, error_fix, retro):
+        assert vault_index.index_note(db, path)
+    _execute(db, "UPDATE notes SET importance=5")
+    _execute(db, "UPDATE notes SET importance=7 WHERE path=?", (retro,))
+    result = vault_index.backfill_importance(db, apply=True)
+    assert result["updated"] == 2
+    assert [_importance(db, p) for p in (decision, error_fix, retro)] == [3, 6, 7]
+
+
+def test_backfill_override_and_non_curated(db, tmp_path):
+    curated = _note(tmp_path, "override.md", extra="importance: 8\n")
+    other = _note(tmp_path, "other.md", "claude-retro")
+    for path in (curated, other):
+        assert vault_index.index_note(db, path)
+    _execute(db, "UPDATE notes SET importance=5")
+    Path(other).write_text("No frontmatter\n")
+    result = vault_index.backfill_importance(db, apply=True)
+    assert result["updated"] == 1
+    assert _importance(db, curated) == 8
+    assert _importance(db, other) == 5

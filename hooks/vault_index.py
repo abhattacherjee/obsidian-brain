@@ -41,6 +41,7 @@ from themes import (  # noqa: F401  (re-export shim)
 )
 from frontmatter import split_frontmatter, split_lines_lf_crlf
 
+DEFAULT_IMPORTANCE = 5
 IMPORTANCE_AUTO_CAPTURE = 3
 IMPORTANCE_HAND_SAVED = 6
 CURATED_IMPORTANCE_TYPES = ("claude-insight", "claude-decision", "claude-error-fix")
@@ -360,6 +361,8 @@ def _parse_note(file_path: str) -> dict | None:
 
     Returns dict with keys: type, date, project, title, source_session,
     source_note, tags (comma-separated), status, body.
+    Every other frontmatter key is passed through as a string too, including
+    source and importance, which _derive_importance reads.
     Returns None for files that can't be parsed.
     """
     return _parse_note_detailed(file_path)[0]
@@ -395,7 +398,7 @@ def _derive_importance(parsed: dict, existing: int | None) -> int:
     if parsed.get("type") in CURATED_IMPORTANCE_TYPES:
         return (IMPORTANCE_AUTO_CAPTURE if parsed.get("source") == "auto-capture"
                 else IMPORTANCE_HAND_SAVED)
-    return existing if existing is not None else 5
+    return existing if existing is not None else DEFAULT_IMPORTANCE
 
 
 def backfill_importance(db_path: str, *, apply: bool = False) -> dict:

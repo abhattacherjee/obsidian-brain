@@ -1,5 +1,27 @@
 #!/usr/bin/env python3
-"""Backfill curated note importance (#449), with a dry run by default."""
+"""One-off backfill of derived note importance (#449).
+
+_sync re-derives only notes whose mtime changed, so rows indexed before
+#449 keep the old default 5. Re-parse non-session notes to apply the rule:
+frontmatter importance 1-10 wins; claude-insight, claude-decision and
+claude-error-fix get 3 with source: auto-capture, otherwise 6. Other types
+without an override and session scores are left untouched.
+
+Usage:
+    python3 scripts/importance_backfill.py                 # dry run
+    python3 scripts/importance_backfill.py --apply         # write changes
+    python3 scripts/importance_backfill.py --db PATH       # use another DB
+
+Options:
+    --apply     write the changes (default: dry run)
+    --db PATH   index DB (default: $OBSIDIAN_BRAIN_DB or
+                ~/.claude/obsidian-brain-vault.db)
+
+No backup is taken because only the importance column changes and from_to
+names every change.
+
+Exit codes: 0 ok, 1 missing DB or failure, 2 usage error.
+"""
 
 import argparse
 import sys
@@ -17,8 +39,10 @@ def main(argv=None) -> int:
         description="Backfill derived importance for non-session notes (#449).",
     )
     parser.add_argument("--apply", action="store_true",
-                        help="update the index (default: dry run)")
-    parser.add_argument("--db", default=None, help="index DB path")
+                        help="write the changes (default: dry run)")
+    parser.add_argument("--db", default=None,
+                        help="index DB path (default: $OBSIDIAN_BRAIN_DB or "
+                             "~/.claude/obsidian-brain-vault.db)")
     args = parser.parse_args(argv)
     try:
         result = vault_index.backfill_importance(

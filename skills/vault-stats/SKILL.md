@@ -99,7 +99,7 @@ Format the JSON into markdown tables and display to the user. Use this structure
 | Signal | Coverage | Notes |
 |---|---|---|
 | Activation (access history) | <pct>% (<has_activation>/<total_notes>) | <total_notes - has_activation> notes never accessed |
-| Importance (non-default) | <pct>% (<has_importance>/<total_notes>) | <total_notes - has_importance> notes at default 5 |
+| Importance (not 5) | <pct>% (<has_importance>/<total_notes>) | <total_notes - has_importance> notes at 5 (curated notes carry a derived 3 or 6; session notes a Haiku score) |
 | Both signals active | <pct>% (<has_both>/<total_notes>) | Full 7-signal scoring |
 | Neither signal | <pct>% (<has_neither>/<total_notes>) | Using 5-signal fallback |
 
@@ -138,7 +138,7 @@ Format the JSON into markdown tables and display to the user. Use this structure
 | Access events | <access_events> |
 | Avg accesses/note | <avg_accesses> |
 | Notes with activation | <notes_with_activation> (<pct>%) |
-| Notes with importance != 5 | <notes_with_importance> (<pct>%) |
+| Notes with importance != 5 (derived or scored) | <notes_with_importance> (<pct>%) |
 
 ## Recent Activity (last 7 days)
 

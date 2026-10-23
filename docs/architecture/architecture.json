@@ -501,7 +501,7 @@
           "files": [
             "hooks/vault_index.py"
           ],
-          "purpose": "Deliberately avoids INSERT OR REPLACE: explicit DELETE+INSERT that stores _derive_importance(): an importance: frontmatter line (1-10) wins; claude-insight/decision/error-fix notes get 3 when source: auto-capture and 6 otherwise; every other type keeps its prior value (the session notes' Haiku score) (#449), and issuing the contentless-FTS5 delete op with old column values so the FTS index never accumulates orphans. Token-scoped term_df fetch: only fetches df rows for terms in the current note (chunked IN clause at 900 placeholders), not a full-table scan, so cost is O(note tokens) not O(vocabulary)."
+          "purpose": "Deliberately avoids INSERT OR REPLACE: an explicit DELETE+INSERT issues the contentless-FTS5 delete op with the old column values, so the FTS index never accumulates orphans. The stored importance comes from _derive_importance() (#449): an importance: frontmatter line (1-10) wins; claude-insight/decision/error-fix notes get 3 with source: auto-capture and 6 otherwise; every other type keeps its prior value (the session notes' Haiku score). Token-scoped term_df fetch: only fetches df rows for terms in the current note (chunked IN clause at 900 placeholders), not a full-table scan, so cost is O(note tokens) not O(vocabulary)."
         },
         {
           "id": "vault-stats-compute",
@@ -510,7 +510,7 @@
           "files": [
             "hooks/vault_stats.py"
           ],
-          "purpose": "Read-only aggregation for /vault-stats: signal coverage (per-note activation + importance), access-by-context, top-accessed, importance distribution, and snapshot integrity metrics (orphans, broken backlinks, summarized fraction)."
+          "purpose": "Read-only aggregation for /vault-stats: signal coverage (per-note activation, and importance other than 5; since #449 curated notes always carry a derived 3 or 6, so importance coverage tracks note type as much as scoring), access-by-context, top-accessed, importance distribution, and snapshot integrity metrics (orphans, broken backlinks, summarized fraction)."
         },
         {
           "id": "access-log-purge-cli",
