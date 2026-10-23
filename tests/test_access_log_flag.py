@@ -4,15 +4,13 @@ Internal searches (capture dedup, wiki lookup, check-items dedup, /compress
 dedup) are not a person retrieving a note. Logging their hits as accesses
 fed ACT-R activation with noise, so they pass log_access=False. Python callers are checked with `ast`. Python snippets in
 SKILL.md/.sh/.md files (`python3 -c '...'`, heredocs, ```python fences) are
-parsed with `ast` too; only an unparseable snippet falls back to tokens. The tests make every new search_vault call outside the user-facing list say so.
+parsed with `ast` too; a snippet that mentions search_vault and does not parse is a finding. The tests make every new search_vault call outside the user-facing list say so.
 """
 
 from __future__ import annotations
 
 import ast
-import io
 import re
-import tokenize
 from pathlib import Path
 
 import pytest
@@ -163,49 +161,31 @@ def _calls(text: str):
 
 # --- caller guard: snippets inside SKILL.md / shell text ---------------------
 
+_DQ_ESCAPE = re.compile(r"\\(\n|[\\\"$`])")
+
+
+def _dq_decode(code: str) -> str:
+    """Undo bash double-quote escapes: backslash before \\ " $ ` yields that
+    character, backslash-newline vanishes, any other backslash stays."""
+    return _DQ_ESCAPE.sub(lambda m: "" if m.group(1) == "\n" else m.group(1), code)
+
+
 _SNIPPET_RES = (
-    re.compile(r"```(?:python|py)[^\n]*\n(.*?)```", re.S),
-    re.compile(r"python3?\s+(?:-\w+\s+)*-c\s+'([^']*)'", re.S),
-    re.compile(r'python3?\s+(?:-\w+\s+)*-c\s+"((?:[^"\\]|\\.)*)"', re.S),
-    re.compile(r"python3?\s+-[ \t]*<<-?\s*['\"]?(\w+)['\"]?[^\n]*\n(.*?)\n\s*\1\b", re.S),
+    (re.compile(r"```(?:python|py)[^\n]*\n(.*?)```", re.S), None),
+    (re.compile(r"python3?\s+(?:-\w+\s+)*-c\s+'([^']*)'", re.S), None),
+    (re.compile(r'python3?\s+(?:-\w+\s+)*-c\s+"((?:[^"\\]|\\.)*)"', re.S), _dq_decode),
+    (re.compile(r"python3?\s+-[ \t]*<<-?\s*['\"]?(\w+)['\"]?[^\n]*\n(.*?)\n\s*\1\b", re.S), None),
 )
 
 
 def _snippets(text: str):
     """Yield (start_offset, end_offset, code) for each Python snippet in *text*."""
-    for rx in _SNIPPET_RES:
+    for rx, decode in _SNIPPET_RES:
         for m in rx.finditer(text):
             code = m.group(m.lastindex)
+            if decode:
+                code = decode(code)
             yield m.start(m.lastindex), m.end(m.lastindex), code
-
-
-def _token_findings(code: str) -> bool:
-    """Fallback for a snippet `ast` cannot parse: True when it is clean, i.e.
-    it has no search_vault call, or every call is matched by a
-    ``log_access = False`` token triple. Comments and strings are separate
-    tokens, so neither can satisfy or hide the check. Unreadable -> False."""
-    try:
-        toks = [
-            t for t in tokenize.generate_tokens(io.StringIO(code).readline)
-            if t.type not in (tokenize.COMMENT, tokenize.NL, tokenize.NEWLINE)
-        ]
-    except (tokenize.TokenError, IndentationError, SyntaxError):
-        return False
-    calls = flags = 0
-    for i, t in enumerate(toks):
-        nxt = toks[i + 1] if i + 1 < len(toks) else None
-        if t.type == tokenize.NAME and t.string == _NAME:
-            if nxt is not None and nxt.string == "(":
-                prev = toks[i - 1].string if i else ""
-                if prev != "def":
-                    calls += 1
-            else:
-                return False  # reference that is not a direct call
-        if (t.type == tokenize.NAME and t.string == "log_access"
-                and i + 2 < len(toks) and toks[i + 1].string == "="
-                and toks[i + 2].string == "False"):
-            flags += 1
-    return calls <= flags
 
 
 def _text_findings(text: str, user_facing: bool = False) -> list[tuple[int, str]]:
@@ -222,8 +202,7 @@ def _text_findings(text: str, user_facing: bool = False) -> list[tuple[int, str]
         try:
             found = _py_findings(code)
         except SyntaxError:
-            if not _token_findings(code):
-                out.append((line0 + 1, "unparseable"))
+            out.append((line0 + 1, "unparseable"))
             continue
         out += [(line0 + n, why) for n, why in found]
     if not user_facing:
@@ -380,8 +359,12 @@ def test_call_scanner(snippet, expected):
     "```python\nsearch_vault(db, q, log_access=False\n```\n",
     "```python\nsearch_vault(db, q)\nx = = 1\n```\n",
     "```python\nsearch_vault(db, q) log_access=False(\n```\n",
+    "```python\nsearch_vault(db, q, log_access=False)\nx = = 1\n```\n",
+    "```python\nsearch_vault(db, q, extra=f(log_access=False))\nx = = 1\n```\n",
+    'python3 -c "search_vault(db, \\"query\\")"\n',
 ], ids=["fence-hash-in-string", "dashc-comment-flag", "dashc-hash-in-string",
-        "heredoc", "fence-comment-flag", "unparseable-no-flag", "tokenizable-no-flag", "unparseable-wrong-order"])
+        "heredoc", "fence-comment-flag", "unparseable-no-flag", "tokenizable-no-flag", "unparseable-wrong-order",
+        "unparseable-with-flag", "unparseable-nested-flag", "dashc-dq-no-flag"])
 def test_skill_scanner_flags(snippet):
     assert _text_findings(snippet)
 
@@ -390,9 +373,8 @@ def test_skill_scanner_flags(snippet):
     "```python\nsearch_vault(db, q, log_access=False)\n```\n",
     "python3 -c 'search_vault(db, q, limit=1, log_access=False)'\n",
     "python3 - <<'EOF'\nsearch_vault(db, q, log_access=False)\nEOF\n",
-    "```python\nsearch_vault(db, q, log_access=False)\nx = = 1\n```\n",
+    'python3 -c "search_vault(db, \\"query\\", log_access=False)"\n',
     "`search_vault` is documented here\n",
-], ids=["fence", "dashc", "heredoc", "unparseable-with-flag", "prose"])
+], ids=["fence", "dashc", "heredoc", "dashc-dq-escaped-quotes", "prose"])
 def test_skill_scanner_passes(snippet):
-    # unparseable-with-flag: ast fails, the token fallback sees a real flag
     assert _text_findings(snippet) == []
