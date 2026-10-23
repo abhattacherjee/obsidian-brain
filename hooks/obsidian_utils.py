@@ -3133,6 +3133,78 @@ def read_note_metadata(file_path: str) -> dict | None:
     return read_note_metadata_detailed(file_path)[0]
 
 
+def _indexed_rows_under(folder: Path) -> dict | None:
+    """Index rows for notes under *folder*, keyed by path string (#447).
+
+    A read-only query: no ensure_index, no sync, no write, so a scan that
+    uses it never pays for (or races) an index update. Returns None when
+    the index cannot answer: vault_index unavailable, no DB file, or any
+    sqlite3.Error (missing table, locked, corrupt). None means "scan every
+    note", never "nothing matched". The #192 guard's RuntimeError (a test
+    reaching the production DB) is deliberately not caught.
+
+    Rows are only a hint. Use _fresh_index_row to decide whether one may
+    stand in for reading the note.
+    """
+    if _vault_index is None:
+        return None
+    db_path = _vault_index._default_db_path()
+    if not os.path.isfile(db_path):
+        return None
+    # Range on the path primary key: every row whose path starts with
+    # "<folder>/". "0" is the character after "/", so the range ends just
+    # past that prefix. A LIKE would need escaping for "%" and "_".
+    prefix = str(folder) + os.sep
+    hi = str(folder) + chr(ord(os.sep) + 1)
+    try:
+        conn = _vault_index._connect(db_path)
+        try:
+            rows = conn.execute(
+                "SELECT path, mtime, type, project, source_session FROM notes "
+                "WHERE path >= ? AND path < ?",
+                (prefix, hi),
+            ).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        print(f"[obsidian-brain] index pre-filter unavailable "
+              f"({type(exc).__name__}); scanning every note", file=sys.stderr)
+        return None
+    return {row["path"]: row for row in rows}
+
+
+def _fresh_index_row(indexed: dict | None, note_path: Path):
+    """The index row for *note_path* if it may stand in for the note's own
+    frontmatter, else None (#447).
+
+    It may only when the note is indexed and its on-disk mtime still
+    matches the indexed one, by the same comparison _sync uses
+    (vault_index.mtime_unchanged). A note edited, created or broken since
+    the last sync fails that and goes through the full read, so a stale row
+    can never hide it.
+
+    One more case is excluded: a note of _FRONTMATTER_MAX_CHARS bytes or
+    more. Only there can read_note_metadata_detailed (which reads a capped
+    prefix) report "frontmatter exceeds ..." for a note the index (which
+    reads the whole file) parsed, and that report must still reach /retro.
+    Bytes bound characters from above, so a smaller file cannot hit the cap.
+    """
+    if indexed is None:
+        return None
+    row = indexed.get(str(note_path))
+    if row is None:
+        return None
+    try:
+        st = note_path.stat()
+    except OSError:
+        return None
+    if st.st_size >= _FRONTMATTER_MAX_CHARS:
+        return None
+    if not _vault_index.mtime_unchanged(st.st_mtime, row["mtime"]):
+        return None
+    return row
+
+
 # WHY A MEMO: date-agnostic discovery is the only correct way to find a snapshot
 # written before midnight for a session whose note is dated the next day (#70),
 # but it means reading every snapshot's frontmatter instead of globbing one
@@ -3700,7 +3772,14 @@ def gather_session_evidence(
             "claude-error-fix": bundle["error_fixes"],
             "claude-retro": bundle["retros"],
         }
+        # The listing stays (it is the truth for which notes exist); the
+        # index only lets a note it proves irrelevant skip the metadata read
+        # (#447). None = no index: read every note, as before.
+        indexed = _indexed_rows_under(insights_path)
         for note_path in sorted(insights_path.glob("*.md")):
+            row = _fresh_index_row(indexed, note_path)
+            if row is not None and row["source_session"] not in id_set:
+                continue
             meta, reason = read_note_metadata_detailed(str(note_path))
             if meta is None:
                 # Record WHY. The old code re-probed the file and only logged
@@ -5231,7 +5310,18 @@ def build_context_brief(
     session_files: list[tuple[str, str, dict]] = []  # (filename, path, metadata)
     if sessions_dir.is_dir():
         md_files = [f for f in sessions_dir.iterdir() if f.suffix == '.md']
+        # Notes the index proves irrelevant (a snapshot, or another project)
+        # skip the metadata read (#447); everything else is read as before.
+        indexed = _indexed_rows_under(sessions_dir)
         for f in sorted(md_files, key=_safe_sort_key, reverse=True):
+            row = _fresh_index_row(indexed, f)
+            if row is not None:
+                row_project = row["project"] or ''
+                if row["type"] == 'claude-snapshot' or (
+                    row_project.lower() != project.lower()
+                    and slugify(row_project) != slugify(project)
+                ):
+                    continue
             meta = read_note_metadata(str(f))
             if not meta:
                 continue

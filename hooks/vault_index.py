@@ -731,6 +731,17 @@ def _sanitize_report_filename(name: str) -> str:
     return cleaned or "<unnamed>"
 
 
+def mtime_unchanged(file_mtime: float, indexed_mtime: float) -> bool:
+    """True when a note's on-disk mtime matches its indexed one.
+
+    The one comparison that decides an indexed row is still current: _sync
+    skips re-parsing on it, and obsidian_utils' bulk scans skip a metadata
+    read on it (#447). Shared so the two cannot drift apart. The tolerance
+    absorbs float round-tripping through SQLite's REAL column.
+    """
+    return abs(file_mtime - indexed_mtime) < 0.001
+
+
 def _sync(conn: sqlite3.Connection, vault_path: str, folders: list[str]) -> dict:
     """Incremental sync: add new/changed files, remove deleted ones.
 
@@ -810,8 +821,8 @@ def _sync(conn: sqlite3.Connection, vault_path: str, folders: list[str]) -> dict
             file_mtime = st.st_mtime
             file_size = st.st_size
 
-            # Skip if mtime unchanged (0.001 tolerance)
-            if abs_path_str in indexed and abs(file_mtime - indexed[abs_path_str]) < 0.001:
+            # Skip if mtime unchanged (see mtime_unchanged)
+            if abs_path_str in indexed and mtime_unchanged(file_mtime, indexed[abs_path_str]):
                 stats["unchanged"] += 1
                 stats["skipped"] += 1
                 continue
