@@ -15,9 +15,10 @@ import re
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 from collections import defaultdict
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 # --- #229 Slice A: TF-IDF + theme primitives moved to sibling modules.
@@ -1183,6 +1184,119 @@ def _gc_access_log_if_needed(conn: sqlite3.Connection) -> None:
             gc_access_log(conn, keep)
     except sqlite3.Error as exc:
         print(f"[vault-index] access_log GC skipped: {exc}", file=sys.stderr)
+
+
+def _access_log_count(conn: sqlite3.Connection) -> int:
+    return conn.execute("SELECT COUNT(*) FROM access_log").fetchone()[0]
+
+
+def _backup_db(src: sqlite3.Connection, dest_path: str) -> None:
+    """Copy the open DB to *dest_path* with SQLite's online backup API,
+    which reads a consistent snapshot even while WAL writers are active."""
+    dest = _connect(dest_path)
+    try:
+        src.backup(dest)
+    finally:
+        dest.close()
+
+
+def purge_access_log(
+    db_path: str,
+    context_type: str,
+    since_ts: float,
+    *,
+    apply: bool = False,
+    backup_dir: str | None = None,
+    list_rows: bool = False,
+) -> dict:
+    """Delete access_log rows of *context_type* with ``timestamp >= since_ts``
+    (#448's one-off cleanup of internal-search noise).
+
+    Dry run by default: returns ``{"applied": False, "matched": N,
+    "by_day": {"YYYY-MM-DD": n}}`` (local dates) and changes nothing;
+    *list_rows* adds ``"rows": [(note_path, timestamp), ...]``. With
+    ``apply=True`` the DB is first copied into *backup_dir* (default
+    ``~/.claude/obsidian-brain/``, 0o700; the copy is 0o600) and the copy is
+    checked to hold every access row; then the rows are deleted in one
+    transaction and the result adds ``deleted``, ``before_total``,
+    ``after_total`` and ``backup_path``. Any backup failure raises before
+    the delete, so nothing is lost without a copy.
+
+    Raises FileNotFoundError when *db_path* does not exist (never creates
+    one).
+    """
+    if not os.path.isfile(db_path):
+        raise FileNotFoundError(db_path)
+    conn = _connect(db_path)
+    try:
+        where = "context_type = ? AND timestamp >= ?"
+        params = (context_type, since_ts)
+        by_day: dict[str, int] = {}
+        rows = conn.execute(
+            f"SELECT note_path, timestamp FROM access_log WHERE {where} "
+            "ORDER BY timestamp, id",
+            params,
+        ).fetchall()
+        for _path, ts in rows:
+            day = datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
+            by_day[day] = by_day.get(day, 0) + 1
+        result: dict = {
+            "applied": False,
+            "matched": len(rows),
+            "by_day": dict(sorted(by_day.items())),
+        }
+        if list_rows:
+            result["rows"] = [(p, ts) for p, ts in rows]
+        if not apply:
+            return result
+
+        if backup_dir is None:
+            backup_dir = os.path.join(os.path.expanduser("~"), ".claude", "obsidian-brain")
+        os.makedirs(backup_dir, mode=0o700, exist_ok=True)
+        os.chmod(backup_dir, 0o700)
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        fd, backup_path = tempfile.mkstemp(
+            prefix=f"vault-db-backup-{stamp}-", suffix=".db", dir=backup_dir
+        )
+        os.close(fd)  # mkstemp made it 0o600; the backup API writes into it
+        _backup_db(conn, backup_path)
+        os.chmod(backup_path, 0o600)
+        before_total = _access_log_count(conn)
+        check = _connect(backup_path)
+        try:
+            backed_up = _access_log_count(check)
+        finally:
+            check.close()
+        if backed_up != before_total:
+            raise RuntimeError(
+                f"backup at {backup_path} holds {backed_up} access rows, "
+                f"expected {before_total}; nothing deleted"
+            )
+
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            before_total = _access_log_count(conn)
+            deleted = conn.execute(
+                f"DELETE FROM access_log WHERE {where}", params
+            ).rowcount
+            after_total = _access_log_count(conn)
+            conn.commit()
+        except BaseException:
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
+            raise
+        result.update(
+            applied=True,
+            deleted=deleted,
+            before_total=before_total,
+            after_total=after_total,
+            backup_path=backup_path,
+        )
+        return result
+    finally:
+        conn.close()
 
 
 def batch_activations(
