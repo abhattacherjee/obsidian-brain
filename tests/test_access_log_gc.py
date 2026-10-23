@@ -114,6 +114,20 @@ def test_default_keep_is_the_spec_1000(indexed):
     assert min(ts for _, ts in remaining) == base + 1
 
 
+@pytest.mark.parametrize("keep", [0, -1], ids=["zero", "negative"])
+def test_keep_below_one_is_refused(indexed, keep):
+    """keep=0 would delete every access row; refuse it before any DELETE."""
+    _vault_path, paths, db = indexed
+    _insert(db, [(paths[0], time.time())])
+    conn = vault_index._connect(db)
+    try:
+        with pytest.raises(ValueError):
+            vault_index.gc_access_log(conn, keep=keep)
+    finally:
+        conn.close()
+    assert len(_rows(db)) == 1
+
+
 def test_no_note_over_keep_deletes_nothing(indexed):
     _vault_path, paths, db = indexed
     base = time.time() - 1000

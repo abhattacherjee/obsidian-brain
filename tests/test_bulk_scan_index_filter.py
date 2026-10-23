@@ -416,3 +416,12 @@ def test_brief_skips_snapshot_reads_through_the_index(tmp_vault, fresh_db, read_
     fresh_db(tmp_vault)
     _brief(tmp_vault)
     assert not {str(p) for p in orphans} & set(read_log)
+
+
+def test_note_gone_since_listing_gets_no_row(tmp_vault):
+    """A note deleted between the listing and the stat must not skip on a
+    row: it goes to the full read, which reports it as unreadable."""
+    gone = tmp_vault / INSIGHTS / "2026-10-20-gone.md"
+    row = {"path": str(gone), "mtime": 0.0, "type": "claude-insight",
+           "project": PROJECT, "source_session": OTHER_SID}
+    assert obsidian_utils._fresh_index_row({str(gone): row}, gone) is None
