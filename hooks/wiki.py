@@ -403,14 +403,16 @@ def _unquote(value) -> str:
 
 def lookup(db_path: str, question: str, limit: int = 3) -> list:
     """Top wiki pages for ``question`` via ``vault_index.search_vault``
-    (BM25 candidates, then reranked; it also logs an access for each hit).
+    (BM25 candidates, then reranked). The hits are not logged as accesses:
+    a lookup is a dedup check, not a read (#448).
     Each candidate carries ``path``, ``question`` (unescaped title),
     ``updated`` and the initial FTS ``rank``."""
     import vault_index
 
     if not str(question or "").strip():
         return []
-    hits = vault_index.search_vault(db_path, question, note_type=PAGE_TYPE, limit=limit)
+    hits = vault_index.search_vault(db_path, question, note_type=PAGE_TYPE, limit=limit,
+                                    log_access=False)
     return [{"path": h.get("path"), "question": _unquote(h.get("title")),
              "updated": h.get("date") or "", "rank": h.get("rank", h.get("score"))}
             for h in hits[:limit]]

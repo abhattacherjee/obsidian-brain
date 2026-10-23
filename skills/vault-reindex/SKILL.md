@@ -150,6 +150,7 @@ Parse the JSON output from Step 3. Extract:
 - `mode` — `"preserve"` or `"full"`
 - `preserved` — dict with `access_log`, `themes`, `theme_members` counts (non-destructive mode only)
 - `pruned_orphans` — dict with `access_log`, `theme_members` pruned counts (non-destructive mode only)
+- `access_log_gc` — access rows dropped because a note had more than 1,000 (the newest 1,000 per note are kept, #448); always 0 in full mode
 
 Present this report:
 
@@ -163,7 +164,7 @@ Present this report:
 >
 > Unchanged: `<unchanged>` file(s) already indexed (nothing to do). Malformed: `<malformed>` file(s) with frontmatter that failed to parse.
 
-Add a line naming the scanned folders from `folders`, marking each one whose `exists` is false as "(missing — nothing indexed)". A missing `wiki_folder` usually means a typo in the config or that `/obsidian-setup` has not been re-run. If `excluded` is greater than 0, add: "Skipped `<excluded>` wiki index/log file(s) (not knowledge, never indexed)." If `foreign_deleted` is greater than 0, add: "Dropped `<foreign_deleted>` row(s) for notes outside the scanned folders (a folder was renamed or removed from the config, or old test data)."
+Add a line naming the scanned folders from `folders`, marking each one whose `exists` is false as "(missing — nothing indexed)". A missing `wiki_folder` usually means a typo in the config or that `/obsidian-setup` has not been re-run. If `excluded` is greater than 0, add: "Skipped `<excluded>` wiki index/log file(s) (not knowledge, never indexed)." If `foreign_deleted` is greater than 0, add: "Dropped `<foreign_deleted>` row(s) for notes outside the scanned folders (a folder was renamed or removed from the config, or old test data)." If `access_log_gc` is greater than 0, add: "Trimmed `<access_log_gc>` old access row(s) (kept the newest 1,000 per note)."
 
 Only include rows in the table for types that appear in `by_type` (omit zero-count types). Sort rows by count descending.
 

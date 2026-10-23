@@ -15,9 +15,10 @@ import re
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 from collections import defaultdict
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 # --- #229 Slice A: TF-IDF + theme primitives moved to sibling modules.
@@ -731,6 +732,17 @@ def _sanitize_report_filename(name: str) -> str:
     return cleaned or "<unnamed>"
 
 
+def mtime_unchanged(file_mtime: float, indexed_mtime: float) -> bool:
+    """True when a note's on-disk mtime matches its indexed one.
+
+    The one comparison that decides an indexed row is still current: _sync
+    skips re-parsing on it, and obsidian_utils' bulk scans skip a metadata
+    read on it (#447). Shared so the two cannot drift apart. The tolerance
+    absorbs float round-tripping through SQLite's REAL column.
+    """
+    return abs(file_mtime - indexed_mtime) < 0.001
+
+
 def _sync(conn: sqlite3.Connection, vault_path: str, folders: list[str]) -> dict:
     """Incremental sync: add new/changed files, remove deleted ones.
 
@@ -810,8 +822,8 @@ def _sync(conn: sqlite3.Connection, vault_path: str, folders: list[str]) -> dict
             file_mtime = st.st_mtime
             file_size = st.st_size
 
-            # Skip if mtime unchanged (0.001 tolerance)
-            if abs_path_str in indexed and abs(file_mtime - indexed[abs_path_str]) < 0.001:
+            # Skip if mtime unchanged (see mtime_unchanged)
+            if abs_path_str in indexed and mtime_unchanged(file_mtime, indexed[abs_path_str]):
                 stats["unchanged"] += 1
                 stats["skipped"] += 1
                 continue
@@ -883,7 +895,9 @@ def _sync(conn: sqlite3.Connection, vault_path: str, folders: list[str]) -> dict
 def ensure_index(vault_path: str, folders: list[str], db_path: str | None = None) -> str:
     """Create or update the vault index. Returns the DB path.
 
-    Handles corrupt DB by deleting and recreating.
+    Handles corrupt DB by deleting and recreating. After the sync, trims
+    access_log when a note has more than ACCESS_LOG_KEEP_PER_NOTE rows
+    (#448); a GC failure is reported and never treated as corruption.
     """
     if db_path is None:
         db_path = _default_db_path()
@@ -923,6 +937,7 @@ def ensure_index(vault_path: str, folders: list[str], db_path: str | None = None
                 if _needs_body_migration(conn):
                     raise sqlite3.DatabaseError("body column missing after rebuild")
             _sync(conn, vault_path, folders)
+            _gc_access_log_if_needed(conn)
         finally:
             conn.close()
     except sqlite3.DatabaseError as exc:
@@ -1112,6 +1127,203 @@ def _batch_log_access(
               f"{len(note_paths)} paths: {exc}", file=sys.stderr)
 
 
+# Access-log GC (#448): keep the newest N events per note, per the Friston
+# spec's Phase 4 ("keep the last 1,000 events per note"). Activation sums
+# t^-0.5 over every row of a candidate, so old rows past this add little to
+# the score but cost a read on every search.
+ACCESS_LOG_KEEP_PER_NOTE = 1000
+
+
+def _access_log_over_keep(conn: sqlite3.Connection, keep: int) -> bool:
+    """True when at least one note has more than *keep* access rows.
+
+    The cheap gate for gc_access_log: an index scan on idx_access_note
+    (~2 ms at 60k rows) against ~50 ms for the ranking delete, so
+    ensure_index can check it on every call.
+    """
+    return conn.execute(
+        "SELECT 1 FROM access_log GROUP BY note_path HAVING COUNT(*) > ? LIMIT 1",
+        (keep,),
+    ).fetchone() is not None
+
+
+def gc_access_log(conn: sqlite3.Connection, keep: int | None = None) -> int:
+    """Delete access rows ranked past *keep* per note, newest first by
+    ``timestamp DESC, id DESC``. Commits. Returns the number deleted.
+
+    *keep* defaults to ACCESS_LOG_KEEP_PER_NOTE, read at call time. A note
+    with *keep* rows or fewer is untouched, so on a log where no note
+    exceeds *keep* this deletes nothing and activation is unchanged.
+    """
+    if keep is None:
+        keep = ACCESS_LOG_KEEP_PER_NOTE
+    if keep < 1:
+        raise ValueError(f"gc_access_log: keep must be >= 1, got {keep}")
+    cur = conn.execute(
+        "DELETE FROM access_log WHERE id IN ("
+        "  SELECT id FROM ("
+        "    SELECT id, ROW_NUMBER() OVER ("
+        "      PARTITION BY note_path ORDER BY timestamp DESC, id DESC"
+        "    ) AS rn FROM access_log"
+        "  ) WHERE rn > ?"
+        ")",
+        (keep,),
+    )
+    conn.commit()
+    return cur.rowcount
+
+
+def _gc_access_log_if_needed(conn: sqlite3.Connection) -> None:
+    """ensure_index's GC step: run gc_access_log only when a note is over
+    the cap. Any sqlite3.Error is reported and swallowed: ensure_index
+    treats sqlite3.DatabaseError as a corrupt DB and deletes it, and a busy
+    or locked access log must never cost the whole index."""
+    try:
+        keep = ACCESS_LOG_KEEP_PER_NOTE
+        if _access_log_over_keep(conn, keep):
+            gc_access_log(conn, keep)
+    except sqlite3.Error as exc:
+        print(f"[vault-index] access_log GC skipped: {exc}", file=sys.stderr)
+
+
+def _access_log_count(conn: sqlite3.Connection) -> int:
+    return conn.execute("SELECT COUNT(*) FROM access_log").fetchone()[0]
+
+
+def _backup_db(src: sqlite3.Connection, dest_path: str) -> None:
+    """Copy the open DB to *dest_path* with SQLite's online backup API,
+    which reads a consistent snapshot even while WAL writers are active."""
+    dest = _connect(dest_path)
+    try:
+        src.backup(dest)
+    finally:
+        dest.close()
+
+
+def purge_access_log(
+    db_path: str,
+    context_type: str,
+    since_ts: float,
+    *,
+    apply: bool = False,
+    backup_dir: str | None = None,
+    list_rows: bool = False,
+) -> dict:
+    """Delete access_log rows of *context_type* with ``timestamp >= since_ts``
+    (#448's one-off cleanup of internal-search noise).
+
+    Dry run by default: returns ``{"applied": False, "matched": N,
+    "by_day": {"YYYY-MM-DD": n}}`` (local dates) and changes nothing;
+    *list_rows* adds ``"rows": [(note_path, timestamp), ...]``. With
+    ``apply=True`` the DB is first copied into *backup_dir* (default
+    ``~/.claude/obsidian-brain/``, 0o700; the copy is 0o600) and the copy is
+    checked to hold every access row; then the rows are deleted in one
+    transaction and the result adds ``deleted``, ``before_total``,
+    ``after_total`` and ``backup_path``. Any backup failure raises before
+    the delete, so nothing is lost without a copy.
+
+    Raises FileNotFoundError when *db_path* does not exist (never creates
+    one).
+    """
+    if not os.path.isfile(db_path):
+        raise FileNotFoundError(db_path)
+    conn = _connect(db_path)
+    try:
+        where = "context_type = ? AND timestamp >= ?"
+        params = (context_type, since_ts)
+        by_day: dict[str, int] = {}
+        rows = conn.execute(
+            f"SELECT note_path, timestamp FROM access_log WHERE {where} "
+            "ORDER BY timestamp, id",
+            params,
+        ).fetchall()
+        for _path, ts in rows:
+            day = datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
+            by_day[day] = by_day.get(day, 0) + 1
+        result: dict = {
+            "applied": False,
+            "matched": len(rows),
+            "by_day": dict(sorted(by_day.items())),
+        }
+        if list_rows:
+            result["rows"] = [(p, ts) for p, ts in rows]
+        if not apply:
+            return result
+
+        if backup_dir is None:
+            backup_dir = os.path.join(os.path.expanduser("~"), ".claude", "obsidian-brain")
+        os.makedirs(backup_dir, mode=0o700, exist_ok=True)
+        os.chmod(backup_dir, 0o700)
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        fd, backup_path = tempfile.mkstemp(
+            prefix=f"vault-db-backup-{stamp}-", suffix=".db", dir=backup_dir
+        )
+        os.close(fd)  # mkstemp made it 0o600; the backup API writes into it
+        pre_max = conn.execute(
+            "SELECT COALESCE(MAX(id), 0) FROM access_log"
+        ).fetchone()[0]
+        def _drop_backup() -> None:
+            # Nothing was deleted, so a failed backup holds no unique data.
+            try:
+                os.unlink(backup_path)
+            except OSError:
+                pass
+
+        try:
+            _backup_db(conn, backup_path)
+            os.chmod(backup_path, 0o600)
+            check = _connect(backup_path)
+            try:
+                backed_up = _access_log_count(check)
+                max_id = check.execute(
+                    "SELECT COALESCE(MAX(id), 0) FROM access_log"
+                ).fetchone()[0]
+            finally:
+                check.close()
+        except BaseException:
+            _drop_backup()
+            raise
+
+        # The backup is kept only once the delete has committed; any failure
+        # before that (lock at BEGIN, mismatch, DELETE error) drops it.
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            # Only rows the backup holds (id <= max_id) may be deleted. A row
+            # inserted after the snapshot is neither backed up nor touched.
+            live_in_backup = conn.execute(
+                "SELECT COUNT(*) FROM access_log WHERE id <= ?", (max_id,)
+            ).fetchone()[0]
+            if max_id < pre_max or backed_up != live_in_backup:
+                raise RuntimeError(
+                    f"backup at {backup_path} holds {backed_up} access rows, "
+                    f"expected {live_in_backup}; nothing deleted"
+                )
+            before_total = _access_log_count(conn)
+            deleted = conn.execute(
+                f"DELETE FROM access_log WHERE {where} AND id <= ?",
+                (*params, max_id),
+            ).rowcount
+            after_total = _access_log_count(conn)
+            conn.commit()
+        except BaseException:
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
+            _drop_backup()
+            raise
+        result.update(
+            applied=True,
+            deleted=deleted,
+            before_total=before_total,
+            after_total=after_total,
+            backup_path=backup_path,
+        )
+        return result
+    finally:
+        conn.close()
+
+
 def batch_activations(
     db_path: str, note_paths: list[str], decay: float = 0.5
 ) -> dict[str, float]:
@@ -1195,7 +1407,9 @@ def rebuild_index(
     (every ``_sync`` stat; ``skipped == unchanged + malformed``) plus, in
     non-destructive mode, ``"foreign_deleted"`` (rows dropped because their
     path is outside every scanned folder), ``"preserved": {...}`` and
-    ``"pruned_orphans": {...}`` reporting the Friston-table delta.
+    ``"pruned_orphans": {...}`` reporting the Friston-table delta. Both modes
+    report ``"access_log_gc"``: rows dropped by gc_access_log, which
+    ``pruned_orphans`` does not count (always 0 for ``full=True``).
     """
     if db_path is None:
         db_path = _default_db_path()
@@ -1226,6 +1440,7 @@ def rebuild_index(
             _ensure_theme_indexes(conn)
             stats = _sync(conn, vault_path, folders)
             stats["backfilled"] = 0  # full wipe rebuilds all vectors from scratch
+            stats["access_log_gc"] = 0  # the wipe emptied access_log
         finally:
             conn.close()
     else:
@@ -1372,6 +1587,11 @@ def rebuild_index(
                 )
             stats["backfilled"] = backfilled_count
 
+            # Step 4: access-log GC (#448). After the orphan prune, so the
+            # two are reported apart: pruned_orphans below excludes it.
+            gc_deleted = gc_access_log(conn)
+            stats["access_log_gc"] = gc_deleted
+
             # Report preserved/pruned counts from the actual after-state
             # rather than deleted rowcount. _sync and _delete_note also
             # remove theme_members rows (and may drop last-member themes)
@@ -1392,7 +1612,7 @@ def rebuild_index(
                 "theme_members": after_members,
             }
             stats["pruned_orphans"] = {
-                "access_log": before_access - after_access,
+                "access_log": before_access - after_access - gc_deleted,
                 "themes": before_themes - after_themes,
                 "theme_members": before_members - after_members,
             }
@@ -1807,6 +2027,7 @@ def search_vault(
     limit: int = 15,
     caller: str | None = None,
     include_vectors: bool = False,
+    log_access: bool = True,
 ) -> list[dict]:
     """Full-text search over the vault index.
 
@@ -1830,6 +2051,11 @@ def search_vault(
     Every result dict carries an ``or_fallback`` boolean: ``True`` when the
     row was retrieved via the OR-fallback branch (AND returned 0 results),
     ``False`` on the normal AND path.
+
+    Each returned hit is logged as a ``search`` access, which feeds ACT-R
+    activation in the rerank. Pass ``log_access=False`` from any search that
+    is not a person or agent retrieving notes (dedup checks, wiki lookup,
+    tuning scripts): logging those turned activation into noise (#448).
     """
     if not os.path.isfile(db_path):
         return []
@@ -1907,12 +2133,13 @@ def search_vault(
         # Log access for returned results (single connection, one commit).
         # Per-row project preserves each note's project attribution for
         # per-project analytics, even when the search itself was unscoped.
-        _batch_log_access(
-            conn,
-            [r["path"] for r in results],
-            "search",
-            project=[r.get("project") for r in results],
-        )
+        if log_access:
+            _batch_log_access(
+                conn,
+                [r["path"] for r in results],
+                "search",
+                project=[r.get("project") for r in results],
+            )
         # Strip body — callers don't need it.
         # Decode tfidf_vector when requested (None-safe); leave key absent otherwise.
         for r in results:

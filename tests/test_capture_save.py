@@ -114,9 +114,12 @@ def _fake_results(monkeypatch, results, vault=None, guard=True):
     monkeypatch.setattr(capture_save.vault_index, "ensure_index", lambda v, f: "db")
     monkeypatch.setattr(capture_save.vault_index, "compute_query_vector",
                         lambda db, q: {"x": 1.0} if q.strip() else {})
-    monkeypatch.setattr(capture_save.vault_index, "search_vault",
-                        lambda db, q, note_type=None, limit=3, include_vectors=True:
-                        [dict(r) for r in results if r["type"] == note_type])
+    def fake_search(db, q, note_type=None, limit=3, include_vectors=True, log_access=True):
+        # Dedup is not a read: its hits must not feed activation (#448).
+        assert log_access is False
+        return [dict(r) for r in results if r["type"] == note_type]
+
+    monkeypatch.setattr(capture_save.vault_index, "search_vault", fake_search)
     if guard:
         monkeypatch.setattr(capture_save.compress_guard, "is_high_confidence_match", lambda res, **kw: True)
 

@@ -37,8 +37,8 @@ CORPUS_PATH = REPO_ROOT / "scripts" / "compress_rank_gap_corpus.json"
 
 def _run_query(db, query):
     """Run the same search that SKILL.md Step 3.5 runs. Returns sorted results."""
-    results = search_vault(db, query, note_type="claude-insight", limit=3)
-    results += search_vault(db, query, note_type="claude-decision", limit=3)
+    results = search_vault(db, query, note_type="claude-insight", limit=3, log_access=False)
+    results += search_vault(db, query, note_type="claude-decision", limit=3, log_access=False)
     results.sort(key=lambda r: r["rank"])
     return results
 
