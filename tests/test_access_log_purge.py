@@ -92,6 +92,7 @@ def test_apply_backs_up_then_deletes_only_matching_rows(db, tmp_path):
     assert Path(backup).parent == bk
     assert _rows(backup) == before
     assert stat.S_IMODE(os.stat(backup).st_mode) == 0o600
+    assert len(list(bk.glob("vault-db-backup-*"))) == 1
     assert stat.S_IMODE(os.stat(bk).st_mode) == 0o700
 
 
@@ -113,6 +114,7 @@ def test_backup_failure_deletes_nothing(db, tmp_path, monkeypatch):
         vault_index.purge_access_log(db, "search", SINCE, apply=True,
                                      backup_dir=str(tmp_path / "bk"))
     assert _rows(db) == before
+    assert not list((tmp_path / "bk").glob("vault-db-backup-*"))
 
 
 def test_backup_count_mismatch_deletes_nothing(db, tmp_path, monkeypatch):
@@ -130,6 +132,7 @@ def test_backup_count_mismatch_deletes_nothing(db, tmp_path, monkeypatch):
         vault_index.purge_access_log(db, "search", SINCE, apply=True,
                                      backup_dir=str(tmp_path / "bk"))
     assert _rows(db) == before
+    assert not list((tmp_path / "bk").glob("vault-db-backup-*"))
 
 
 def test_row_inserted_after_backup_survives_and_does_not_abort(db, tmp_path, monkeypatch):
