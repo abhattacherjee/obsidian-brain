@@ -510,7 +510,7 @@
           "files": [
             "hooks/vault_stats.py"
           ],
-          "purpose": "Read-only aggregation for /vault-stats: signal coverage (per-note activation, and importance other than 5; since #449 curated notes always carry a derived 3 or 6, so importance coverage tracks note type as much as scoring), access-by-context, top-accessed, importance distribution, and snapshot integrity metrics (orphans, broken backlinks, summarized fraction)."
+          "purpose": "Read-only aggregation for /vault-stats: signal coverage (per-note activation, and importance other than 5; since #449 curated notes carry a derived 3 or 6 unless an importance: line overrides it, so importance coverage tracks note type as much as scoring), access-by-context, top-accessed, importance distribution, and snapshot integrity metrics (orphans, broken backlinks, summarized fraction)."
         },
         {
           "id": "access-log-purge-cli",
