@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.9.1] - 2026-10-23
+
 ### Added
 - Curated notes now use importance 3 for auto-captures and 6 for hand-saved notes; an `importance:` frontmatter integer from 1 to 10 overrides either value. `scripts/importance_backfill.py` updates existing non-session index values, with a dry run by default (#449).
 - `./scripts/commit-preflight.sh --allow-empty` mints a token for `git commit --allow-empty` (#116). It runs only when nothing is staged and no tracked file is modified, because `git commit -a` or a pathspec would commit a modified file with no scan or test. With files staged, with unstaged changes to tracked files, or when git cannot read the index or the working tree, it exits 1 and writes no token. An untracked file does not block it. The token's `staged_files` count is now exact, so it is 0 for an empty commit. The version-sync check still runs, and there is nothing to scan or test. `require-preflight.py` is unchanged: the token is bound to HEAD (#408), so the empty commit spends it. `scripts/dev-test/DEV-TEST-ISSUE-105.md` Phase 2 uses the flag again instead of a throwaway file.
