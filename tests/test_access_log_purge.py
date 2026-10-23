@@ -132,6 +132,31 @@ def test_backup_count_mismatch_deletes_nothing(db, tmp_path, monkeypatch):
     assert _rows(db) == before
 
 
+def test_row_inserted_after_backup_survives_and_does_not_abort(db, tmp_path, monkeypatch):
+    """A search row that lands between the backup and the delete is not in the
+    backup, so the purge must leave it alone and must not abort on the count."""
+    real_backup = vault_index._backup_db
+
+    def backup_then_insert(src, dest_path):
+        real_backup(src, dest_path)
+        late = vault_index._connect(db)
+        try:
+            late.execute(
+                "INSERT INTO access_log (note_path, timestamp, context_type, project) "
+                "VALUES ('/v/late.md', ?, 'search', 'p')", (SINCE + 99,))
+            late.commit()
+        finally:
+            late.close()
+
+    monkeypatch.setattr(vault_index, "_backup_db", backup_then_insert)
+    result = vault_index.purge_access_log(db, "search", SINCE, apply=True,
+                                          backup_dir=str(tmp_path / "bk"))
+    assert result["deleted"] == 3
+    after = _rows(db)
+    assert ("/v/late.md", SINCE + 99, "search") in after
+    assert ("/v/late.md", SINCE + 99, "search") not in _rows(result["backup_path"])
+
+
 def test_missing_db_raises(tmp_path):
     with pytest.raises(FileNotFoundError):
         vault_index.purge_access_log(str(tmp_path / "absent.db"), "search", SINCE)
@@ -179,6 +204,25 @@ def test_script_apply_exits_0_and_reports_counts(db, tmp_path):
     assert "deleted 3" in proc.stdout
     assert "before 7, after 4" in proc.stdout
     assert len(_rows(db)) == 4
+
+
+def test_existing_loose_backup_dir_is_tightened_to_0700(db, tmp_path):
+    bk = tmp_path / "bk"
+    bk.mkdir()
+    os.chmod(bk, 0o755)
+    vault_index.purge_access_log(db, "search", SINCE, apply=True, backup_dir=str(bk))
+    assert stat.S_IMODE(os.stat(bk).st_mode) == 0o700
+
+
+def test_script_apply_with_context_recall_deletes_only_recall(db, tmp_path):
+    proc = _run("--db", db, "--since", "2026-10-18", "--context", "recall", "--apply",
+                "--backup-dir", str(tmp_path / "bk"))
+    assert proc.returncode == 0, proc.stderr
+    assert "deleted 1" in proc.stdout
+    after = _rows(db)
+    assert len(after) == 6
+    assert "recall" not in {r[2] for r in after}
+    assert sum(1 for r in after if r[2] == "search") == 5
 
 
 def test_script_missing_db_exits_1(tmp_path):

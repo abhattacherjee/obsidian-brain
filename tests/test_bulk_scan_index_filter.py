@@ -425,3 +425,29 @@ def test_note_gone_since_listing_gets_no_row(tmp_vault):
     row = {"path": str(gone), "mtime": 0.0, "type": "claude-insight",
            "project": PROJECT, "source_session": OTHER_SID}
     assert obsidian_utils._fresh_index_row({str(gone): row}, gone) is None
+
+
+def test_brief_keeps_notes_whose_project_differs_by_case_or_slug(
+        tmp_vault, fresh_db, monkeypatch, read_log):
+    """The pre-filter must compare projects the way the full scan does: by
+    case and by slug. A raw `!=` would skip these notes, and the indexed run
+    would then differ from the full scan."""
+    ses = tmp_vault / SESSIONS
+    ses.mkdir(parents=True, exist_ok=True)
+    cased = _session(ses / "2026-10-22-case-cccc.md", sid="c-sid",
+                     project="Obsidian-Brain", day="2026-10-22")
+    slugged = _session(ses / "2026-10-22-slug-dddd.md", sid="d-sid",
+                       project="obsidian brain", day="2026-10-22")
+    _build_vault(tmp_vault)
+    fresh_db(tmp_vault)
+    with_index = _brief(tmp_vault)
+    read_with_index = set(read_log)
+    del read_log[:]
+    fresh_db(tmp_vault)
+    with monkeypatch.context() as m:
+        _no_index(m)
+        without = _brief(tmp_vault)
+    assert with_index == without
+    # Not skipped: the indexed run still read both notes.
+    assert str(cased) in read_with_index
+    assert str(slugged) in read_with_index

@@ -1259,25 +1259,36 @@ def purge_access_log(
             prefix=f"vault-db-backup-{stamp}-", suffix=".db", dir=backup_dir
         )
         os.close(fd)  # mkstemp made it 0o600; the backup API writes into it
+        pre_max = conn.execute(
+            "SELECT COALESCE(MAX(id), 0) FROM access_log"
+        ).fetchone()[0]
         _backup_db(conn, backup_path)
         os.chmod(backup_path, 0o600)
-        before_total = _access_log_count(conn)
         check = _connect(backup_path)
         try:
             backed_up = _access_log_count(check)
+            max_id = check.execute(
+                "SELECT COALESCE(MAX(id), 0) FROM access_log"
+            ).fetchone()[0]
         finally:
             check.close()
-        if backed_up != before_total:
-            raise RuntimeError(
-                f"backup at {backup_path} holds {backed_up} access rows, "
-                f"expected {before_total}; nothing deleted"
-            )
 
         conn.execute("BEGIN IMMEDIATE")
         try:
+            # Only rows the backup holds (id <= max_id) may be deleted. A row
+            # inserted after the snapshot is neither backed up nor touched.
+            live_in_backup = conn.execute(
+                "SELECT COUNT(*) FROM access_log WHERE id <= ?", (max_id,)
+            ).fetchone()[0]
+            if max_id < pre_max or backed_up != live_in_backup:
+                raise RuntimeError(
+                    f"backup at {backup_path} holds {backed_up} access rows, "
+                    f"expected {live_in_backup}; nothing deleted"
+                )
             before_total = _access_log_count(conn)
             deleted = conn.execute(
-                f"DELETE FROM access_log WHERE {where}", params
+                f"DELETE FROM access_log WHERE {where} AND id <= ?",
+                (*params, max_id),
             ).rowcount
             after_total = _access_log_count(conn)
             conn.commit()

@@ -66,7 +66,7 @@ def test_default_still_logs(tmp_path):
 
 # --- caller grep -------------------------------------------------------------
 
-_CALL_RE = re.compile(r"(?<![\w.])(?:vault_index\.)?search_vault\(")
+_CALL_RE = re.compile(r"\bsearch_vault\s*\(")
 
 
 def _calls(text: str):
@@ -151,6 +151,26 @@ def test_capture_split_scorer_does_not_search():
     ("def search_vault(db_path):\n", []),
     ("`search_vault` in prose\n", []),
     ("the same search_vault() path\n", []),
-], ids=["inline", "multiline", "comment", "def", "prose", "prose-empty-call"])
+    ("x = _vault_index.search_vault(db, q)", ["db, q"]),
+    ("x = vi.search_vault(db, q)", ["db, q"]),
+    ("x = search_vault (db, q)", ["db, q"]),
+], ids=["inline", "multiline", "comment", "def", "prose", "prose-empty-call",
+        "underscore-qualified", "alias-qualified", "space-before-paren"])
 def test_call_scanner(snippet, expected):
     assert [a for _, a in _calls(snippet)] == expected
+
+
+def test_no_file_imports_search_vault_under_an_alias():
+    """An aliased import (`search_vault as sv`) would hide calls from the scan."""
+    bad = []
+    for d in SCAN_DIRS:
+        root = REPO / d
+        if not root.is_dir():
+            continue
+        for path in sorted(root.rglob("*")):
+            if path.suffix not in (".py", ".md", ".sh") or not path.is_file():
+                continue
+            text = path.read_text(encoding="utf-8", errors="replace")
+            if re.search(r"\bsearch_vault\s+as\s+\w", text):
+                bad.append(path.relative_to(REPO).as_posix())
+    assert not bad, f"do not alias search_vault, the caller scan cannot see it: {bad}"

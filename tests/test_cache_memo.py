@@ -70,6 +70,23 @@ def test_external_rewrite_is_seen():
     assert obsidian_utils.cache_get(SID, "b") == 2
 
 
+def test_same_size_external_rewrite_with_new_mtime_is_seen():
+    """Same size, different bytes, different mtime_ns: size alone would not
+    tell the files apart, so the mtime must."""
+    obsidian_utils.cache_set(SID, "a", "AAAA")
+    assert obsidian_utils.cache_get(SID, "a") == "AAAA"
+    path = _cache_path()
+    st = os.stat(path)
+    with open(path, "r+") as f:  # same inode, same length
+        raw = f.read()
+        assert "AAAA" in raw
+        f.seek(0)
+        f.write(raw.replace("AAAA", "BBBB"))
+    assert os.stat(path).st_size == st.st_size
+    os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + 5_000_000_000))
+    assert obsidian_utils.cache_get(SID, "a") == "BBBB"
+
+
 def test_cache_set_merges_over_external_rewrite():
     obsidian_utils.cache_set(SID, "mine", 1)
     _external_write({"mine": 1, "theirs": "written-by-another-process"})

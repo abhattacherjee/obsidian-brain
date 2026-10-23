@@ -175,6 +175,31 @@ def test_ensure_index_trims_when_a_note_exceeds_keep(indexed, monkeypatch):
     assert len(_rows(db, paths[1])) == 2
 
 
+def test_ensure_index_gc_threshold_is_exactly_keep(indexed, monkeypatch):
+    """A note with exactly `keep` rows is not over the limit: no GC, no loss.
+    One more row tips it over."""
+    vault, paths, db = indexed
+    monkeypatch.setattr(vault_index, "ACCESS_LOG_KEEP_PER_NOTE", 3)
+    calls = []
+    real = vault_index.gc_access_log
+
+    def spy(conn, keep=None):
+        calls.append(keep)
+        return real(conn, keep)
+
+    monkeypatch.setattr(vault_index, "gc_access_log", spy)
+    base = time.time() - 1000
+    _insert(db, [(paths[0], base + i) for i in range(3)])
+    vault_index.ensure_index(str(vault), [FOLDER], db_path=db)
+    assert calls == []
+    assert len(_rows(db, paths[0])) == 3
+
+    _insert(db, [(paths[0], base + 3)])
+    vault_index.ensure_index(str(vault), [FOLDER], db_path=db)
+    assert len(calls) == 1
+    assert len(_rows(db, paths[0])) == 3
+
+
 def test_ensure_index_skips_gc_when_no_note_exceeds_keep(indexed, monkeypatch):
     vault, paths, db = indexed
     calls = []
