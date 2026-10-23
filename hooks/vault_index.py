@@ -41,6 +41,11 @@ from themes import (  # noqa: F401  (re-export shim)
 )
 from frontmatter import split_frontmatter, split_lines_lf_crlf
 
+DEFAULT_IMPORTANCE = 5
+IMPORTANCE_AUTO_CAPTURE = 3
+IMPORTANCE_HAND_SAVED = 6
+CURATED_IMPORTANCE_TYPES = ("claude-insight", "claude-decision", "claude-error-fix")
+
 # ---------------------------------------------------------------------------
 # Schema
 # ---------------------------------------------------------------------------
@@ -356,6 +361,8 @@ def _parse_note(file_path: str) -> dict | None:
 
     Returns dict with keys: type, date, project, title, source_session,
     source_note, tags (comma-separated), status, body.
+    Every other frontmatter key is passed through as a string too, including
+    source and importance, which _derive_importance reads.
     Returns None for files that can't be parsed.
     """
     return _parse_note_detailed(file_path)[0]
@@ -364,6 +371,92 @@ def _parse_note(file_path: str) -> dict | None:
 # ---------------------------------------------------------------------------
 # Sync engine
 # ---------------------------------------------------------------------------
+
+
+def _frontmatter_importance(raw) -> int | None:
+    """Return a plain decimal integer from 1 to 10, or None."""
+    if not isinstance(raw, str) or not re.fullmatch(r"[0-9]+", raw.strip()):
+        return None
+    value = raw.strip().lstrip("0")
+    if value not in {str(n) for n in range(1, 11)}:
+        return None
+    return int(value)
+
+
+def _derive_importance(parsed: dict, existing: int | None) -> int:
+    """Return the importance to store for a note (#449).
+
+    First match wins: a valid ``importance:`` frontmatter line (1-10, any
+    type); for the curated types, 3 when ``source: auto-capture`` and 6
+    otherwise; else *existing* (the session notes' Haiku score lives here);
+    else 5. The note file is the source of truth, so a --full rebuild derives
+    the same values for curated notes.
+    """
+    override = _frontmatter_importance(parsed.get("importance"))
+    if override is not None:
+        return override
+    if parsed.get("type") in CURATED_IMPORTANCE_TYPES:
+        return (IMPORTANCE_AUTO_CAPTURE if parsed.get("source") == "auto-capture"
+                else IMPORTANCE_HAND_SAVED)
+    return existing if existing is not None else DEFAULT_IMPORTANCE
+
+
+def backfill_importance(db_path: str, *, apply: bool = False) -> dict:
+    """Set the derived importance on rows indexed before #449.
+
+    ``_sync`` re-derives only notes whose mtime changed, so existing rows keep
+    the old default 5 until this runs. Scans every non-session row (session
+    scores are never touched), re-parses its file and returns ``applied``,
+    ``scanned``, ``changed``, ``by_value`` and ``from_to`` (counts of changed
+    rows) and ``unreadable`` (files missing or without frontmatter, skipped).
+    Dry run by default. ``apply=True`` writes in one transaction, each UPDATE
+    guarded by the value read, so a row re-indexed meanwhile is left alone;
+    ``updated`` counts the rows written. No backup is taken: only the
+    importance column changes and ``from_to`` names every change.
+
+    Raises FileNotFoundError when *db_path* does not exist (never creates one).
+    """
+    if not os.path.isfile(db_path):
+        raise FileNotFoundError(f"no index DB at {db_path}")
+    conn = _connect(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT path, importance FROM notes WHERE type != 'claude-session'"
+        ).fetchall()
+        changes = []
+        by_value = defaultdict(int)
+        from_to = defaultdict(int)
+        unreadable = 0
+        for path, current in rows:
+            parsed = _parse_note(path)
+            if parsed is None:
+                unreadable += 1
+                continue
+            new = _derive_importance(parsed, current)
+            if new != current:
+                changes.append((new, path, current))
+                by_value[str(new)] += 1
+                from_to[f"{current}->{new}"] += 1
+        result = {"applied": apply, "scanned": len(rows), "changed": len(changes),
+                  "by_value": dict(by_value), "from_to": dict(from_to),
+                  "unreadable": unreadable}
+        if apply:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                updated = 0
+                for change in changes:
+                    updated += conn.execute(
+                        "UPDATE notes SET importance=? WHERE path=? AND importance=?",
+                        change,
+                    ).rowcount
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            result["updated"] = updated
+        return result
+    finally:
+        conn.close()
 
 
 def _prior_tokens_for(conn: sqlite3.Connection, note_path: str) -> set[str]:
@@ -466,7 +559,7 @@ def _upsert_note(conn: sqlite3.Connection, rel_path: str, parsed: dict, mtime: f
             mtime,
             size,
             parsed.get("body", ""),
-            existing_importance if existing_importance is not None else 5,
+            _derive_importance(parsed, existing_importance),
             tfidf_json,
         ),
     )
@@ -1918,7 +2011,8 @@ def rerank_results(
         activation 0.20 — ACT-R base-level activation from access history
         type       0.10 — note type score adapted to task context
         recency    0.10 — exponential decay based on note age
-        importance 0.10 — editorial importance (frontmatter, 1-10 scale)
+        importance 0.10 — index value (Haiku score for session notes, derived
+            3/6 for curated notes; an importance: frontmatter line overrides)
         density    0.05 — fraction of query terms matched in full text
 
     When ``db_path`` is None, the activation signal is 0 for all candidates.
