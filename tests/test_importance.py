@@ -1,10 +1,14 @@
 """Tests for importance column on notes table and importance parsing."""
 
 import sqlite3
+import subprocess
+import sys
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
+import capture_save
 import obsidian_utils
 import vault_index
 
@@ -203,3 +207,222 @@ class TestImportanceWriteBack:
         conn.close()
         assert row is not None
         assert row[0] == 9
+
+
+SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "importance_backfill.py"
+
+
+@pytest.fixture
+def db(tmp_path):
+    path = str(tmp_path / "importance.db")
+    conn = vault_index._connect(path)
+    try:
+        vault_index._init_schema(conn)
+    finally:
+        conn.close()
+    return path
+
+
+def _execute(db, sql, args=()):
+    conn = vault_index._connect(db)
+    try:
+        rows = conn.execute(sql, args).fetchall()
+        conn.commit()
+        return [tuple(row) for row in rows]
+    finally:
+        conn.close()
+
+
+def _note(tmp_path, name, kind="claude-insight", extra=""):
+    path = tmp_path / name
+    path.write_text(f"---\ntype: {kind}\ndate: 2026-10-20\n{extra}"
+                    "---\n# Shared title\n\nShared searchable knowledge.\n")
+    return str(path)
+
+
+def _importance(db, path):
+    return _execute(db, "SELECT importance FROM notes WHERE path=?", (path,))[0][0]
+
+
+@pytest.mark.parametrize("kind", vault_index.CURATED_IMPORTANCE_TYPES)
+@pytest.mark.parametrize("source, expected", [("auto-capture", 3), ("manual", 6), (None, 6)])
+def test_curated_derivation(kind, source, expected):
+    assert vault_index._derive_importance({"type": kind, "source": source}, 9) == expected
+
+
+@pytest.mark.parametrize("kind", ["claude-session", "unknown"])
+@pytest.mark.parametrize("existing, expected", [(8, 8), (None, 5)])
+def test_other_types_keep_existing(kind, existing, expected):
+    assert vault_index._derive_importance({"type": kind}, existing) == expected
+
+
+@pytest.mark.parametrize("kind", [*vault_index.CURATED_IMPORTANCE_TYPES, "claude-session"])
+@pytest.mark.parametrize("raw", ["1", "10", " 6 "])
+def test_override(kind, raw):
+    assert vault_index._derive_importance(
+        {"type": kind, "source": "auto-capture", "importance": raw}, 8,
+    ) == int(raw)
+
+
+@pytest.mark.parametrize("raw", ["6.5", "high", "0", "11", "", "+6", "-1", None, 6, "٦"])
+def test_invalid_importance_falls_back(raw):
+    assert vault_index._frontmatter_importance(raw) is None
+    assert vault_index._derive_importance(
+        {"type": "claude-insight", "importance": raw}, 8,
+    ) == 6
+    assert vault_index._derive_importance(
+        {"type": "claude-session", "importance": raw}, 8,
+    ) == 8
+
+
+def test_real_capture_writer(mock_config, tmp_vault, db, monkeypatch):
+    monkeypatch.setattr(capture_save, "find_match", lambda *a, **k: None)
+    row = capture_save.save_candidate(
+        {"type": "insight", "title": "Shared knowledge", "body": "Useful knowledge.",
+         "topic": "testing"}, session_id="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        project="test", config=mock_config,
+    )
+    path = str(tmp_vault / row["note_path"])
+    assert vault_index.index_note(db, path)
+    assert _importance(db, path) == 3
+
+
+def test_hand_saved_and_resync(tmp_path, db):
+    hand = _note(tmp_path, "hand.md", extra="source_session: example\ntags:\n  - claude/insight\n")
+    auto = _note(tmp_path, "auto.md", extra="source: auto-capture\n")
+    assert vault_index.index_note(db, hand)
+    assert vault_index.index_note(db, auto)
+    assert _importance(db, hand) == 6
+    assert _importance(db, auto) == 3
+    Path(auto).write_text(Path(auto).read_text().replace("source: auto-capture\n", ""))
+    conn = vault_index._connect(db)
+    try:
+        vault_index._sync(conn, str(tmp_path), ["."])
+        conn.commit()
+    finally:
+        conn.close()
+    assert _importance(db, auto) == 6
+
+
+def test_quoted_override_and_session_resync(tmp_path, db):
+    path = _note(tmp_path, "session.md", "claude-session")
+    assert vault_index.index_note(db, path)
+    _execute(db, "UPDATE notes SET importance=9")
+    assert vault_index.index_note(db, path)
+    assert _importance(db, path) == 9
+    Path(path).write_text(Path(path).read_text().replace("date:", 'importance: "7"\ndate:'))
+    assert vault_index.index_note(db, path)
+    assert _importance(db, path) == 7
+
+
+@pytest.fixture
+def legacy(db, tmp_path):
+    paths = [
+        _note(tmp_path, "auto.md", extra="source: auto-capture\n"),
+        _note(tmp_path, "hand.md"),
+        _note(tmp_path, "session.md", "claude-session", "importance: 10\n"),
+        _note(tmp_path, "missing.md"),
+        _note(tmp_path, "malformed.md"),
+    ]
+    for path in paths:
+        assert vault_index.index_note(db, path)
+    _execute(db, "UPDATE notes SET importance=5")
+    Path(paths[3]).unlink()
+    Path(paths[4]).write_text("No frontmatter")
+    return paths
+
+
+def test_backfill_dry_run_and_apply(db, legacy):
+    result = vault_index.backfill_importance(db)
+    assert result == {"applied": False, "scanned": 4, "changed": 2,
+                      "by_value": {"3": 1, "6": 1},
+                      "from_to": {"5->3": 1, "5->6": 1}, "unreadable": 2}
+    assert [_importance(db, p) for p in legacy] == [5] * 5
+    result = vault_index.backfill_importance(db, apply=True)
+    assert result["updated"] == 2
+    assert [_importance(db, p) for p in legacy] == [3, 6, 5, 5, 5]
+
+
+def test_backfill_compare_and_set(db, legacy, monkeypatch):
+    real_parse = vault_index._parse_note
+
+    def parse_then_change(path):
+        parsed = real_parse(path)
+        if path == legacy[0]:
+            _execute(db, "UPDATE notes SET importance=9 WHERE path=?", (path,))
+        return parsed
+
+    monkeypatch.setattr(vault_index, "_parse_note", parse_then_change)
+    result = vault_index.backfill_importance(db, apply=True)
+    assert result["changed"] == 2
+    assert result["updated"] == 1
+    assert _importance(db, legacy[0]) == 9
+
+
+def test_backfill_rolls_back_on_failure(db, legacy, monkeypatch):
+    real_connect = vault_index._connect
+
+    class Proxy:
+        def __init__(self, conn):
+            self.conn = conn
+            self.updates = 0
+
+        def execute(self, sql, *args):
+            if sql.startswith("UPDATE notes SET importance"):
+                self.updates += 1
+                if self.updates == 2:
+                    raise sqlite3.OperationalError("failed update")
+            return self.conn.execute(sql, *args)
+
+        def __getattr__(self, name):
+            return getattr(self.conn, name)
+
+    monkeypatch.setattr(vault_index, "_connect", lambda path: Proxy(real_connect(path)))
+    with pytest.raises(sqlite3.OperationalError, match="failed update"):
+        vault_index.backfill_importance(db, apply=True)
+    assert [_importance(db, p) for p in legacy] == [5] * 5
+
+
+def test_missing_db(tmp_path):
+    path = tmp_path / "absent.db"
+    with pytest.raises(FileNotFoundError):
+        vault_index.backfill_importance(str(path))
+    assert not path.exists()
+
+
+def test_hand_saved_ranks_first(tmp_path, db):
+    auto = _note(tmp_path, "auto.md", extra="source: auto-capture\n")
+    hand = _note(tmp_path, "hand.md")
+    for path in (auto, hand):
+        assert vault_index.index_note(db, path)
+    results = vault_index.search_vault(db, "searchable knowledge", log_access=False)
+    assert [r["path"] for r in results] == [hand, auto]
+    assert _execute(db, "SELECT count(*) FROM access_log") == [(0,)]
+
+
+def _run(*args):
+    return subprocess.run([sys.executable, str(SCRIPT), *args], capture_output=True,
+                          text=True, timeout=60, stdin=subprocess.DEVNULL)
+
+
+def test_script_dry_run_and_apply(db, legacy):
+    proc = _run("--db", db)
+    assert proc.returncode == 0, proc.stderr
+    for text in ("dry run", "scanned: 4", "changed: 2", "unreadable: 2", "by_value:", "from_to:"):
+        assert text in proc.stdout
+    assert [_importance(db, p) for p in legacy] == [5] * 5
+    proc = _run("--db", db, "--apply")
+    assert proc.returncode == 0, proc.stderr
+    assert "updated: 2" in proc.stdout
+
+
+def test_script_missing_db(tmp_path):
+    proc = _run("--db", str(tmp_path / "absent.db"))
+    assert proc.returncode == 1
+    assert "no index DB" in proc.stderr
+
+
+def test_script_bad_flag():
+    proc = _run("--bad-flag")
+    assert proc.returncode == 2
+    assert "usage: importance_backfill.py" in proc.stderr
