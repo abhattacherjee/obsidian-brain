@@ -12,6 +12,7 @@ import time
 import types
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import NamedTuple
 from unittest.mock import patch
 
 import pytest
@@ -1834,6 +1835,237 @@ _GROWTH_MIN_WORK_FRACTION = 0.5
 _GROWTH_MAX_RATIO = 3.0
 
 
+# A miss at twice the bound or more is a regression, not queueing noise.
+_TIMING_GROSS_FACTOR = 2.0
+
+
+class _TimingMiss(NamedTuple):
+    """A timing check that missed: what to say, and how far over the bound.
+
+    ``factor`` is measured / bound. A cell that never finished is infinite.
+    """
+    message: str
+    factor: float
+
+
+def _retry_timing_once(check):
+    """Run a wall-clock check, and once more if it fails (#437).
+
+    ``check()`` makes one full measurement and returns None when it is in
+    bounds, or a ``_TimingMiss``. Under load a single sample can miss: on
+    2026-10-21 the growth sweep read 4.40x against its 3.0x bound at a load
+    average of ~20, and the stall gate 3.17 s against 3.0 s at ~30. Both
+    passed when run alone. A real regression should miss on both runs, so it
+    still fails; the bounds themselves do not change. The cost: a mild
+    regression whose extra work is near the noise can pass one of two runs
+    under heavy load, and one passing run is enough. CI, on a quieter
+    runner, is the backstop.
+
+    Returns None when either run passed, else one ``_TimingMiss`` with both
+    messages and the smaller of the two factors.
+    """
+    first = check()
+    if first is None:
+        return None
+    second = check()
+    if second is None:
+        return None
+    return _TimingMiss(
+        f"failed twice in a row:\n  1st: {first.message}\n  2nd: {second.message}",
+        min(first.factor, second.factor))
+
+
+def _fail_timing(miss):
+    """Fail on a timing check that missed twice -- or skip, saying why, when
+    the machine is overloaded, this is not CI, and the miss is marginal
+    (#437).
+
+    The retry alone did not hold: in the #437 branch's first preflight both
+    runs of the growth sweep missed (5.30x, then 4.02x) at a load average of
+    ~93 on 12 CPUs, and the same cell passed 3 of 3 when re-run straight
+    after. Two back-to-back samples land in the same load spike. A load
+    average above the CPU count means the wall clock is measuring the queue,
+    not the hook. CI (GitHub Actions sets CI=true) keeps the strict failure,
+    and so does any miss at ``_TIMING_GROSS_FACTOR`` times the bound or more.
+    """
+    if not os.environ.get("CI") and miss.factor < _TIMING_GROSS_FACTOR:
+        try:
+            load = os.getloadavg()[0]
+        except OSError:
+            load = None
+        cpus = os.cpu_count()
+        if load is not None and cpus and load > cpus:
+            pytest.skip(f"timing missed twice at {miss.factor:.2f}x the bound, "
+                        f"at load average {load:.1f} on {cpus} CPUs; CI runs "
+                        f"this strictly. {miss.message}")
+    pytest.fail(miss.message)
+
+
+def _growth_gate(work_dir, env, unit, timeout_s):
+    """The growth sweep for one input shape: measure, retry once, then fail
+    (or skip under load, see ``_fail_timing``). Skips when it compared
+    nothing. Lives at module level so a test can run it on a planted hook."""
+    def measure(command):
+        best = None
+        for _ in range(_GROWTH_REPS):
+            start = time.perf_counter()
+            try:
+                proc = subprocess.run(
+                    [sys.executable,
+                     str(work_dir / ".claude/hooks/prevent-direct-push.py")],
+                    input=json.dumps({"tool_name": "Bash",
+                                      "tool_input": {"command": command}}),
+                    capture_output=True, text=True,
+                    timeout=timeout_s, cwd=work_dir,
+                    env=env,
+                )
+            except subprocess.TimeoutExpired:
+                return None
+            assert proc.returncode == 0, (
+                f"prevent-direct-push exited {proc.returncode}: "
+                f"{proc.stderr[-400:]!r}"
+            )
+            elapsed = (time.perf_counter() - start) * 1000
+            best = elapsed if best is None else min(best, elapsed)
+        return best
+
+    # The passing run's cells, for the "compared nothing" skip below.
+    passed = {}
+
+    def check():
+        works = []
+        for kb in _GROWTH_SIZES_KB:
+            # The fixed cost of getting in and out of the hook at all,
+            # measured right before each cell rather than once, so the
+            # load the cell sees moves its baseline too (#413).
+            baseline = measure("git pu" + "sh origin feature/probe")
+            assert baseline is not None, "the baseline command itself timed out"
+            elapsed = measure(_matrix_command(f"{unit} @ {kb}KB"))
+            if elapsed is None:
+                return _TimingMiss(
+                    f"prevent-direct-push did not finish {unit!r} at {kb}KB "
+                    f"within {timeout_s}s -- superlinear "
+                    f"growth over separator or quote density (the fixed "
+                    f"code costs single-digit milliseconds of work here)",
+                    float("inf"))
+            works.append((kb, max(elapsed - baseline, 0.0), baseline))
+
+        compared = 0
+        for (kb_a, work_a, base_a), (kb_b, work_b, baseline) in zip(works, works[1:]):
+            if work_a < max(_GROWTH_MIN_WORK_MS, _GROWTH_MIN_WORK_FRACTION * base_a):
+                continue  # noise, not signal -- see _GROWTH_MIN_WORK_FRACTION
+            compared += 1
+            ratio = work_b / work_a
+            if ratio >= _GROWTH_MAX_RATIO:
+                return _TimingMiss(
+                    f"prevent-direct-push work grew {ratio:.2f}x for {unit!r} "
+                    f"when the input doubled from {kb_a}KB to {kb_b}KB "
+                    f"({work_a:.1f}ms -> {work_b:.1f}ms over baselines of "
+                    f"{base_a:.1f}ms and {baseline:.1f}ms), past the "
+                    f"{_GROWTH_MAX_RATIO}x bound. Linear "
+                    f"work doubles; quadratic work quadruples.",
+                    ratio / _GROWTH_MAX_RATIO)
+        passed.update(works=works, compared=compared)
+        return None
+
+    miss = _retry_timing_once(check)
+    if miss is not None:
+        _fail_timing(miss)
+    works, compared = passed["works"], passed["compared"]
+    if not compared:
+        # Say so rather than pass having compared nothing: the smaller
+        # cell of every pair was under the noise floor, so this run
+        # measured no growth at all.
+        pytest.skip(f"{unit!r}: the smaller cell of every pair was under the "
+                    f"noise floor (kb, work ms, baseline ms): "
+                    f"{[(kb, round(w, 1), round(bs, 1)) for kb, w, bs in works]}")
+
+
+class TestRetryTimingOnce:
+    """The retry around the two wall-clock tests (#437)."""
+
+    @staticmethod
+    def _check(*results):
+        calls = []
+
+        def check():
+            calls.append(1)
+            return results[len(calls) - 1]
+        return check, calls
+
+    def test_one_noisy_sample_then_a_clean_one_passes(self):
+        check, calls = self._check(_TimingMiss("4.40x past the 3.0x bound", 1.47),
+                                   None)
+        assert _retry_timing_once(check) is None
+        assert len(calls) == 2
+
+    def test_a_clean_first_sample_is_not_measured_again(self):
+        check, calls = self._check(None)
+        assert _retry_timing_once(check) is None
+        assert len(calls) == 1
+
+    def test_a_miss_on_both_runs_fails_and_names_both(self):
+        check, calls = self._check(_TimingMiss("slow 1", 3.0),
+                                   _TimingMiss("slow 2", 1.5))
+        miss = _retry_timing_once(check)
+        assert miss is not None
+        assert "slow 1" in miss.message and "slow 2" in miss.message
+        assert miss.factor == 1.5, "the smaller factor decides the skip"
+        assert len(calls) == 2
+
+    @staticmethod
+    def _load(monkeypatch, load, ci):
+        monkeypatch.setattr(os, "cpu_count", lambda: 12)
+        monkeypatch.setattr(os, "getloadavg", lambda: (load, load, load))
+        if ci:
+            monkeypatch.setenv("CI", "true")
+        else:
+            monkeypatch.delenv("CI", raising=False)
+
+    @staticmethod
+    def _outcome(miss):
+        """("skip" | "fail", message). Both are caught here: a skip escaping
+        pytest.raises(fail) reports the test as skipped, not failed."""
+        try:
+            _fail_timing(miss)
+        except pytest.skip.Exception as e:
+            return "skip", str(e)
+        except pytest.fail.Exception as e:
+            return "fail", str(e)
+        return "returned", ""
+
+    def test_a_marginal_double_miss_under_overload_skips_locally(self, monkeypatch):
+        self._load(monkeypatch, 93.0, ci=False)
+        kind, msg = self._outcome(_TimingMiss("slow twice", 1.4))
+        assert kind == "skip" and "load average 93.0 on 12 CPUs" in msg, (kind, msg)
+        assert "1.40x" in msg
+
+    def test_a_gross_double_miss_fails_even_under_overload(self, monkeypatch):
+        self._load(monkeypatch, 93.0, ci=False)
+        assert self._outcome(_TimingMiss("slow twice", 3.0)) == ("fail", "slow twice")
+
+    def test_a_never_finished_cell_fails_even_under_overload(self, monkeypatch):
+        self._load(monkeypatch, 93.0, ci=False)
+        assert self._outcome(
+            _TimingMiss("slow twice", float("inf"))) == ("fail", "slow twice")
+
+    def test_ci_fails_a_double_miss_even_under_overload(self, monkeypatch):
+        self._load(monkeypatch, 93.0, ci=True)
+        assert self._outcome(_TimingMiss("slow twice", 1.4)) == ("fail", "slow twice")
+
+    def test_a_double_miss_at_normal_load_fails(self, monkeypatch):
+        self._load(monkeypatch, 12.0, ci=False)
+        assert self._outcome(_TimingMiss("slow twice", 1.4)) == ("fail", "slow twice")
+
+    def test_an_unreadable_load_average_fails(self, monkeypatch):
+        self._load(monkeypatch, 0.0, ci=False)
+
+        def broken():
+            raise OSError("no load average")
+        monkeypatch.setattr(os, "getloadavg", broken)
+        assert self._outcome(_TimingMiss("slow twice", 1.4)) == ("fail", "slow twice")
+
+
 # Memo for the size-matched baselines, keyed by (hook, size in KB).
 _SIZE_MATCHED_BASELINES = {}
 
@@ -2167,69 +2399,34 @@ class TestDecisionTimeIsBounded:
         regimes rather than merely ranking them.
         """
         work_dir, env = TestHookBlockingPathsFire._repo(tmp_path)
+        _growth_gate(work_dir, env, unit, self.SUBPROCESS_TIMEOUT_S)
 
-        def measure(command):
-            best = None
-            for _ in range(_GROWTH_REPS):
-                start = time.perf_counter()
-                try:
-                    proc = subprocess.run(
-                        [sys.executable,
-                         str(work_dir / ".claude/hooks/prevent-direct-push.py")],
-                        input=json.dumps({"tool_name": "Bash",
-                                          "tool_input": {"command": command}}),
-                        capture_output=True, text=True,
-                        timeout=self.SUBPROCESS_TIMEOUT_S, cwd=work_dir,
-                        env=env,
-                    )
-                except subprocess.TimeoutExpired:
-                    return None
-                assert proc.returncode == 0, (
-                    f"prevent-direct-push exited {proc.returncode}: "
-                    f"{proc.stderr[-400:]!r}"
-                )
-                elapsed = (time.perf_counter() - start) * 1000
-                best = elapsed if best is None else min(best, elapsed)
-            return best
-
-        works = []
-        for kb in _GROWTH_SIZES_KB:
-            # The fixed cost of getting in and out of the hook at all,
-            # measured right before each cell rather than once, so the load
-            # the cell sees moves its baseline too (#413).
-            baseline = measure("git pu" + "sh origin feature/probe")
-            assert baseline is not None, "the baseline command itself timed out"
-            elapsed = measure(_matrix_command(f"{unit} @ {kb}KB"))
-            if elapsed is None:
-                pytest.fail(
-                    f"prevent-direct-push did not finish {unit!r} at {kb}KB "
-                    f"within {self.SUBPROCESS_TIMEOUT_S}s -- superlinear "
-                    f"growth over separator or quote density (the fixed code "
-                    f"costs single-digit milliseconds of work here)"
-                )
-            works.append((kb, max(elapsed - baseline, 0.0), baseline))
-
-        compared = 0
-        for (kb_a, work_a, base_a), (kb_b, work_b, baseline) in zip(works, works[1:]):
-            if work_a < max(_GROWTH_MIN_WORK_MS, _GROWTH_MIN_WORK_FRACTION * base_a):
-                continue  # noise, not signal -- see _GROWTH_MIN_WORK_FRACTION
-            compared += 1
-            ratio = work_b / work_a
-            assert ratio < _GROWTH_MAX_RATIO, (
-                f"prevent-direct-push work grew {ratio:.2f}x for {unit!r} "
-                f"when the input doubled from {kb_a}KB to {kb_b}KB "
-                f"({work_a:.1f}ms -> {work_b:.1f}ms over baselines of "
-                f"{base_a:.1f}ms and {baseline:.1f}ms), past the "
-                f"{_GROWTH_MAX_RATIO}x bound. Linear "
-                f"work doubles; quadratic work quadruples."
-            )
-        if not compared:
-            # Say so rather than pass having compared nothing: the smaller
-            # cell of every pair was under the noise floor, so this run
-            # measured no growth at all.
-            pytest.skip(f"{unit!r}: the smaller cell of every pair was under the "
-                        f"noise floor (kb, work ms, baseline ms): "
-                        f"{[(kb, round(w, 1), round(bs, 1)) for kb, w, bs in works]}")
+    def test_a_quadratic_hook_still_fails_the_growth_sweep(self, tmp_path,
+                                                            monkeypatch):
+        """The negative control on the growth sweep (#437): a planted
+        quadratic term, run through ``_growth_gate`` as the real test does it,
+        must fail. Deleting the failure call in ``_growth_gate`` turns this
+        red."""
+        work_dir, env = TestHookBlockingPathsFire._repo(tmp_path)
+        hook = work_dir / ".claude/hooks/prevent-direct-push.py"
+        src = hook.read_text(encoding="utf-8")
+        # After `command` is assigned and normalised. PR #415 planted
+        # command.count run len//1000 times, but that is only ~10-160 ms of
+        # work per cell: at a load average of ~160 on 12 CPUs one of the two
+        # runs passed on noise 3 times in 8. This control proves the gate's
+        # failure path is wired, so it plants a term that dominates
+        # (len//100, ~0.1-1.6 s). A mild quadratic under heavy load can still
+        # pass one run, and one passing run is enough: that is the cost of
+        # the retry (see _retry_timing_once).
+        anchor = r'command = command.replace("\\\n", " ")'
+        assert src.count(anchor) == 1, "the plant's anchor line moved"
+        plant = '_ = [command.count("x") for _ in range(len(command) // 100)]'
+        hook.write_text(src.replace(anchor, anchor + "\n" + plant),
+                        encoding="utf-8")
+        monkeypatch.setenv("CI", "true")
+        with pytest.raises(pytest.fail.Exception):
+            _growth_gate(work_dir, env, "bare separators",
+                         self.SUBPROCESS_TIMEOUT_S)
 
 
 def _hook_regex_constants(hook):
@@ -3495,6 +3692,19 @@ class TestProtectedBranchDeletionIsBlocked:
         worst possible way to pass this test.
         """
         work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        self._stall_gate(work, env)
+
+    def _stall_gate(self, work, env):
+        """The stall check with its retry and failure, as the real test runs
+        it. Split out so the negative control exercises the same wiring."""
+        miss = _retry_timing_once(lambda: self._large_command_stall(work, env))
+        if miss is not None:
+            _fail_timing(miss)
+
+    def _large_command_stall(self, work, env):
+        """One timed run of the 900 KB command: None when it is under the
+        3.0 s bound, else why not. The verdict is asserted on every run and
+        never retried -- a fast ALLOW is a failure, not noise."""
         command = (f"{self.PUSH} --delete origin release/x "
                    + "b" * 900_000 + f" {self.MAIN}")
         started = time.monotonic()
@@ -3502,10 +3712,39 @@ class TestProtectedBranchDeletionIsBlocked:
             work, env, "prevent-direct-push", command)
         elapsed = time.monotonic() - started
         assert got == "deny", f"a 900 KB command must still deny, got {got}"
-        assert elapsed < 3.0, (
+        if elapsed < 3.0:
+            return None
+        return _TimingMiss(
             f"the gate took {elapsed:.2f}s on a 900 KB command; the quadratic "
-            f"shlex path is back (it measured 5.6s, the fixed path 0.04s)"
-        )
+            f"shlex path is back (it measured 5.6s, the fixed path 0.04s)",
+            elapsed / 3.0)
+
+    def test_a_gate_that_really_stalls_still_fails(self, tmp_path, monkeypatch):
+        """The negative control on the retry (#437): a hook with a planted
+        3.5 s stall misses the 3.0 s bound on both runs, so the retry cannot
+        turn a real regression into a pass. It goes through ``_stall_gate``,
+        the same path the real test takes, so deleting the failure call there
+        turns this red."""
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        hook = work / ".claude/hooks/prevent-direct-push.py"
+        src = hook.read_text(encoding="utf-8")
+        anchor = 'input_data = _read_hook_input("Push hook")'
+        assert src.count(anchor) == 1, "the plant's anchor line moved"
+        hook.write_text(src.replace(
+            anchor, "import time as _t; _t.sleep(3.5)\n" + anchor),
+            encoding="utf-8")
+        monkeypatch.setenv("CI", "true")
+        calls = []
+        real = self._large_command_stall
+
+        def counting(work, env):
+            calls.append(1)
+            return real(work, env)
+
+        monkeypatch.setattr(self, "_large_command_stall", counting)
+        with pytest.raises(pytest.fail.Exception, match="failed twice"):
+            self._stall_gate(work, env)
+        assert len(calls) == 2
 
     def test_the_delete_analysis_is_what_carries_these(self, tmp_path):
         """The negative control on the guard itself.
@@ -5075,3 +5314,102 @@ class TestPreflightTokenSurvivesADeniedCall:
             work, env, "rev-parse", "HEAD")
         assert self._decide(work, env, self.REG) == "allow"
         assert token.exists()
+
+    # --- --allow-empty (#116) -------------------------------------------------
+
+    EMPTY = "git " + C + " --allow-empty -m marker"
+
+    def _preflight(self, work, env, *args):
+        if not (work / "scripts").exists():
+            (work / "scripts").mkdir()
+            shutil.copy("scripts/commit-preflight.sh", work / "scripts")
+        return subprocess.run(
+            ["bash", "scripts/commit-preflight.sh", *args],
+            cwd=work, env=env, capture_output=True, text=True, timeout=60)
+
+    def test_allow_empty_mints_a_token_for_an_empty_commit(self, repo):
+        work, env, token = repo
+        proc = self._preflight(work, env, "--allow-empty")
+        assert proc.returncode == 0, proc.stdout[-400:] + proc.stderr[-400:]
+        data = json.loads(token.read_text())
+        assert data["head"] == self._git(work, env, "rev-parse", "HEAD")
+        assert data["staged_files"] == 0
+        assert data["skip_reason"] == "empty commit (--allow-empty)"
+        assert self._decide(work, env, self.EMPTY) == "allow"
+
+    def test_the_empty_commit_spends_the_token(self, repo):
+        """Single use: once the empty commit has landed, HEAD has moved, so
+        the same token does not cover a second commit with real changes."""
+        work, env, token = repo
+        assert self._preflight(work, env, "--allow-empty").returncode == 0
+        assert self._decide(work, env, self.EMPTY) == "allow"
+        self._git(work, env, self.C, "-q", "--allow-empty", "-m", "marker")
+        (work / "f.txt").write_text("x")
+        self._git(work, env, "add", "f.txt")
+        assert self._decide(work, env, self.REG) == "deny"
+        assert not token.exists()
+
+    def test_allow_empty_refuses_when_files_are_staged(self, repo):
+        """Otherwise --allow-empty would be a way to skip the tests on real
+        changes."""
+        work, env, token = repo
+        (work / "f.txt").write_text("x")
+        self._git(work, env, "add", "f.txt")
+        proc = self._preflight(work, env, "--allow-empty")
+        assert proc.returncode == 1
+        assert "files are staged" in proc.stdout
+        assert not token.exists()
+
+    def test_allow_empty_refuses_unstaged_tracked_changes(self, repo):
+        """The hook checks only expiry and HEAD, so `git commit -a` or
+        `git commit -m x <path>` would commit these with no scan or test."""
+        work, env, token = repo
+        (work / "f.txt").write_text("x")
+        self._git(work, env, "add", "f.txt")
+        self._git(work, env, self.C, "-q", "-m", "track f")
+        (work / "f.txt").write_text("changed")
+        proc = self._preflight(work, env, "--allow-empty")
+        assert proc.returncode == 1, proc.stdout[-400:]
+        assert "unstaged changes" in proc.stdout
+        assert "f.txt" in proc.stdout
+        assert not token.exists()
+
+    def test_allow_empty_still_allows_an_untracked_file(self, repo):
+        """`git commit -a` never takes untracked files, and a pathspec
+        naming one errors in git, so an untracked file cannot slip through."""
+        work, env, token = repo
+        (work / "new.txt").write_text("x")
+        proc = self._preflight(work, env, "--allow-empty")
+        assert proc.returncode == 0, proc.stdout[-400:] + proc.stderr[-400:]
+        assert token.exists()
+
+    def test_allow_empty_refuses_when_git_cannot_read_the_index(self, repo):
+        """The staged list falls back to empty when git fails, so the flag
+        asks git itself, and a git error is not "nothing staged"."""
+        work, env, token = repo
+        self._preflight(work, env, "--not-a-flag")  # copies the script in
+        shim = work.parent / "fatal-git"
+        shim.mkdir()
+        (shim / "git").write_text("#!/bin/sh\nexit 128\n")
+        (shim / "git").chmod(0o755)
+        env = dict(env, PATH=f"{shim}{os.pathsep}{env.get('PATH', '')}")
+        proc = self._preflight(work, env, "--allow-empty")
+        assert proc.returncode == 1, proc.stdout[-400:]
+        assert "Could not read the git index (git exited 128)" in proc.stdout
+        assert not token.exists()
+
+    def test_nothing_staged_without_the_flag_is_still_refused(self, repo):
+        work, env, token = repo
+        proc = self._preflight(work, env)
+        assert proc.returncode == 1
+        assert "No staged files" in proc.stdout
+        assert "--allow-empty" in proc.stdout
+        assert not token.exists()
+
+    def test_the_token_counts_staged_files_exactly(self, repo):
+        work, env, token = repo
+        for name in ("a.txt", "b.txt"):
+            (work / name).write_text("x")
+            self._git(work, env, "add", name)
+        assert self._preflight(work, env, "--skip-tests", "probe").returncode == 0
+        assert json.loads(token.read_text())["staged_files"] == 2
