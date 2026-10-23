@@ -37,6 +37,13 @@ Files: `scripts/commit-preflight.sh`, `tests/test_security.py`, `scripts/dev-tes
 
 Filed as harden-repo#160 (the known content-binding limit is harden-repo#81): the template `templates/scripts/commit-preflight.sh` has no `--allow-empty`, so #418's template swap would drop it. The new tests here then fail, which is the signal.
 
+## Review fixes
+
+1. `--allow-empty` also refuses unstaged changes to tracked files (`git diff --quiet`), because `git commit -a` or a pathspec would commit them unchecked. An untracked file is allowed.
+2. The two wall-clock tests call `_stall_gate` and `_growth_gate`, and the negative controls (planted stall, planted quadratic term) run those same functions, so removing the failure call turns a test red.
+3. The load skip applies only to a miss under `_TIMING_GROSS_FACTOR` (2.0) times the bound. A gross miss or a cell that never finishes fails, even under overload.
+4. CHANGELOG: dropped the `staged_files` Fixed bullet (no token could reach that bug before this PR) and noted the exact count under Added.
+
 ## Failure modes
 
 - **Fail-open paths:** the retry could turn a real regression into a pass. Test: slow every time still fails (helper test, plus the planted 3.5 s sleep). A timed-out cell counts as a failed run, never a skip. For `--allow-empty`, the open path is staged files plus the flag; test: exits 1, no token.

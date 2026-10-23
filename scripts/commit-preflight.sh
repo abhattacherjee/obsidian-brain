@@ -10,7 +10,7 @@
 #   ./scripts/commit-preflight.sh --skip-tests "reason"  # Skip with reason
 #   ./scripts/commit-preflight.sh --auto       # Auto-detect if tests needed
 #   ./scripts/commit-preflight.sh --allow-empty  # For `git commit --allow-empty`
-#                                                # (refuses if anything is staged)
+#                                                # (refuses if anything is staged or modified)
 #
 # Installed by /harden-repo
 # Lint/test commands customized for this project during installation.
@@ -75,7 +75,10 @@ STAGED_COUNT=$(printf '%s' "$STAGED_FILES" | grep -c '' || true)
 if [ "$ALLOW_EMPTY" = true ]; then
     # An empty commit has nothing to scan or test (#116). Ask git directly:
     # the `|| echo ""` above turns a git failure into an empty list, which
-    # must not read as "nothing staged" here.
+    # must not read as "nothing staged" here. Two checks, because the hook
+    # only checks the token's expiry and HEAD: an empty index alone would let
+    # `git commit -a` or `git commit -m x <path>` commit modified tracked
+    # files with no scan or test.
     INDEX_STATE=0
     git diff --cached --quiet 2>/dev/null || INDEX_STATE=$?
     case "$INDEX_STATE" in
@@ -90,6 +93,24 @@ if [ "$ALLOW_EMPTY" = true ]; then
             ;;
         *)
             echo "❌ Could not read the git index (git exited $INDEX_STATE)."
+            rm -f "$TOKEN_FILE"
+            exit 1
+            ;;
+    esac
+    TREE_STATE=0
+    git diff --quiet 2>/dev/null || TREE_STATE=$?
+    case "$TREE_STATE" in
+        0)
+            ;;
+        1)
+            echo "❌ --allow-empty needs a clean working tree: tracked files have unstaged changes, and 'git commit -a' or a pathspec would commit them unchecked:"
+            git diff --name-only | head -10 | sed 's/^/   /'
+            echo "   Commit or stash them, or run preflight without --allow-empty."
+            rm -f "$TOKEN_FILE"
+            exit 1
+            ;;
+        *)
+            echo "❌ Could not read the working tree (git exited $TREE_STATE)."
             rm -f "$TOKEN_FILE"
             exit 1
             ;;
