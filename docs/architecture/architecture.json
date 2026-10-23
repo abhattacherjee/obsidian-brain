@@ -456,7 +456,7 @@
           "files": [
             "hooks/vault_index.py"
           ],
-          "purpose": "Weighted sum: proximity 0.25, bm25 0.20, activation 0.20, type 0.10, recency 0.10, importance 0.10, density 0.05. Type score has a column per context (debugging/standup/emerge/search/general). Only the general column is used in production today: search_vault picks another context only when a caller passes caller=, and no caller does. Every note type a writer emits has an explicit weight in every context (tests/test_type_scores.py scans hooks/, scripts/, skills/ and templates/ for them, #376); a missing type would fall back to 0.5. claude-stats and claude-check-items-report score 0.0, and claude-emerge scores 0.0 in the emerge context. 0.0 is a down-weight, not an exclusion: it lowers the final score by at most 0.05 against the 0.5 default. claude-wiki (#383) weighs the same as claude-insight in every context."
+          "purpose": "Weighted sum: proximity 0.25, bm25 0.20, activation 0.20, type 0.10, recency 0.10, importance 0.10, density 0.05. Type score has a column per context (debugging/standup/emerge/search/general). Only the general column is used in production today: search_vault picks another context only when a caller passes caller=, and no caller does. Every note type a writer emits has an explicit weight in every context (tests/test_type_scores.py scans hooks/, scripts/, skills/ and templates/ for them, #376); a missing type would fall back to 0.5. claude-stats and claude-check-items-report score 0.0, and claude-emerge scores 0.0 in the emerge context. 0.0 is a down-weight, not an exclusion: it lowers the final score by at most 0.05 against the 0.5 default. claude-wiki (#383) weighs the same as claude-insight in every context. Importance is the index value: the Haiku score for session notes, 3 (auto-capture) or 6 (hand-saved) for the three curated types, or an importance: frontmatter override (#449)."
         },
         {
           "id": "access-log",
@@ -501,7 +501,7 @@
           "files": [
             "hooks/vault_index.py"
           ],
-          "purpose": "Deliberately avoids INSERT OR REPLACE: explicit DELETE+INSERT preserving the prior importance value, and issuing the contentless-FTS5 delete op with old column values so the FTS index never accumulates orphans. Token-scoped term_df fetch: only fetches df rows for terms in the current note (chunked IN clause at 900 placeholders), not a full-table scan, so cost is O(note tokens) not O(vocabulary)."
+          "purpose": "Deliberately avoids INSERT OR REPLACE: explicit DELETE+INSERT that stores _derive_importance(): an importance: frontmatter line (1-10) wins; claude-insight/decision/error-fix notes get 3 when source: auto-capture and 6 otherwise; every other type keeps its prior value (the session notes' Haiku score) (#449), and issuing the contentless-FTS5 delete op with old column values so the FTS index never accumulates orphans. Token-scoped term_df fetch: only fetches df rows for terms in the current note (chunked IN clause at 900 placeholders), not a full-table scan, so cost is O(note tokens) not O(vocabulary)."
         },
         {
           "id": "vault-stats-compute",
@@ -520,6 +520,16 @@
             "scripts/access_log_purge.py"
           ],
           "purpose": "One-off cleanup of access_log rows written by internal searches before #448: deletes every row of one context type (--context search|recall|related, default search) at or after local midnight of --since YYYY-MM-DD. Dry run by default (counts by local day; --list prints each row). --apply backs up the DB to --backup-dir (default ~/.claude/obsidian-brain/) and then deletes. --db defaults to $OBSIDIAN_BRAIN_DB or ~/.claude/obsidian-brain-vault.db. Exit 0 ok, 1 refused or failed (no DB, backup failed, DB error; nothing deleted), 2 usage."
+        },
+        {
+          "id": "importance-backfill-cli",
+          "name": "importance_backfill.py / backfill_importance()",
+          "kind": "cli",
+          "files": [
+            "scripts/importance_backfill.py",
+            "hooks/vault_index.py"
+          ],
+          "purpose": "One-off backfill for #449: _sync re-derives importance only for notes whose mtime changed, so rows indexed earlier keep the old default 5. Scans every non-session row (session scores are never touched), re-parses its file and reports scanned, changed, unreadable, by_value and from_to. Dry run by default; --apply writes in one transaction, each UPDATE guarded by the value it read. No backup: only the importance column changes. --db defaults to $OBSIDIAN_BRAIN_DB or ~/.claude/obsidian-brain-vault.db. Exit 0 ok, 1 missing DB or failure, 2 usage."
         }
       ]
     },
@@ -2149,6 +2159,28 @@
           "from": "access-log",
           "to": "db-index",
           "label": "DELETE matching rows in one transaction"
+        }
+      ]
+    },
+    {
+      "id": "importance-derivation",
+      "name": "Importance for curated notes",
+      "description": "Each indexed curated note gets an importance from its own frontmatter, so ranking favours hand-saved notes over auto-captures and a --full rebuild derives the same values (#449).",
+      "steps": [
+        {
+          "from": "ensure-index",
+          "to": "upsert-note",
+          "label": "_upsert_note(): _derive_importance() from type, source and importance:"
+        },
+        {
+          "from": "importance-backfill-cli",
+          "to": "db-index",
+          "label": "backfill_importance(): set derived values on rows indexed before #449 (dry run by default)"
+        },
+        {
+          "from": "rerank",
+          "to": "db-index",
+          "label": "importance 0.10 of the score"
         }
       ]
     }
