@@ -1284,15 +1284,16 @@ def purge_access_log(
             _drop_backup()
             raise
 
-        conn.execute("BEGIN IMMEDIATE")
+        # The backup is kept only once the delete has committed; any failure
+        # before that (lock at BEGIN, mismatch, DELETE error) drops it.
         try:
+            conn.execute("BEGIN IMMEDIATE")
             # Only rows the backup holds (id <= max_id) may be deleted. A row
             # inserted after the snapshot is neither backed up nor touched.
             live_in_backup = conn.execute(
                 "SELECT COUNT(*) FROM access_log WHERE id <= ?", (max_id,)
             ).fetchone()[0]
             if max_id < pre_max or backed_up != live_in_backup:
-                _drop_backup()
                 raise RuntimeError(
                     f"backup at {backup_path} holds {backed_up} access rows, "
                     f"expected {live_in_backup}; nothing deleted"
@@ -1309,6 +1310,7 @@ def purge_access_log(
                 conn.rollback()
             except sqlite3.Error:
                 pass
+            _drop_backup()
             raise
         result.update(
             applied=True,

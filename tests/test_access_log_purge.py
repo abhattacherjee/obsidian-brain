@@ -264,3 +264,34 @@ def test_script_unknown_context_exits_2(db):
     proc = _run("--db", db, "--since", "2026-10-18", "--context", "bogus")
     assert proc.returncode == 2
     assert "usage: access_log_purge.py" in proc.stderr
+
+
+def test_lock_at_begin_deletes_nothing_and_drops_backup(db, tmp_path, monkeypatch):
+    """A failure at BEGIN IMMEDIATE (database is locked) is before the commit:
+    nothing is deleted and the backup file must not be left behind."""
+    before = _rows(db)
+    real_connect = vault_index._connect
+
+    class _Proxy:
+        def __init__(self, conn):
+            self._c = conn
+
+        def execute(self, sql, *a):
+            if sql.strip().upper().startswith("BEGIN IMMEDIATE"):
+                raise sqlite3.OperationalError("database is locked")
+            return self._c.execute(sql, *a)
+
+        def __getattr__(self, name):
+            return getattr(self._c, name)
+
+    def connect(path, *a, **k):
+        conn = real_connect(path, *a, **k)
+        return _Proxy(conn) if path == db else conn
+
+    monkeypatch.setattr(vault_index, "_connect", connect)
+    with pytest.raises(sqlite3.OperationalError, match="locked"):
+        vault_index.purge_access_log(db, "search", SINCE, apply=True,
+                                     backup_dir=str(tmp_path / "bk"))
+    monkeypatch.setattr(vault_index, "_connect", real_connect)
+    assert _rows(db) == before
+    assert not list((tmp_path / "bk").glob("vault-db-backup-*"))
