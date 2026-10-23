@@ -175,7 +175,7 @@ def main() -> int:
         try:
             db = vault_index.ensure_index(str(vault), ["claude-sessions"], db_path=str(iso))
 
-            hits = vault_index.search_vault(str(iso), "bravo", limit=10)
+            hits = vault_index.search_vault(str(iso), "bravo", limit=10, log_access=False)
             if hits:
                 pass_(f"regression: search_vault returned {len(hits)} hit(s)")
             else:

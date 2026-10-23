@@ -1572,6 +1572,7 @@ def deep_analysis_pipeline(
                     # handles tokenization internally; literal "OR" would be a search term)
                     hits = vault_index.search_vault(
                         actual_db, " ".join(kws), project=project, limit=5,
+                        log_access=False,
                     )
                     fts_mentions[item_text[:60]] = len(hits)
             if fts_mentions:

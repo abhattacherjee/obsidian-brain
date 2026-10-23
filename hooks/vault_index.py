@@ -894,7 +894,9 @@ def _sync(conn: sqlite3.Connection, vault_path: str, folders: list[str]) -> dict
 def ensure_index(vault_path: str, folders: list[str], db_path: str | None = None) -> str:
     """Create or update the vault index. Returns the DB path.
 
-    Handles corrupt DB by deleting and recreating.
+    Handles corrupt DB by deleting and recreating. After the sync, trims
+    access_log when a note has more than ACCESS_LOG_KEEP_PER_NOTE rows
+    (#448); a GC failure is reported and never treated as corruption.
     """
     if db_path is None:
         db_path = _default_db_path()
@@ -934,6 +936,7 @@ def ensure_index(vault_path: str, folders: list[str], db_path: str | None = None
                 if _needs_body_migration(conn):
                     raise sqlite3.DatabaseError("body column missing after rebuild")
             _sync(conn, vault_path, folders)
+            _gc_access_log_if_needed(conn)
         finally:
             conn.close()
     except sqlite3.DatabaseError as exc:
@@ -1123,6 +1126,65 @@ def _batch_log_access(
               f"{len(note_paths)} paths: {exc}", file=sys.stderr)
 
 
+# Access-log GC (#448): keep the newest N events per note, per the Friston
+# spec's Phase 4 ("keep the last 1,000 events per note"). Activation sums
+# t^-0.5 over every row of a candidate, so old rows past this add little to
+# the score but cost a read on every search.
+ACCESS_LOG_KEEP_PER_NOTE = 1000
+
+
+def _access_log_over_keep(conn: sqlite3.Connection, keep: int) -> bool:
+    """True when at least one note has more than *keep* access rows.
+
+    The cheap gate for gc_access_log: an index scan on idx_access_note
+    (~2 ms at 60k rows) against ~50 ms for the ranking delete, so
+    ensure_index can check it on every call.
+    """
+    return conn.execute(
+        "SELECT 1 FROM access_log GROUP BY note_path HAVING COUNT(*) > ? LIMIT 1",
+        (keep,),
+    ).fetchone() is not None
+
+
+def gc_access_log(conn: sqlite3.Connection, keep: int | None = None) -> int:
+    """Delete access rows ranked past *keep* per note, newest first by
+    ``timestamp DESC, id DESC``. Commits. Returns the number deleted.
+
+    *keep* defaults to ACCESS_LOG_KEEP_PER_NOTE, read at call time. A note
+    with *keep* rows or fewer is untouched, so on a log where no note
+    exceeds *keep* this deletes nothing and activation is unchanged.
+    """
+    if keep is None:
+        keep = ACCESS_LOG_KEEP_PER_NOTE
+    if keep < 1:
+        raise ValueError(f"gc_access_log: keep must be >= 1, got {keep}")
+    cur = conn.execute(
+        "DELETE FROM access_log WHERE id IN ("
+        "  SELECT id FROM ("
+        "    SELECT id, ROW_NUMBER() OVER ("
+        "      PARTITION BY note_path ORDER BY timestamp DESC, id DESC"
+        "    ) AS rn FROM access_log"
+        "  ) WHERE rn > ?"
+        ")",
+        (keep,),
+    )
+    conn.commit()
+    return cur.rowcount
+
+
+def _gc_access_log_if_needed(conn: sqlite3.Connection) -> None:
+    """ensure_index's GC step: run gc_access_log only when a note is over
+    the cap. Any sqlite3.Error is reported and swallowed: ensure_index
+    treats sqlite3.DatabaseError as a corrupt DB and deletes it, and a busy
+    or locked access log must never cost the whole index."""
+    try:
+        keep = ACCESS_LOG_KEEP_PER_NOTE
+        if _access_log_over_keep(conn, keep):
+            gc_access_log(conn, keep)
+    except sqlite3.Error as exc:
+        print(f"[vault-index] access_log GC skipped: {exc}", file=sys.stderr)
+
+
 def batch_activations(
     db_path: str, note_paths: list[str], decay: float = 0.5
 ) -> dict[str, float]:
@@ -1206,7 +1268,9 @@ def rebuild_index(
     (every ``_sync`` stat; ``skipped == unchanged + malformed``) plus, in
     non-destructive mode, ``"foreign_deleted"`` (rows dropped because their
     path is outside every scanned folder), ``"preserved": {...}`` and
-    ``"pruned_orphans": {...}`` reporting the Friston-table delta.
+    ``"pruned_orphans": {...}`` reporting the Friston-table delta. Both modes
+    report ``"access_log_gc"``: rows dropped by gc_access_log, which
+    ``pruned_orphans`` does not count (always 0 for ``full=True``).
     """
     if db_path is None:
         db_path = _default_db_path()
@@ -1237,6 +1301,7 @@ def rebuild_index(
             _ensure_theme_indexes(conn)
             stats = _sync(conn, vault_path, folders)
             stats["backfilled"] = 0  # full wipe rebuilds all vectors from scratch
+            stats["access_log_gc"] = 0  # the wipe emptied access_log
         finally:
             conn.close()
     else:
@@ -1383,6 +1448,11 @@ def rebuild_index(
                 )
             stats["backfilled"] = backfilled_count
 
+            # Step 4: access-log GC (#448). After the orphan prune, so the
+            # two are reported apart: pruned_orphans below excludes it.
+            gc_deleted = gc_access_log(conn)
+            stats["access_log_gc"] = gc_deleted
+
             # Report preserved/pruned counts from the actual after-state
             # rather than deleted rowcount. _sync and _delete_note also
             # remove theme_members rows (and may drop last-member themes)
@@ -1403,7 +1473,7 @@ def rebuild_index(
                 "theme_members": after_members,
             }
             stats["pruned_orphans"] = {
-                "access_log": before_access - after_access,
+                "access_log": before_access - after_access - gc_deleted,
                 "themes": before_themes - after_themes,
                 "theme_members": before_members - after_members,
             }
@@ -1818,6 +1888,7 @@ def search_vault(
     limit: int = 15,
     caller: str | None = None,
     include_vectors: bool = False,
+    log_access: bool = True,
 ) -> list[dict]:
     """Full-text search over the vault index.
 
@@ -1841,6 +1912,11 @@ def search_vault(
     Every result dict carries an ``or_fallback`` boolean: ``True`` when the
     row was retrieved via the OR-fallback branch (AND returned 0 results),
     ``False`` on the normal AND path.
+
+    Each returned hit is logged as a ``search`` access, which feeds ACT-R
+    activation in the rerank. Pass ``log_access=False`` from any search that
+    is not a person or agent retrieving notes (dedup checks, wiki lookup,
+    tuning scripts): logging those turned activation into noise (#448).
     """
     if not os.path.isfile(db_path):
         return []
@@ -1918,12 +1994,13 @@ def search_vault(
         # Log access for returned results (single connection, one commit).
         # Per-row project preserves each note's project attribution for
         # per-project analytics, even when the search itself was unscoped.
-        _batch_log_access(
-            conn,
-            [r["path"] for r in results],
-            "search",
-            project=[r.get("project") for r in results],
-        )
+        if log_access:
+            _batch_log_access(
+                conn,
+                [r["path"] for r in results],
+                "search",
+                project=[r.get("project") for r in results],
+            )
         # Strip body — callers don't need it.
         # Decode tfidf_vector when requested (None-safe); leave key absent otherwise.
         for r in results:

@@ -237,7 +237,8 @@ def find_match(query: str, config: dict, session_id: str | None = None) -> str |
     own = {_vault_rel(p, root) for p in capture_state.notes_created_by(session_id)} if session_id else set()
     results: list[dict] = []
     for note_type in (*_CURATED_NOTE_TYPES, "claude-session"):
-        results += vault_index.search_vault(db, query, note_type=note_type, limit=3, include_vectors=True)
+        results += vault_index.search_vault(db, query, note_type=note_type, limit=3, include_vectors=True,
+                                          log_access=False)
     results = [r for r in results if not _is_rejected(r.get("path", ""))]
     for r in results:
         r["rel_path"] = _vault_rel(r.get("path", ""), root)
