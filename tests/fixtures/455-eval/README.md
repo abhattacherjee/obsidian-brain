@@ -31,8 +31,9 @@ the same keep rates.
 
 The repo is public, so the fixture holds no note text: note names are hashed,
 the judges' reasons are dropped, and each vector's terms are hashed with a
-random salt that is not stored. Cosines are unchanged. The full spike,
-`blind.json` with the note text included, stays in
+random salt that is not stored. Cosines are unchanged. The raw spike files
+(`blind.json` with the note text, `key.json` with the note names, the labels
+with the judges' reasons, and the spike scripts) stay in
 `~/.claude/obsidian-brain/spike-455/` on the machine that ran it.
 
 ## Rebuild
