@@ -330,7 +330,7 @@
           "files": [
             "hooks/obsidian_utils.py"
           ],
-          "purpose": "Builds the /recall context brief entirely in Python (no sub-agent): reads session/insight files directly, composes the brief + load-manifest, appends each session's indented snapshot rows via fetch_snapshot_summaries() — which since #70 discovers DATE-AGNOSTICALLY (the `date` argument is retained for the four-positional-arg calls in skills/vault-search and skills/vault-ask but no longer filters) so a PreCompact snapshot written before midnight is still found under the next day's session note, and reads it from find_snapshots_for_session(use_index=True), a process-lifetime memo of session_id → snapshot stems keyed by resolved sessions folder and invalidated on that folder's mtime, so an M-row history table costs ONE frontmatter scan instead of M; the memo is opt-in precisely so the SessionEnd write path, which creates a snapshot and then reads the list back, keeps the uncached scan, then runs open-item detection via open_item_dedup.collect_open_items(). Cross-references each open item's own source-session date against every OTHER scanned session's '## Summary' text: for every candidate session STRICTLY NEWER than the item's source (never same-date, never the item's own note), match_items_against_evidence() checks for a completion match; the highest-confidence strictly-newer hit is kept, tagged with contradicted_by (date) and contradicted_by_title, so /recall Step 4 renders a one-line 'looks done per session <date>' nudge instead of silently re-listing the item as still open (#264 Task 3, Fix B). The session-table scan skips the metadata read for a note the index proves is a snapshot or belongs to another project (indexed, mtime unchanged, under the character cap), and runs inside cache_deferred() (#447). Related insights come from query_related_notes, which leaves provisional auto notes (#455) out of all three layers; the file-scan fallback skips them too."
+          "purpose": "Builds the /recall context brief entirely in Python (no sub-agent): reads session/insight files directly, composes the brief + load-manifest, appends each session's indented snapshot rows via fetch_snapshot_summaries() — which since #70 discovers DATE-AGNOSTICALLY (the `date` argument is retained for the four-positional-arg calls in skills/vault-search and skills/vault-ask but no longer filters) so a PreCompact snapshot written before midnight is still found under the next day's session note, and reads it from find_snapshots_for_session(use_index=True), a process-lifetime memo of session_id → snapshot stems keyed by resolved sessions folder and invalidated on that folder's mtime, so an M-row history table costs ONE frontmatter scan instead of M; the memo is opt-in precisely so the SessionEnd write path, which creates a snapshot and then reads the list back, keeps the uncached scan, then runs open-item detection via open_item_dedup.collect_open_items(). Cross-references each open item's own source-session date against every OTHER scanned session's '## Summary' text: for every candidate session STRICTLY NEWER than the item's source (never same-date, never the item's own note), match_items_against_evidence() checks for a completion match; the highest-confidence strictly-newer hit is kept, tagged with contradicted_by (date) and contradicted_by_title, so /recall Step 4 renders a one-line 'looks done per session <date>' nudge instead of silently re-listing the item as still open (#264 Task 3, Fix B). The session-table scan skips the metadata read for a note the index proves is a snapshot or belongs to another project (indexed, mtime unchanged, under the character cap), and runs inside cache_deferred() (#447). Related insights come from query_related_notes, which leaves provisional auto notes (#455) out of all three layers; the file-scan fallback skips them too. query_related_notes keeps at most 1 claude-retro (#458, related_select.select_related); the file-scan fallback applies the same rule to its date-ordered list, even when vault_index cannot be imported."
         },
         {
           "id": "retro-gate-sentinel",
@@ -441,6 +441,16 @@
           "purpose": "Sanitizes the query to AND-mode FTS5 (hyphens to spaces), runs bm25 with title 10x and tags 5x weighting, OR-fallback when AND is empty, reranks, batch-logs access, strips body before returning. Two opt-in additions: include_vectors=True adds a decoded tfidf_vector key (dict[str,float] or None) to each result, used by /compress Step 3.5 for the cosine gate; every result dict also carries an or_fallback bool (True when retrieved via the OR-fallback branch). log_access=True (default) batch-logs each hit as a 'search' access; internal callers (capture dedup, wiki lookup, check-items dedup, /compress dedup, tune_compress_rank_gap.py) pass log_access=False so dedup checks do not feed activation (#448). tests/test_access_log_flag.py greps hooks/, skills/, scripts/ and mods/ so a new internal call must pass it. include_provisional (default True, so every dedup caller still sees them) set to False leaves out status: provisional notes (#455); /vault-ask Step 3 passes False."
         },
         {
+          "id": "related-select",
+          "name": "query_related_notes() / related_select.select_related()",
+          "kind": "function",
+          "files": [
+            "hooks/vault_index.py",
+            "hooks/related_select.py"
+          ],
+          "purpose": "/recall related insights. query_related_notes builds a layered candidate list (Layer 1 backlinks by date DESC, Layer 2 claude/topic tags, Layer 3 FTS by rank), leaving provisional notes out of every layer (#455). select_related(rows, limit, max_retros=RELATED_MAX_RETROS=1) picks the result in layer order and skips a claude-retro once one is taken (#458: judges kept 1% of retros there), so the kept retro is the first in layer order. Later layers run while fewer than limit rows are selectable, Layer 3 fetches limit * 2 + the rows already taken, and access is logged only for the selected rows. related_select.py is stdlib-only and imports nothing, so the /recall file-scan fallback uses it too. tests/test_recall_retro_eval.py replays it on the #458 spike fixture (tests/fixtures/458-eval/)."
+        },
+        {
           "id": "compute-query-vector",
           "name": "compute_query_vector()",
           "kind": "function",
@@ -483,7 +493,7 @@
           "files": [
             "hooks/themes.py"
           ],
-          "purpose": "Full theme lifecycle: creation (create_theme), incremental assignment (assign_to_theme), merge (merge_themes), split support via _theme_member_vectors, Free-Energy surprise detection (detect_surprise), centroid math (compute_centroid), and read helpers (get_unassigned_notes, get_all_vectorized_notes, theme_stats). Adds the theme-query/activation layer for /emerge and /recall (#231): recompute_activation() writes themes.activation as the ACT-R recency-decayed sum over member added_date (0.5 ** age/HALF_LIFE_DAYS, half-life 30d); get_themes_in_window() / get_top_themes_for_project() rank by activation DESC; get_theme_member_previews() returns top-N members by similarity with truncated excerpts; get_unassigned_notes_in_window() lists vectorized, theme-less notes in a date window. Extracted from vault_index.py (#229). Depends on tfidf (one-directional); lazy-imports vault_index._connect at call-time to break the import cycle. assign_to_theme() prefilters theme candidates by term-overlap before computing cosine, and accepts optional note_text to compute surprise via detect_surprise within the same BEGIN IMMEDIATE transaction. merge_themes() guards against self-merge (a==b) before opening any DB connection. assign_to_theme() enforces single-theme membership (#234): on reassignment to a different best theme it vacates the note's prior theme_members row and reconciles that theme's note_count + centroid (reverse-fold, mirroring _delete_note), so a note belongs to at most one theme."
+          "purpose": "Full theme lifecycle: creation (create_theme), incremental assignment (assign_to_theme), merge (merge_themes), split support via _theme_member_vectors, Free-Energy surprise detection (detect_surprise), centroid math (compute_centroid), and read helpers (get_unassigned_notes, get_all_vectorized_notes, theme_stats). Adds the theme-query/activation layer for /emerge and /recall (#231): recompute_activation() writes themes.activation as the ACT-R recency-decayed sum over member added_date (0.5 ** age/HALF_LIFE_DAYS, half-life 30d); get_themes_in_window() / get_top_themes_for_project() rank by activation DESC; get_theme_member_previews() returns top-N members by similarity with truncated excerpts; get_unassigned_notes_in_window() lists vectorized, theme-less notes in a date window. Extracted from vault_index.py (#229). Depends on tfidf (one-directional); lazy-imports vault_index._connect at call-time to break the import cycle. assign_to_theme() prefilters theme candidates by term-overlap before computing cosine, and accepts optional note_text to compute surprise via detect_surprise within the same BEGIN IMMEDIATE transaction. merge_themes() guards against self-merge (a==b) before opening any DB connection. assign_to_theme() enforces single-theme membership (#234): on reassignment to a different best theme it vacates the note's prior theme_members row and reconciles that theme's note_count + centroid (reverse-fold, mirroring _delete_note), so a note belongs to at most one theme. Provisional auto notes (#455) never join a theme (#458): get_unassigned_notes, get_all_vectorized_notes, assign_to_theme and get_unassigned_notes_in_window filter with vault_index.NOT_PROVISIONAL_SQL. prune_provisional_members(conn, now_iso) removes provisional members from existing themes inside the caller's transaction: it reverse-folds each one out of its centroid, decrements note_count and deletes an emptied theme."
         },
         {
           "id": "rebuild-index",
@@ -620,7 +630,7 @@
           "files": [
             "hooks/emerge_cli.py"
           ],
-          "purpose": "Thin CLI backing /emerge (theme-level). run_emerge_themes(days) refreshes theme activation (BEGIN IMMEDIATE), pulls themes updated in the window with their top-3 member previews plus windowed unassigned candidates, and writes a compact emerge-themes.json corpus atomically; emits STATUS=SPARSE:<n> (and writes nothing) when fewer than 2 themes are in the window. run_build_note() assembles the claude-emerge note from the sub-agent's emerge-analysis.md. The raw-note corpus path (run_corpus/run_recollect) was retired."
+          "purpose": "Thin CLI backing /emerge (theme-level). run_emerge_themes(days) refreshes theme activation (BEGIN IMMEDIATE), pulls themes updated in the window with their top-3 member previews plus windowed unassigned candidates, and writes a compact emerge-themes.json corpus atomically; emits STATUS=SPARSE:<n> (and writes nothing) when fewer than 2 themes are in the window. run_build_note() assembles the claude-emerge note from the sub-agent's emerge-analysis.md. The raw-note corpus path (run_corpus/run_recollect) was retired. Its unassigned candidates leave provisional notes out (#458)."
         },
         {
           "id": "consolidate-cli",
@@ -629,7 +639,7 @@
           "files": [
             "hooks/consolidate_cli.py"
           ],
-          "purpose": "Thin CLI backing /consolidate: gathers unassigned (or all, with --full) note vectors, clusters per-project, names via Haiku, persists themes + theme_members; stats/split/merge."
+          "purpose": "Thin CLI backing /consolidate: gathers unassigned (or all, with --full) non-provisional note vectors, clusters per-project, names via Haiku, persists themes + theme_members; stats/split/merge. In the same write transaction, before any --full wipe or new theme, themes.prune_provisional_members drops provisional members of existing themes and prints PRUNED_PROVISIONAL=<n>, 0 once done (#458)."
         },
         {
           "id": "clustering",
@@ -1071,7 +1081,7 @@
           "files": [
             "skills/consolidate/SKILL.md"
           ],
-          "purpose": "TRIAGE. Batch agglomerative clustering of unassigned notes into named themes (Haiku); stats/split/merge sub-commands; --full recluster."
+          "purpose": "TRIAGE. Batch agglomerative clustering of unassigned notes into named themes (Haiku); stats/split/merge sub-commands; --full recluster. Provisional auto notes never join a theme; the run reports PRUNED_PROVISIONAL=<n> (#458)."
         }
       ]
     },
@@ -1116,7 +1126,7 @@
             "dashboards/project-index.md",
             "dashboards/weekly-review.md"
           ],
-          "purpose": "Six Dataview/dataviewjs dashboards over claude-sessions + claude-insights: recent sessions, open items by project, decision timeline, topic/error-pattern velocity, project index, and a 7-day weekly review. Require the Obsidian Dataview plugin."
+          "purpose": "Six Dataview/dataviewjs dashboards over claude-sessions + claude-insights: recent sessions, open items by project, decision timeline, topic/error-pattern velocity, project index, and a 7-day weekly review. Every query that lists or groups claude-insights notes leaves provisional notes out unless it already filters to a status, and every list query over them has a LIMIT (#458); tests/test_dashboards.py checks this and that the inline copies in skills/obsidian-setup Step 6 equal these files. Require the Obsidian Dataview plugin."
         }
       ]
     },

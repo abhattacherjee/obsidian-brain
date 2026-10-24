@@ -17,6 +17,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `tests/fixtures/455-eval/` holds the blind-judged spike (9 sessions, 1,547 notes; no note text, as the repo is public). `tests/test_capture_select_eval.py` replays the selection on it: the top-10 keep rate is 84% under the Opus labels and 68% under Astra, against 43% and 40% for capture order.
 - `capture_select.promote_used` promotes a provisional note that was used after it was captured, in any project and session, so a note of a finished session is no longer stuck out of the pool (#455). `run_batch` calls it after `demote_closed` at the end of every batch; a failure is logged as `promote-used-failed` and never blocks the batch.
 
+### Changed
+- `/recall` related insights keep at most 1 retro (#458), the first in layer order (the newest backlinked one when Layer 1 has one); the freed slots go to the next notes in today's order. In the #458 spike, blind judges kept 1% of the retros that filled the list; the new top 20 scored Opus 74/100 and GPT 67/100, against 68 and 59 before. The rule is `select_related` in new `hooks/related_select.py`. Later layers now run while fewer than 20 notes are selectable, and Layer 3 fetches `limit * 2` rows plus the rows already taken, so skipped retros and FTS repeats of Layer 1 do not leave slots empty. The file-scan fallback applies the same rule. `tests/fixtures/458-eval/` holds the spike's labels with salted ids only, and `tests/test_recall_retro_eval.py` checks the rule against them.
+
 ### Fixed
 - Review fixes for capture selection (#455):
   - If a demotion write fails, `run_selection` makes no promotion in that run (it logs `select-failed detail=demotion-write`), so a session never holds more than 10 non-sticky picks.
@@ -38,6 +41,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `vault_scan.py meta` reads `status` from the frontmatter block (up to its closing `---`, at most the first 64 KB, never the body) for a note whose frontmatter cannot be parsed, and prints it lowercased.
   - The mixed-cycle tests check refs with `is None` and capture ids, so index 0 is not read as "no reference".
   - `build_fixture.py` fails the build if an output id equals `sha1(name)[:12]` of an input name or blind id.
+- Provisional auto notes stay out of themes and `/emerge` (#458). `/consolidate` (incremental and `--full`), incremental theme assignment and `/emerge`'s new candidates use the same provisional check as `/recall`. A note promoted later joins a theme at the next `/consolidate`. Each `/consolidate` run also removes provisional notes from existing themes, updating each centroid and count and dropping a theme left empty, and prints `PRUNED_PROVISIONAL=<n>`. On a copy of the live DB this removed 579 members and 54 emptied themes (272 → 218); the largest theme (132 notes) had no provisional members and is unchanged. Run `/consolidate` once after updating.
+- Dashboards leave provisional notes out (#458): every query that lists or groups `claude-insights` notes adds `(!status OR !startswith(lower(string(status)), "provisional"))` unless it already filters to a status, including the `learning-velocity` topic counts. List queries get a `LIMIT` (`weekly-review` 100; `decision-timeline` and `project-index` error fixes 50; `sessions-overview` active decisions 20). `/obsidian-setup` in upgrade mode does not overwrite installed dashboards: to refresh them, delete the files in `claude-dashboards/` and run `/obsidian-setup` (upgrade) again, or copy them from the plugin's `dashboards/` folder.
 
 ## [3.9.1] - 2026-10-23
 
