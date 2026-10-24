@@ -3,6 +3,7 @@
 ## Topics by Frequency
 ```dataviewjs
 let pages = dv.pages('"claude-insights"')
+    .where(p => !p.status || !String(p.status).toLowerCase().startsWith("provisional"))
     .where(p => p.tags);
 
 let topics = {};
@@ -37,6 +38,7 @@ LIMIT 10
 ## Error Patterns (Most Common)
 ```dataviewjs
 let pages = dv.pages('"claude-insights"')
+    .where(p => !p.status || !String(p.status).toLowerCase().startsWith("provisional"))
     .where(p => p.type === "claude-error-fix");
 
 let topics = {};
