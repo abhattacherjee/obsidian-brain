@@ -587,20 +587,45 @@ def test_a_failed_demotion_gives_its_session_no_promotion(vault, monkeypatch):
 
 
 def test_a_failed_demotion_in_one_session_does_not_block_another(vault, monkeypatch):
-    planned = _plan(vault)
-    other = [n for n in planned["notes"] if n["session"] == S2 and n["want"] != "provisional"]
-    assert other
+    names = [f"a{i}" for i in range(12)]
+    _apply_window(vault, "2026-10-18", "2026-10-23", vault["scores"])
+    held = _promoted(vault, names)
+    demote = [n for n in held if vault["scores"][f"{n}.md"] == 3][:2]
+    rise = [n for n in names if n not in held]
+    assert rise and demote
+    # S2 has a pending promotion: edge-first was left provisional by an earlier backlog run
+    edge = vault["notes"]["edge-first"]
+    edge.write_text(edge.read_text().replace("tags:", "status: provisional\ncapture_merit: 0.4\n"
+                                             "selected_by: backlog\ndemoted_by: backlog\ntags:", 1))
+    scores = {**vault["scores"], **{f"{n}.md": 1 for n in demote}, **{f"{n}.md": 10 for n in rise},
+              "edge-first.md": 9}
     real = capture_backlog.note_writer.set_frontmatter_fields
 
     def flaky(v, p, f, **kw):
-        if p.endswith("a0.md") or p.endswith("a1.md"):
+        if p.endswith(f"{demote[0]}.md") and f.get("status") == "provisional":
             raise OSError("locked")
         return real(v, p, f, **kw)
 
     monkeypatch.setattr(capture_backlog.note_writer, "set_frontmatter_fields", flaky)
-    result = capture_backlog.apply(vault["config"], planned, vault["db"])
-    assert all(_status(n["path"]) == n["want"] for n in other if n["fm"].get("status") != n["want"])
-    assert result["written"] >= len(other)
+    planned, result = _apply_window(vault, "2026-10-18", "2026-10-23", scores)
+    assert any(demote[0] in e["note"] and "OSError" in e["error"] for e in result["errors"])  # S1 really failed
+    assert [_status(vault["notes"][n]) for n in rise] == ["provisional"] * len(rise)  # S1: no promotion
+    assert _status(edge) == "promoted"  # S2 still got its promotion
+    assert result["skipped"] == len(rise)
+
+
+def test_build_fixture_outputs_depend_on_the_salt():
+    """Same input, two salts, two outputs: the ids and terms cannot be recomputed from a name alone."""
+    import importlib.util
+    path = Path(__file__).resolve().parent / "fixtures" / "455-eval" / "build_fixture.py"
+    spec = importlib.util.spec_from_file_location("build_fixture_salt", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)  # a plain module: it reads the raw spike files only inside main()
+    for fn in (mod._opaque, mod._blind, mod._term):
+        assert fn(b"salt-one", "same-input") != fn(b"salt-two", "same-input")
+        assert fn(b"salt-one", "same-input") == fn(b"salt-one", "same-input")
+        assert fn(b"salt-one", "a") != fn(b"salt-one", "b")
+    assert len({mod._opaque(b"s", "x"), mod._blind(b"s", "x"), mod._term(b"s", "x")}) == 3  # domain-separated
 
 
 def test_a_narrower_window_cannot_push_a_session_over_the_cap(vault):

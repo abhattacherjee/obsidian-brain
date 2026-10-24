@@ -323,9 +323,9 @@ def _apply(e: dict, config: dict, db: str, project: str, sid: str) -> str | None
     newly_sticky = e["kind"] == "sticky" and not fm.get("promoted_by")
     if was == want and not (unrecorded or newly_sticky):
         return None  # a rank change alone does not rewrite the file (Ruling 7)
-    pre, wrote = vault_index.file_stat_key(str(e["path"])), []
+    wrote = []
     note_writer.set_frontmatter_fields(config["vault_path"], str(e["path"]), e["fields"], stat_out=wrote)
-    vault_index.update_note_status(db, str(e["path"]), pre, wrote[0] if wrote else None)
+    vault_index.update_note_status(db, str(e["path"]), *wrote)
     if was == want:
         return None
     outcome = "promoted" if want != PROVISIONAL else "demoted"
@@ -427,7 +427,7 @@ def promote_used(config: dict, *, now: float | None = None, db: str | None = Non
                 continue
             by = "hand-update"  # a row we loaded anyway; no vault-wide body scan
         top = "active" if hit["type"] == "claude-decision" else "promoted"
-        pre, wrote = vault_index.file_stat_key(str(path)), []
+        wrote = []
         try:
             note_writer.set_frontmatter_fields(config["vault_path"], str(path),
                                                {"status": top, "promoted_by": by, "demoted_by": None},
@@ -436,7 +436,7 @@ def promote_used(config: dict, *, now: float | None = None, db: str | None = Non
             capture_state.append_capture_log(hit["project"] or "", hit["sid"], "select-write-failed",
                                              f"path={path.name};{type(exc).__name__}: {exc}"[:160])
             continue
-        vault_index.update_note_status(db, str(path), pre, wrote[0] if wrote else None)
+        vault_index.update_note_status(db, str(path), *wrote)
         _log(hit["project"] or "", hit["sid"], "promoted", row.get("id") or path.name,
              fm.get("capture_merit"), None, f"sticky-{by}")
         out["promoted"] += 1
@@ -596,7 +596,7 @@ def demote_closed(project: str, config: dict, *, now: float | None = None, run=N
             continue
         if is_sticky(str(path), created, db):
             continue  # used since the last selection: kept
-        pre, wrote = vault_index.file_stat_key(str(path)), []
+        wrote = []
         try:
             note_writer.set_frontmatter_fields(config["vault_path"], str(path),
                                                {"status": PROVISIONAL, "demoted_by": ISSUE_CLOSED}, stat_out=wrote)
@@ -604,7 +604,7 @@ def demote_closed(project: str, config: dict, *, now: float | None = None, run=N
             capture_state.append_capture_log(project, row.get("session_id"), "select-write-failed",
                                              f"cid={row['id']};{type(exc).__name__}: {exc}"[:160])
             continue
-        vault_index.update_note_status(db, str(path), pre, wrote[0] if wrote else None)
+        vault_index.update_note_status(db, str(path), *wrote)
         _log(project, row.get("session_id"), "demoted", row["id"], fm.get("capture_merit"), None,
              f"{ISSUE_CLOSED}:{row['about_issue']}")
         demoted += 1

@@ -40,7 +40,7 @@ from frontmatter import (
     split_frontmatter,
     split_lines_lf_crlf,
 )
-from obsidian_utils import write_vault_note
+from obsidian_utils import normalize_status, write_vault_note
 
 # Private aliases kept so every existing call site in this module (and its
 # test suite, tests/test_note_writer.py, which must keep passing UNCHANGED)
@@ -1100,7 +1100,7 @@ def _append_update_locked(
         print(f"ERROR: {tags_merge_err}", file=sys.stderr)
         return 1
 
-    if promote_provisional and _fm_scalar(fm_lines, "status") == "provisional":
+    if promote_provisional and normalize_status(_fm_scalar(fm_lines, "status")) == "provisional":
         top = "active" if _fm_scalar(fm_lines, "type") == "claude-decision" else "promoted"
         fm_lines = _set_fields(fm_lines, {"status": top, "promoted_by": "hand-update", "demoted_by": None}, eol)
 
@@ -1214,8 +1214,11 @@ def set_frontmatter_fields(vault_path: str, note_path: str, fields: dict, stat_o
     endings, and rewrites atomically only if the bytes change; a note that
     changed between the read and the rename is left alone.
 
-    ``stat_out``, when a list, receives ``(st_mtime_ns, st_size)`` of the file
-    this call wrote (nothing when it wrote nothing).
+    ``stat_out``, when a list, is set to ``[pre, post]`` when this call wrote
+    the file (and left empty when it wrote nothing): ``pre`` is
+    ``(st_mtime, st_size)`` from the open file, under the lock, before the
+    read; ``post`` is ``(st_mtime_ns, st_size)`` of what we wrote. Pass them
+    on as ``vault_index.update_note_status(db, path, *stat_out)``.
 
     Returns True when the file changed. Raises ValueError for a bad key,
     value, path or a note without frontmatter, and OSError when the note is
@@ -1244,10 +1247,13 @@ def set_frontmatter_fields(vault_path: str, note_path: str, fields: dict, stat_o
         content = open_fence + "".join(new_fm) + close_fence + "".join(body_lines)
         if content == original:
             return False
-        extra = {} if stat_out is None else {"stat_out": stat_out}
+        post: list = []
+        extra = {} if stat_out is None else {"stat_out": post}
         write_err = _atomic_rewrite(resolved, content, (st.st_mtime_ns, st.st_size), **extra)
         if write_err:
             raise OSError(write_err)
+        if stat_out is not None:
+            stat_out[:] = [(st.st_mtime, st.st_size), post[0]]
         return True
     finally:
         _release_lock(lock)

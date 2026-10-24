@@ -34,8 +34,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Re-check fixes for capture selection (#455):
   - Backlog `apply` writes demotions first; if one fails, no note of that session is promoted in that run, the failure is reported and the exit is 1.
   - The backlog counts every promoted, selected, non-sticky note of a session against its cap of 10, whatever its date, so a narrower window cannot push a session over it.
-  - `update_note_status` stamps the row's mtime and size only if the row matched the pre-write stat and the file still has the stat of our own write (`set_frontmatter_fields(..., stat_out=)`).
-  - `vault_scan.py meta` reads `status` from the first 8 KB for a note whose frontmatter cannot be parsed, and prints it lowercased.
+  - `update_note_status` stamps the row's mtime and size only if the row matched the stat `set_frontmatter_fields` took under the note's lock before its read, and the file still has the stat of our own write (`stat_out` is `[pre, post]`).
+  - `append-update` promotes a note whose status is `"Provisional"` or `provisional # note` too.
+  - `vault_scan.py meta` reads `status` from the frontmatter block (up to its closing `---`, at most the first 64 KB, never the body) for a note whose frontmatter cannot be parsed, and prints it lowercased.
   - The mixed-cycle tests check refs with `is None` and capture ids, so index 0 is not read as "no reference".
   - `build_fixture.py` fails the build if an output id equals `sha1(name)[:12]` of an input name or blind id.
 

@@ -331,7 +331,7 @@ def _describe_parse_failure(reason: str) -> str:
     return _describe_note_parse_failure(reason)
 
 
-_LENIENT_STATUS_BYTES = 8192
+_LENIENT_STATUS_BYTES = 65536
 _LENIENT_STATUS_RE = re.compile(r"^status:\s*[\"']?([A-Za-z_-]+)")
 
 
@@ -352,8 +352,9 @@ def _normalized_status(value) -> str | None:
 def _lenient_status(path: Path) -> str | None:
     """The note's ``status`` when its frontmatter cannot be parsed (oversized, malformed, unreadable).
 
-    Reads only the first 8 KB and takes the first ``status:`` line before a
-    closing ``---`` if there is one. /vault-ask drops ``provisional`` notes by
+    Scans the frontmatter block, up to its closing ``---`` and at most the first
+    64 KB (a note is never read past that, so never its body when it is big),
+    and takes the first ``status:`` line. /vault-ask drops ``provisional`` notes by
     this value, so an error row must still say it.
     """
     try:

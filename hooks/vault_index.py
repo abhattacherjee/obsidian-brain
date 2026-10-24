@@ -1790,15 +1790,6 @@ def index_note(db_path: str, note_path: str) -> bool:
         conn.close()
 
 
-def file_stat_key(note_path: str) -> tuple[float, int] | None:
-    """``(st_mtime, st_size)`` of ``note_path``, or None when it cannot be read."""
-    try:
-        st = os.stat(note_path)
-    except OSError:
-        return None
-    return (st.st_mtime, st.st_size)
-
-
 def update_note_status(db_path: str, note_path: str, pre_stat: tuple[float, int] | None = None,
                        post_stat: tuple[int, int] | None = None) -> bool:
     """Refresh one indexed note's ``status`` from its file, keeping its vector (#455).
@@ -1808,9 +1799,10 @@ def update_note_status(db_path: str, note_path: str, pre_stat: tuple[float, int]
     the TF-IDF vector against the current IDF, and that drift alone can flip
     a near-tie in the next selection. A note not indexed yet is indexed in full.
 
-    ``pre_stat`` is ``file_stat_key`` taken just before our own write;
-    ``post_stat`` is the ``(st_mtime_ns, st_size)`` that write produced
-    (``set_frontmatter_fields(..., stat_out=)``). The row's mtime and size
+    ``pre_stat`` and ``post_stat`` are what ``set_frontmatter_fields(...,
+    stat_out=)`` reports: the file's ``(st_mtime, st_size)`` read under the
+    note's lock just before our own write, and the ``(st_mtime_ns, st_size)``
+    that write produced. The row's mtime and size
     are stamped with the file's new ones only when (a) the row still held
     ``pre_stat``, i.e. the index had seen exactly the content we edited, and
     (b) the file still has ``post_stat``, i.e. nobody edited it after us.

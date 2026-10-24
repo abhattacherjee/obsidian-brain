@@ -407,7 +407,7 @@ def apply(config: dict, planned: dict, db: str) -> dict:
             continue
         try:
             rel = str(Path(n["path"]).resolve().relative_to(vault))
-            pre, wrote = vault_index.file_stat_key(str(n["path"])), []
+            wrote = []
             with open(n["path"], encoding="utf-8", newline="") as fh:
                 capture_state._atomic_write(note_backup / rel.replace("/", "__"), fh.read())
             note_writer.set_frontmatter_fields(config["vault_path"], str(n["path"]), n["fields"], stat_out=wrote)
@@ -416,7 +416,7 @@ def apply(config: dict, planned: dict, db: str) -> dict:
             if n["want"] == capture_select.PROVISIONAL and n["fm"].get("status") != capture_select.PROVISIONAL:
                 failed_sessions.add(n["session"])
             continue
-        vault_index.update_note_status(db, str(n["path"]), pre, wrote[0] if wrote else None)
+        vault_index.update_note_status(db, str(n["path"]), *wrote)
         if rel in ledger:
             capture_state.ledger_update(ledger[rel], score=n["score"], novelty=n["novelty"])
         written += 1

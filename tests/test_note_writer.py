@@ -3713,3 +3713,15 @@ def test_cli_append_update_promotes_a_crlf_note_in_the_same_write(tmp_path):
     raw = note.read_bytes()
     assert b"status: promoted\r\n" in raw and b"promoted_by: hand-update\r\n" in raw
     assert raw.count(b"\n") == raw.count(b"\r\n")
+
+
+@pytest.mark.parametrize("status", ['"Provisional"', "provisional # note", "'PROVISIONAL'", "Provisional # x"])
+def test_cli_append_update_promotes_any_spelling_of_provisional(tmp_path, status):
+    vault = tmp_path / "vault"
+    note = _provisional_note(vault, "n.md", "claude-insight")
+    note.write_text(note.read_text(encoding="utf-8").replace("status: provisional", f"status: {status}"),
+                    encoding="utf-8")
+    assert _run_append_update(vault, note, UPDATE_SECTION).returncode == 0
+    text = note.read_text(encoding="utf-8")
+    assert "status: promoted\n" in text and "promoted_by: hand-update\n" in text
+    assert "rovisional" not in text.split("---")[1]

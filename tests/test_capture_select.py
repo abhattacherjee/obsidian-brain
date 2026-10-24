@@ -609,10 +609,10 @@ def test_update_note_status_keeps_the_vector(mock_config, db):
     conn.execute("UPDATE notes SET tfidf_vector = ? WHERE path = ?", ('{"kept": 1.0}', path))
     conn.commit()
     conn.close()
-    pre, wrote = vault_index.file_stat_key(path), []
+    wrote = []
     capture_select.note_writer.set_frontmatter_fields(mock_config["vault_path"], path, {"status": "promoted"},
                                                       stat_out=wrote)
-    assert vault_index.update_note_status(db, path, pre, wrote[0])
+    assert vault_index.update_note_status(db, path, *wrote)
     conn = vault_index._connect(db)
     got = conn.execute("SELECT status, tfidf_vector, mtime FROM notes WHERE path = ?", (path,)).fetchone()
     conn.close()
@@ -632,10 +632,10 @@ def test_update_note_status_stamps_a_fresh_row(mock_config, db):
     row = _note(mock_config, 0)
     path = str(Path(mock_config["vault_path"]) / row["note_path"])
     vault_index.index_note(db, path)
-    pre, wrote = vault_index.file_stat_key(path), []
+    wrote = []
     capture_select.note_writer.set_frontmatter_fields(mock_config["vault_path"], path, {"status": "promoted"},
                                                       stat_out=wrote)
-    assert vault_index.update_note_status(db, path, pre, wrote[0])
+    assert vault_index.update_note_status(db, path, *wrote)
     got, st = _index_stat(db, path), Path(path).stat()
     assert got["status"] == "promoted" and got["size"] == st.st_size
     assert vault_index.mtime_unchanged(st.st_mtime, got["mtime"])
@@ -649,10 +649,10 @@ def test_update_note_status_leaves_a_row_stale_after_an_unseen_external_edit(moc
     old = _index_stat(db, str(path))
     time.sleep(0.01)
     path.write_text(path.read_text().replace(_words(3, 20), _words(4, 20)))  # edited in Obsidian, not indexed yet
-    pre, wrote = vault_index.file_stat_key(str(path)), []
+    wrote = []
     capture_select.note_writer.set_frontmatter_fields(mock_config["vault_path"], str(path), {"status": "promoted"},
                                                       stat_out=wrote)
-    assert vault_index.update_note_status(db, str(path), pre, wrote[0])
+    assert vault_index.update_note_status(db, str(path), *wrote)
     got = _index_stat(db, str(path))
     assert got["status"] == "promoted" and got["mtime"] == old["mtime"] and got["size"] == old["size"]
     assert not vault_index.mtime_unchanged(path.stat().st_mtime, got["mtime"])
@@ -805,12 +805,12 @@ def test_update_note_status_leaves_a_row_stale_after_an_edit_that_lands_after_ou
     path = Path(mock_config["vault_path"]) / row["note_path"]
     vault_index.index_note(db, str(path))
     old = _index_stat(db, str(path))
-    pre, wrote = vault_index.file_stat_key(str(path)), []
+    wrote = []
     capture_select.note_writer.set_frontmatter_fields(mock_config["vault_path"], str(path), {"status": "promoted"},
                                                       stat_out=wrote)
     time.sleep(0.01)
     path.write_text(path.read_text().replace(_words(3, 20), _words(4, 20)))  # an external edit lands now
-    assert vault_index.update_note_status(db, str(path), pre, wrote[0])
+    assert vault_index.update_note_status(db, str(path), *wrote)
     got = _index_stat(db, str(path))
     assert got["status"] == "promoted" and got["mtime"] == old["mtime"] and got["size"] == old["size"]
     vault_index.ensure_index(mock_config["vault_path"], FOLDERS, db_path=db)
@@ -827,8 +827,31 @@ def test_set_frontmatter_fields_reports_the_stat_of_what_it_wrote(mock_config, d
     assert capture_select.note_writer.set_frontmatter_fields(mock_config["vault_path"], str(path),
                                                              {"status": "promoted"}, stat_out=wrote)
     st = path.stat()
-    assert wrote == [(st.st_mtime_ns, st.st_size)]
+    assert wrote[1] == (st.st_mtime_ns, st.st_size) and len(wrote) == 2
     unchanged = []
     assert capture_select.note_writer.set_frontmatter_fields(mock_config["vault_path"], str(path),
                                                              {"status": "promoted"}, stat_out=unchanged) is False
     assert unchanged == []
+
+
+def test_update_note_status_goes_by_the_stat_the_setter_took_under_its_lock(mock_config, db):
+    """An edit that lands after the caller's own stat but before the setter's locked read must leave the row stale."""
+    row = _note(mock_config, 0, body=_words(3, 20))
+    path = Path(mock_config["vault_path"]) / row["note_path"]
+    vault_index.index_note(db, str(path))
+    old = _index_stat(db, str(path))
+    earlier = (path.stat().st_mtime, path.stat().st_size)  # what a caller's own stat would have said
+    time.sleep(0.01)
+    path.write_text(path.read_text().replace(_words(3, 20), _words(4, 20)))  # lands before the locked read
+    wrote = []
+    capture_select.note_writer.set_frontmatter_fields(mock_config["vault_path"], str(path), {"status": "promoted"},
+                                                      stat_out=wrote)
+    assert wrote[0] != earlier and vault_index.mtime_unchanged(earlier[0], old["mtime"])
+    assert vault_index.update_note_status(db, str(path), *wrote)
+    got = _index_stat(db, str(path))
+    assert got["status"] == "promoted" and got["mtime"] == old["mtime"] and got["size"] == old["size"]
+    vault_index.ensure_index(mock_config["vault_path"], FOLDERS, db_path=db)
+    conn = vault_index._connect(db)
+    body = conn.execute("SELECT body FROM notes WHERE path = ?", (str(path),)).fetchone()["body"]
+    conn.close()
+    assert _words(4, 20) in body

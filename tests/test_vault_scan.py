@@ -777,15 +777,35 @@ def test_meta_malformed_frontmatter_still_reports_a_provisional_status(tmp_path,
     assert row["error"] and row["status"] == "provisional"
 
 
-def test_meta_lenient_status_ignores_text_past_the_fence_and_past_8kb(tmp_path):
+def test_meta_lenient_status_ignores_text_past_the_fence(tmp_path):
     v = tmp_path / "v"
     (v / "ins").mkdir(parents=True)
     past_fence = v / "ins" / "a.md"
     past_fence.write_text("---\ntype: x\n---\n\nstatus: provisional\n[unclosed")  # parses fine: status is body text
-    far = v / "ins" / "b.md"
-    far.write_text("---\nnoclose: " + "x" * 9000 + "\nstatus: provisional\n")  # beyond the first 8 KB
     assert json.loads(_run("meta", v, past_fence).stdout)["status"] is None
-    assert json.loads(_run("meta", v, far).stdout)["status"] is None
+
+
+def test_meta_lenient_status_reads_the_whole_frontmatter_block_up_to_64kb(tmp_path):
+    v = tmp_path / "v"
+    (v / "ins").mkdir(parents=True)
+    deep = v / "ins" / "deep.md"  # status after 8 KB of frontmatter, no closing fence: unparsable
+    deep.write_text("---\nnoclose: " + "x" * 9000 + "\nstatus: provisional\n")
+    assert json.loads(_run("meta", v, deep).stdout)["status"] == "provisional"
+    over = v / "ins" / "over.md"  # status beyond the 64 KB cap: never read
+    over.write_text("---\nnoclose: " + "x" * 70000 + "\nstatus: provisional\n")
+    assert json.loads(_run("meta", v, over).stdout)["status"] is None
+
+
+def test_meta_oversized_note_with_status_deep_in_its_frontmatter(tmp_path, monkeypatch, capsys):
+    v = tmp_path / "v"
+    (v / "ins").mkdir(parents=True)
+    big = v / "ins" / "big.md"
+    big.write_text("---\ntype: claude-insight\nnote: " + "y" * 9000 + "\nstatus: provisional\n---\n\n# Big\n\n"
+                   + "z" * 5000 + "\n")
+    monkeypatch.setattr(vault_scan, "MAX_FILE_BYTES", 10000)
+    rc, out, _ = _main(capsys, "meta", v, big)
+    row = json.loads(out)
+    assert row["error"] == "file too large" and row["status"] == "provisional"
 
 
 def test_vault_ask_meta_filter_drops_every_provisional_spelling(tmp_path):
