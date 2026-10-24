@@ -132,6 +132,7 @@ def test_apply_moves_sections_and_keeps_the_rest(mock_config, hub, hand):
     new = hub.parent.parent / row["note_path"]
     text = new.read_text()
     assert text.startswith("---\n") and "type: claude-insight" in text and "source: auto-capture" in text
+    assert "status: provisional" not in text  # #455: a migrated note is not a new capture
     assert f"source_session: {OTHER}" in text and "  - claude/topic/ledgers" in text
     body = text.split("---", 2)[2]
     assert body == f"\n\n# {PELICAN[0]}\n\n{PELICAN[1]}\n"  # no heading, bold title or end marker

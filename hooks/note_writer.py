@@ -1126,6 +1126,101 @@ def _append_update_locked(
     return 0
 
 
+# #455: what set_frontmatter_fields may write. Allow-lists, like the tag rule
+# above: a key or value outside them could inject YAML into the frontmatter.
+_FIELD_KEY_RE = re.compile(r"\A[A-Za-z_][A-Za-z0-9_]*\Z", re.ASCII)
+_FIELD_VALUE_RE = re.compile(r"\A[A-Za-z0-9._:-]+\Z", re.ASCII)
+
+
+def _field_value(key: str, value) -> str | None:
+    """``value`` as frontmatter text, or None to remove the key; ValueError when not allowed."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        raise ValueError(f"field {key!r}: unsupported value type {type(value).__name__}")
+    if isinstance(value, float) and (value != value or abs(value) == float("inf")):
+        raise ValueError(f"field {key!r}: value must be finite")
+    text = str(value)
+    if not _FIELD_VALUE_RE.match(text):
+        raise ValueError(f"field {key!r}: value {text[:40]!r} is outside the allowed characters")
+    return text
+
+
+def _set_fields(fm_lines: list[str], fields: dict, eol: str) -> list[str]:
+    """``fm_lines`` with each top-level key replaced, inserted at the end, or removed (None).
+
+    A replaced or removed key takes its indented continuation lines with it,
+    and a repeated key keeps only its first line.
+    """
+    out = list(fm_lines)
+    for key, text in fields.items():
+        key_re = re.compile(rf"^{re.escape(key)}\s*:")
+        new_line = None if text is None else f"{key}: {text}{eol}"
+        kept, placed, i = [], False, 0
+        while i < len(out):
+            if not key_re.match(out[i]):
+                kept.append(out[i])
+                i += 1
+                continue
+            j = i + 1
+            while j < len(out) and out[j][:1] in (" ", "\t"):
+                j += 1
+            if new_line is not None and not placed:
+                kept.append(new_line)
+                placed = True
+            i = j
+        if new_line is not None and not placed:
+            if kept and not kept[-1].endswith(("\n", "\r")):
+                kept[-1] += eol
+            kept.append(new_line)
+        out = kept
+    return out
+
+
+def set_frontmatter_fields(vault_path: str, note_path: str, fields: dict) -> bool:
+    """Set, insert or remove (value None) top-level frontmatter fields of an existing note (#455).
+
+    ``note_path`` is absolute or vault-relative and must resolve inside the
+    vault. Keys and values are allow-listed (``_FIELD_KEY_RE``,
+    ``_FIELD_VALUE_RE``). Runs under the note's lock, keeps the note's line
+    endings, and rewrites atomically only if the bytes change; a note that
+    changed between the read and the rename is left alone.
+
+    Returns True when the file changed. Raises ValueError for a bad key,
+    value, path or a note without frontmatter, and OSError when the note is
+    locked, changed under us, or the write fails.
+    """
+    texts = {}
+    for key, value in fields.items():
+        if not isinstance(key, str) or not _FIELD_KEY_RE.match(key):
+            raise ValueError(f"invalid frontmatter key: {key!r}")
+        texts[key] = _field_value(key, value)
+    p = Path(note_path)
+    resolved, err = _resolve_note_path(vault_path, str(p if p.is_absolute() else Path(vault_path) / p))
+    if err:
+        raise ValueError(err)
+    lock, lock_err = _acquire_lock(resolved)
+    if lock_err:
+        raise OSError(lock_err)
+    try:
+        with open(resolved, "r", encoding="utf-8", newline="") as fh:
+            original = fh.read()
+        st = os.stat(resolved)
+        open_fence, fm_lines, close_fence, body_lines, split_err = _split_frontmatter(_split_lines_lf_crlf(original))
+        if split_err:
+            raise ValueError(f"{split_err}: {note_path}")
+        new_fm = _set_fields(fm_lines, texts, _detect_line_ending(original))
+        content = open_fence + "".join(new_fm) + close_fence + "".join(body_lines)
+        if content == original:
+            return False
+        write_err = _atomic_rewrite(resolved, content, (st.st_mtime_ns, st.st_size))
+        if write_err:
+            raise OSError(write_err)
+        return True
+    finally:
+        _release_lock(lock)
+
+
 def _oversize_error() -> str:
     """The single ``ERROR:`` line both commands print on oversize stdin.
 

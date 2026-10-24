@@ -62,9 +62,41 @@ def test_decision_and_error_fix_types(mock_config, tmp_vault, no_match):
                                     project="p", session_note="", config=mock_config)
     dfront, _ = _front(tmp_vault / d["note_path"])
     efront, _ = _front(tmp_vault / e["note_path"])
-    assert "type: claude-decision" in dfront and "status: active" in dfront
+    assert "type: claude-decision" in dfront and "status: provisional" in dfront
+    assert "status: active" not in dfront  # #455: the template's status is replaced, not doubled
     assert "type: claude-error-fix" in efront
     assert "source_session_note" not in dfront  # omitted, not written empty
+
+
+@pytest.mark.parametrize("ctype", ["insight", "decision", "error-fix"])
+def test_every_new_note_is_saved_provisional(mock_config, tmp_vault, no_match, ctype):
+    """#455: a new auto note starts out of the default retrieval pool; selection promotes it."""
+    row = capture_save.save_candidate(_cand(type=ctype, score=8, about_issue=12), session_id=SID, project="p",
+                                      session_note="", config=mock_config, repo="/work/p")
+    front, _ = _front(tmp_vault / row["note_path"])
+    assert re.findall(r"^status: .*$", front, flags=re.M) == ["status: provisional"]
+    assert "source: auto-capture\nstatus: provisional\n" in front or ctype == "decision"
+    assert (row["score"], row["about_issue"], row["repo"]) == (8, 12, "/work/p")
+    assert capture_state.ledger_get(row["id"])["score"] == 8
+
+
+def test_row_fields_are_none_without_worker_data(mock_config, tmp_vault, no_match):
+    row = capture_save.save_candidate(_cand(), session_id=SID, project="p", session_note="", config=mock_config)
+    assert row["score"] is None and row["about_issue"] is None and row["repo"] is None
+
+
+def test_update_path_writes_no_status(mock_config, tmp_vault, monkeypatch):
+    existing = tmp_vault / "claude-insights" / "2026-10-01-old-note-abcd.md"
+    existing.write_text("---\ntype: claude-insight\ndate: 2026-10-01\ntags:\n  - claude/insight\n---\n\n# Old\n\nBody.\n")
+    monkeypatch.setattr(capture_save, "find_match", lambda *a, **k: "claude-insights/2026-10-01-old-note-abcd.md")
+    row = capture_save.save_candidate(_cand(score=9), session_id=SID, project="p", today="2026-10-18", config=mock_config)
+    assert row["kind"] == "updated" and "status:" not in existing.read_text()
+
+
+def test_frontmatter_status_none_keeps_the_template():
+    front = capture_save._frontmatter(_cand(type="decision"), session_id=SID, project="p", session_note="",
+                                      today="2026-10-18", status=None)
+    assert "status: active" in front and "provisional" not in front
 
 
 def test_match_appends_update(mock_config, tmp_vault, monkeypatch):
