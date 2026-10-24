@@ -319,6 +319,7 @@ def test_meta_reads_fields_deep_in_frontmatter(tmp_path):
         "project": "obsidian-brain",
         "session_id": "abc-123",
         "source_session_note": "[[2026-04-24-parent-aa11]]",
+        "status": None,
         "tags": ["claude/emerge", "claude/auto"],
         "title": "Emerge Title",
         "snippet": row["snippet"],
@@ -386,6 +387,26 @@ def test_meta_bad_files_do_not_abort_the_rest(capsys, vault, tmp_path):
     for r in rows:
         if r["error"]:
             assert r["type"] is None and r["tags"] is None and r["title"] is None
+
+
+def test_meta_oversized_provisional_note_still_reports_its_status(capsys, vault, monkeypatch):
+    """/vault-ask drops provisional notes by `status`; an oversized one must not slip through as unknown."""
+    note = vault / "claude-insights" / "big.md"
+    note.parent.mkdir(exist_ok=True)
+    note.write_text("---\ntype: claude-insight\nstatus: provisional\n---\n\n# Big\n\n" + "x" * 200 + "\n")
+    monkeypatch.setattr(vault_scan, "MAX_FILE_BYTES", 50)
+    rc, out, _ = _main(capsys, "meta", vault, note)
+    row = json.loads(out)
+    assert rc == 0 and row["error"] == "file too large"
+    assert row["status"] == "provisional" and row["type"] is None and row["title"] is None
+
+
+def test_meta_outside_the_vault_never_reads_the_file(capsys, vault, tmp_path_factory):
+    other = tmp_path_factory.mktemp("elsewhere") / "n.md"
+    other.write_text("---\nstatus: provisional\n---\nbody\n")
+    rc, out, _ = _main(capsys, "meta", vault, other)
+    row = json.loads(out)
+    assert row["error"] == "outside the vault" and row["status"] is None
 
 
 def test_meta_oversized_and_unreadable(capsys, vault, monkeypatch):
@@ -708,3 +729,112 @@ def test_meta_quote_escapes_end_to_end(capsys, tmp_path):
     assert row["project"] == "Bob's app"
     assert row["source_session_note"] == '[[a "q" b]]'
     assert row["tags"] == ["it's", 'a "b"']
+
+
+def test_meta_prints_status(tmp_path):
+    """#455: /vault-ask drops provisional auto notes by the status meta prints."""
+    v = tmp_path / "v"
+    (v / "ins").mkdir(parents=True)
+    note = v / "ins" / "n.md"
+    note.write_text(_note("type: claude-insight\nstatus: provisional\n", "# T\n\nBody.\n"))
+    r = _run("meta", v, note)
+    assert r.returncode == 0, r.stderr
+    assert json.loads(r.stdout)["status"] == "provisional"
+
+
+# ---------------------------------------------------------------------------
+# #455: status in meta rows, normalised and lenient
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("raw, want", [
+    ("provisional", "provisional"),
+    ('"Provisional"', "provisional"),
+    ("'PROVISIONAL'", "provisional"),
+    ("provisional # kept for now", "provisional"),
+    ("promoted", "promoted"),
+])
+def test_meta_status_is_normalised(tmp_path, raw, want):
+    v = tmp_path / "v"
+    (v / "ins").mkdir(parents=True)
+    note = v / "ins" / "n.md"
+    note.write_text(_note(f"type: claude-insight\nstatus: {raw}\n"))
+    r = _run("meta", v, note)
+    assert r.returncode == 0, r.stderr
+    assert json.loads(r.stdout)["status"] == want
+
+
+@pytest.mark.parametrize("text", [
+    "---\ntype: claude-insight\nstatus: provisional\ntags: [unclosed\n# no closing fence\nbody\n",
+    "---\nstatus: \"Provisional\"\nbroken line without colon\n",
+    "﻿---\nstatus: provisional # x\nno close\n",
+])
+def test_meta_malformed_frontmatter_still_reports_a_provisional_status(tmp_path, text):
+    v = tmp_path / "v"
+    (v / "ins").mkdir(parents=True)
+    note = v / "ins" / "n.md"
+    note.write_text(text)
+    row = json.loads(_run("meta", v, note).stdout)
+    assert row["error"] and row["status"] == "provisional"
+
+
+def test_meta_lenient_status_ignores_text_past_the_fence(tmp_path):
+    v = tmp_path / "v"
+    (v / "ins").mkdir(parents=True)
+    past_fence = v / "ins" / "a.md"
+    past_fence.write_text("---\ntype: x\n---\n\nstatus: provisional\n[unclosed")  # parses fine: status is body text
+    assert json.loads(_run("meta", v, past_fence).stdout)["status"] is None
+
+
+def test_meta_lenient_status_reads_the_whole_frontmatter_block_up_to_64kb(tmp_path):
+    v = tmp_path / "v"
+    (v / "ins").mkdir(parents=True)
+    deep = v / "ins" / "deep.md"  # status after 8 KB of frontmatter, no closing fence: unparsable
+    deep.write_text("---\nnoclose: " + "x" * 9000 + "\nstatus: provisional\n")
+    assert json.loads(_run("meta", v, deep).stdout)["status"] == "provisional"
+    over = v / "ins" / "over.md"  # status beyond the 64 KB cap: never read
+    over.write_text("---\nnoclose: " + "x" * 70000 + "\nstatus: provisional\n")
+    assert json.loads(_run("meta", v, over).stdout)["status"] is None
+
+
+def test_meta_oversized_note_with_status_deep_in_its_frontmatter(tmp_path, monkeypatch, capsys):
+    v = tmp_path / "v"
+    (v / "ins").mkdir(parents=True)
+    big = v / "ins" / "big.md"
+    big.write_text("---\ntype: claude-insight\nnote: " + "y" * 9000 + "\nstatus: provisional\n---\n\n# Big\n\n"
+                   + "z" * 5000 + "\n")
+    monkeypatch.setattr(vault_scan, "MAX_FILE_BYTES", 10000)
+    rc, out, _ = _main(capsys, "meta", v, big)
+    row = json.loads(out)
+    assert row["error"] == "file too large" and row["status"] == "provisional"
+
+
+def test_vault_ask_meta_filter_drops_every_provisional_spelling(tmp_path):
+    """The /vault-ask rule is: drop a meta row whose `status` is `provisional`, error or not. Run on real rows."""
+    v = tmp_path / "v"
+    (v / "ins").mkdir(parents=True)
+    notes = {
+        "plain": _note("type: claude-insight\nstatus: provisional\n"),
+        "comment": _note("type: claude-insight\nstatus: provisional # x\n"),
+        "quoted": _note('type: claude-insight\nstatus: "Provisional"\n'),
+        "malformed": "---\ntype: claude-insight\nstatus: provisional\nno closing fence\n",
+        "promoted": _note("type: claude-insight\nstatus: promoted\n"),
+        "legacy": _note("type: claude-insight\n"),
+    }
+    paths = []
+    for name, text in notes.items():
+        (v / "ins" / f"{name}.md").write_text(text)
+        paths.append(v / "ins" / f"{name}.md")
+    r = _run("meta", v, *paths)
+    assert r.returncode == 0, r.stderr
+    rows = [json.loads(ln) for ln in r.stdout.splitlines()]
+    assert len(rows) == len(notes)
+    kept = {Path(row["path"]).stem for row in rows if row["status"] != "provisional"}
+    assert kept == {"promoted", "legacy"}
+
+
+def test_lenient_status_stops_at_the_closing_fence(tmp_path):
+    p = tmp_path / "n.md"
+    p.write_text("---\nfoo: 1\n---\nstatus: provisional\n")
+    assert vault_scan._lenient_status(p) is None
+    p.write_text("---\nfoo: 1\nstatus: provisional\n---\nstatus: promoted\n")
+    assert vault_scan._lenient_status(p) == "provisional"

@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Auto-capture promotes at most 10 notes per session, picked by merit (#455). Every new auto note is saved `status: provisional`, out of the default `/recall` related insights and `/vault-ask` candidates; `/vault-search` still lists it. After each slice, new `hooks/capture_select.py` re-ranks the whole session: merit = 0.7 × score/10 + 0.3 × novelty, +0.02 for error-fix and decision, where novelty is 1 − the max TF-IDF cosine to earlier curated notes of the same project from other sessions. Picks are greedy: merit − 0.5 × the max cosine to the notes already picked, and a note at cosine ≥ 0.6 to a pick is skipped. The top 10 become `status: promoted` (`active` for a decision) and the rest stay provisional, so a later, stronger note can displace an earlier pick. Each note records `capture_score`, `capture_novelty`, `capture_merit` and `capture_rank`, and each promotion or demotion writes a `promoted`/`demoted` line to `obsidian-brain-hook.log`.
+- The capture worker scores each candidate 1–10 with rubric v2 and returns `duplicate_of`, `superseded_by` (another element of its answer, or an earlier capture by the `[id]` the prompt now lists) and `about_issue`. A missing or invalid score is 5. A duplicate stays provisional, and so does a superseded note.
+- A note that was really used is promoted for good, outside the cap: a `search` or `tool-open` access after it was created, or a hand `/compress` update. The worker now logs each `Read` tool call on a curated vault note as a `tool-open` access. A promoted note chiefly about one issue (`about_issue`) is demoted when `gh issue view` shows the issue closed after the note was captured; this check runs at most every 6 hours per project, covers the last 60 days, and changes nothing when `gh` fails.
+- `search_vault` gains `include_provisional` (default `True`, so dedup still sees provisional notes); `query_related_notes` leaves them out of all three layers unless asked. `vault_scan.py meta` prints `status`. Notes with no status, which is every note from before #455, stay in the pool.
+- `scripts/capture_provisional_backfill.py` runs the same selection over auto notes captured from 2026-10-18 to 2026-10-23 (`--since`/`--until`, both inclusive). Scores come from `--scores FILE` (read-only, such as the spike's `scores_v2.json`) and a cache that `--score` or `--apply` fills with Haiku in batches of 20. A note that was ever opened (an access, a hand update, or another session's `Read` of it in any transcript) stays promoted. The dry run is the default: it calls no model, writes nothing, and prints counts per project and session and a token estimate. `--apply` backs up the DB (row counts checked) and every note it touches, then writes the status, the score parts and `demoted_by: backlog`. It deletes no note. Exit 0 ok, 1 refused or failed, 2 usage error. On the live vault, the dry run finds 3,402 notes: 402 would stay promoted, 27 are kept as opened, and 2,973 would become provisional.
+- `note_writer.set_frontmatter_fields` sets, inserts or removes top-level frontmatter fields under the note's lock, atomically, keeping its line endings. Keys and values are allow-listed. `vault_index.update_note_status` refreshes an indexed note's status without re-deriving its vector.
+- `tests/fixtures/455-eval/` holds the blind-judged spike (9 sessions, 1,547 notes; no note text, as the repo is public). `tests/test_capture_select_eval.py` replays the selection on it: the top-10 keep rate is 84% under the Opus labels and 68% under Astra, against 43% and 40% for capture order.
+- `capture_select.promote_used` promotes a provisional note that was used after it was captured, in any project and session, so a note of a finished session is no longer stuck out of the pool (#455). `run_batch` calls it after `demote_closed` at the end of every batch; a failure is logged as `promote-used-failed` and never blocks the batch.
+
+### Fixed
+- Review fixes for capture selection (#455):
+  - If a demotion write fails, `run_selection` makes no promotion in that run (it logs `select-failed detail=demotion-write`), so a session never holds more than 10 non-sticky picks.
+  - `vault_index.update_note_status` stamps a row's mtime and size only when the row still held the file's stat from just before our own write. An external edit the index had not seen now stays stale and is re-indexed by the next sync.
+  - `note_writer.set_frontmatter_fields` takes its stat from the open file before the read, so a change between the read and the stat is caught.
+  - The backlog tool can be run twice over the same window: notes it selected earlier are selected again, notes the live selection promoted count against their session's cap of 10, and notes it wrote carry `selected_by: backlog`.
+  - Mixed `duplicate_of` and `superseded_by` cycles keep one note eligible.
+  - The backlog scorer fences each note in tags that carry a random per-batch nonce and defuses any `</note` in the text, in any case or spacing.
+  - The backlog skips notes that resolve outside the vault and reports a bad note instead of stopping. `demote_closed` skips a ledger path outside the vault.
+  - `vault_scan.py meta` reports `status` for an oversized note, and `/vault-ask` drops a provisional row even when it has an `error`.
+  - The eval fixture derives note ids with HMAC-SHA256 under the same unstored salt as its terms (keep rates unchanged). `AUTO_HEADING_RE` ends with `\Z`.
+- `/compress` append-update promotes a provisional auto note (#455): `note_writer.py append-update` sets `status` to `promoted` (`active` for a decision) and `promoted_by: hand-update` in the same locked write as the update section. Auto-capture's own update keeps the note provisional. `promote_used` also promotes a provisional note it loads that already has a hand update.
+- `obsidian_utils.normalize_status` reads a `status` as one lowercase token with quotes and an inline `# comment` removed. `/recall`'s file-scan fallback and `vault_scan.py meta` use it. The SQL provisional filter (`search_vault`, all three `query_related_notes` layers) leaves out any status that starts with `provisional` after trimming and lowercasing. Both leave out `"Provisional"` and `provisional # note` like `provisional`.
+- Re-check fixes for capture selection (#455):
+  - Backlog `apply` writes demotions first; if one fails, no note of that session is promoted in that run, the failure is reported and the exit is 1.
+  - The backlog counts every promoted, selected, non-sticky note of a session against its cap of 10, whatever its date, so a narrower window cannot push a session over it.
+  - `update_note_status` stamps the row's mtime and size only if the row matched the stat `set_frontmatter_fields` took under the note's lock before its read, and the file still has the stat of our own write (`stat_out` is `[pre, post]`).
+  - `append-update` promotes a note whose status is `"Provisional"` or `provisional # note` too.
+  - `vault_scan.py meta` reads `status` from the frontmatter block (up to its closing `---`, at most the first 64 KB, never the body) for a note whose frontmatter cannot be parsed, and prints it lowercased.
+  - The mixed-cycle tests check refs with `is None` and capture ids, so index 0 is not read as "no reference".
+  - `build_fixture.py` fails the build if an output id equals `sha1(name)[:12]` of an input name or blind id.
+
 ## [3.9.1] - 2026-10-23
 
 ### Added
