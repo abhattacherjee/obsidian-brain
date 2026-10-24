@@ -42,6 +42,10 @@ from themes import (  # noqa: F401  (re-export shim)
 from frontmatter import split_frontmatter, split_lines_lf_crlf
 
 DEFAULT_IMPORTANCE = 5
+# #455: auto notes capture selection did not promote. NULL (every note from
+# before #455, and hand notes) stays in. ``p`` is the table alias prefix.
+NOT_PROVISIONAL_SQL = "({p}status IS NULL OR {p}status != 'provisional')"
+
 IMPORTANCE_AUTO_CAPTURE = 3
 IMPORTANCE_HAND_SAVED = 6
 CURATED_IMPORTANCE_TYPES = ("claude-insight", "claude-decision", "claude-error-fix")
@@ -2147,6 +2151,7 @@ def search_vault(
     caller: str | None = None,
     include_vectors: bool = False,
     log_access: bool = True,
+    include_provisional: bool = True,
 ) -> list[dict]:
     """Full-text search over the vault index.
 
@@ -2175,6 +2180,10 @@ def search_vault(
     activation in the rerank. Pass ``log_access=False`` from any search that
     is not a person or agent retrieving notes (dedup checks, wiki lookup,
     tuning scripts): logging those turned activation into noise (#448).
+
+    ``include_provisional=False`` leaves out auto-captured notes that capture
+    selection did not promote (``status: provisional``, #455). The default
+    keeps them, so dedup (``find_match``, ``/compress``) still sees them.
     """
     if not os.path.isfile(db_path):
         return []
@@ -2203,6 +2212,8 @@ def search_vault(
         if note_type:
             filter_sql += "AND n.type = ? "
             filter_params.append(note_type)
+        if not include_provisional:
+            filter_sql += f"AND {NOT_PROVISIONAL_SQL.format(p='n.')} "
 
         # Optionally include the stored TF-IDF vector column.
         vector_col = ", n.tfidf_vector" if include_vectors else ""
@@ -2367,6 +2378,7 @@ def query_related_notes(
     session_summary: str,
     note_types: list[str] | None = None,
     limit: int = 20,
+    include_provisional: bool = False,
 ) -> list[dict]:
     """Find notes related to current context using layered ranking.
 
@@ -2374,7 +2386,9 @@ def query_related_notes(
     Layer 2: Tag overlap (claude/topic/* tags)
     Layer 3: FTS keyword search on session summary
 
-    Returns up to `limit` results, filling slots layer by layer.
+    Returns up to `limit` results, filling slots layer by layer. Provisional
+    auto-captured notes (#455) are left out of every layer unless
+    ``include_provisional`` is set.
     """
     if not os.path.isfile(db_path):
         return []
@@ -2396,6 +2410,8 @@ def query_related_notes(
             placeholders = ",".join("?" for _ in note_types)
             type_filter = f"AND type IN ({placeholders})"
             type_params = list(note_types)
+        if not include_provisional:
+            type_filter += f" AND {NOT_PROVISIONAL_SQL.format(p='')}"
 
         # Layer 1: Backlinks — notes whose source_session matches loaded sessions
         if session_ids:

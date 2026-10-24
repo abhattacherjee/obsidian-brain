@@ -5550,6 +5550,8 @@ def build_context_brief(
                 fm_project = meta.get('project', '')
                 if fm_project.lower() != project.lower() and slugify(fm_project) != slugify(project):
                     continue
+                if meta.get('status') == 'provisional':  # #455: as query_related_notes leaves them out
+                    continue
                 project_insights.append(f)
 
             insight_count = len(project_insights)

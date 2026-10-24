@@ -57,7 +57,7 @@ else:
 
 MAX_FILE_BYTES = 5 * 1024 * 1024
 SNIPPET_CHARS = 200
-META_FIELDS = ("date", "type", "project", "session_id", "source_session_note")
+META_FIELDS = ("date", "type", "project", "session_id", "source_session_note", "status")
 SKIP_KINDS = ("too_large", "unreadable", "outside_vault", "bad_frontmatter",
               "symlinked_dirs", "unreadable_dirs")
 _UTILS_WARNED = False

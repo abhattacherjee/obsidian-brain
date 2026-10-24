@@ -319,6 +319,7 @@ def test_meta_reads_fields_deep_in_frontmatter(tmp_path):
         "project": "obsidian-brain",
         "session_id": "abc-123",
         "source_session_note": "[[2026-04-24-parent-aa11]]",
+        "status": None,
         "tags": ["claude/emerge", "claude/auto"],
         "title": "Emerge Title",
         "snippet": row["snippet"],
@@ -708,3 +709,14 @@ def test_meta_quote_escapes_end_to_end(capsys, tmp_path):
     assert row["project"] == "Bob's app"
     assert row["source_session_note"] == '[[a "q" b]]'
     assert row["tags"] == ["it's", 'a "b"']
+
+
+def test_meta_prints_status(tmp_path):
+    """#455: /vault-ask drops provisional auto notes by the status meta prints."""
+    v = tmp_path / "v"
+    (v / "ins").mkdir(parents=True)
+    note = v / "ins" / "n.md"
+    note.write_text(_note("type: claude-insight\nstatus: provisional\n", "# T\n\nBody.\n"))
+    r = _run("meta", v, note)
+    assert r.returncode == 0, r.stderr
+    assert json.loads(r.stdout)["status"] == "provisional"
