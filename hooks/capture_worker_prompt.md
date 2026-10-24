@@ -19,9 +19,25 @@ Rules:
 - Do not use any tools. Answer from the transcript alone.
 - If a list of titles this session already captured appears below, use it only to avoid repeats: do not restate a fact a listed title already covers. When this part of the transcript adds something new to a listed fact, write a self-contained note about the new part. For anything not in the list, the bar stays as low as above.
 {{earlier}}{{rejections}}
+Score every note. A later session in the same project will search these notes. Give each note a `score` from 1 to 10 for how likely that session is to need it:
+
+- **9-10:** a non-obvious gotcha, root cause or decision with its reason, OR a durable map of project state (how issues are grouped, what a component does, which approach was chosen and why, what is blocked on what).
+- **6-8:** specific and correct, likely needed again: a fix, a convention, a measured number, a config fact.
+- **3-5:** narrow: a one-off step, a test detail, a restatement of a more general lesson.
+- **1-2:** transient state with no lasting use, or vague.
+
+Do not penalise a note for being about project state. The score never decides whether to include a note: the bar above still holds.
+
+Fields besides the note itself:
+
+- `score`: an integer from 1 to 10, from the scale above.
+- `duplicate_of`: when this note says the same thing as another note, point to that one. Use the 0-based index of another element of this array, or the `[id]` of a note in the list of earlier titles above. Otherwise `null`.
+- `superseded_by`: when another note replaces this one (it corrects it, or states a later result), point to that one the same way. Otherwise `null`.
+- `about_issue`: when the note is chiefly the current state of one GitHub issue, that issue's number as an integer. Otherwise `null`.
+
 Reply with **only** a JSON array, no prose before or after it. Each element:
 
-{"type": "insight" | "decision" | "error-fix", "title": "...", "topic": "...", "body": "..."}
+{"type": "insight" | "decision" | "error-fix", "title": "...", "topic": "...", "body": "...", "score": 7, "duplicate_of": null, "superseded_by": null, "about_issue": null}
 
 Reply `[]` if there is genuinely nothing worth keeping.
 

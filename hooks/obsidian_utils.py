@@ -709,6 +709,19 @@ def _peek_frontmatter_fields(
     return result
 
 
+def normalize_status(value) -> str | None:
+    """A frontmatter ``status`` value as a comparable token, or None.
+
+    The first token, lowercased, with an inline ``# comment`` and quotes
+    removed: ``"Provisional"`` and ``provisional # kept for now`` both give
+    ``provisional`` (#455). Anything that is not a string gives None.
+    """
+    if not isinstance(value, str):
+        return None
+    text = re.split(r"(?:^|\s)#", value, maxsplit=1)[0].strip().strip("\"'").strip()
+    return text.split()[0].lower() if text.split() else None
+
+
 def _peek_frontmatter_field(path: Path, field: str) -> str | None:
     """Return the unquoted YAML scalar for ``field:`` from a vault note's
     frontmatter, or None. One-field wrapper over ``_peek_frontmatter_fields``
@@ -5549,6 +5562,8 @@ def build_context_brief(
                     continue
                 fm_project = meta.get('project', '')
                 if fm_project.lower() != project.lower() and slugify(fm_project) != slugify(project):
+                    continue
+                if normalize_status(meta.get('status')) == 'provisional':  # #455: as query_related_notes leaves them out
                     continue
                 project_insights.append(f)
 

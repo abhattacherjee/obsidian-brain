@@ -57,7 +57,7 @@ else:
 
 MAX_FILE_BYTES = 5 * 1024 * 1024
 SNIPPET_CHARS = 200
-META_FIELDS = ("date", "type", "project", "session_id", "source_session_note")
+META_FIELDS = ("date", "type", "project", "session_id", "source_session_note", "status")
 SKIP_KINDS = ("too_large", "unreadable", "outside_vault", "bad_frontmatter",
               "symlinked_dirs", "unreadable_dirs")
 _UTILS_WARNED = False
@@ -331,6 +331,53 @@ def _describe_parse_failure(reason: str) -> str:
     return _describe_note_parse_failure(reason)
 
 
+_LENIENT_STATUS_BYTES = 65536
+_LENIENT_STATUS_RE = re.compile(r"^status:\s*[\"']?([A-Za-z_-]+)")
+
+
+def _normalized_status(value) -> str | None:
+    """``status`` as one lowercase token (quotes and an inline comment dropped); see obsidian_utils.normalize_status."""
+    global _UTILS_WARNED
+    try:
+        from obsidian_utils import normalize_status
+    except ImportError as exc:
+        if not _UTILS_WARNED:
+            _UTILS_WARNED = True
+            print(f"vault_scan: obsidian_utils unavailable: {exc}", file=sys.stderr)
+        text = re.split(r"(?:^|\s)#", value, maxsplit=1)[0].strip().strip("\"'") if isinstance(value, str) else ""
+        return text.split()[0].lower() if text.split() else None
+    return normalize_status(value)
+
+
+def _lenient_status(path: Path) -> str | None:
+    """The note's ``status`` when its frontmatter cannot be parsed (oversized, malformed, unreadable).
+
+    Scans the frontmatter block, up to its closing ``---`` and at most the first
+    64 KB (a note is never read past that, so never its body when it is big),
+    and takes the first ``status:`` line. /vault-ask drops ``provisional`` notes by
+    this value, so an error row must still say it.
+    """
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(_LENIENT_STATUS_BYTES).decode("utf-8", errors="replace")
+    except OSError:
+        return None
+    for i, line in enumerate(head.splitlines()):
+        line = line.rstrip("\r")
+        if i > 0 and line.strip() == "---":
+            break
+        m = _LENIENT_STATUS_RE.match(line)
+        if m:
+            return _normalized_status(m.group(1))
+    return None
+
+
+def _error_row(file_arg: str, error: str, path: Path) -> dict:
+    row = _empty_row(file_arg, error)
+    row["status"] = _lenient_status(path)
+    return row
+
+
 def note_meta(vault_root: Path, vault: str, file_arg: str) -> dict:
     path = Path(file_arg)
     if not path.is_absolute():
@@ -343,13 +390,13 @@ def note_meta(vault_root: Path, vault: str, file_arg: str) -> dict:
         if not path.is_file():
             return _empty_row(file_arg, "not found")
         if path.stat().st_size > MAX_FILE_BYTES:
-            return _empty_row(file_arg, "file too large")
+            return _error_row(file_arg, "file too large", path)
         text = _read_text(path)
     except OSError as exc:
-        return _empty_row(file_arg, f"unreadable: {exc.strerror or type(exc).__name__}")
+        return _error_row(file_arg, f"unreadable: {exc.strerror or type(exc).__name__}", path)
     _open, fm, _close, body, err = split_frontmatter(split_lines_lf_crlf(text))
     if err:
-        return _empty_row(file_arg, f"unparsable frontmatter: {_describe_parse_failure(err)}")
+        return _error_row(file_arg, f"unparsable frontmatter: {_describe_parse_failure(err)}", path)
     fields = _parse_fields(fm)
     body_text = "".join(body)
     title = next(
@@ -358,6 +405,7 @@ def note_meta(vault_root: Path, vault: str, file_arg: str) -> dict:
     )
     row = {"path": file_arg}
     row.update({f: (fields.get(f) or None) for f in META_FIELDS})
+    row["status"] = _normalized_status(row["status"])
     row.update({
         "tags": fields["tags"],
         "title": title,

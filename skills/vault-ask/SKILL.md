@@ -168,10 +168,13 @@ results = search_vault(
     sys.argv[1],
     project=sys.argv[2] if len(sys.argv) > 2 and sys.argv[2] != "None" else None,
     limit=15,
+    include_provisional=False,
 )
 print(json.dumps(results))
 ' "$SEARCH_TERMS_JOINED" "$PROJECT"
 ```
+
+`include_provisional=False` leaves out auto-captured notes that capture selection did not promote (`status: provisional`). They stay on disk and `/vault-search` still finds them.
 
 If the output is a non-empty JSON array with 5+ results: extract the `path` field from each result and use those file paths as `CANDIDATE_FILES`. Skip the Grep searches in Step 4, but still run its memory search, then go to Step 5.
 
@@ -288,7 +291,7 @@ test -f "$HOOKS/vault_scan.py" || { echo "ERROR: vault_scan.py not found under $
 python3 "$HOOKS/vault_scan.py" meta '<vault_path>' '<file_1>' '<file_2>'
 ```
 
-It prints one JSON object per file, one per line, with `path`, `type`, `date`, `project`, `session_id`, `source_session_note`, `tags`, `title`, `snippet` and `error`. Read `type` and `date` from it. The call succeeded only if it exited 0 and printed one JSON row per file you passed. Otherwise show the `ERROR:` line (or the whole stderr) to the user and stop. A `vault_scan: obsidian_utils unavailable: ...` line on stderr is a warning, not a failure. Do not use a fixed-line `Read` for this: frontmatter can run past line 40 (/emerge notes close their fence as deep as line 461), so a fixed line limit silently drops fields. `meta` parses the whole frontmatter block. If a row has a non-null `error`, keep the file but give it no type or recency points. Do not pass memory files to `vault_scan.py meta`: they are outside the vault. They already have type `claude-memory` and get no recency points. Paste each value inside single quotes as shown. If a value itself contains a `'`, write it as `'\''`.
+It prints one JSON object per file, one per line, with `path`, `type`, `date`, `project`, `session_id`, `source_session_note`, `status`, `tags`, `title`, `snippet` and `error`. Read `type` and `date` from it. Drop every file whose `status` is `provisional` from `CANDIDATE_FILES` before scoring: it is an auto-captured note that capture selection did not promote, and Step 4's Grep finds it because Grep does not read the index. The call succeeded only if it exited 0 and printed one JSON row per file you passed. Otherwise show the `ERROR:` line (or the whole stderr) to the user and stop. A `vault_scan: obsidian_utils unavailable: ...` line on stderr is a warning, not a failure. Do not use a fixed-line `Read` for this: frontmatter can run past line 40 (/emerge notes close their fence as deep as line 461), so a fixed line limit silently drops fields. `meta` parses the whole frontmatter block. If a row has a non-null `error`, keep the file but give it no type or recency points, unless its `status` is `provisional`: drop it like any other provisional row, because `meta` reports `status` even for an oversized or unparsable note. `meta` prints `status` lowercased, with quotes and an inline `#` comment removed, so compare it to `provisional` exactly. Do not pass memory files to `vault_scan.py meta`: they are outside the vault. They already have type `claude-memory` and get no recency points. Paste each value inside single quotes as shown. If a value itself contains a `'`, write it as `'\''`.
 
 Sort `CANDIDATE_FILES` by score descending. Take the top 10. Store as `RANKED_FILES`.
 

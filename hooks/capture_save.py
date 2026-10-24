@@ -121,7 +121,7 @@ def section_end(lines: list[str], start: int, marker: str) -> int:
     return len(lines)
 
 
-AUTO_HEADING_RE = re.compile(r"^## Update \([^)]*\) — auto-capture (?P<id>[0-9a-f]{12})$")
+AUTO_HEADING_RE = re.compile(r"^## Update \([^)]*\) — auto-capture (?P<id>[0-9a-f]{12})\Z")
 
 
 def strip_auto_updates(text: str) -> str:
@@ -277,8 +277,13 @@ def session_note_for(session_id: str, project: str, config: dict) -> str:
     return obsidian_utils.resolve_source_session_note(name, session_id, vault, folder)
 
 
+PROVISIONAL = "provisional"  # #455: every new auto note starts out of the default retrieval pool
+
+
 def _frontmatter(c: Candidate, *, session_id: str, project: str, session_note: str, today: str,
-                 created_at: str | None = None) -> str:
+                 created_at: str | None = None, status: str | None = PROVISIONAL) -> str:
+    """The new note's frontmatter. ``status`` replaces the template's (decisions say
+    ``active``) or is added after ``source:``; None keeps the template as it is."""
     template_name, _ = TYPES[c["type"]]
     template = (_TEMPLATES / template_name).read_text(encoding="utf-8")
     front = template.split("---", 2)[1]
@@ -296,6 +301,10 @@ def _frontmatter(c: Candidate, *, session_id: str, project: str, session_note: s
     if not session_note:
         front = re.sub(r'^source_session_note: ""\n', "", front, flags=re.M)
     front = front.replace(f"project: {project_tag}\n", f"project: {project_tag}\nsource: auto-capture\n", 1)
+    if status is not None:
+        front, n = re.subn(r"^status: .*\n", f"status: {status}\n", front, count=1, flags=re.M)
+        if not n:
+            front = front.replace("source: auto-capture\n", f"source: auto-capture\nstatus: {status}\n", 1)
     front = front.rstrip("\n") + "\n  - claude/auto\n"
     return f"---{front}---\n"
 
@@ -317,8 +326,14 @@ def save_candidate(
     session_note: str | None = None,
     today: str | None = None,
     config: dict | None = None,
+    repo: str | None = None,
 ) -> dict:
-    """Write ``c`` as a new note or an update; append and return its ledger row."""
+    """Write ``c`` as a new note or an update; append and return its ledger row.
+
+    #455: the row also keeps the worker's ``score`` and ``about_issue`` and
+    the session's ``repo`` (its cwd), which selection and the closed-issue
+    check read later. A new note is written ``status: provisional``.
+    """
     if c.get("type") not in TYPES:
         raise ValueError(f"unknown candidate type: {c.get('type')!r}")
     config = config or obsidian_utils.load_config()
@@ -331,7 +346,8 @@ def save_candidate(
         raise ValueError("candidate has an empty body")
     cid = secrets.token_hex(6)
     row = {"id": cid, "session_id": session_id, "project": project, "type": c["type"],
-           "title": title, "status": "active", "summary": summary_of(body)}
+           "title": title, "status": "active", "summary": summary_of(body),
+           "score": c.get("score"), "about_issue": c.get("about_issue"), "repo": repo}
 
     try:
         match = find_match(query_text(title, body), config, session_id=session_id)

@@ -198,7 +198,8 @@ def _note_content(row: dict, title: str, body: str, heading: str, config: dict, 
         sessions[sid] = capture_save.session_note_for(sid, project, config) if sid else ""
     cand = {"type": ctype, "title": title, "body": body, "topic": _topic(source_text)}
     content = capture_save._frontmatter(cand, session_id=sid, project=project, session_note=sessions[sid],
-                                        today=_day(heading, row.get("ts")), created_at=_created_at(row.get("ts")))
+                                        today=_day(heading, row.get("ts")), created_at=_created_at(row.get("ts")),
+                                        status=None)  # #455: a migrated note is not a new capture; no selection runs on it
     return content + f"\n# {title}\n\n{body}\n"
 
 

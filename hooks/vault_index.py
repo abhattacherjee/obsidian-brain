@@ -42,6 +42,12 @@ from themes import (  # noqa: F401  (re-export shim)
 from frontmatter import split_frontmatter, split_lines_lf_crlf
 
 DEFAULT_IMPORTANCE = 5
+# #455: auto notes capture selection did not promote. NULL (every note from
+# before #455, and hand notes) stays in. ``p`` is the table alias prefix.
+# Tolerant of case, quotes and an inline comment ("Provisional", provisional # x).
+_SQL_TRIM_CHARS = "' \"'''"  # a space, a double quote and a single quote, as an SQL literal
+NOT_PROVISIONAL_SQL = ("({p}status IS NULL OR lower(trim({p}status, " + _SQL_TRIM_CHARS + ")) NOT LIKE 'provisional%')")
+
 IMPORTANCE_AUTO_CAPTURE = 3
 IMPORTANCE_HAND_SAVED = 6
 CURATED_IMPORTANCE_TYPES = ("claude-insight", "claude-decision", "claude-error-fix")
@@ -1784,6 +1790,54 @@ def index_note(db_path: str, note_path: str) -> bool:
         conn.close()
 
 
+def update_note_status(db_path: str, note_path: str, pre_stat: tuple[float, int] | None = None,
+                       post_stat: tuple[int, int] | None = None) -> bool:
+    """Refresh one indexed note's ``status`` from its file, keeping its vector (#455).
+
+    Capture selection rewrites only frontmatter fields the index does not
+    score (``status``, ``capture_*``). A full ``index_note`` would re-derive
+    the TF-IDF vector against the current IDF, and that drift alone can flip
+    a near-tie in the next selection. A note not indexed yet is indexed in full.
+
+    ``pre_stat`` and ``post_stat`` are what ``set_frontmatter_fields(...,
+    stat_out=)`` reports: the file's ``(st_mtime, st_size)`` read under the
+    note's lock just before our own write, and the ``(st_mtime_ns, st_size)``
+    that write produced. The row's mtime and size
+    are stamped with the file's new ones only when (a) the row still held
+    ``pre_stat``, i.e. the index had seen exactly the content we edited, and
+    (b) the file still has ``post_stat``, i.e. nobody edited it after us.
+    Otherwise (an external edit the index never saw, one after our write, or
+    no stat given) only ``status`` changes and the row stays stale, so the
+    next ``_sync`` re-indexes the content.
+    """
+    if not os.path.isfile(db_path) or not os.path.isfile(note_path):
+        return False
+    parsed = _parse_note(note_path)
+    if parsed is None:
+        return False
+    st = os.stat(note_path)
+    conn = _connect(db_path)
+    try:
+        row = conn.execute("SELECT mtime, size FROM notes WHERE path = ?", (note_path,)).fetchone()
+        if row is None:
+            updated = False
+        else:
+            fresh = (pre_stat is not None and post_stat is not None
+                     and row["mtime"] is not None and row["size"] is not None
+                     and mtime_unchanged(pre_stat[0], row["mtime"]) and pre_stat[1] == row["size"]
+                     and (st.st_mtime_ns, st.st_size) == tuple(post_stat))
+            if fresh:
+                conn.execute("UPDATE notes SET status = ?, mtime = ?, size = ? WHERE path = ?",
+                             (parsed.get("status"), st.st_mtime, st.st_size, note_path))
+            else:
+                conn.execute("UPDATE notes SET status = ? WHERE path = ?", (parsed.get("status"), note_path))
+            conn.commit()
+            updated = True
+    finally:
+        conn.close()
+    return True if updated else index_note(db_path, note_path)
+
+
 # ---------------------------------------------------------------------------
 # Task-context detection
 # ---------------------------------------------------------------------------
@@ -2122,6 +2176,7 @@ def search_vault(
     caller: str | None = None,
     include_vectors: bool = False,
     log_access: bool = True,
+    include_provisional: bool = True,
 ) -> list[dict]:
     """Full-text search over the vault index.
 
@@ -2150,6 +2205,10 @@ def search_vault(
     activation in the rerank. Pass ``log_access=False`` from any search that
     is not a person or agent retrieving notes (dedup checks, wiki lookup,
     tuning scripts): logging those turned activation into noise (#448).
+
+    ``include_provisional=False`` leaves out auto-captured notes that capture
+    selection did not promote (``status: provisional``, #455). The default
+    keeps them, so dedup (``find_match``, ``/compress``) still sees them.
     """
     if not os.path.isfile(db_path):
         return []
@@ -2178,6 +2237,8 @@ def search_vault(
         if note_type:
             filter_sql += "AND n.type = ? "
             filter_params.append(note_type)
+        if not include_provisional:
+            filter_sql += f"AND {NOT_PROVISIONAL_SQL.format(p='n.')} "
 
         # Optionally include the stored TF-IDF vector column.
         vector_col = ", n.tfidf_vector" if include_vectors else ""
@@ -2342,6 +2403,7 @@ def query_related_notes(
     session_summary: str,
     note_types: list[str] | None = None,
     limit: int = 20,
+    include_provisional: bool = False,
 ) -> list[dict]:
     """Find notes related to current context using layered ranking.
 
@@ -2349,7 +2411,9 @@ def query_related_notes(
     Layer 2: Tag overlap (claude/topic/* tags)
     Layer 3: FTS keyword search on session summary
 
-    Returns up to `limit` results, filling slots layer by layer.
+    Returns up to `limit` results, filling slots layer by layer. Provisional
+    auto-captured notes (#455) are left out of every layer unless
+    ``include_provisional`` is set.
     """
     if not os.path.isfile(db_path):
         return []
@@ -2371,6 +2435,8 @@ def query_related_notes(
             placeholders = ",".join("?" for _ in note_types)
             type_filter = f"AND type IN ({placeholders})"
             type_params = list(note_types)
+        if not include_provisional:
+            type_filter += f" AND {NOT_PROVISIONAL_SQL.format(p='')}"
 
         # Layer 1: Backlinks — notes whose source_session matches loaded sessions
         if session_ids:
