@@ -40,6 +40,7 @@ from themes import (  # noqa: F401  (re-export shim)
     _THEME_SIMILARITY_THRESHOLD,
 )
 from frontmatter import split_frontmatter, split_lines_lf_crlf
+from related_select import RELATED_MAX_RETROS, select_related  # noqa: F401  (re-export; #458)
 
 DEFAULT_IMPORTANCE = 5
 # #455: auto notes capture selection did not promote. NULL (every note from
@@ -2404,6 +2405,7 @@ def query_related_notes(
     note_types: list[str] | None = None,
     limit: int = 20,
     include_provisional: bool = False,
+    max_retros: int = RELATED_MAX_RETROS,
 ) -> list[dict]:
     """Find notes related to current context using layered ranking.
 
@@ -2413,7 +2415,9 @@ def query_related_notes(
 
     Returns up to `limit` results, filling slots layer by layer. Provisional
     auto-captured notes (#455) are left out of every layer unless
-    ``include_provisional`` is set.
+    ``include_provisional`` is set. At most ``max_retros`` ``claude-retro``
+    notes are kept, the first ones in layer order (#458, ``select_related``);
+    a later layer runs while fewer than ``limit`` rows are selectable.
     """
     if not os.path.isfile(db_path):
         return []
@@ -2462,10 +2466,14 @@ def query_related_notes(
                       file=sys.stderr)
 
         # Layer 2: Tag overlap (claude/topic/* tags)
+        def _short() -> bool:
+            # Count with the selection rule, so skipped retros never stop a layer early.
+            return len(select_related(results, limit, max_retros)) < limit
+
         topic_tags = [t for t in session_tags if t.startswith("claude/topic/")]
-        if topic_tags and len(results) < limit:
+        if topic_tags and _short():
             for tag in topic_tags:
-                if len(results) >= limit:
+                if not _short():
                     break
                 escaped_tag = tag.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
                 sql = (
@@ -2490,14 +2498,16 @@ def query_related_notes(
                           file=sys.stderr)
 
         # Layer 3: FTS keyword search
-        if len(results) < limit and session_summary:
+        if _short() and session_summary:
             keywords = extract_keywords(session_summary)
             if keywords:
                 # Layer 3 uses OR-mode: keyword discovery benefits from
                 # recall over precision (5-8 keywords rarely all co-occur).
                 fts_query = _sanitize_fts_query_or(" ".join(keywords))
                 if fts_query:
-                    remaining = limit - len(results)
+                    # #458: room for retros the selection skips (limit * 2), plus
+                    # the rows already taken, which FTS returns again and dedup drops.
+                    fetch = limit * 2 + len(results)
                     sql = (
                         f"SELECT n.path, n.type, n.date, n.project, n.title, n.tags, "
                         f"n.status, n.source_session, n.source_note, n.size "
@@ -2509,7 +2519,7 @@ def query_related_notes(
                     )
                     try:
                         rows = conn.execute(
-                            sql, [fts_query, project] + type_params + [remaining]
+                            sql, [fts_query, project] + type_params + [fetch]
                         ).fetchall()
                         for row in rows:
                             d = dict(row)
@@ -2521,14 +2531,15 @@ def query_related_notes(
                         print(f"[vault-index] Layer 3 (FTS) query failed: {exc}",
                               file=sys.stderr)
 
+        selected = select_related(results, limit, max_retros)
         # Log access for returned results (single connection, one commit)
         _batch_log_access(
             conn,
-            [r["path"] for r in results[:limit]],
+            [r["path"] for r in selected],
             "related",
             project=project,
         )
-        return results[:limit]
+        return selected
     finally:
         conn.close()
 

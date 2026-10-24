@@ -5555,7 +5555,7 @@ def build_context_brief(
                 [f for f in insights_dir.iterdir() if f.suffix == '.md'],
                 reverse=True
             )
-            project_insights: list[Path] = []
+            candidates: list[dict] = []
             for f in insight_files:
                 meta = read_note_metadata(str(f))
                 if not meta:
@@ -5565,8 +5565,11 @@ def build_context_brief(
                     continue
                 if normalize_status(meta.get('status')) == 'provisional':  # #455: as query_related_notes leaves them out
                     continue
-                project_insights.append(f)
+                candidates.append({"path": f, "type": meta.get('type')})
 
+            # #458: the same retro rule as query_related_notes, on the date-ordered list.
+            from related_select import select_related
+            project_insights: list[Path] = [r["path"] for r in select_related(candidates, len(candidates))]
             insight_count = len(project_insights)
             for f in project_insights[:20]:
                 title = f.stem
