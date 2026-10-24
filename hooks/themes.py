@@ -37,14 +37,16 @@ def compute_centroid(vectors: list[dict[str, float]]) -> dict[str, float]:
 
 def get_unassigned_notes(db_path: str, project: str | None = None) -> list[tuple[str, str | None, dict]]:
     """Notes with a non-empty tfidf_vector and NO theme_members row. If ``project``
-    is given, restrict to that project. Returns [(path, project, vec), ...]."""
-    from vault_index import _connect
+    is given, restrict to that project. Returns [(path, project, vec), ...].
+    Provisional notes (#455) are left out (#458); one promoted later joins on the next run."""
+    from vault_index import _connect, NOT_PROVISIONAL_SQL
     conn = _connect(db_path)
     try:
         sql = (
             "SELECT n.path, n.project, n.tfidf_vector FROM notes n "
             "LEFT JOIN theme_members m ON n.path = m.note_path "
-            "WHERE m.note_path IS NULL AND n.tfidf_vector IS NOT NULL AND n.tfidf_vector != ''"
+            "WHERE m.note_path IS NULL AND n.tfidf_vector IS NOT NULL AND n.tfidf_vector != '' "
+            f"AND {NOT_PROVISIONAL_SQL.format(p='n.')}"
         )
         params: tuple = ()
         if project is not None:
@@ -71,13 +73,15 @@ def get_unassigned_notes(db_path: str, project: str | None = None) -> list[tuple
 def get_all_vectorized_notes(db_path: str, project: str | None = None) -> list[tuple[str, str | None, dict]]:
     """Notes with a non-empty tfidf_vector, regardless of theme membership. If
     ``project`` is given, restrict to that project. Returns [(path, project, vec), ...].
-    Used by ``--full`` consolidation to read all notes after deferring the wipe."""
-    from vault_index import _connect
+    Used by ``--full`` consolidation to read all notes after deferring the wipe.
+    Provisional notes (#455) are left out (#458)."""
+    from vault_index import _connect, NOT_PROVISIONAL_SQL
     conn = _connect(db_path)
     try:
         sql = (
             "SELECT path, project, tfidf_vector FROM notes "
-            "WHERE tfidf_vector IS NOT NULL AND tfidf_vector != ''"
+            "WHERE tfidf_vector IS NOT NULL AND tfidf_vector != '' "
+            f"AND {NOT_PROVISIONAL_SQL.format(p='')}"
         )
         params: tuple = ()
         if project is not None:
@@ -128,6 +132,53 @@ def create_theme(
     return theme_id
 
 
+def prune_provisional_members(conn: sqlite3.Connection, now_iso: str) -> int:
+    """Remove every provisional note (#455) from the themes it is in (#458 one-time cleanup).
+
+    Each removal reverse-folds the note's vector out of the theme centroid and
+    decrements ``note_count``, as ``vault_index._delete_note`` does; a theme
+    left with no members is deleted. A bad centroid or vector JSON reads as
+    ``{}`` (same as ``_delete_note``). Caller owns the transaction (no commit),
+    so an error leaves nothing half-pruned. Idempotent. Returns the number of
+    member rows removed.
+    """
+    from vault_index import NOT_PROVISIONAL_SQL
+    rows = conn.execute(
+        "SELECT m.theme_id, m.note_path, n.tfidf_vector FROM theme_members m "
+        "JOIN notes n ON n.path = m.note_path "
+        f"WHERE NOT {NOT_PROVISIONAL_SQL.format(p='n.')} "
+        "ORDER BY m.theme_id, m.note_path"
+    ).fetchall()
+    for theme_id, note_path, vec_json in rows:
+        try:
+            note_vec = json.loads(vec_json) if vec_json else {}
+        except (ValueError, TypeError):
+            note_vec = {}
+        theme = conn.execute(
+            "SELECT centroid, note_count FROM themes WHERE id = ?", (theme_id,)
+        ).fetchone()
+        conn.execute(
+            "DELETE FROM theme_members WHERE theme_id = ? AND note_path = ?", (theme_id, note_path)
+        )
+        if theme is None:
+            continue
+        count = theme[1] or 0
+        if count <= 1:
+            conn.execute("DELETE FROM theme_members WHERE theme_id = ?", (theme_id,))
+            conn.execute("DELETE FROM themes WHERE id = ?", (theme_id,))
+            continue
+        try:
+            centroid = json.loads(theme[0]) if theme[0] else {}
+        except (ValueError, TypeError):
+            centroid = {}
+        conn.execute(
+            "UPDATE themes SET centroid = ?, note_count = ?, updated_date = ? WHERE id = ?",
+            (json.dumps(_reverse_fold_centroid(centroid, note_vec or {}, count), separators=(",", ":")),
+             count - 1, now_iso, theme_id),
+        )
+    return len(rows)
+
+
 def assign_to_theme(
     db_path: str,
     note_path: str,
@@ -161,7 +212,7 @@ def assign_to_theme(
     # (obsidian_utils/open_item_dedup/vault_stats all `import vault_index`), so a
     # monkeypatch of vault_index._connect is honored. Do not switch to a package
     # (`hooks.vault_index`) import here.
-    from vault_index import _connect
+    from vault_index import _connect, NOT_PROVISIONAL_SQL
     if not os.path.isfile(db_path):
         return None
 
@@ -179,8 +230,10 @@ def assign_to_theme(
         # _connect()) before sqlite3 raises OperationalError.
         conn.execute("BEGIN IMMEDIATE")
         try:
+            # #458: a provisional note never joins a theme; it reads as "no vector".
             row = conn.execute(
-                "SELECT tfidf_vector FROM notes WHERE path = ?", (note_path,)
+                "SELECT tfidf_vector FROM notes WHERE path = ? "
+                f"AND {NOT_PROVISIONAL_SQL.format(p='')}", (note_path,)
             ).fetchone()
             if not row or not row["tfidf_vector"]:
                 conn.commit()
@@ -626,16 +679,18 @@ def get_unassigned_notes_in_window(db_path: str, window_start: str,
     """Vectorized notes with no theme_members row and date >= window_start,
     newest first, capped at ``limit``. These are /emerge's new candidates.
     Excludes transient ``claude-snapshot`` notes (parity with the retired
-    ``collect_vault_corpus`` default). Returns [{note_path, title, excerpt,
-    project, date}].
+    ``collect_vault_corpus`` default) and provisional notes (#458: else the
+    newest provisional captures fill every slot). Returns [{note_path, title,
+    excerpt, project, date}].
     """
-    from vault_index import _connect
+    from vault_index import _connect, NOT_PROVISIONAL_SQL
     conn = _connect(db_path)
     try:
         rows = conn.execute(
             "SELECT n.path, n.title, n.body, n.project, n.date FROM notes n "
             "WHERE n.tfidf_vector IS NOT NULL AND n.tfidf_vector != '' "
             "AND n.type != 'claude-snapshot' "
+            f"AND {NOT_PROVISIONAL_SQL.format(p='n.')} "
             "AND n.date >= ? "
             "AND NOT EXISTS (SELECT 1 FROM theme_members tm WHERE tm.note_path = n.path) "
             "ORDER BY n.date DESC LIMIT ?",
