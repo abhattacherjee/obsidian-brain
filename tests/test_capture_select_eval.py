@@ -11,6 +11,7 @@ A pick with no label counts as a drop.
 import gzip
 import importlib.util
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -96,3 +97,12 @@ def test_blind_eval_score_agrees(replay, judge):
     totals = blind_eval.score(replay_key, {judge: labels})["judges"][judge]["totals"]
     kept, n = totals["v2"]
     assert abs(kept / n - _keep_rate(key, labels, sets, "v2")) <= 0.01
+
+
+def test_blind_ids_are_salted_not_filename_hashes():
+    """The spike's blind ids were sha1(file name)[:12]; a guessed name could be confirmed against them."""
+    key = json.loads((FIXTURE / "key.json").read_text())
+    ids = set(key) | {i for j in ("opus_round1", "opus_round2", "astra_round2") for i in _labels(j)}
+    assert ids and all(re.fullmatch(r"b[0-9a-f]{12}", i) for i in ids)
+    assert not any(re.fullmatch(r"[0-9a-f]{12}", i) for i in ids)
+    assert set(_labels("opus_round1")) <= set(key)

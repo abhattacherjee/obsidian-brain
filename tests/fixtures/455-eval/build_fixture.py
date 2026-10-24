@@ -42,6 +42,11 @@ def _opaque(salt: bytes, name: str) -> str:
     return "n" + hmac.new(salt, b"id\0" + name.encode(), hashlib.sha256).hexdigest()[:12]
 
 
+def _blind(salt: bytes, bid: str) -> str:
+    """An opaque blind id: the spike's own ids are sha1(file name)[:12], so they must not be kept."""
+    return "b" + hmac.new(salt, b"blind\0" + bid.encode(), hashlib.sha256).hexdigest()[:12]
+
+
 def _term(salt: bytes, t: str) -> str:
     return hmac.new(salt, b"term\0" + t.encode(), hashlib.sha256).hexdigest()[:10]
 
@@ -77,11 +82,11 @@ def main(argv: list[str] | None = None) -> int:
         notes[unit] = {"notes": rows, "top_v2": sorted(_opaque(salt, x) for x in report[unit]["top_v2"])}
 
     (HERE / "key.json").write_text(json.dumps(
-        {bid: {**k, "item": _opaque(salt, k["item"])} for bid, k in sorted(key.items())}, indent=1) + "\n")
+        {_blind(salt, bid): {**k, "item": _opaque(salt, k["item"])} for bid, k in sorted(key.items())}, indent=1) + "\n")
     for judge in JUDGE_FILES:
         labels = json.loads((args.spike / "labels" / f"{judge}.json").read_text())
         (HERE / "labels" / f"{judge}.json").write_text(json.dumps(
-            [{"id": r["id"], "label": r["label"]} for r in labels], indent=1) + "\n")
+            [{"id": _blind(salt, r["id"]), "label": r["label"]} for r in labels], indent=1) + "\n")
     with gzip.open(HERE / "notes.json.gz", "wt", encoding="utf-8", compresslevel=9) as fh:
         json.dump(notes, fh, separators=(",", ":"))
     total = sum(len(u["notes"]) for u in notes.values())
