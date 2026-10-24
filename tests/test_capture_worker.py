@@ -570,3 +570,60 @@ def test_worker_can_point_at_an_earlier_capture_by_id(transcript, fake_claude, m
     assert f"[{old}] earlier" in fake_claude.calls[0].input
     again = next(r for r in capture_state.ledger_list(session=SID) if r["title"] == "again")
     assert again["duplicate_of"] == old
+
+
+def _log_text():
+    import obsidian_utils
+    path = capture_state._log_dir() / obsidian_utils._HOOK_LOG_NAME
+    return path.read_text() if path.exists() else ""
+
+
+def test_selection_failure_still_advances_the_offset(transcript, fake_claude, saves, mock_config, monkeypatch):
+    monkeypatch.setattr(capture_worker.capture_select, "run_selection",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("selection broke")))
+    fake_claude.outputs = [_envelope([CAND])]
+    assert capture_worker.run_batch(SID, transcript, "demo", mock_config) == "saved:1"
+    assert capture_state.get_state(SID)["offset"] == transcript.stat().st_size
+    assert "outcome=select-failed detail=RuntimeError:_selection_broke" in _log_text()
+
+
+def test_issue_check_failure_is_logged_and_the_batch_succeeds(transcript, fake_claude, saves, mock_config, monkeypatch):
+    monkeypatch.setattr(capture_worker.capture_select, "demote_closed",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError("gh gone")))
+    fake_claude.outputs = [_envelope([CAND])]
+    assert capture_worker.run_batch(SID, transcript, "demo", mock_config) == "saved:1"
+    assert "outcome=issue-check-failed" in _log_text()
+
+
+def test_run_batch_saves_provisional_then_promotes(transcript, fake_claude, mock_config, monkeypatch, tmp_vault):
+    """End to end in a tmp vault: the saved note is promoted by the slice's selection and the outcome says so."""
+    monkeypatch.setattr(capture_worker.capture_save, "find_match", lambda *a, **k: None)
+    monkeypatch.setattr(capture_worker.capture_save, "session_note_for", lambda *a: "")
+    gh = []
+    monkeypatch.setattr(capture_worker.capture_select, "demote_closed",
+                        lambda project, config: gh.append(project) or {"demoted": 0})
+    fake_claude.outputs = [_envelope([{**CAND, "title": "worth keeping", "body": "A real fact.", "score": 8}])]
+    assert capture_worker.run_batch(SID, transcript, "demo", mock_config) == "saved:1"
+    note = next((tmp_vault / "claude-insights").glob("*.md"))
+    assert "status: promoted" in note.read_text() and "capture_score: 8" in note.read_text()
+    assert "outcome=saved:1 detail=slices=1;promoted=1;demoted=0" in _log_text()
+    assert gh == ["demo"]  # once per run, after the slices
+
+
+def test_run_batch_logs_reads_of_vault_notes(tmp_path, fake_claude, saves, mock_config, monkeypatch, tmp_vault):
+    import vault_index
+    hand = tmp_vault / "claude-insights" / "hand.md"
+    hand.write_text("---\ntype: claude-insight\nproject: demo\n---\n\n# Hand\n\nA hand note.\n")
+    root = tmp_path / "projects"
+    (root / "-w").mkdir(parents=True)
+    t = root / "-w" / f"{SID}.jsonl"
+    read = {"type": "assistant", "timestamp": "2026-10-24T09:00:00Z", "message": {"role": "assistant", "content": [
+        {"type": "tool_use", "name": "Read", "input": {"file_path": str(hand)}}]}}
+    t.write_text("".join(json.dumps(r) + "\n" for r in [_row("a"), _row("b"), read, _row("c")]))
+    monkeypatch.setattr(capture_worker, "_TRANSCRIPTS_ROOT", root)
+    fake_claude.outputs = [_envelope([])]
+    capture_worker.run_batch(SID, t, "demo", mock_config)
+    conn = vault_index._connect(vault_index._default_db_path())
+    rows = conn.execute("SELECT note_path, context_type FROM access_log").fetchall()
+    conn.close()
+    assert [tuple(r) for r in rows] == [(str(hand), "tool-open")]

@@ -23,9 +23,12 @@ from pathlib import Path
 
 import capture_reject
 import capture_save
+import capture_select
 import capture_slice
 import capture_state
 import obsidian_utils
+import vault_index
+from obsidian_utils import indexed_folders
 
 SENTINEL = "OBSIDIAN-BRAIN-CAPTURE-WORKER v1"
 WORKER_TIMEOUT_SECONDS = 600
@@ -265,6 +268,26 @@ def resolve_refs(candidates: list[dict], cids: list) -> None:
             capture_state.ledger_update(cid, **refs)
 
 
+def _select(sid: str, project: str, config: dict, transcript_path: Path, start: int, end: int,
+            moved: dict) -> None:
+    """Log the slice's note opens, then re-select the session (#455). A failure is logged and changes nothing more."""
+    try:
+        db = vault_index.ensure_index(config["vault_path"], indexed_folders(config))
+        capture_select.log_slice_opens(transcript_path, start, end, config, sid, db)
+        got = capture_select.run_selection(sid, project, config, db=db)
+        moved["promoted"] += got["promoted"]
+        moved["demoted"] += got["demoted"]
+    except Exception as exc:  # noqa: BLE001 -- selection never blocks the offset
+        capture_state.append_capture_log(project, sid, "select-failed", f"{type(exc).__name__}: {exc}"[:160])
+
+
+def _demote_closed(project: str, config: dict, sid: str, moved: dict) -> None:
+    try:
+        moved["demoted"] += capture_select.demote_closed(project, config)["demoted"]
+    except Exception as exc:  # noqa: BLE001 -- a failed issue check demotes nothing
+        capture_state.append_capture_log(project, sid, "issue-check-failed", f"{type(exc).__name__}: {exc}"[:160])
+
+
 class _BatchStop(Exception):
     """Ends a batch early with an outcome; the offset stays where it is."""
 
@@ -286,6 +309,7 @@ def run_batch(sid: str, transcript_path: Path, project: str, config: dict | None
         capture_state.append_capture_log(project, sid, "claimed")
         return "claimed"
     outcome, saved, slices, detail = "empty", 0, 0, ""
+    moved = {"promoted": 0, "demoted": 0}
     try:
         config = config or obsidian_utils.load_config()
         session_note = repo = None
@@ -324,10 +348,13 @@ def run_batch(sid: str, transcript_path: Path, project: str, config: dict | None
                 pending = {**pending, "next": i + 1, "cids": cids}
                 capture_state.set_state(sid, pending=pending)
             resolve_refs(pending["candidates"], cids)
+            _select(sid, project, config, Path(transcript_path), offset, int(pending["end"]), moved)
             capture_state.set_state(sid, offset=int(pending["end"]), pending=None,
                                     transcript_path=str(transcript_path), project=project,
                                     last_batch_at=time.time())
             slices += 1
+        if slices:
+            _demote_closed(project, config, sid, moved)
     except _BatchStop as stop:
         outcome, detail = stop.outcome, stop.detail
     except Exception as exc:  # noqa: BLE001 -- logged as an error, never as "empty"
@@ -335,7 +362,8 @@ def run_batch(sid: str, transcript_path: Path, project: str, config: dict | None
     finally:
         capture_state.release(sid, token)
     if slices:
-        detail = f"slices={slices}" + (f";then={outcome}:{detail}" if outcome != "empty" else "")
+        detail = (f"slices={slices};promoted={moved['promoted']};demoted={moved['demoted']}"
+                  + (f";then={outcome}:{detail}" if outcome != "empty" else ""))
         outcome = f"saved:{saved}"
     capture_state.append_capture_log(project, sid, outcome, detail)
     return outcome

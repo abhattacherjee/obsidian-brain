@@ -1784,6 +1784,31 @@ def index_note(db_path: str, note_path: str) -> bool:
         conn.close()
 
 
+def update_note_status(db_path: str, note_path: str) -> bool:
+    """Refresh one indexed note's ``status``, mtime and size from its file, keeping its vector (#455).
+
+    Capture selection rewrites only frontmatter fields the index does not
+    score (``status``, ``capture_*``). A full ``index_note`` would re-derive
+    the TF-IDF vector against the current IDF, and that drift alone can flip
+    a near-tie in the next selection. A note not indexed yet is indexed in full.
+    """
+    if not os.path.isfile(db_path) or not os.path.isfile(note_path):
+        return False
+    parsed = _parse_note(note_path)
+    if parsed is None:
+        return False
+    st = os.stat(note_path)
+    conn = _connect(db_path)
+    try:
+        cur = conn.execute("UPDATE notes SET status = ?, mtime = ?, size = ? WHERE path = ?",
+                           (parsed.get("status"), st.st_mtime, st.st_size, note_path))
+        conn.commit()
+        updated = cur.rowcount > 0
+    finally:
+        conn.close()
+    return True if updated else index_note(db_path, note_path)
+
+
 # ---------------------------------------------------------------------------
 # Task-context detection
 # ---------------------------------------------------------------------------
