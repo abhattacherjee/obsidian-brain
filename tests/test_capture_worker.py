@@ -506,6 +506,27 @@ def test_ref_cycles_keep_one_note():
     assert [c["superseded_by"] for c in out] == [None, None, 3, None, None]
 
 
+def test_a_mixed_ref_cycle_keeps_one_note_eligible():
+    """a is a duplicate of b and b is superseded by a: each field alone is acyclic, together they exclude both."""
+    items = [{**CAND, "title": "a", "duplicate_of": 1}, {**CAND, "title": "b", "superseded_by": 0}]
+    out = capture_worker.parse_candidates(_envelope(items))
+    assert sum(1 for c in out if not c["duplicate_of"] and not c["superseded_by"]) == 1
+
+
+def test_longer_and_overlapping_mixed_cycles_each_keep_a_note():
+    items = [{**CAND, "title": "a", "duplicate_of": 1}, {**CAND, "title": "b", "superseded_by": 2},
+             {**CAND, "title": "c", "duplicate_of": 0, "superseded_by": 1},
+             {**CAND, "title": "d", "superseded_by": 4}, {**CAND, "title": "e", "duplicate_of": 3}]
+    out = capture_worker.parse_candidates(_envelope(items))
+    assert any(not c["duplicate_of"] and not c["superseded_by"] for c in out[:3])
+    assert any(not c["duplicate_of"] and not c["superseded_by"] for c in out[3:])
+    assert _find_no_cycle(out)
+
+
+def _find_no_cycle(out):
+    return capture_worker._find_cycle(out) is None
+
+
 def test_prompt_has_rubric_v2_ids_and_fields():
     p = capture_worker.build_prompt("x", "demo", [], [("0123456789ab", "t")])
     for text in ("**9-10:** a non-obvious gotcha", "**1-2:** transient state",
@@ -519,6 +540,14 @@ def test_earlier_titles_skip_rows_without_a_capture_id(mock_config):
     capture_state.ledger_append({"id": "not-hex", "session_id": SID, "title": "odd", "ts": 5.0})
     _ledger(SID, "good", ts=1.0)
     assert [t for _, t in capture_worker.earlier_titles(SID)] == ["good"]
+
+
+@pytest.mark.parametrize("bad", ["abc", "0123456789abc", "0123456789AB", "0123456789ag", "0123456789ab\n",
+                                 "０１２３４５６７８９ａｂ", ""])
+def test_earlier_titles_skip_ids_that_are_not_twelve_lowercase_hex(mock_config, bad):
+    capture_state.ledger_append({"id": bad, "session_id": SID, "title": "odd", "ts": 5.0})
+    capture_state.ledger_append({"id": "0123456789ab", "session_id": SID, "title": "good", "ts": 1.0})
+    assert capture_worker.earlier_titles(SID) == [("0123456789ab", "good")]
 
 
 def test_refs_resolve_to_cids_across_a_retry(transcript, fake_claude, monkeypatch, mock_config):
@@ -593,6 +622,25 @@ def test_issue_check_failure_is_logged_and_the_batch_succeeds(transcript, fake_c
     fake_claude.outputs = [_envelope([CAND])]
     assert capture_worker.run_batch(SID, transcript, "demo", mock_config) == "saved:1"
     assert "outcome=issue-check-failed" in _log_text()
+
+
+def test_promote_used_failure_is_logged_and_the_batch_succeeds(transcript, fake_claude, saves, mock_config, monkeypatch):
+    monkeypatch.setattr(capture_worker.capture_select, "promote_used",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError("db gone")))
+    fake_claude.outputs = [_envelope([CAND])]
+    assert capture_worker.run_batch(SID, transcript, "demo", mock_config) == "saved:1"
+    assert "outcome=promote-used-failed" in _log_text()
+
+
+def test_promote_used_runs_once_after_the_slices_and_counts(transcript, fake_claude, saves, mock_config, monkeypatch):
+    seen = []
+    monkeypatch.setattr(capture_worker.capture_select, "promote_used",
+                        lambda config, **k: seen.append(config) or {"promoted": 2, "checked": 2})
+    fake_claude.outputs = [_envelope([CAND])]
+    assert capture_worker.run_batch(SID, transcript, "demo", mock_config) == "saved:1"
+    assert seen == [mock_config] and "promoted=" in _log_text()
+    assert capture_worker.run_batch(SID, transcript, "demo", mock_config) == "empty"  # no slices: no pass
+    assert len(seen) == 1
 
 
 def test_run_batch_saves_provisional_then_promotes(transcript, fake_claude, mock_config, monkeypatch, tmp_vault):

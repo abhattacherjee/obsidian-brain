@@ -173,19 +173,56 @@ def _coerce_ref(value, i: int, kept: dict[int, int], earlier_ids: set[str]):
     return None
 
 
-def _break_cycles(cands: list[dict], field: str, keep) -> None:
-    """Null the ref that closes an in-array cycle (a dup of b, b dup of a), so one note of it survives.
+def _find_cycle(cands: list[dict]) -> list[tuple[int, str]] | None:
+    """One cycle in the combined ``duplicate_of`` + ``superseded_by`` graph, as ``[(node, field of its edge)]``."""
+    def edges(i):
+        for field in _REF_FIELDS:
+            j = cands[i].get(field)
+            if isinstance(j, int) and not isinstance(j, bool) and 0 <= j < len(cands):
+                yield field, j
 
-    ``keep`` picks the survivor from the cycle's indices: the first for
-    duplicates, the last (newest) for supersessions.
-    """
+    done: set[int] = set()
     for start in range(len(cands)):
-        seen, j = [], start
-        while isinstance(cands[j].get(field), int) and j not in seen:
-            seen.append(j)
-            j = cands[j][field]
-        if j in seen:
-            cands[keep(seen[seen.index(j):])][field] = None
+        if start in done:
+            continue
+        path: list[tuple[int, str]] = []  # nodes on the current walk with the edge taken out of each
+        stack = [(start, iter(edges(start)))]
+        on_path = {start: 0}
+        while stack:
+            node, it = stack[-1]
+            nxt = next(it, None)
+            if nxt is None:
+                stack.pop()
+                on_path.pop(node, None)
+                done.add(node)
+                if path:
+                    path.pop()
+                continue
+            field, j = nxt
+            path.append((node, field))
+            if j in on_path:
+                return path[on_path[j]:]
+            if j in done:
+                path.pop()
+                continue
+            on_path[j] = len(path)
+            stack.append((j, iter(edges(j))))
+    return None
+
+
+def _break_cycles(cands: list[dict]) -> None:
+    """Null the ref that closes a cycle (a dup of b, b dup of a, or a dup of b, b superseded by a), so one note survives.
+
+    Cycles are found on the combined graph of both ref fields: a mixed cycle
+    would otherwise leave every note in it excluded. The survivor is the
+    first note of a duplicate cycle and the last (newest) of any cycle that
+    holds a supersession.
+    """
+    while (cycle := _find_cycle(cands)) is not None:
+        pick = min if all(f == "duplicate_of" for _, f in cycle) else max
+        node = pick(n for n, _ in cycle)
+        field = next(f for n, f in cycle if n == node)
+        cands[node][field] = None
 
 
 def parse_candidates(stdout: str, earlier_ids=()) -> list[dict]:
@@ -214,8 +251,7 @@ def parse_candidates(stdout: str, earlier_ids=()) -> list[dict]:
         for field in _REF_FIELDS:
             cand[field] = _coerce_ref(items[n].get(field), n, kept, ids)
         out.append(cand)
-    _break_cycles(out, "duplicate_of", min)
-    _break_cycles(out, "superseded_by", max)
+    _break_cycles(out)
     return out
 
 
@@ -288,6 +324,13 @@ def _demote_closed(project: str, config: dict, sid: str, moved: dict) -> None:
         capture_state.append_capture_log(project, sid, "issue-check-failed", f"{type(exc).__name__}: {exc}"[:160])
 
 
+def _promote_used(project: str, config: dict, sid: str, moved: dict) -> None:
+    try:
+        moved["promoted"] += capture_select.promote_used(config)["promoted"]
+    except Exception as exc:  # noqa: BLE001 -- a failed promotion pass changes nothing more
+        capture_state.append_capture_log(project, sid, "promote-used-failed", f"{type(exc).__name__}: {exc}"[:160])
+
+
 class _BatchStop(Exception):
     """Ends a batch early with an outcome; the offset stays where it is."""
 
@@ -355,6 +398,7 @@ def run_batch(sid: str, transcript_path: Path, project: str, config: dict | None
             slices += 1
         if slices:
             _demote_closed(project, config, sid, moved)
+            _promote_used(project, config, sid, moved)
     except _BatchStop as stop:
         outcome, detail = stop.outcome, stop.detail
     except Exception as exc:  # noqa: BLE001 -- logged as an error, never as "empty"

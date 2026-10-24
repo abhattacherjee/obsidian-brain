@@ -1788,13 +1788,29 @@ def index_note(db_path: str, note_path: str) -> bool:
         conn.close()
 
 
-def update_note_status(db_path: str, note_path: str) -> bool:
-    """Refresh one indexed note's ``status``, mtime and size from its file, keeping its vector (#455).
+def file_stat_key(note_path: str) -> tuple[float, int] | None:
+    """``(st_mtime, st_size)`` of ``note_path``, or None when it cannot be read."""
+    try:
+        st = os.stat(note_path)
+    except OSError:
+        return None
+    return (st.st_mtime, st.st_size)
+
+
+def update_note_status(db_path: str, note_path: str, pre_stat: tuple[float, int] | None = None) -> bool:
+    """Refresh one indexed note's ``status`` from its file, keeping its vector (#455).
 
     Capture selection rewrites only frontmatter fields the index does not
     score (``status``, ``capture_*``). A full ``index_note`` would re-derive
     the TF-IDF vector against the current IDF, and that drift alone can flip
     a near-tie in the next selection. A note not indexed yet is indexed in full.
+
+    ``pre_stat`` is ``file_stat_key`` taken just before our own write. The
+    row's mtime and size are stamped with the file's new ones only when the
+    row still held ``pre_stat``, i.e. the index had seen exactly the content
+    we edited. Otherwise (an external edit the index never saw, or no
+    ``pre_stat``) only ``status`` changes and the row stays stale, so the
+    next ``_sync`` re-indexes the content.
     """
     if not os.path.isfile(db_path) or not os.path.isfile(note_path):
         return False
@@ -1804,10 +1820,19 @@ def update_note_status(db_path: str, note_path: str) -> bool:
     st = os.stat(note_path)
     conn = _connect(db_path)
     try:
-        cur = conn.execute("UPDATE notes SET status = ?, mtime = ?, size = ? WHERE path = ?",
-                           (parsed.get("status"), st.st_mtime, st.st_size, note_path))
-        conn.commit()
-        updated = cur.rowcount > 0
+        row = conn.execute("SELECT mtime, size FROM notes WHERE path = ?", (note_path,)).fetchone()
+        if row is None:
+            updated = False
+        else:
+            fresh = (pre_stat is not None and row["mtime"] is not None and row["size"] is not None
+                     and mtime_unchanged(pre_stat[0], row["mtime"]) and pre_stat[1] == row["size"])
+            if fresh:
+                conn.execute("UPDATE notes SET status = ?, mtime = ?, size = ? WHERE path = ?",
+                             (parsed.get("status"), st.st_mtime, st.st_size, note_path))
+            else:
+                conn.execute("UPDATE notes SET status = ? WHERE path = ?", (parsed.get("status"), note_path))
+            conn.commit()
+            updated = True
     finally:
         conn.close()
     return True if updated else index_note(db_path, note_path)

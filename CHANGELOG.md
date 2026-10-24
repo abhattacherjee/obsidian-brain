@@ -15,6 +15,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `scripts/capture_provisional_backfill.py` runs the same selection over auto notes captured from 2026-10-18 to 2026-10-23 (`--since`/`--until`, both inclusive). Scores come from `--scores FILE` (read-only, such as the spike's `scores_v2.json`) and a cache that `--score` or `--apply` fills with Haiku in batches of 20. A note that was ever opened (an access, a hand update, or another session's `Read` of it in any transcript) stays promoted. The dry run is the default: it calls no model, writes nothing, and prints counts per project and session and a token estimate. `--apply` backs up the DB (row counts checked) and every note it touches, then writes the status, the score parts and `demoted_by: backlog`. It deletes no note. Exit 0 ok, 1 refused or failed, 2 usage error. On the live vault, the dry run finds 3,402 notes: 402 would stay promoted, 27 are kept as opened, and 2,973 would become provisional.
 - `note_writer.set_frontmatter_fields` sets, inserts or removes top-level frontmatter fields under the note's lock, atomically, keeping its line endings. Keys and values are allow-listed. `vault_index.update_note_status` refreshes an indexed note's status without re-deriving its vector.
 - `tests/fixtures/455-eval/` holds the blind-judged spike (9 sessions, 1,547 notes; no note text, as the repo is public). `tests/test_capture_select_eval.py` replays the selection on it: the top-10 keep rate is 84% under the Opus labels and 68% under Astra, against 43% and 40% for capture order.
+- `capture_select.promote_used` promotes a provisional note that was used after it was captured, in any project and session, so a note of a finished session is no longer stuck out of the pool (#455). `run_batch` calls it after `demote_closed` at the end of every batch; a failure is logged as `promote-used-failed` and never blocks the batch.
+
+### Fixed
+- Review fixes for capture selection (#455):
+  - If a demotion write fails, `run_selection` makes no promotion in that run (it logs `select-failed detail=demotion-write`), so a session never holds more than 10 non-sticky picks.
+  - `vault_index.update_note_status` stamps a row's mtime and size only when the row still held the file's stat from just before our own write. An external edit the index had not seen now stays stale and is re-indexed by the next sync.
+  - `note_writer.set_frontmatter_fields` takes its stat from the open file before the read, so a change between the read and the stat is caught.
+  - The backlog tool can be run twice over the same window: notes it selected earlier are selected again, notes the live selection promoted count against their session's cap of 10, and notes it wrote carry `selected_by: backlog`.
+  - Mixed `duplicate_of` and `superseded_by` cycles keep one note eligible.
+  - The backlog scorer fences each note in tags that carry a random per-batch nonce and defuses any `</note` in the text, in any case or spacing.
+  - The backlog skips notes that resolve outside the vault and reports a bad note instead of stopping. `demote_closed` skips a ledger path outside the vault.
+  - `vault_scan.py meta` reports `status` for an oversized note, and `/vault-ask` drops a provisional row even when it has an `error`.
+  - The eval fixture derives note ids with HMAC-SHA256 under the same unstored salt as its terms (keep rates unchanged). `AUTO_HEADING_RE` ends with `\Z`.
 
 ## [3.9.1] - 2026-10-23
 

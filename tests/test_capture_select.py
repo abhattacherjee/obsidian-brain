@@ -4,6 +4,7 @@ Every test uses a tmp vault and a tmp index; no test runs gh or claude.
 """
 
 import json
+import os
 import subprocess
 import time
 from pathlib import Path
@@ -134,6 +135,28 @@ def test_hand_updated_rules(tmp_path):
     p.write_text(base + "\n## Update (2026-10-23)\n\nwritten by /compress\n")
     assert capture_select.hand_updated(p) is True
     assert capture_select.hand_updated(tmp_path / "missing.md") is False
+
+
+@pytest.mark.parametrize("heading", [
+    "## Update (2026-10-20) — auto-capture abcdef123456 extra",
+    "## Update (2026-10-20) — auto-capture abc",
+])
+def test_a_near_miss_auto_heading_counts_as_a_hand_update(tmp_path, heading):
+    p = tmp_path / "n.md"
+    p.write_text(f"---\ntype: claude-insight\n---\n\n# T\n\nBody.\n\n{heading}\n\nby hand\n")
+    assert capture_select.hand_updated(p) is True
+
+
+def test_dup_cos_boundary_is_at_point_six():
+    assert capture_select.DUP_COS == 0.6
+    a = {"id": "a", "merit": 0.9, "vector": {"x": 1.0}, "ts": 1}
+
+    def twin(cos):
+        return {"id": "b", "merit": 0.8, "vector": {"x": cos, "y": (1 - cos * cos) ** 0.5}, "ts": 2}
+
+    assert capture_select.select([a, twin(0.5999)], cap=5) == ["a", "b"]  # just below: picked
+    assert capture_select.select([a, twin(0.6001)], cap=5) == ["a"]       # just above: skipped
+    assert capture_select.select([a, twin(0.6)], cap=5) == ["a"]          # the bound itself is skipped (>=)
 
 
 # --- run_selection ---------------------------------------------------------------
@@ -359,6 +382,31 @@ def test_demotions_are_written_before_promotions(mock_config, db, monkeypatch):
     assert order == ["provisional", "promoted"]
 
 
+def test_a_failed_demotion_blocks_every_promotion_in_that_run(mock_config, db, monkeypatch):
+    rows = [_note(mock_config, i, score=5) for i in range(10)]
+    capture_select.run_selection(SID, "demo", mock_config, db=db)
+    strong = [_note(mock_config, 10 + i, score=10) for i in range(2)]  # displace two of the ten
+    real = capture_select.note_writer.set_frontmatter_fields
+    fail = {"on": True}
+
+    def flaky(vault, path, fields):
+        if fail["on"] and fields.get("status") == "provisional":
+            raise OSError("another process is updating this note")
+        return real(vault, path, fields)
+
+    monkeypatch.setattr(capture_select.note_writer, "set_frontmatter_fields", flaky)
+    got = capture_select.run_selection(SID, "demo", mock_config, db=db)
+    assert got["promoted"] == 0 and got.get("deferred") is True
+    assert [_status(mock_config, r) for r in strong] == ["provisional"] * 2
+    assert [_status(mock_config, r) for r in rows].count("promoted") == 10  # never over the cap
+    assert any("outcome=select-failed" in ln and "detail=demotion-write;cid=" in ln for ln in _log_lines())
+    fail["on"] = False  # the next slice finishes the job
+    got = capture_select.run_selection(SID, "demo", mock_config, db=db)
+    assert got["promoted"] == 2 and got["demoted"] == 2 and "deferred" not in got
+    every = rows + strong
+    assert [_status(mock_config, r) for r in every].count("promoted") == 10
+
+
 def test_a_pick_clears_the_backlog_flag(mock_config, db):
     note = _note(mock_config, 0, score=9, extra_fm="demoted_by: backlog\n")
     capture_select.run_selection(SID, "demo", mock_config, db=db)
@@ -445,6 +493,24 @@ def test_closed_issue_demotes(mock_config, db, promoted_issue_note):
     assert any("why=issue-closed:455" in ln and "outcome=demoted" in ln for ln in _log_lines())
     capture_select.run_selection(SID, "demo", mock_config, db=db)
     assert _status(mock_config, promoted_issue_note) == "provisional"  # selection never re-promotes it
+
+
+def test_a_ledger_path_that_escapes_the_vault_is_not_read(mock_config, db, tmp_path_factory, promoted_issue_note):
+    outside = tmp_path_factory.mktemp("elsewhere") / "evil.md"
+    vault_note = Path(mock_config["vault_path"]) / promoted_issue_note["note_path"]
+    outside.write_text(vault_note.read_text())
+    before = outside.read_bytes()
+    capture_state.ledger_append({**{k: v for k, v in promoted_issue_note.items() if k != "id"},
+                                 "note_path": os.path.relpath(outside, mock_config["vault_path"]),
+                                 "ts": time.time()})
+    link = Path(mock_config["vault_path"]) / "claude-insights" / "link.md"
+    link.symlink_to(outside)
+    capture_state.ledger_append({**{k: v for k, v in promoted_issue_note.items() if k != "id"},
+                                 "note_path": "claude-insights/link.md", "ts": time.time()})
+    vault_note.unlink()  # leave only the escaping rows
+    run = _gh()
+    assert capture_select.demote_closed("demo", mock_config, run=run, db=db) == {"checked": 0, "demoted": 0}
+    assert run.calls == [] and outside.read_bytes() == before
 
 
 @pytest.mark.parametrize("run", [
@@ -543,11 +609,150 @@ def test_update_note_status_keeps_the_vector(mock_config, db):
     conn.execute("UPDATE notes SET tfidf_vector = ? WHERE path = ?", ('{"kept": 1.0}', path))
     conn.commit()
     conn.close()
+    pre = vault_index.file_stat_key(path)
     capture_select.note_writer.set_frontmatter_fields(mock_config["vault_path"], path, {"status": "promoted"})
-    assert vault_index.update_note_status(db, path)
+    assert vault_index.update_note_status(db, path, pre)
     conn = vault_index._connect(db)
     got = conn.execute("SELECT status, tfidf_vector, mtime FROM notes WHERE path = ?", (path,)).fetchone()
     conn.close()
     assert vec and got["status"] == "promoted" and got["tfidf_vector"] == '{"kept": 1.0}'
     assert vault_index.mtime_unchanged(Path(path).stat().st_mtime, got["mtime"])
     assert vault_index.update_note_status(db, path + ".missing") is False
+
+
+def _index_stat(db, path):
+    conn = vault_index._connect(db)
+    row = conn.execute("SELECT status, mtime, size FROM notes WHERE path = ?", (path,)).fetchone()
+    conn.close()
+    return row
+
+
+def test_update_note_status_stamps_a_fresh_row(mock_config, db):
+    row = _note(mock_config, 0)
+    path = str(Path(mock_config["vault_path"]) / row["note_path"])
+    vault_index.index_note(db, path)
+    pre = vault_index.file_stat_key(path)
+    capture_select.note_writer.set_frontmatter_fields(mock_config["vault_path"], path, {"status": "promoted"})
+    assert vault_index.update_note_status(db, path, pre)
+    got, st = _index_stat(db, path), Path(path).stat()
+    assert got["status"] == "promoted" and got["size"] == st.st_size
+    assert vault_index.mtime_unchanged(st.st_mtime, got["mtime"])
+
+
+def test_update_note_status_leaves_a_row_stale_after_an_unseen_external_edit(mock_config, db):
+    """The index never saw the external edit, so stamping our mtime would hide it from _sync for good."""
+    row = _note(mock_config, 0, body=_words(3, 20))
+    path = Path(mock_config["vault_path"]) / row["note_path"]
+    vault_index.index_note(db, str(path))
+    old = _index_stat(db, str(path))
+    time.sleep(0.01)
+    path.write_text(path.read_text().replace(_words(3, 20), _words(4, 20)))  # edited in Obsidian, not indexed yet
+    pre = vault_index.file_stat_key(str(path))
+    capture_select.note_writer.set_frontmatter_fields(mock_config["vault_path"], str(path), {"status": "promoted"})
+    assert vault_index.update_note_status(db, str(path), pre)
+    got = _index_stat(db, str(path))
+    assert got["status"] == "promoted" and got["mtime"] == old["mtime"] and got["size"] == old["size"]
+    assert not vault_index.mtime_unchanged(path.stat().st_mtime, got["mtime"])
+    vault_index.ensure_index(mock_config["vault_path"], FOLDERS, db_path=db)  # _sync re-indexes the content
+    conn = vault_index._connect(db)
+    body = conn.execute("SELECT body FROM notes WHERE path = ?", (str(path),)).fetchone()["body"]
+    conn.close()
+    assert _words(4, 20) in body
+
+
+def test_update_note_status_without_a_pre_stat_never_stamps(mock_config, db):
+    row = _note(mock_config, 0)
+    path = str(Path(mock_config["vault_path"]) / row["note_path"])
+    vault_index.index_note(db, path)
+    old = _index_stat(db, path)
+    capture_select.note_writer.set_frontmatter_fields(mock_config["vault_path"], path, {"status": "promoted"})
+    assert vault_index.update_note_status(db, path)
+    got = _index_stat(db, path)
+    assert got["status"] == "promoted" and got["mtime"] == old["mtime"]
+
+
+# --- promote_used: promotion on use for finished sessions ---------------------------
+
+LATER = CREATED_TS + 30 * 86400  # "now" for promote_used: after every fixture access row
+
+
+def _provisional(config, db, i=0, **kw):
+    """A provisional note that has been indexed, from a session whose selection is long over."""
+    row = _note(config, i, score=kw.pop("score", 1), **kw)
+    vault_index.index_note(db, str(Path(config["vault_path"]) / row["note_path"]))
+    return row
+
+
+def test_promote_used_promotes_a_finished_sessions_note_searched_a_day_later(mock_config, db):
+    row = _provisional(mock_config, db)
+    _access(db, row, mock_config, "search", CREATED_TS + 86400)
+    got = capture_select.promote_used(mock_config, db=db, now=LATER)
+    assert got["promoted"] == 1
+    fm = _fm(mock_config, row)
+    assert fm["status"] == "promoted" and fm["promoted_by"] == "access"
+    assert vault_index._connect(db).execute("SELECT status FROM notes WHERE path LIKE ?", ("%n0.md",)).fetchone()[0] \
+        == "promoted"
+    assert any(f"cid={row['id']}" in ln and "outcome=promoted" in ln and "why=sticky-access" in ln
+               for ln in _log_lines())
+    capture_select.run_selection(SID, "demo", mock_config, db=db)  # selection then agrees: still promoted, sticky
+    assert _fm(mock_config, row)["status"] == "promoted"
+
+
+def test_promote_used_keeps_a_decision_active(mock_config, db):
+    row = _provisional(mock_config, db, ntype="decision")
+    _access(db, row, mock_config, "tool-open", CREATED_TS + 60)
+    capture_select.promote_used(mock_config, db=db, now=LATER)
+    assert _status(mock_config, row) == "active"
+
+
+@pytest.mark.parametrize("context, offset", [("related", 3600), ("recall", 3600), ("search", -3600),
+                                              ("tool-open", -3600)])
+def test_promote_used_ignores_automatic_and_earlier_rows(mock_config, db, context, offset):
+    row = _provisional(mock_config, db)
+    _access(db, row, mock_config, context, CREATED_TS + offset)
+    assert capture_select.promote_used(mock_config, db=db, now=LATER)["promoted"] == 0
+    assert _status(mock_config, row) == "provisional"
+
+
+def test_promote_used_twice_writes_once(mock_config, db):
+    row = _provisional(mock_config, db)
+    _access(db, row, mock_config, "search", CREATED_TS + 60)
+    assert capture_select.promote_used(mock_config, db=db, now=LATER)["promoted"] == 1
+    path = Path(mock_config["vault_path"]) / row["note_path"]
+    before, lines = (path.stat().st_mtime_ns, path.read_bytes()), len(_log_lines())
+    assert capture_select.promote_used(mock_config, db=db, now=LATER)["promoted"] == 0
+    assert (path.stat().st_mtime_ns, path.read_bytes()) == before and len(_log_lines()) == lines
+
+
+def test_promote_used_skips_rejected_issue_closed_and_outside_the_vault(mock_config, db, tmp_path_factory):
+    closed = _provisional(mock_config, db, 0, extra_fm="demoted_by: issue-closed\n")
+    rej = _provisional(mock_config, db, 1)
+    vault = Path(mock_config["vault_path"])
+    (vault / "claude-insights" / "_rejected").mkdir()
+    (vault / rej["note_path"]).rename(vault / "claude-insights" / "_rejected" / "n1.md")
+    moved = str(vault / "claude-insights" / "_rejected" / "n1.md")
+    outside = tmp_path_factory.mktemp("elsewhere") / "outside.md"
+    outside.write_text((vault / _note(mock_config, 5, ledger=False)["note_path"]).read_text())  # plain provisional
+    conn = vault_index._connect(db)
+    conn.execute("UPDATE notes SET path = ? WHERE path LIKE ?", (moved, "%n1.md"))
+    conn.execute("INSERT INTO notes (path, type, status, mtime, project) VALUES (?, 'claude-insight', 'provisional', 1, 'demo')",
+                 (str(outside),))
+    for p in (str(vault / closed["note_path"]), moved, str(outside)):
+        conn.execute("INSERT INTO access_log (note_path, timestamp, context_type, project) VALUES (?, ?, 'search', 'demo')",
+                     (p, CREATED_TS + 60))
+    conn.commit()
+    conn.close()
+    before = outside.read_bytes()
+    assert capture_select.promote_used(mock_config, db=db, now=LATER)["promoted"] == 0
+    assert "status: provisional" in (vault / "claude-insights" / "_rejected" / "n1.md").read_text()
+    assert _status(mock_config, closed) == "provisional" and outside.read_bytes() == before
+
+
+def test_promote_used_confirms_status_from_the_frontmatter(mock_config, db):
+    """A stale index row says provisional, but the file was promoted since: nothing is written."""
+    row = _provisional(mock_config, db)
+    path = Path(mock_config["vault_path"]) / row["note_path"]
+    path.write_text(path.read_text().replace("status: provisional", "status: superseded"))
+    _access(db, row, mock_config, "search", CREATED_TS + 60)
+    assert capture_select.promote_used(mock_config, db=db, now=LATER)["promoted"] == 0
+    assert "status: superseded" in path.read_text()

@@ -332,6 +332,26 @@ def test_strip_auto_updates_needs_the_exact_heading():
     assert capture_save.strip_auto_updates(near) == near
 
 
+@pytest.mark.parametrize("heading", [
+    "## Update (2026-10-20) — auto-capture abcdef123456 extra",   # trailing text after the id
+    "## Update (2026-10-20) — auto-capture abc",                  # id too short
+    "## Update (2026-10-20) — auto-capture abcdef1234567",        # id too long
+    "## Update (2026-10-20) — auto-capture abcdef12345g",         # not hex
+    "## Update (2026-10-20) — auto-capture abcdef123456 ",        # trailing space
+    "### Update (2026-10-20) — auto-capture abcdef123456",        # wrong level
+])
+def test_only_the_exact_auto_heading_is_ours(heading):
+    """A near-miss heading is a hand heading: strip_auto_updates keeps it and hand_updated sees it (C-015)."""
+    assert capture_save.AUTO_HEADING_RE.match(heading) is None
+    text = f"# T\n\nOriginal.\n\n{heading}\n\nhand words\n"
+    assert capture_save.strip_auto_updates(text) == text
+
+
+def test_the_exact_auto_heading_matches():
+    assert capture_save.AUTO_HEADING_RE.match("## Update (2026-10-20) — auto-capture abcdef123456")
+    assert capture_save.AUTO_HEADING_RE.match("## Update (2026-10-20) — auto-capture abcdef123456\n") is None
+
+
 def test_empty_query_vector_saves_as_new(mock_config, tmp_vault, monkeypatch):
     _fake_results(monkeypatch, [{"path": "claude-insights/b.md", "type": "claude-insight", "rank": -30.0}],
                   vault=tmp_vault)

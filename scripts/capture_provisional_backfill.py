@@ -8,6 +8,10 @@ by merit (rubric v2 score, novelty) promoted and marks the rest
 (a search or tool-open access, a hand /compress update, or another
 session's Read of it) stays promoted outside the cap. No note is deleted.
 
+Running it again over the same window is safe: notes this tool selected
+earlier (`selected_by: backlog`) are selected again, and notes the live
+selection promoted are skipped but count against their session's cap of 10.
+
 Usage:
     python3 scripts/capture_provisional_backfill.py                       # dry run
     python3 scripts/capture_provisional_backfill.py --scores scores_v2.json --score   # fill the score cache

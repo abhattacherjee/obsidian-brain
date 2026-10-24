@@ -29,9 +29,10 @@ the same keep rates.
   `top_v2`. `score` is the Haiku rubric v2 score and `novelty` the spike's.
 - `build_fixture.py`: rebuilds the three above from the spike directory.
 
-The repo is public, so the fixture holds no note text: note names are hashed,
-the judges' reasons are dropped, and each vector's terms are hashed with a
-random salt that is not stored. Cosines are unchanged. The raw spike files
+The repo is public, so the fixture holds no note text: note ids and vector terms
+are HMAC-SHA256 values under one random salt that is not stored (a bare hash
+of a note name could be checked by guessing names), and the judges' reasons are
+dropped. Cosines are unchanged. The raw spike files
 (`blind.json` with the note text, `key.json` with the note names, the labels
 with the judges' reasons, and the spike scripts) stay in
 `~/.claude/obsidian-brain/spike-455/` on the machine that ran it.
@@ -44,5 +45,5 @@ python3 tests/fixtures/455-eval/build_fixture.py
 
 It reads the spike directory and opens the live index
 (`~/.claude/obsidian-brain-vault.db`) read-only for the vectors. It writes
-only the files above. A rebuild uses a new salt, so `notes.json.gz` changes
+only the files above. A rebuild uses a new salt, so `notes.json.gz` and `key.json` change
 even when nothing else did.

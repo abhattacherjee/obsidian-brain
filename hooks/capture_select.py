@@ -14,7 +14,9 @@ session's new notes from the ledger and promotes the best ``CAP`` of them:
 
 A note that was really used (a ``search`` or ``tool-open`` access after it
 was created) or updated by hand is promoted for good, outside the cap.
-``demote_closed`` demotes a promoted note that is chiefly the state of an
+``promote_used`` does that for finished sessions too: it runs at the end of
+every capture batch and promotes any provisional note used since it was
+captured, in any project and session. ``demote_closed`` demotes a promoted note that is chiefly the state of an
 issue that closed after the note was captured.
 
 Statuses: provisional, promoted (insight and error-fix), active (decision,
@@ -321,8 +323,9 @@ def _apply(e: dict, config: dict, db: str, project: str, sid: str) -> str | None
     newly_sticky = e["kind"] == "sticky" and not fm.get("promoted_by")
     if was == want and not (unrecorded or newly_sticky):
         return None  # a rank change alone does not rewrite the file (Ruling 7)
+    pre = vault_index.file_stat_key(str(e["path"]))
     note_writer.set_frontmatter_fields(config["vault_path"], str(e["path"]), e["fields"])
-    vault_index.update_note_status(db, str(e["path"]))
+    vault_index.update_note_status(db, str(e["path"]), pre)
     if was == want:
         return None
     outcome = "promoted" if want != PROVISIONAL else "demoted"
@@ -333,24 +336,103 @@ def _apply(e: dict, config: dict, db: str, project: str, sid: str) -> str | None
 def run_selection(session_id: str, project: str, config: dict, *, db: str | None = None) -> dict:
     """Re-select the session's notes and write the changes; returns ``{promoted, demoted, picked}``.
 
-    Demotions are written before promotions, so a failure partway never
-    leaves more than ``CAP`` picks promoted. A note that cannot be written
-    (locked, changed under us) keeps its status and is retried next slice.
+    Demotions are written before promotions. If any demotion write fails,
+    this run makes no promotion at all (it logs ``select-failed`` with
+    ``detail=demotion-write`` and adds ``deferred: True`` to the counts), so a
+    failure never leaves more than ``CAP`` picks promoted; the next slice
+    retries. Any other note that cannot be written (locked, changed under us)
+    keeps its status and is retried next slice.
     """
     db = db or vault_index.ensure_index(config["vault_path"], indexed_folders(config))
     entries = plan_session(session_id, config, db)
     counts = {"promoted": 0, "demoted": 0, "picked": sum(e["why"] == "pick" for e in entries)}
     order = sorted(entries, key=lambda e: e["want"] != PROVISIONAL)  # demotions first
+    demotion_failed = None
     for e in order:
+        is_demotion = e["want"] == PROVISIONAL and e["fm"].get("status") != PROVISIONAL
+        if demotion_failed and e["want"] != PROVISIONAL:
+            break  # only promotions remain: leave them for the next slice
         try:
             outcome = _apply(e, config, db, project, session_id)
         except (OSError, ValueError) as exc:
             capture_state.append_capture_log(project, session_id, "select-write-failed",
                                              f"cid={e['row']['id']};{type(exc).__name__}: {exc}"[:160])
+            if is_demotion and demotion_failed is None:
+                demotion_failed = e["row"]["id"]
             continue
         if outcome:
             counts[outcome] += 1
+    if demotion_failed:
+        capture_state.append_capture_log(project, session_id, "select-failed",
+                                         f"detail=demotion-write;cid={demotion_failed}")
+        counts["deferred"] = True
     return counts
+
+
+def promote_used(config: dict, *, now: float | None = None, db: str | None = None) -> dict:
+    """Promote for good every provisional note that was used after it was captured, in any project and session.
+
+    Selection checks use per session, and only while the session is still
+    being captured; a note used after its session ended would stay hidden.
+    One join finds provisional notes with a ``search`` or ``tool-open``
+    access row; the note's own ``created_at`` and status are then confirmed
+    from its frontmatter. The note becomes ``promoted_status(type)`` with
+    ``promoted_by: access``, outside the cap. Notes in ``_rejected``, outside
+    the vault, or flagged ``issue-closed`` are skipped. A second run writes
+    nothing. Returns ``{"checked", "promoted"}``.
+    """
+    now = time.time() if now is None else now
+    db = db or vault_index._default_db_path()
+    out = {"checked": 0, "promoted": 0}
+    if not os.path.isfile(db):
+        return out
+    vault = Path(config["vault_path"])
+    root = vault.resolve()
+    conn = vault_index._connect(db)
+    try:
+        hits = conn.execute(
+            f"SELECT n.path AS path, n.type AS type, n.project AS project, n.source_session AS sid, "
+            f"MAX(a.timestamp) AS used FROM notes n JOIN access_log a ON a.note_path = n.path "
+            f"WHERE n.status = ? AND a.timestamp <= ? AND a.context_type IN ({','.join('?' * len(STICKY_CONTEXTS))}) "
+            f"GROUP BY n.path", (PROVISIONAL, now, *STICKY_CONTEXTS)).fetchall()
+    finally:
+        conn.close()
+    if not hits:
+        return out
+    ledger = {r["note_path"]: r for r in capture_state.ledger_list(limit=10**9)
+              if r.get("kind") == "new" and isinstance(r.get("note_path"), str)}
+    for hit in hits:
+        path = Path(hit["path"])
+        try:
+            resolved = path.resolve()
+        except (OSError, RuntimeError):
+            continue
+        if not resolved.is_relative_to(root) or capture_save._is_rejected(str(resolved.relative_to(root))):
+            continue
+        if not path.is_file():
+            continue
+        out["checked"] += 1
+        fm = obsidian_utils._peek_frontmatter_fields(path, _FM_FIELDS)
+        if fm.get("status") != PROVISIONAL or fm.get("demoted_by") == ISSUE_CLOSED:
+            continue
+        row = ledger.get(str(resolved.relative_to(root))) or {}
+        created = _epoch(fm.get("created_at"), float(row.get("ts") or 0.0))
+        if not hit["used"] > created:
+            continue
+        top = "active" if hit["type"] == "claude-decision" else "promoted"
+        pre = vault_index.file_stat_key(str(path))
+        try:
+            note_writer.set_frontmatter_fields(config["vault_path"], str(path),
+                                               {"status": top, "promoted_by": "access", "demoted_by": None})
+        except (OSError, ValueError) as exc:
+            capture_state.append_capture_log(hit["project"] or "", hit["sid"], "select-write-failed",
+                                             f"path={path.name};{type(exc).__name__}: {exc}"[:160])
+            continue
+        vault_index.update_note_status(db, str(path), pre)
+        _log(hit["project"] or "", hit["sid"], "promoted", row.get("id") or path.name,
+             fm.get("capture_merit"), None, "sticky-access")
+        out["promoted"] += 1
+    return out
 
 
 def _transcript_epoch(row: dict, fallback: float) -> float:
@@ -476,6 +558,7 @@ def demote_closed(project: str, config: dict, *, now: float | None = None, run=N
         return {"skipped": "rate-limited", "demoted": 0}
     capture_state._atomic_write(state, json.dumps({"checked_at": now}))
     vault = Path(config["vault_path"])
+    root = vault.resolve()
     todo = []
     for row in capture_state.ledger_list(limit=10**9, since=now - ISSUE_WINDOW_SECONDS):
         issue, repo = row.get("about_issue"), row.get("repo")
@@ -484,8 +567,8 @@ def demote_closed(project: str, config: dict, *, now: float | None = None, run=N
                 or not isinstance(row.get("note_path"), str)):
             continue
         path = vault / row["note_path"]
-        if not path.is_file():
-            continue
+        if not path.resolve().is_relative_to(root) or not path.is_file():
+            continue  # outside the vault (a ledger path with .. or a symlink) or gone
         fm = obsidian_utils._peek_frontmatter_fields(path, _FM_FIELDS)
         if (fm.get("status") != promoted_status(row.get("type")) or fm.get("promoted_by")
                 or fm.get("demoted_by")):
@@ -505,6 +588,7 @@ def demote_closed(project: str, config: dict, *, now: float | None = None, run=N
             continue
         if is_sticky(str(path), created, db):
             continue  # used since the last selection: kept
+        pre = vault_index.file_stat_key(str(path))
         try:
             note_writer.set_frontmatter_fields(config["vault_path"], str(path),
                                                {"status": PROVISIONAL, "demoted_by": ISSUE_CLOSED})
@@ -512,7 +596,7 @@ def demote_closed(project: str, config: dict, *, now: float | None = None, run=N
             capture_state.append_capture_log(project, row.get("session_id"), "select-write-failed",
                                              f"cid={row['id']};{type(exc).__name__}: {exc}"[:160])
             continue
-        vault_index.update_note_status(db, str(path))
+        vault_index.update_note_status(db, str(path), pre)
         _log(project, row.get("session_id"), "demoted", row["id"], fm.get("capture_merit"), None,
              f"{ISSUE_CLOSED}:{row['about_issue']}")
         demoted += 1

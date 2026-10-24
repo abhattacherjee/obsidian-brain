@@ -1204,8 +1204,8 @@ def set_frontmatter_fields(vault_path: str, note_path: str, fields: dict) -> boo
         raise OSError(lock_err)
     try:
         with open(resolved, "r", encoding="utf-8", newline="") as fh:
+            st = os.fstat(fh.fileno())  # taken before the read, so a change after it fails the re-check
             original = fh.read()
-        st = os.stat(resolved)
         open_fence, fm_lines, close_fence, body_lines, split_err = _split_frontmatter(_split_lines_lf_crlf(original))
         if split_err:
             raise ValueError(f"{split_err}: {note_path}")

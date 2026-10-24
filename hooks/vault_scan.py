@@ -331,6 +331,33 @@ def _describe_parse_failure(reason: str) -> str:
     return _describe_note_parse_failure(reason)
 
 
+def _peek_status(path: Path) -> str | None:
+    """The note's ``status`` from its frontmatter, read by the bounded shared parser; None when unreadable.
+
+    An error row (an oversized note) still reports ``status``: /vault-ask drops
+    ``provisional`` notes by it, and must not keep one just because meta could
+    not read the whole file.
+    """
+    global _UTILS_WARNED
+    try:
+        from obsidian_utils import _peek_frontmatter_field
+    except ImportError as exc:
+        if not _UTILS_WARNED:
+            _UTILS_WARNED = True
+            print(f"vault_scan: obsidian_utils unavailable: {exc}", file=sys.stderr)
+        return None
+    try:
+        return _peek_frontmatter_field(path, "status") or None
+    except Exception:  # noqa: BLE001 -- a status peek must never turn an error row into a crash
+        return None
+
+
+def _error_row(file_arg: str, error: str, path: Path) -> dict:
+    row = _empty_row(file_arg, error)
+    row["status"] = _peek_status(path)
+    return row
+
+
 def note_meta(vault_root: Path, vault: str, file_arg: str) -> dict:
     path = Path(file_arg)
     if not path.is_absolute():
@@ -343,13 +370,13 @@ def note_meta(vault_root: Path, vault: str, file_arg: str) -> dict:
         if not path.is_file():
             return _empty_row(file_arg, "not found")
         if path.stat().st_size > MAX_FILE_BYTES:
-            return _empty_row(file_arg, "file too large")
+            return _error_row(file_arg, "file too large", path)
         text = _read_text(path)
     except OSError as exc:
-        return _empty_row(file_arg, f"unreadable: {exc.strerror or type(exc).__name__}")
+        return _error_row(file_arg, f"unreadable: {exc.strerror or type(exc).__name__}", path)
     _open, fm, _close, body, err = split_frontmatter(split_lines_lf_crlf(text))
     if err:
-        return _empty_row(file_arg, f"unparsable frontmatter: {_describe_parse_failure(err)}")
+        return _error_row(file_arg, f"unparsable frontmatter: {_describe_parse_failure(err)}", path)
     fields = _parse_fields(fm)
     body_text = "".join(body)
     title = next(

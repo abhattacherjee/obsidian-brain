@@ -389,6 +389,26 @@ def test_meta_bad_files_do_not_abort_the_rest(capsys, vault, tmp_path):
             assert r["type"] is None and r["tags"] is None and r["title"] is None
 
 
+def test_meta_oversized_provisional_note_still_reports_its_status(capsys, vault, monkeypatch):
+    """/vault-ask drops provisional notes by `status`; an oversized one must not slip through as unknown."""
+    note = vault / "claude-insights" / "big.md"
+    note.parent.mkdir(exist_ok=True)
+    note.write_text("---\ntype: claude-insight\nstatus: provisional\n---\n\n# Big\n\n" + "x" * 200 + "\n")
+    monkeypatch.setattr(vault_scan, "MAX_FILE_BYTES", 50)
+    rc, out, _ = _main(capsys, "meta", vault, note)
+    row = json.loads(out)
+    assert rc == 0 and row["error"] == "file too large"
+    assert row["status"] == "provisional" and row["type"] is None and row["title"] is None
+
+
+def test_meta_outside_the_vault_never_reads_the_file(capsys, vault, tmp_path_factory):
+    other = tmp_path_factory.mktemp("elsewhere") / "n.md"
+    other.write_text("---\nstatus: provisional\n---\nbody\n")
+    rc, out, _ = _main(capsys, "meta", vault, other)
+    row = json.loads(out)
+    assert row["error"] == "outside the vault" and row["status"] is None
+
+
 def test_meta_oversized_and_unreadable(capsys, vault, monkeypatch):
     good = vault / "claude-sessions" / "s1.md"
     monkeypatch.setattr(vault_scan, "MAX_FILE_BYTES", 10)

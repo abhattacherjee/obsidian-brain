@@ -63,6 +63,9 @@ def test_repeated_key_keeps_one_line(tmp_vault, note):
     {"status": float("nan")},
     {"status": float("inf")},
     {"status": ["a"]},
+    {"status": "x\n"},  # a trailing newline: \Z, not $
+    {"status": "é"},     # non-ASCII: the class is ASCII-only
+    {"status": "x\r"},
     {"bad key": "a"},
     {"tags\n": "a"},
 ])
@@ -109,3 +112,34 @@ def test_locked_note_is_refused(tmp_vault, note):
     finally:
         note_writer._release_lock(lock)
     assert note.read_text() == NOTE
+
+
+def test_a_change_between_the_read_and_the_stat_is_not_lost(tmp_vault, note, monkeypatch):
+    """The stat must come from the open file before the read: a writer landing right after the read is caught."""
+    real_open = open
+
+    class RacingFile:
+        def __init__(self, fh):
+            self.fh = fh
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self.fh.close()
+
+        def fileno(self):
+            return self.fh.fileno()
+
+        def read(self, *a):
+            data = self.fh.read(*a)
+            note.write_text(NOTE + "edited in Obsidian, longer than before\n")  # lands just after our read
+            return data
+
+    monkeypatch.setattr(note_writer, "open",
+                        lambda path, *a, **k: RacingFile(real_open(path, *a, **k)) if str(path) == str(note.resolve())
+                        else real_open(path, *a, **k), raising=False)
+    with pytest.raises(OSError):
+        note_writer.set_frontmatter_fields(str(tmp_vault), str(note), {"status": "promoted"})
+    assert note.read_text().endswith("edited in Obsidian, longer than before\n")
+    assert "status: provisional" in note.read_text()

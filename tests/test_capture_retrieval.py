@@ -1,6 +1,10 @@
 """#455: provisional auto notes are out of /recall related insights and /vault-ask by default."""
 
 import builtins
+import json
+import os
+import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -11,6 +15,7 @@ import capture_state
 import obsidian_utils
 import vault_index
 
+REPO = Path(__file__).resolve().parent.parent
 SID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 FOLDERS = ["claude-sessions", "claude-insights"]
 
@@ -138,11 +143,45 @@ def _skill(name):
     return (Path(__file__).resolve().parent.parent / "skills" / name / "SKILL.md").read_text()
 
 
-def test_vault_ask_leaves_provisional_notes_out():
+_STEP3_RE = re.compile(r"python3 -c '(.*?)'((?: \"\$[A-Z_]+\")*)", re.DOTALL)
+
+
+def _step3_snippet():
+    """The python snippet and the names of the shell variables /vault-ask Step 3 passes to it."""
+    step3 = _skill("vault-ask").split("### Step 3")[1].split("### Step 4")[0]
+    for m in _STEP3_RE.finditer(step3):
+        if "search_vault(" in m.group(1):
+            return m.group(1), re.findall(r"\$([A-Z_]+)", m.group(2))
+    raise AssertionError("no search_vault snippet in /vault-ask Step 3")
+
+
+def test_vault_ask_step3_leaves_provisional_notes_out(tmp_path):
+    """Run Step 3's real snippet against a tmp index: the provisional match is dropped, the promoted one stays."""
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True)
+    vault = tmp_path / "vault"
+    for folder in FOLDERS:
+        (vault / folder).mkdir(parents=True)
+    (home / ".claude" / "obsidian-brain-config.json").write_text(json.dumps({"vault_path": str(vault)}))
+    _insight(str(vault), "kept", status="promoted", body="zebrafinch mangosteen kept note", title="Kept")
+    _insight(str(vault), "hidden", status="provisional", body="zebrafinch mangosteen hidden note", title="Hidden")
+    _insight(str(vault), "legacy", body="zebrafinch mangosteen legacy note without status", title="Legacy")
+    code, names = _step3_snippet()
+    values = {"SEARCH_TERMS_JOINED": "zebrafinch mangosteen", "PROJECT": "demo"}
+    env = dict(os.environ, HOME=str(home), OBSIDIAN_BRAIN_DB=str(tmp_path / "i.db"),
+               CLAUDE_CODE_SESSION_ID="step3-test-0000")
+    r = subprocess.run([sys.executable, "-c", code, *[values[n] for n in names]], cwd=REPO, env=env,
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stderr
+    stems = {Path(h["path"]).stem for h in json.loads(r.stdout.strip().splitlines()[-1])}
+    assert {"kept", "legacy"} <= stems  # positive control: the query does match notes
+    assert "hidden" not in stems
+
+
+def test_vault_ask_step5_drops_provisional_rows_even_with_an_error():
     text = _skill("vault-ask")
-    step3 = text.split("### Step 3")[1].split("### Step 4")[0]
     step5 = text.split("### Step 5")[1].split("### Step 6")[0]
-    assert "    include_provisional=False,\n" in step3
     assert "Drop every file whose `status` is `provisional` from `CANDIDATE_FILES` before scoring" in step5
+    assert "unless its `status` is `provisional`" in step5
     assert "`source_session_note`, `status`, `tags`" in step5
     assert "auto-captured notes with `status: provisional`" in _skill("recall")

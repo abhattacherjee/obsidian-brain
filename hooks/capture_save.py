@@ -121,7 +121,7 @@ def section_end(lines: list[str], start: int, marker: str) -> int:
     return len(lines)
 
 
-AUTO_HEADING_RE = re.compile(r"^## Update \([^)]*\) — auto-capture (?P<id>[0-9a-f]{12})$")
+AUTO_HEADING_RE = re.compile(r"^## Update \([^)]*\) — auto-capture (?P<id>[0-9a-f]{12})\Z")
 
 
 def strip_auto_updates(text: str) -> str:
