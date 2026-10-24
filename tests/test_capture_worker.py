@@ -506,11 +506,30 @@ def test_ref_cycles_keep_one_note():
     assert [c["superseded_by"] for c in out] == [None, None, 3, None, None]
 
 
+def _refs(out, cids):
+    """Each candidate's refs as capture ids, with None for no reference (index 0 is a real reference)."""
+    def cid(v):
+        return None if v is None else cids[v]
+    return [(cid(c["duplicate_of"]), cid(c["superseded_by"])) for c in out]
+
+
 def test_a_mixed_ref_cycle_keeps_one_note_eligible():
     """a is a duplicate of b and b is superseded by a: each field alone is acyclic, together they exclude both."""
     items = [{**CAND, "title": "a", "duplicate_of": 1}, {**CAND, "title": "b", "superseded_by": 0}]
     out = capture_worker.parse_candidates(_envelope(items))
-    assert sum(1 for c in out if not c["duplicate_of"] and not c["superseded_by"]) == 1
+    assert _refs(out, ["cid-a", "cid-b"]) == [("cid-b", None), (None, None)]  # b survives; a stays a duplicate of b
+    eligible = [i for i, c in enumerate(out) if c["duplicate_of"] is None and c["superseded_by"] is None]
+    assert eligible == [1]
+
+
+def test_a_mixed_cycle_through_index_zero_still_breaks():
+    """A ref to index 0 is a reference: it must not read as 'no reference'."""
+    items = [{**CAND, "title": "a", "superseded_by": 1}, {**CAND, "title": "b", "duplicate_of": 0}]
+    out = capture_worker.parse_candidates(_envelope(items))
+    assert _refs(out, ["cid-a", "cid-b"]) == [(None, "cid-b"), (None, None)]
+    assert [i for i, c in enumerate(out) if c["duplicate_of"] is None and c["superseded_by"] is None] == [1]
+    items = [{**CAND, "title": "a"}, {**CAND, "title": "b", "duplicate_of": 0}]
+    assert _refs(capture_worker.parse_candidates(_envelope(items)), ["cid-a", "cid-b"]) == [(None, None), ("cid-a", None)]
 
 
 def test_longer_and_overlapping_mixed_cycles_each_keep_a_note():
@@ -518,8 +537,8 @@ def test_longer_and_overlapping_mixed_cycles_each_keep_a_note():
              {**CAND, "title": "c", "duplicate_of": 0, "superseded_by": 1},
              {**CAND, "title": "d", "superseded_by": 4}, {**CAND, "title": "e", "duplicate_of": 3}]
     out = capture_worker.parse_candidates(_envelope(items))
-    assert any(not c["duplicate_of"] and not c["superseded_by"] for c in out[:3])
-    assert any(not c["duplicate_of"] and not c["superseded_by"] for c in out[3:])
+    free = [i for i, c in enumerate(out) if c["duplicate_of"] is None and c["superseded_by"] is None]
+    assert [i for i in free if i < 3] and [i for i in free if i >= 3]
     assert _find_no_cycle(out)
 
 

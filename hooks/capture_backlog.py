@@ -99,9 +99,10 @@ def scan(config: dict, since: datetime.date, until: datetime.date) -> tuple[list
     The pool holds notes whose ``date`` is in ``[since, until]`` (both
     inclusive) that are unselected, or that an earlier backlog run selected
     (``selected_by: backlog`` or ``demoted_by: backlog``) and that nobody has
-    used since. A note selected live is not in the pool; if it is promoted
-    and not sticky it counts in ``live`` for its session (any date), so the
-    backlog fills only the rest of that session's cap. Paths outside the
+    used since. Every other selected, promoted, non-sticky note of the
+    session counts in ``live`` (any date, live or backlog, in the window or
+    not), so the window only limits the candidates and the backlog fills just
+    the rest of that session's cap of 10. Paths outside the
     vault (a symlink) and ``_rejected`` notes are skipped.
     """
     vault = Path(config["vault_path"])
@@ -123,21 +124,23 @@ def scan(config: dict, since: datetime.date, until: datetime.date) -> tuple[list
             continue
         top = capture_select.promoted_status(ntype)
         status = fm.get("status")
-        if fm.get("capture_merit"):
-            ours = BACKLOG in (fm.get("selected_by"), fm.get("demoted_by"))
-            if not ours:
-                if status == top and not fm.get("promoted_by"):
-                    live[fm["source_session"]] = live.get(fm["source_session"], 0) + 1
-                continue  # selected live, or a status a person set
-            if status not in (capture_select.PROVISIONAL, top) or fm.get("promoted_by"):
-                continue  # used or changed since: left as it is
-        elif status not in (None, top):
-            continue  # a status a person set (e.g. superseded)
+        counts = (bool(fm.get("capture_merit")) and status == top and not fm.get("promoted_by"))
         try:
             day = datetime.date.fromisoformat(str(fm.get("date")))
         except ValueError:
-            continue
-        if not since <= day <= until:
+            day = None
+        in_pool = day is not None and since <= day <= until
+        if fm.get("capture_merit"):
+            ours = BACKLOG in (fm.get("selected_by"), fm.get("demoted_by"))
+            if not (ours and in_pool):
+                in_pool = False  # selected live, or by an earlier run outside this window
+            elif status not in (capture_select.PROVISIONAL, top) or fm.get("promoted_by"):
+                in_pool = False  # used or changed since: left as it is
+        elif status not in (None, top):
+            in_pool = False  # a status a person set (e.g. superseded)
+        if not in_pool:
+            if counts:  # any date, live or backlog: it still uses the session's cap
+                live[fm["source_session"]] = live.get(fm["source_session"], 0) + 1
             continue
         out.append({"path": path, "name": path.name, "type": ntype, "day": day.isoformat(), "fm": fm,
                     "session": fm["source_session"], "project": fm.get("project") or ""})
@@ -379,7 +382,8 @@ def apply(config: dict, planned: dict, db: str) -> dict:
 
     Ledger rows of the notes get their score and novelty, so a live
     selection that runs again for one of these sessions agrees. A note that
-    fails is reported and left as it was; no note is ever deleted.
+    fails is reported and left as it was; no note is ever deleted. If a
+    demotion fails, no note of its session is promoted in this run.
     """
     stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     note_backup = capture_state.capture_dir() / f"backlog-backup-{stamp}"
@@ -387,20 +391,35 @@ def apply(config: dict, planned: dict, db: str) -> dict:
     vault = Path(config["vault_path"]).resolve()
     ledger = {r["note_path"]: r["id"] for r in capture_state.ledger_list(limit=10**9)
               if r.get("kind") == "new" and isinstance(r.get("note_path"), str)}
-    written, errors = 0, []
-    for n in planned["notes"]:
+    written, errors, skipped = 0, [], []
+    failed_sessions: set[str] = set()
+
+    def is_promotion(n):
+        return n["want"] != capture_select.PROVISIONAL and n["fm"].get("status") != n["want"]
+
+    # Demotions first. If one fails, its session gets no promotion in this run
+    # (the same rule as capture_select.run_selection), so it never ends over the cap.
+    order = sorted(planned["notes"], key=lambda n: n["want"] != capture_select.PROVISIONAL)
+    for n in order:
         rel = str(n["path"])
+        if n["session"] in failed_sessions and is_promotion(n):
+            skipped.append(rel)
+            continue
         try:
             rel = str(Path(n["path"]).resolve().relative_to(vault))
-            pre = vault_index.file_stat_key(str(n["path"]))
+            pre, wrote = vault_index.file_stat_key(str(n["path"])), []
             with open(n["path"], encoding="utf-8", newline="") as fh:
                 capture_state._atomic_write(note_backup / rel.replace("/", "__"), fh.read())
-            note_writer.set_frontmatter_fields(config["vault_path"], str(n["path"]), n["fields"])
+            note_writer.set_frontmatter_fields(config["vault_path"], str(n["path"]), n["fields"], stat_out=wrote)
         except (OSError, ValueError) as exc:
             errors.append({"note": rel, "error": f"{type(exc).__name__}: {exc}"})
+            if n["want"] == capture_select.PROVISIONAL and n["fm"].get("status") != capture_select.PROVISIONAL:
+                failed_sessions.add(n["session"])
             continue
-        vault_index.update_note_status(db, str(n["path"]), pre)
+        vault_index.update_note_status(db, str(n["path"]), pre, wrote[0] if wrote else None)
         if rel in ledger:
             capture_state.ledger_update(ledger[rel], score=n["score"], novelty=n["novelty"])
         written += 1
-    return {"written": written, "errors": errors, "note_backup": str(note_backup)}
+    for rel in skipped:
+        errors.append({"note": rel, "error": "promotion skipped: a demotion in its session failed (retry the run)"})
+    return {"written": written, "errors": errors, "note_backup": str(note_backup), "skipped": len(skipped)}

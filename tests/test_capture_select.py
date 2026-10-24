@@ -359,10 +359,10 @@ def test_a_note_that_cannot_be_written_is_logged_and_the_rest_go_on(mock_config,
     rows = [_note(mock_config, i, score=9) for i in range(3)]
     real = capture_select.note_writer.set_frontmatter_fields
 
-    def flaky(vault, path, fields):
+    def flaky(vault, path, fields, **kw):
         if path.endswith("n1.md"):
             raise OSError("another process is updating this note")
-        return real(vault, path, fields)
+        return real(vault, path, fields, **kw)
 
     monkeypatch.setattr(capture_select.note_writer, "set_frontmatter_fields", flaky)
     assert capture_select.run_selection(SID, "demo", mock_config, db=db)["promoted"] == 2
@@ -377,7 +377,7 @@ def test_demotions_are_written_before_promotions(mock_config, db, monkeypatch):
     order = []
     real = capture_select.note_writer.set_frontmatter_fields
     monkeypatch.setattr(capture_select.note_writer, "set_frontmatter_fields",
-                        lambda v, p, f: order.append(f["status"]) or real(v, p, f))
+                        lambda v, p, f, **kw: order.append(f["status"]) or real(v, p, f, **kw))
     capture_select.run_selection(SID, "demo", mock_config, db=db)
     assert order == ["provisional", "promoted"]
 
@@ -389,10 +389,10 @@ def test_a_failed_demotion_blocks_every_promotion_in_that_run(mock_config, db, m
     real = capture_select.note_writer.set_frontmatter_fields
     fail = {"on": True}
 
-    def flaky(vault, path, fields):
+    def flaky(vault, path, fields, **kw):
         if fail["on"] and fields.get("status") == "provisional":
             raise OSError("another process is updating this note")
-        return real(vault, path, fields)
+        return real(vault, path, fields, **kw)
 
     monkeypatch.setattr(capture_select.note_writer, "set_frontmatter_fields", flaky)
     got = capture_select.run_selection(SID, "demo", mock_config, db=db)
@@ -609,9 +609,10 @@ def test_update_note_status_keeps_the_vector(mock_config, db):
     conn.execute("UPDATE notes SET tfidf_vector = ? WHERE path = ?", ('{"kept": 1.0}', path))
     conn.commit()
     conn.close()
-    pre = vault_index.file_stat_key(path)
-    capture_select.note_writer.set_frontmatter_fields(mock_config["vault_path"], path, {"status": "promoted"})
-    assert vault_index.update_note_status(db, path, pre)
+    pre, wrote = vault_index.file_stat_key(path), []
+    capture_select.note_writer.set_frontmatter_fields(mock_config["vault_path"], path, {"status": "promoted"},
+                                                      stat_out=wrote)
+    assert vault_index.update_note_status(db, path, pre, wrote[0])
     conn = vault_index._connect(db)
     got = conn.execute("SELECT status, tfidf_vector, mtime FROM notes WHERE path = ?", (path,)).fetchone()
     conn.close()
@@ -631,9 +632,10 @@ def test_update_note_status_stamps_a_fresh_row(mock_config, db):
     row = _note(mock_config, 0)
     path = str(Path(mock_config["vault_path"]) / row["note_path"])
     vault_index.index_note(db, path)
-    pre = vault_index.file_stat_key(path)
-    capture_select.note_writer.set_frontmatter_fields(mock_config["vault_path"], path, {"status": "promoted"})
-    assert vault_index.update_note_status(db, path, pre)
+    pre, wrote = vault_index.file_stat_key(path), []
+    capture_select.note_writer.set_frontmatter_fields(mock_config["vault_path"], path, {"status": "promoted"},
+                                                      stat_out=wrote)
+    assert vault_index.update_note_status(db, path, pre, wrote[0])
     got, st = _index_stat(db, path), Path(path).stat()
     assert got["status"] == "promoted" and got["size"] == st.st_size
     assert vault_index.mtime_unchanged(st.st_mtime, got["mtime"])
@@ -647,9 +649,10 @@ def test_update_note_status_leaves_a_row_stale_after_an_unseen_external_edit(moc
     old = _index_stat(db, str(path))
     time.sleep(0.01)
     path.write_text(path.read_text().replace(_words(3, 20), _words(4, 20)))  # edited in Obsidian, not indexed yet
-    pre = vault_index.file_stat_key(str(path))
-    capture_select.note_writer.set_frontmatter_fields(mock_config["vault_path"], str(path), {"status": "promoted"})
-    assert vault_index.update_note_status(db, str(path), pre)
+    pre, wrote = vault_index.file_stat_key(str(path)), []
+    capture_select.note_writer.set_frontmatter_fields(mock_config["vault_path"], str(path), {"status": "promoted"},
+                                                      stat_out=wrote)
+    assert vault_index.update_note_status(db, str(path), pre, wrote[0])
     got = _index_stat(db, str(path))
     assert got["status"] == "promoted" and got["mtime"] == old["mtime"] and got["size"] == old["size"]
     assert not vault_index.mtime_unchanged(path.stat().st_mtime, got["mtime"])
@@ -756,3 +759,76 @@ def test_promote_used_confirms_status_from_the_frontmatter(mock_config, db):
     _access(db, row, mock_config, "search", CREATED_TS + 60)
     assert capture_select.promote_used(mock_config, db=db, now=LATER)["promoted"] == 0
     assert "status: superseded" in path.read_text()
+
+
+def test_promote_used_promotes_a_loaded_row_with_a_hand_update(mock_config, db):
+    row = _provisional(mock_config, db)
+    path = Path(mock_config["vault_path"]) / row["note_path"]
+    path.write_text(path.read_text() + "\n## Update (2026-10-24)\n\nAdded by /compress.\n")
+    _access(db, row, mock_config, "search", CREATED_TS - 3600)  # loaded by the join, but before capture
+    assert capture_select.promote_used(mock_config, db=db, now=LATER)["promoted"] == 1
+    fm = _fm(mock_config, row)
+    assert fm["status"] == "promoted" and fm["promoted_by"] == "hand-update"
+    assert any(f"cid={row['id']}" in ln and "why=sticky-hand-update" in ln for ln in _log_lines())
+
+
+def test_promote_used_does_not_scan_note_bodies_it_did_not_load(mock_config, db):
+    row = _provisional(mock_config, db)  # no access row: not loaded
+    path = Path(mock_config["vault_path"]) / row["note_path"]
+    path.write_text(path.read_text() + "\n## Update (2026-10-24)\n\nAdded by /compress.\n")
+    assert capture_select.promote_used(mock_config, db=db, now=LATER)["promoted"] == 0
+    assert _status(mock_config, row) == "provisional"
+
+
+def test_promote_used_ignores_an_auto_update_section(mock_config, db):
+    row = _provisional(mock_config, db)
+    path = Path(mock_config["vault_path"]) / row["note_path"]
+    path.write_text(path.read_text() + "\n## Update (2026-10-24) — auto-capture 0123456789ab\n\nauto\n")
+    _access(db, row, mock_config, "search", CREATED_TS - 3600)
+    assert capture_select.promote_used(mock_config, db=db, now=LATER)["promoted"] == 0
+
+
+@pytest.mark.parametrize("status", ['"Provisional"', "provisional # keep for now", "PROVISIONAL"])
+def test_promote_used_finds_a_provisional_status_in_any_spelling(mock_config, db, status):
+    row = _provisional(mock_config, db)
+    path = Path(mock_config["vault_path"]) / row["note_path"]
+    path.write_text(path.read_text().replace("status: provisional", f"status: {status}"))
+    vault_index.index_note(db, str(path))
+    _access(db, row, mock_config, "search", CREATED_TS + 60)
+    assert capture_select.promote_used(mock_config, db=db, now=LATER)["promoted"] == 1
+    assert _status(mock_config, row) == "promoted"
+
+
+def test_update_note_status_leaves_a_row_stale_after_an_edit_that_lands_after_our_write(mock_config, db):
+    """Only our own write may be stamped: an edit between our write and the index update stays visible to _sync."""
+    row = _note(mock_config, 0, body=_words(3, 20))
+    path = Path(mock_config["vault_path"]) / row["note_path"]
+    vault_index.index_note(db, str(path))
+    old = _index_stat(db, str(path))
+    pre, wrote = vault_index.file_stat_key(str(path)), []
+    capture_select.note_writer.set_frontmatter_fields(mock_config["vault_path"], str(path), {"status": "promoted"},
+                                                      stat_out=wrote)
+    time.sleep(0.01)
+    path.write_text(path.read_text().replace(_words(3, 20), _words(4, 20)))  # an external edit lands now
+    assert vault_index.update_note_status(db, str(path), pre, wrote[0])
+    got = _index_stat(db, str(path))
+    assert got["status"] == "promoted" and got["mtime"] == old["mtime"] and got["size"] == old["size"]
+    vault_index.ensure_index(mock_config["vault_path"], FOLDERS, db_path=db)
+    conn = vault_index._connect(db)
+    body = conn.execute("SELECT body FROM notes WHERE path = ?", (str(path),)).fetchone()["body"]
+    conn.close()
+    assert _words(4, 20) in body
+
+
+def test_set_frontmatter_fields_reports_the_stat_of_what_it_wrote(mock_config, db):
+    row = _note(mock_config, 0)
+    path = Path(mock_config["vault_path"]) / row["note_path"]
+    wrote = []
+    assert capture_select.note_writer.set_frontmatter_fields(mock_config["vault_path"], str(path),
+                                                             {"status": "promoted"}, stat_out=wrote)
+    st = path.stat()
+    assert wrote == [(st.st_mtime_ns, st.st_size)]
+    unchanged = []
+    assert capture_select.note_writer.set_frontmatter_fields(mock_config["vault_path"], str(path),
+                                                             {"status": "promoted"}, stat_out=unchanged) is False
+    assert unchanged == []

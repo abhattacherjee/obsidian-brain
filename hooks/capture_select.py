@@ -323,9 +323,9 @@ def _apply(e: dict, config: dict, db: str, project: str, sid: str) -> str | None
     newly_sticky = e["kind"] == "sticky" and not fm.get("promoted_by")
     if was == want and not (unrecorded or newly_sticky):
         return None  # a rank change alone does not rewrite the file (Ruling 7)
-    pre = vault_index.file_stat_key(str(e["path"]))
-    note_writer.set_frontmatter_fields(config["vault_path"], str(e["path"]), e["fields"])
-    vault_index.update_note_status(db, str(e["path"]), pre)
+    pre, wrote = vault_index.file_stat_key(str(e["path"])), []
+    note_writer.set_frontmatter_fields(config["vault_path"], str(e["path"]), e["fields"], stat_out=wrote)
+    vault_index.update_note_status(db, str(e["path"]), pre, wrote[0] if wrote else None)
     if was == want:
         return None
     outcome = "promoted" if want != PROVISIONAL else "demoted"
@@ -376,8 +376,12 @@ def promote_used(config: dict, *, now: float | None = None, db: str | None = Non
     being captured; a note used after its session ended would stay hidden.
     One join finds provisional notes with a ``search`` or ``tool-open``
     access row; the note's own ``created_at`` and status are then confirmed
-    from its frontmatter. The note becomes ``promoted_status(type)`` with
-    ``promoted_by: access``, outside the cap. Notes in ``_rejected``, outside
+    from its frontmatter (the status is compared normalized: case, quotes and
+    an inline comment ignored). The note becomes ``promoted_status(type)`` with
+    ``promoted_by: access``, outside the cap. A loaded row whose access came
+    too early but whose body has a hand ``## Update (`` section is promoted
+    with ``promoted_by: hand-update``; bodies of notes the join did not load
+    are never scanned (``/compress`` promotes at write time instead). Notes in ``_rejected``, outside
     the vault, or flagged ``issue-closed`` are skipped. A second run writes
     nothing. Returns ``{"checked", "promoted"}``.
     """
@@ -393,8 +397,8 @@ def promote_used(config: dict, *, now: float | None = None, db: str | None = Non
         hits = conn.execute(
             f"SELECT n.path AS path, n.type AS type, n.project AS project, n.source_session AS sid, "
             f"MAX(a.timestamp) AS used FROM notes n JOIN access_log a ON a.note_path = n.path "
-            f"WHERE n.status = ? AND a.timestamp <= ? AND a.context_type IN ({','.join('?' * len(STICKY_CONTEXTS))}) "
-            f"GROUP BY n.path", (PROVISIONAL, now, *STICKY_CONTEXTS)).fetchall()
+            f"WHERE lower(trim(n.status, {vault_index._SQL_TRIM_CHARS})) LIKE 'provisional%' AND a.timestamp <= ? AND a.context_type IN ({','.join('?' * len(STICKY_CONTEXTS))}) "
+            f"GROUP BY n.path", (now, *STICKY_CONTEXTS)).fetchall()
     finally:
         conn.close()
     if not hits:
@@ -413,24 +417,28 @@ def promote_used(config: dict, *, now: float | None = None, db: str | None = Non
             continue
         out["checked"] += 1
         fm = obsidian_utils._peek_frontmatter_fields(path, _FM_FIELDS)
-        if fm.get("status") != PROVISIONAL or fm.get("demoted_by") == ISSUE_CLOSED:
+        if obsidian_utils.normalize_status(fm.get("status")) != PROVISIONAL or fm.get("demoted_by") == ISSUE_CLOSED:
             continue
         row = ledger.get(str(resolved.relative_to(root))) or {}
         created = _epoch(fm.get("created_at"), float(row.get("ts") or 0.0))
+        by = "access"
         if not hit["used"] > created:
-            continue
+            if not hand_updated(path):
+                continue
+            by = "hand-update"  # a row we loaded anyway; no vault-wide body scan
         top = "active" if hit["type"] == "claude-decision" else "promoted"
-        pre = vault_index.file_stat_key(str(path))
+        pre, wrote = vault_index.file_stat_key(str(path)), []
         try:
             note_writer.set_frontmatter_fields(config["vault_path"], str(path),
-                                               {"status": top, "promoted_by": "access", "demoted_by": None})
+                                               {"status": top, "promoted_by": by, "demoted_by": None},
+                                               stat_out=wrote)
         except (OSError, ValueError) as exc:
             capture_state.append_capture_log(hit["project"] or "", hit["sid"], "select-write-failed",
                                              f"path={path.name};{type(exc).__name__}: {exc}"[:160])
             continue
-        vault_index.update_note_status(db, str(path), pre)
+        vault_index.update_note_status(db, str(path), pre, wrote[0] if wrote else None)
         _log(hit["project"] or "", hit["sid"], "promoted", row.get("id") or path.name,
-             fm.get("capture_merit"), None, "sticky-access")
+             fm.get("capture_merit"), None, f"sticky-{by}")
         out["promoted"] += 1
     return out
 
@@ -588,15 +596,15 @@ def demote_closed(project: str, config: dict, *, now: float | None = None, run=N
             continue
         if is_sticky(str(path), created, db):
             continue  # used since the last selection: kept
-        pre = vault_index.file_stat_key(str(path))
+        pre, wrote = vault_index.file_stat_key(str(path)), []
         try:
             note_writer.set_frontmatter_fields(config["vault_path"], str(path),
-                                               {"status": PROVISIONAL, "demoted_by": ISSUE_CLOSED})
+                                               {"status": PROVISIONAL, "demoted_by": ISSUE_CLOSED}, stat_out=wrote)
         except (OSError, ValueError) as exc:
             capture_state.append_capture_log(project, row.get("session_id"), "select-write-failed",
                                              f"cid={row['id']};{type(exc).__name__}: {exc}"[:160])
             continue
-        vault_index.update_note_status(db, str(path), pre)
+        vault_index.update_note_status(db, str(path), pre, wrote[0] if wrote else None)
         _log(project, row.get("session_id"), "demoted", row["id"], fm.get("capture_merit"), None,
              f"{ISSUE_CLOSED}:{row['about_issue']}")
         demoted += 1

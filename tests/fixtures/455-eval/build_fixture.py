@@ -47,6 +47,18 @@ def _blind(salt: bytes, bid: str) -> str:
     return "b" + hmac.new(salt, b"blind\0" + bid.encode(), hashlib.sha256).hexdigest()[:12]
 
 
+def _assert_no_guessable_ids(outputs: set[str], inputs: set[str]) -> None:
+    """Fail the build if any output id is, or ends in, ``sha1(name)[:12]`` of an input name or an input blind id.
+
+    The spike's own ids were exactly that, so a guessed file name could be
+    confirmed against them. CI cannot run this (it never sees the names).
+    """
+    guessable = {hashlib.sha1(x.encode()).hexdigest()[:12] for x in inputs} | inputs
+    bad = sorted(o for o in outputs if o in guessable or o[1:] in guessable)
+    if bad:
+        raise SystemExit(f"refusing to write: {len(bad)} output id(s) are guessable from an input name, e.g. {bad[0]}")
+
+
 def _term(salt: bytes, t: str) -> str:
     return hmac.new(salt, b"term\0" + t.encode(), hashlib.sha256).hexdigest()[:10]
 
@@ -80,6 +92,13 @@ def main(argv: list[str] | None = None) -> int:
                          "vector": {_term(salt, t): w for t, w in vec.items()} if vec else None})
         rows.sort(key=lambda r: r["ts"])
         notes[unit] = {"notes": rows, "top_v2": sorted(_opaque(salt, x) for x in report[unit]["top_v2"])}
+
+    outputs = {r["name"] for u in notes.values() for r in u["notes"]} | set(_blind(salt, b) for b in key)
+    outputs |= {_blind(salt, r["id"]) for j in JUDGE_FILES
+                for r in json.loads((args.spike / "labels" / f"{j}.json").read_text())}
+    outputs |= {_opaque(salt, k["item"]) for k in key.values()}
+    names = {n for unit in units for n in report[unit]["notes"]} | {k["item"] for k in key.values()} | set(key)
+    _assert_no_guessable_ids(outputs, names)
 
     (HERE / "key.json").write_text(json.dumps(
         {_blind(salt, bid): {**k, "item": _opaque(salt, k["item"])} for bid, k in sorted(key.items())}, indent=1) + "\n")

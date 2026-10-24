@@ -866,7 +866,7 @@ def _release_lock(lock):
         pass
 
 
-def _atomic_rewrite(dest: Path, content: str, expect_stat=None):
+def _atomic_rewrite(dest: Path, content: str, expect_stat=None, stat_out=None):
     """Rewrite an EXISTING file at ``dest`` with ``content``, atomically.
 
     Mirrors obsidian_utils.write_vault_note()'s temp-file + chmod 0o600 +
@@ -893,6 +893,10 @@ def _atomic_rewrite(dest: Path, content: str, expect_stat=None):
     but it converts the common case (two sessions running /compress on the
     same note) from silent loss into a loud, retryable error.
 
+    ``stat_out``, when a list, receives ``(st_mtime_ns, st_size)`` of the file
+    we wrote, taken from the temp file just before the rename (which keeps
+    both), so a later edit by someone else can never be mistaken for ours.
+
     Returns None on success, a non-empty error string on failure.
 
     Opens with ``newline=""`` -- ``content`` already carries whatever line
@@ -906,6 +910,9 @@ def _atomic_rewrite(dest: Path, content: str, expect_stat=None):
             with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
                 fh.write(content)
             os.chmod(tmp_path, 0o600)
+            if stat_out is not None:
+                written = os.stat(tmp_path)
+                stat_out.append((written.st_mtime_ns, written.st_size))
             if expect_stat is not None:
                 current = os.stat(str(dest))
                 if (current.st_mtime_ns, current.st_size) != expect_stat:
@@ -967,9 +974,16 @@ def run_append_update(
     update_text: str,
     last_updated: str | None = None,
     add_tags_csv: str | None = None,
+    promote_provisional: bool = False,
 ) -> int:
     """Append ``update_text`` to the existing note at ``note_path`` and, in
     the SAME atomic write, apply frontmatter mutations.
+
+    ``promote_provisional`` (the CLI passes True; auto-capture's own update
+    keeps False): when the note's ``status`` is ``provisional``, the same
+    write also sets it to ``promoted`` (``active`` for a ``claude-decision``)
+    and ``promoted_by: hand-update`` (#455), because a hand update means the
+    note is in use. A note with any other status keeps it.
 
     Insertion point: scans the note body (after the frontmatter's closing
     fence) top-down for the first line matching a trailing metadata marker
@@ -1034,7 +1048,7 @@ def run_append_update(
         return 1
     try:
         return _append_update_locked(
-            resolved, note_path, update_text, last_updated, add_tags
+            resolved, note_path, update_text, last_updated, add_tags, promote_provisional
         )
     finally:
         _release_lock(lock)
@@ -1046,6 +1060,7 @@ def _append_update_locked(
     update_text: str,
     last_updated,
     add_tags: list[str],
+    promote_provisional: bool = False,
 ) -> int:
     """The read-modify-write half of run_append_update, run while holding the
     note's lock. Split out purely so the lock has one obvious scope and one
@@ -1084,6 +1099,10 @@ def _append_update_locked(
     if tags_merge_err:
         print(f"ERROR: {tags_merge_err}", file=sys.stderr)
         return 1
+
+    if promote_provisional and _fm_scalar(fm_lines, "status") == "provisional":
+        top = "active" if _fm_scalar(fm_lines, "type") == "claude-decision" else "promoted"
+        fm_lines = _set_fields(fm_lines, {"status": top, "promoted_by": "hand-update", "demoted_by": None}, eol)
 
     insertion_idx = _find_insertion_index(body_lines)
 
@@ -1146,6 +1165,15 @@ def _field_value(key: str, value) -> str | None:
     return text
 
 
+def _fm_scalar(fm_lines: list[str], key: str) -> str | None:
+    """The first top-level ``key:`` value in ``fm_lines``, unquoted, or None."""
+    for line in fm_lines:
+        m = re.match(rf"^{re.escape(key)}\s*:\s*(.*?)\s*$", line)
+        if m:
+            return m.group(1).strip("\"'") or None
+    return None
+
+
 def _set_fields(fm_lines: list[str], fields: dict, eol: str) -> list[str]:
     """``fm_lines`` with each top-level key replaced, inserted at the end, or removed (None).
 
@@ -1177,7 +1205,7 @@ def _set_fields(fm_lines: list[str], fields: dict, eol: str) -> list[str]:
     return out
 
 
-def set_frontmatter_fields(vault_path: str, note_path: str, fields: dict) -> bool:
+def set_frontmatter_fields(vault_path: str, note_path: str, fields: dict, stat_out: list | None = None) -> bool:
     """Set, insert or remove (value None) top-level frontmatter fields of an existing note (#455).
 
     ``note_path`` is absolute or vault-relative and must resolve inside the
@@ -1185,6 +1213,9 @@ def set_frontmatter_fields(vault_path: str, note_path: str, fields: dict) -> boo
     ``_FIELD_VALUE_RE``). Runs under the note's lock, keeps the note's line
     endings, and rewrites atomically only if the bytes change; a note that
     changed between the read and the rename is left alone.
+
+    ``stat_out``, when a list, receives ``(st_mtime_ns, st_size)`` of the file
+    this call wrote (nothing when it wrote nothing).
 
     Returns True when the file changed. Raises ValueError for a bad key,
     value, path or a note without frontmatter, and OSError when the note is
@@ -1213,7 +1244,8 @@ def set_frontmatter_fields(vault_path: str, note_path: str, fields: dict) -> boo
         content = open_fence + "".join(new_fm) + close_fence + "".join(body_lines)
         if content == original:
             return False
-        write_err = _atomic_rewrite(resolved, content, (st.st_mtime_ns, st.st_size))
+        extra = {} if stat_out is None else {"stat_out": stat_out}
+        write_err = _atomic_rewrite(resolved, content, (st.st_mtime_ns, st.st_size), **extra)
         if write_err:
             raise OSError(write_err)
         return True
@@ -1289,7 +1321,8 @@ def main():
             print(_oversize_error(), file=sys.stderr)
             sys.exit(1)
         sys.exit(
-            run_append_update(vault_path, note_path, update_text, last_updated, add_tags_csv)
+            run_append_update(vault_path, note_path, update_text, last_updated, add_tags_csv,
+                              promote_provisional=True)
         )
 
     print(f"unknown command: {cmd}", file=sys.stderr)

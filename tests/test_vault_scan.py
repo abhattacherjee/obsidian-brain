@@ -740,3 +740,81 @@ def test_meta_prints_status(tmp_path):
     r = _run("meta", v, note)
     assert r.returncode == 0, r.stderr
     assert json.loads(r.stdout)["status"] == "provisional"
+
+
+# ---------------------------------------------------------------------------
+# #455: status in meta rows, normalised and lenient
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("raw, want", [
+    ("provisional", "provisional"),
+    ('"Provisional"', "provisional"),
+    ("'PROVISIONAL'", "provisional"),
+    ("provisional # kept for now", "provisional"),
+    ("promoted", "promoted"),
+])
+def test_meta_status_is_normalised(tmp_path, raw, want):
+    v = tmp_path / "v"
+    (v / "ins").mkdir(parents=True)
+    note = v / "ins" / "n.md"
+    note.write_text(_note(f"type: claude-insight\nstatus: {raw}\n"))
+    r = _run("meta", v, note)
+    assert r.returncode == 0, r.stderr
+    assert json.loads(r.stdout)["status"] == want
+
+
+@pytest.mark.parametrize("text", [
+    "---\ntype: claude-insight\nstatus: provisional\ntags: [unclosed\n# no closing fence\nbody\n",
+    "---\nstatus: \"Provisional\"\nbroken line without colon\n",
+    "﻿---\nstatus: provisional # x\nno close\n",
+])
+def test_meta_malformed_frontmatter_still_reports_a_provisional_status(tmp_path, text):
+    v = tmp_path / "v"
+    (v / "ins").mkdir(parents=True)
+    note = v / "ins" / "n.md"
+    note.write_text(text)
+    row = json.loads(_run("meta", v, note).stdout)
+    assert row["error"] and row["status"] == "provisional"
+
+
+def test_meta_lenient_status_ignores_text_past_the_fence_and_past_8kb(tmp_path):
+    v = tmp_path / "v"
+    (v / "ins").mkdir(parents=True)
+    past_fence = v / "ins" / "a.md"
+    past_fence.write_text("---\ntype: x\n---\n\nstatus: provisional\n[unclosed")  # parses fine: status is body text
+    far = v / "ins" / "b.md"
+    far.write_text("---\nnoclose: " + "x" * 9000 + "\nstatus: provisional\n")  # beyond the first 8 KB
+    assert json.loads(_run("meta", v, past_fence).stdout)["status"] is None
+    assert json.loads(_run("meta", v, far).stdout)["status"] is None
+
+
+def test_vault_ask_meta_filter_drops_every_provisional_spelling(tmp_path):
+    """The /vault-ask rule is: drop a meta row whose `status` is `provisional`, error or not. Run on real rows."""
+    v = tmp_path / "v"
+    (v / "ins").mkdir(parents=True)
+    notes = {
+        "plain": _note("type: claude-insight\nstatus: provisional\n"),
+        "comment": _note("type: claude-insight\nstatus: provisional # x\n"),
+        "quoted": _note('type: claude-insight\nstatus: "Provisional"\n'),
+        "malformed": "---\ntype: claude-insight\nstatus: provisional\nno closing fence\n",
+        "promoted": _note("type: claude-insight\nstatus: promoted\n"),
+        "legacy": _note("type: claude-insight\n"),
+    }
+    paths = []
+    for name, text in notes.items():
+        (v / "ins" / f"{name}.md").write_text(text)
+        paths.append(v / "ins" / f"{name}.md")
+    r = _run("meta", v, *paths)
+    assert r.returncode == 0, r.stderr
+    rows = [json.loads(ln) for ln in r.stdout.splitlines()]
+    assert len(rows) == len(notes)
+    kept = {Path(row["path"]).stem for row in rows if row["status"] != "provisional"}
+    assert kept == {"promoted", "legacy"}
+
+
+def test_lenient_status_stops_at_the_closing_fence(tmp_path):
+    p = tmp_path / "n.md"
+    p.write_text("---\nfoo: 1\n---\nstatus: provisional\n")
+    assert vault_scan._lenient_status(p) is None
+    p.write_text("---\nfoo: 1\nstatus: provisional\n---\nstatus: promoted\n")
+    assert vault_scan._lenient_status(p) == "provisional"

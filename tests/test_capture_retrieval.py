@@ -139,6 +139,54 @@ def test_file_scan_fallback_leaves_provisional_out(tmp_vault, mock_config, monke
     assert "Promoted Insight" in brief and "Provisional Insight" not in brief
 
 
+_SPELLINGS = ['"Provisional"', "provisional # kept for now", "PROVISIONAL", "'provisional'"]
+
+
+@pytest.mark.parametrize("spelling", _SPELLINGS)
+def test_sql_filter_excludes_any_spelling_of_provisional(tmp_vault, tmp_path, spelling):
+    v = str(tmp_vault)
+    for layer, kw in (("backlink", {}), ("tag", {"session": "other", "tags": ["claude/topic/kiwi"]}),
+                      ("fts", {"session": "other", "body": "zebrafinch mangosteen notes"})):
+        _insight(v, f"{layer}-odd", status=spelling, **kw)
+        _insight(v, f"{layer}-kept", status="promoted", **kw)
+    _insight(v, "q-odd", status=spelling, session="other2", body="quokka facts")
+    _insight(v, "q-kept", status="promoted", session="other2", body="quokka facts")
+    db = vault_index.ensure_index(v, FOLDERS, db_path=str(tmp_path / "idx.db"))
+    got = _related(db)
+    assert set(got) == {"backlink-kept", "tag-kept", "fts-kept"}
+    strict = {Path(r["path"]).stem for r in vault_index.search_vault(db, "quokka", log_access=False,
+                                                                       include_provisional=False)}
+    assert strict == {"q-kept"}
+    assert "backlink-odd" in _related(db, include_provisional=True)
+
+
+@pytest.mark.parametrize("spelling", _SPELLINGS)
+def test_file_scan_fallback_excludes_any_spelling_of_provisional(tmp_vault, mock_config, monkeypatch, spelling):
+    _insight(str(tmp_vault), "provnote", status=spelling, title="Provisional Insight")
+    _insight(str(tmp_vault), "kept", status="promoted", title="Promoted Insight")
+    monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda: "test-sid")
+    monkeypatch.setattr(obsidian_utils, "cache_get", lambda *a: None)
+    monkeypatch.setattr(obsidian_utils, "cache_set", lambda *a: None)
+    monkeypatch.delitem(sys.modules, "vault_index", raising=False)
+    real = builtins.__import__
+
+    def no_index(name, *args, **kwargs):
+        if name == "vault_index":
+            raise ImportError("vault_index not available")
+        return real(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", no_index)
+    brief = obsidian_utils.build_context_brief(str(tmp_vault), "claude-sessions", "claude-insights", "demo")
+    assert "Promoted Insight" in brief and "Provisional Insight" not in brief
+
+
+@pytest.mark.parametrize("raw, want", [("provisional", "provisional"), ('"Provisional"', "provisional"),
+                                       ("provisional # x", "provisional"), ("  Promoted  ", "promoted"),
+                                       ("", None), ("# only a comment", None), (None, None), (5, None)])
+def test_normalize_status(raw, want):
+    assert obsidian_utils.normalize_status(raw) == want
+
+
 def _skill(name):
     return (Path(__file__).resolve().parent.parent / "skills" / name / "SKILL.md").read_text()
 
@@ -178,10 +226,19 @@ def test_vault_ask_step3_leaves_provisional_notes_out(tmp_path):
     assert "hidden" not in stems
 
 
-def test_vault_ask_step5_drops_provisional_rows_even_with_an_error():
-    text = _skill("vault-ask")
-    step5 = text.split("### Step 5")[1].split("### Step 6")[0]
-    assert "Drop every file whose `status` is `provisional` from `CANDIDATE_FILES` before scoring" in step5
+def test_vault_ask_step5_rule_is_stated_for_rows_with_an_error():
+    """The rule itself is run on real meta rows in tests/test_vault_scan.py; here only that Step 5 states it."""
+    step5 = _skill("vault-ask").split("### Step 5")[1].split("### Step 6")[0]
     assert "unless its `status` is `provisional`" in step5
-    assert "`source_session_note`, `status`, `tags`" in step5
+    assert "`meta` prints `status` lowercased" in step5
     assert "auto-captured notes with `status: provisional`" in _skill("recall")
+
+
+@pytest.mark.parametrize("stored, kept", [("provisional", False), ('"Provisional"', False), ("'provisional'", False),
+                                          ("provisional # x", False), (" PROVISIONAL ", False), (None, True),
+                                          ("promoted", True), ("active", True), ("superseded", True)])
+def test_not_provisional_sql_on_stored_values(stored, kept):
+    import sqlite3
+    conn = sqlite3.connect(":memory:")
+    sql = "SELECT " + vault_index.NOT_PROVISIONAL_SQL.format(p="") + " FROM (SELECT ? AS status)"
+    assert bool(conn.execute(sql, (stored,)).fetchone()[0]) is kept

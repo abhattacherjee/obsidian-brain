@@ -331,30 +331,49 @@ def _describe_parse_failure(reason: str) -> str:
     return _describe_note_parse_failure(reason)
 
 
-def _peek_status(path: Path) -> str | None:
-    """The note's ``status`` from its frontmatter, read by the bounded shared parser; None when unreadable.
+_LENIENT_STATUS_BYTES = 8192
+_LENIENT_STATUS_RE = re.compile(r"^status:\s*[\"']?([A-Za-z_-]+)")
 
-    An error row (an oversized note) still reports ``status``: /vault-ask drops
-    ``provisional`` notes by it, and must not keep one just because meta could
-    not read the whole file.
-    """
+
+def _normalized_status(value) -> str | None:
+    """``status`` as one lowercase token (quotes and an inline comment dropped); see obsidian_utils.normalize_status."""
     global _UTILS_WARNED
     try:
-        from obsidian_utils import _peek_frontmatter_field
+        from obsidian_utils import normalize_status
     except ImportError as exc:
         if not _UTILS_WARNED:
             _UTILS_WARNED = True
             print(f"vault_scan: obsidian_utils unavailable: {exc}", file=sys.stderr)
-        return None
+        text = re.split(r"(?:^|\s)#", value, maxsplit=1)[0].strip().strip("\"'") if isinstance(value, str) else ""
+        return text.split()[0].lower() if text.split() else None
+    return normalize_status(value)
+
+
+def _lenient_status(path: Path) -> str | None:
+    """The note's ``status`` when its frontmatter cannot be parsed (oversized, malformed, unreadable).
+
+    Reads only the first 8 KB and takes the first ``status:`` line before a
+    closing ``---`` if there is one. /vault-ask drops ``provisional`` notes by
+    this value, so an error row must still say it.
+    """
     try:
-        return _peek_frontmatter_field(path, "status") or None
-    except Exception:  # noqa: BLE001 -- a status peek must never turn an error row into a crash
+        with open(path, "rb") as fh:
+            head = fh.read(_LENIENT_STATUS_BYTES).decode("utf-8", errors="replace")
+    except OSError:
         return None
+    for i, line in enumerate(head.splitlines()):
+        line = line.rstrip("\r")
+        if i > 0 and line.strip() == "---":
+            break
+        m = _LENIENT_STATUS_RE.match(line)
+        if m:
+            return _normalized_status(m.group(1))
+    return None
 
 
 def _error_row(file_arg: str, error: str, path: Path) -> dict:
     row = _empty_row(file_arg, error)
-    row["status"] = _peek_status(path)
+    row["status"] = _lenient_status(path)
     return row
 
 
@@ -385,6 +404,7 @@ def note_meta(vault_root: Path, vault: str, file_arg: str) -> dict:
     )
     row = {"path": file_arg}
     row.update({f: (fields.get(f) or None) for f in META_FIELDS})
+    row["status"] = _normalized_status(row["status"])
     row.update({
         "tags": fields["tags"],
         "title": title,

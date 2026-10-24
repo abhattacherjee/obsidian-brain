@@ -44,7 +44,9 @@ from frontmatter import split_frontmatter, split_lines_lf_crlf
 DEFAULT_IMPORTANCE = 5
 # #455: auto notes capture selection did not promote. NULL (every note from
 # before #455, and hand notes) stays in. ``p`` is the table alias prefix.
-NOT_PROVISIONAL_SQL = "({p}status IS NULL OR {p}status != 'provisional')"
+# Tolerant of case, quotes and an inline comment ("Provisional", provisional # x).
+_SQL_TRIM_CHARS = "' \"'''"  # a space, a double quote and a single quote, as an SQL literal
+NOT_PROVISIONAL_SQL = ("({p}status IS NULL OR lower(trim({p}status, " + _SQL_TRIM_CHARS + ")) NOT LIKE 'provisional%')")
 
 IMPORTANCE_AUTO_CAPTURE = 3
 IMPORTANCE_HAND_SAVED = 6
@@ -1797,7 +1799,8 @@ def file_stat_key(note_path: str) -> tuple[float, int] | None:
     return (st.st_mtime, st.st_size)
 
 
-def update_note_status(db_path: str, note_path: str, pre_stat: tuple[float, int] | None = None) -> bool:
+def update_note_status(db_path: str, note_path: str, pre_stat: tuple[float, int] | None = None,
+                       post_stat: tuple[int, int] | None = None) -> bool:
     """Refresh one indexed note's ``status`` from its file, keeping its vector (#455).
 
     Capture selection rewrites only frontmatter fields the index does not
@@ -1805,11 +1808,14 @@ def update_note_status(db_path: str, note_path: str, pre_stat: tuple[float, int]
     the TF-IDF vector against the current IDF, and that drift alone can flip
     a near-tie in the next selection. A note not indexed yet is indexed in full.
 
-    ``pre_stat`` is ``file_stat_key`` taken just before our own write. The
-    row's mtime and size are stamped with the file's new ones only when the
-    row still held ``pre_stat``, i.e. the index had seen exactly the content
-    we edited. Otherwise (an external edit the index never saw, or no
-    ``pre_stat``) only ``status`` changes and the row stays stale, so the
+    ``pre_stat`` is ``file_stat_key`` taken just before our own write;
+    ``post_stat`` is the ``(st_mtime_ns, st_size)`` that write produced
+    (``set_frontmatter_fields(..., stat_out=)``). The row's mtime and size
+    are stamped with the file's new ones only when (a) the row still held
+    ``pre_stat``, i.e. the index had seen exactly the content we edited, and
+    (b) the file still has ``post_stat``, i.e. nobody edited it after us.
+    Otherwise (an external edit the index never saw, one after our write, or
+    no stat given) only ``status`` changes and the row stays stale, so the
     next ``_sync`` re-indexes the content.
     """
     if not os.path.isfile(db_path) or not os.path.isfile(note_path):
@@ -1824,8 +1830,10 @@ def update_note_status(db_path: str, note_path: str, pre_stat: tuple[float, int]
         if row is None:
             updated = False
         else:
-            fresh = (pre_stat is not None and row["mtime"] is not None and row["size"] is not None
-                     and mtime_unchanged(pre_stat[0], row["mtime"]) and pre_stat[1] == row["size"])
+            fresh = (pre_stat is not None and post_stat is not None
+                     and row["mtime"] is not None and row["size"] is not None
+                     and mtime_unchanged(pre_stat[0], row["mtime"]) and pre_stat[1] == row["size"]
+                     and (st.st_mtime_ns, st.st_size) == tuple(post_stat))
             if fresh:
                 conn.execute("UPDATE notes SET status = ?, mtime = ?, size = ? WHERE path = ?",
                              (parsed.get("status"), st.st_mtime, st.st_size, note_path))

@@ -106,3 +106,17 @@ def test_blind_ids_are_salted_not_filename_hashes():
     assert ids and all(re.fullmatch(r"b[0-9a-f]{12}", i) for i in ids)
     assert not any(re.fullmatch(r"[0-9a-f]{12}", i) for i in ids)
     assert set(_labels("opus_round1")) <= set(key)
+
+
+def test_build_fixture_refuses_a_guessable_id():
+    """The builder's own check (CI never sees the raw names): an id equal to sha1(name)[:12] fails the build."""
+    import hashlib
+    spec = importlib.util.spec_from_file_location("build_fixture", FIXTURE / "build_fixture.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    name = "2026-10-20-some-note.md"
+    guess = hashlib.sha1(name.encode()).hexdigest()[:12]
+    for bad in (guess, "n" + guess, "b" + guess):
+        with pytest.raises(SystemExit):
+            mod._assert_no_guessable_ids({bad}, {name})
+    mod._assert_no_guessable_ids({mod._opaque(b"salt", name), mod._blind(b"salt", guess)}, {name, guess})

@@ -476,10 +476,10 @@ def test_a_note_that_fails_is_reported_and_exits_one(vault, capsys, monkeypatch,
     monkeypatch.setattr(capture_backlog.subprocess, "run", lambda argv, **kw: subprocess.CompletedProcess(argv, 1, "", ""))
     real = capture_backlog.note_writer.set_frontmatter_fields
 
-    def flaky(v, p, f):
+    def flaky(v, p, f, **kw):
         if p.endswith("a5.md"):
             raise OSError("another process is updating this note")
-        return real(v, p, f)
+        return real(v, p, f, **kw)
 
     monkeypatch.setattr(capture_backlog.note_writer, "set_frontmatter_fields", flaky)
     rc, out, _ = _run(capsys, "--db", vault["db"], "--apply", "--backup-dir", str(tmp_path))
@@ -537,3 +537,87 @@ def test_a_note_the_first_run_selected_is_in_the_pool_again(vault):
     names = {n["name"] for n in capture_backlog.notes_in_window(
         vault["config"], capture_backlog.datetime.date(2026, 10, 18), capture_backlog.datetime.date(2026, 10, 23))}
     assert "a0.md" in names
+
+
+def _set_day(path, day):
+    path.write_text(path.read_text().replace("date: 2026-10-20", f"date: {day}", 1))
+
+
+def _apply_window(vault, since, until, scores, **kw):
+    d = capture_backlog.datetime.date
+    planned = capture_backlog.plan(vault["config"], d.fromisoformat(since), d.fromisoformat(until), scores,
+                                   vault["db"], root=vault["vault"].parent / "no-transcripts")
+    return planned, capture_backlog.apply(vault["config"], planned, vault["db"])
+
+
+def _promoted(vault, names):
+    return [n for n in names if _status(vault["notes"][n]) == "promoted"]
+
+
+def test_a_failed_demotion_gives_its_session_no_promotion(vault, monkeypatch):
+    names = [f"a{i}" for i in range(12)]
+    _apply_window(vault, "2026-10-18", "2026-10-23", vault["scores"])
+    assert len(_promoted(vault, names)) == 10
+    held = _promoted(vault, names)
+    demote = [n for n in held if vault["scores"][f"{n}.md"] == 3][:2]
+    rise = [n for n in names if n not in held]
+    scores = dict(vault["scores"])
+    scores.update({f"{n}.md": 1 for n in demote} | {f"{n}.md": 10 for n in rise})
+    real = capture_backlog.note_writer.set_frontmatter_fields
+
+    def flaky(v, p, f, **kw):
+        if p.endswith(f"{demote[0]}.md") and f.get("status") == "provisional":
+            raise OSError("another process is updating this note")
+        return real(v, p, f, **kw)
+
+    monkeypatch.setattr(capture_backlog.note_writer, "set_frontmatter_fields", flaky)
+    d = capture_backlog.datetime.date
+    planned = capture_backlog.plan(vault["config"], d(2026, 10, 18), d(2026, 10, 23), scores, vault["db"],
+                                   root=vault["vault"].parent / "no-transcripts")
+    planned["notes"].sort(key=lambda n: n["want"] == "provisional")  # promotions listed first: apply must reorder
+    result = capture_backlog.apply(vault["config"], planned, vault["db"])
+    assert any(demote[0] in e["note"] and "OSError" in e["error"] for e in result["errors"])
+    assert result["skipped"] == len(rise)
+    assert all("promotion skipped" in e["error"] for e in result["errors"] if rise[0] in e["note"])
+    assert [_status(vault["notes"][n]) for n in rise] == ["provisional"] * len(rise)  # no promotion in S1
+    assert len(_promoted(vault, names)) <= 10
+    monkeypatch.setattr(capture_backlog.note_writer, "set_frontmatter_fields", real)
+    _apply_window(vault, "2026-10-18", "2026-10-23", scores)  # the retry finishes the job
+    assert len(_promoted(vault, names)) == 10 and set(rise) <= set(_promoted(vault, names))
+
+
+def test_a_failed_demotion_in_one_session_does_not_block_another(vault, monkeypatch):
+    planned = _plan(vault)
+    other = [n for n in planned["notes"] if n["session"] == S2 and n["want"] != "provisional"]
+    assert other
+    real = capture_backlog.note_writer.set_frontmatter_fields
+
+    def flaky(v, p, f, **kw):
+        if p.endswith("a0.md") or p.endswith("a1.md"):
+            raise OSError("locked")
+        return real(v, p, f, **kw)
+
+    monkeypatch.setattr(capture_backlog.note_writer, "set_frontmatter_fields", flaky)
+    result = capture_backlog.apply(vault["config"], planned, vault["db"])
+    assert all(_status(n["path"]) == n["want"] for n in other if n["fm"].get("status") != n["want"])
+    assert result["written"] >= len(other)
+
+
+def test_a_narrower_window_cannot_push_a_session_over_the_cap(vault):
+    names = [f"a{i}" for i in range(12)]
+    for i in range(6):
+        _set_day(vault["notes"][f"a{i}"], "2026-10-19")
+    for i in range(6, 12):
+        _set_day(vault["notes"][f"a{i}"], "2026-10-21")
+    scores = {f"a{i}.md": 8 for i in range(12)}
+    _apply_window(vault, "2026-10-18", "2026-10-23", scores)
+    assert len(_promoted(vault, names)) == 10
+    outside = _promoted(vault, names[:6])
+    assert outside  # the first six are outside the narrow window below
+    rescored = {**scores, **{f"a{i}.md": 10 for i in range(6, 12)}}
+    _apply_window(vault, "2026-10-21", "2026-10-21", rescored)
+    got = _promoted(vault, names)
+    assert len(got) <= 10 and set(outside) <= set(got)  # the window limits candidates, not the cap
+    assert len(_promoted(vault, names[6:])) == 10 - len(outside)
+    _apply_window(vault, "2026-10-21", "2026-10-21", rescored)  # and a repeat changes nothing
+    assert _promoted(vault, names) == got

@@ -3661,3 +3661,55 @@ def test_run_append_update_in_process_reports_lock_contention(tmp_path, capsys):
     assert rc == 1
     assert "lock held" in capsys.readouterr().err
     assert note.read_bytes() == before
+
+
+# ---------------------------------------------------------------------------
+# #455: a hand update (the CLI path) promotes a provisional note
+# ---------------------------------------------------------------------------
+
+def _provisional_note(vault, name, ntype):
+    return _make_note(vault, "claude-insights", name,
+                      f"---\ntype: {ntype}\ndate: 2026-10-23\nstatus: provisional\ncapture_merit: 0.5\n"
+                      f"tags:\n  - claude/auto\n---\n\n# T\n\nBody.\n")
+
+
+@pytest.mark.parametrize("ntype, want", [("claude-insight", "promoted"), ("claude-decision", "active"),
+                                         ("claude-error-fix", "promoted")])
+def test_cli_append_update_promotes_a_provisional_note(tmp_path, ntype, want):
+    vault = tmp_path / "vault"
+    note = _provisional_note(vault, "n.md", ntype)
+    r = _run_append_update(vault, note, UPDATE_SECTION)
+    assert r.returncode == 0, r.stderr
+    text = note.read_text(encoding="utf-8")
+    assert f"status: {want}\n" in text and "promoted_by: hand-update\n" in text
+    assert "status: provisional" not in text and "## Update (2026-07-25)" in text
+    assert "capture_merit: 0.5\n" in text  # the rest of the frontmatter is untouched
+
+
+def test_in_process_default_does_not_promote(tmp_path, capsys):
+    """capture_save's auto update uses the default: an auto update must not promote."""
+    vault = tmp_path / "vault"
+    note = _provisional_note(vault, "n.md", "claude-insight")
+    assert note_writer.run_append_update(str(vault), str(note), UPDATE_SECTION) == 0
+    text = note.read_text(encoding="utf-8")
+    assert "status: provisional\n" in text and "promoted_by" not in text
+
+
+@pytest.mark.parametrize("status", ["promoted", "active", "superseded"])
+def test_cli_append_update_keeps_a_non_provisional_status(tmp_path, status):
+    vault = tmp_path / "vault"
+    note = _make_note(vault, "claude-insights", "n.md",
+                      f"---\ntype: claude-insight\nstatus: {status}\ntags:\n  - x\n---\n\nBody.\n")
+    assert _run_append_update(vault, note, UPDATE_SECTION).returncode == 0
+    text = note.read_text(encoding="utf-8")
+    assert f"status: {status}\n" in text and "promoted_by" not in text
+
+
+def test_cli_append_update_promotes_a_crlf_note_in_the_same_write(tmp_path):
+    vault = tmp_path / "vault"
+    note = _provisional_note(vault, "n.md", "claude-insight")
+    note.write_bytes(note.read_bytes().replace(b"\n", b"\r\n"))
+    assert _run_append_update(vault, note, UPDATE_SECTION).returncode == 0
+    raw = note.read_bytes()
+    assert b"status: promoted\r\n" in raw and b"promoted_by: hand-update\r\n" in raw
+    assert raw.count(b"\n") == raw.count(b"\r\n")

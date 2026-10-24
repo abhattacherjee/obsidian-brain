@@ -29,6 +29,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `vault_scan.py meta` reports `status` for an oversized note, and `/vault-ask` drops a provisional row even when it has an `error`.
   - The eval fixture derives note ids with HMAC-SHA256 under the same unstored salt as its terms (keep rates unchanged). `AUTO_HEADING_RE` ends with `\Z`.
 
+- `/compress` append-update promotes a provisional auto note (#455): `note_writer.py append-update` sets `status` to `promoted` (`active` for a decision) and `promoted_by: hand-update` in the same locked write as the update section. Auto-capture's own update keeps the note provisional. `promote_used` also promotes a provisional note it loads that already has a hand update.
+- `obsidian_utils.normalize_status` reads a `status` as one lowercase token with quotes and an inline `# comment` removed. `/recall`'s file-scan fallback, `vault_scan.py meta` and the SQL provisional filter (`search_vault`, all three `query_related_notes` layers) use it, so `"Provisional"` and `provisional # note` are left out like `provisional`.
+- Re-check fixes for capture selection (#455):
+  - Backlog `apply` writes demotions first; if one fails, no note of that session is promoted in that run, the failure is reported and the exit is 1.
+  - The backlog counts every promoted, selected, non-sticky note of a session against its cap of 10, whatever its date, so a narrower window cannot push a session over it.
+  - `update_note_status` stamps the row's mtime and size only if the row matched the pre-write stat and the file still has the stat of our own write (`set_frontmatter_fields(..., stat_out=)`).
+  - `vault_scan.py meta` reads `status` from the first 8 KB for a note whose frontmatter cannot be parsed, and prints it lowercased.
+  - The mixed-cycle tests check refs with `is None` and capture ids, so index 0 is not read as "no reference".
+  - `build_fixture.py` fails the build if an output id equals `sha1(name)[:12]` of an input name or blind id.
+
 ## [3.9.1] - 2026-10-23
 
 ### Added
