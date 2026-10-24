@@ -183,6 +183,22 @@ def test_consolidate_prunes_old_provisional_members_and_prints_the_count(db, ful
     assert "PRUNED_PROVISIONAL=0" in capsys.readouterr().out
 
 
+def test_a_themed_note_demoted_later_is_pruned_on_the_next_run(db, capsys):
+    _seed(db, [("a.md", None, {"q": 1.0}), ("b.md", None, {"q": 1.0}), ("c.md", "promoted", {"q": 1.0})])
+    _theme_with(db, [("a.md", {"q": 1.0}), ("b.md", {"q": 1.0}), ("c.md", {"q": 1.0})])
+    with patch("consolidate_cli.generate_theme_names", _fake_names):
+        consolidate_cli.run_consolidate(full=False)
+    assert "PRUNED_PROVISIONAL=0" in capsys.readouterr().out
+    conn = sqlite3.connect(db)  # what capture_select does when a stronger note displaces it
+    conn.execute("UPDATE notes SET status = 'provisional' WHERE path = 'c.md'")
+    conn.commit()
+    conn.close()
+    with patch("consolidate_cli.generate_theme_names", _fake_names):
+        consolidate_cli.run_consolidate(full=False)
+    assert "PRUNED_PROVISIONAL=1" in capsys.readouterr().out
+    assert "c.md" not in _members(db)
+
+
 def test_an_error_after_the_prune_rolls_it_back_and_exits_1(db, monkeypatch):
     _seed(db, [("a.md", None, {"q": 1.0}), ("b.md", None, {"q": 1.0}), ("p.md", "provisional", {"q": 1.0}),
                ("c1.md", None, {"x": 1.0}), ("c2.md", None, {"x": 1.0}), ("c3.md", None, {"x": 1.0})])

@@ -133,7 +133,7 @@ def create_theme(
 
 
 def prune_provisional_members(conn: sqlite3.Connection, now_iso: str) -> int:
-    """Remove every provisional note (#455) from the themes it is in (#458 one-time cleanup).
+    """Remove every provisional note (#455) from the themes it is in (#458).
 
     Each removal reverse-folds the note's vector out of the theme centroid and
     decrements ``note_count``, as ``vault_index._delete_note`` does; a theme

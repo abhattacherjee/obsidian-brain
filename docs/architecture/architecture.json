@@ -1126,7 +1126,7 @@
             "dashboards/project-index.md",
             "dashboards/weekly-review.md"
           ],
-          "purpose": "Six Dataview/dataviewjs dashboards over claude-sessions + claude-insights: recent sessions, open items by project, decision timeline, topic/error-pattern velocity, project index, and a 7-day weekly review. Every query that lists or groups claude-insights notes leaves provisional notes out unless it already filters to a status, and every list query over them has a LIMIT (#458); tests/test_dashboards.py checks this and that the inline copies in skills/obsidian-setup Step 6 equal these files. Require the Obsidian Dataview plugin."
+          "purpose": "Six Dataview/dataviewjs dashboards over claude-sessions + claude-insights: recent sessions, open items by project, decision timeline, topic/error-pattern velocity, project index, and a 7-day weekly review. Every query that lists or groups claude-insights notes leaves provisional notes out unless it already filters to a status (the retro-only Recent Retrospectives query is exempt, since auto capture never writes retros), and every list query over them has a LIMIT (#458); tests/test_dashboards.py checks this and that the inline copies in skills/obsidian-setup Step 6 equal these files. Require the Obsidian Dataview plugin."
         }
       ]
     },

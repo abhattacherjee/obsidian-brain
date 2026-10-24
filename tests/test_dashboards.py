@@ -13,6 +13,7 @@ REPO = Path(__file__).resolve().parent.parent
 DASH = REPO / "dashboards"
 SETUP = REPO / "skills" / "obsidian-setup" / "SKILL.md"
 FILES = sorted(p.name for p in DASH.glob("*.md"))
+EXPECTED_INSIGHT_BLOCKS = 11  # claude-insights query blocks across dashboards/*.md; update when one is added or removed
 
 DQL_FILTER = '(!status OR !startswith(lower(string(status)), "provisional"))'
 JS_FILTER = '.where(p => !p.status || !String(p.status).toLowerCase().startsWith("provisional"))'
@@ -23,6 +24,13 @@ def _blocks(text):
     return [(m.group(1), m.group(2)) for m in _BLOCK.finditer(text)]
 
 
+def _has_positive_status(where):
+    """A `status = "<x>"` (x not provisional, any case) AND-joined to the rest of the WHERE."""
+    if re.search(r"\bOR\b", where, re.I):
+        return False
+    return bool(re.search(r'\bstatus = "(?!provisional)', where, re.I))
+
+
 def _insight_blocks():
     out = []
     for name in FILES:
@@ -30,6 +38,23 @@ def _insight_blocks():
             if "claude-insights" in body:
                 out.append(pytest.param(kind, body, id=f"{name}#{i}"))
     return out
+
+
+def test_the_walk_finds_the_expected_insight_blocks():
+    # Positive control: an empty walk would skip the parametrized tests instead of failing them.
+    expected = sum("claude-insights" in body for n in FILES for _, body in _blocks((DASH / n).read_text()))
+    assert expected == EXPECTED_INSIGHT_BLOCKS and len(_insight_blocks()) == expected
+
+
+@pytest.mark.parametrize("where,ok", [
+    ('type = "claude-insight" AND status = "active"', True),
+    ('type = "claude-insight" OR status = "active"', False),
+    ('status = "Provisional"', False),
+    ('status = "provisional"', False),
+    ('status = "promoted"', True),
+])
+def test_positive_status_exemption(where, ok):
+    assert _has_positive_status(where) is ok
 
 
 def test_every_dashboard_has_blocks():
@@ -47,8 +72,7 @@ def test_insight_queries_leave_provisional_out(kind, body):
     assert where, body
     if re.fullmatch(r'type = "claude-retro"', where.group(1)):
         return  # auto capture never writes a retro, so no retro is provisional
-    positive_status = re.search(r'\bstatus = "(?!provisional)', where.group(1))
-    assert positive_status or DQL_FILTER in where.group(1), body
+    assert _has_positive_status(where.group(1)) or DQL_FILTER in where.group(1), body
 
 
 @pytest.mark.parametrize("kind,body", [p for p in _insight_blocks() if p.values[0] == "dataview"])

@@ -2416,8 +2416,11 @@ def query_related_notes(
     Returns up to `limit` results, filling slots layer by layer. Provisional
     auto-captured notes (#455) are left out of every layer unless
     ``include_provisional`` is set. At most ``max_retros`` ``claude-retro``
-    notes are kept, the first ones in layer order (#458, ``select_related``);
-    a later layer runs while fewer than ``limit`` rows are selectable.
+    notes are kept, the first ones in layer order (#458, ``select_related``).
+    A later layer runs while fewer than ``limit`` rows are selectable, and
+    Layer 3 pages through its ranked matches until ``limit`` rows are
+    selectable or the matches run out. The list is short only when fewer
+    than ``limit`` rows match at all.
     """
     if not os.path.isfile(db_path):
         return []
@@ -2505,9 +2508,11 @@ def query_related_notes(
                 # recall over precision (5-8 keywords rarely all co-occur).
                 fts_query = _sanitize_fts_query_or(" ".join(keywords))
                 if fts_query:
-                    # #458: room for retros the selection skips (limit * 2), plus
-                    # the rows already taken, which FTS returns again and dedup drops.
-                    fetch = limit * 2 + len(results)
+                    # #458: page through the ranked matches until the selection has
+                    # `limit` rows or the matches run out, so retros that outrank
+                    # every other match cannot leave the list short. Rows already
+                    # taken come back from FTS and dedup drops them.
+                    page = max(limit * 2, 20)
                     sql = (
                         f"SELECT n.path, n.type, n.date, n.project, n.title, n.tags, "
                         f"n.status, n.source_session, n.source_note, n.size "
@@ -2515,18 +2520,23 @@ def query_related_notes(
                         f"JOIN notes n ON n.rowid = f.rowid "
                         f"WHERE notes_fts MATCH ? AND n.project = ? "
                         f"{type_filter} "
-                        f"ORDER BY f.rank LIMIT ?"
+                        f"ORDER BY f.rank, n.rowid LIMIT ? OFFSET ?"
                     )
                     try:
-                        rows = conn.execute(
-                            sql, [fts_query, project] + type_params + [fetch]
-                        ).fetchall()
-                        for row in rows:
-                            d = dict(row)
-                            d["layer"] = "fts"
-                            if d["path"] not in seen_paths:
-                                results.append(d)
-                                seen_paths.add(d["path"])
+                        offset = 0
+                        while _short():
+                            rows = conn.execute(
+                                sql, [fts_query, project] + type_params + [page, offset]
+                            ).fetchall()
+                            for row in rows:
+                                d = dict(row)
+                                d["layer"] = "fts"
+                                if d["path"] not in seen_paths:
+                                    results.append(d)
+                                    seen_paths.add(d["path"])
+                            if len(rows) < page:
+                                break
+                            offset += page
                     except sqlite3.Error as exc:
                         print(f"[vault-index] Layer 3 (FTS) query failed: {exc}",
                               file=sys.stderr)

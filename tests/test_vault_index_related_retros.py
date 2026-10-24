@@ -196,3 +196,25 @@ def test_file_scan_fallback_keeps_one_retro_when_the_index_fails(fallback_vault,
     monkeypatch.setattr(vault_index, "ensure_index", broken)
     shown, _ = _fallback_brief(fallback_vault)
     assert shown == ["2026-10-24-retro", "2026-09-01-ins", "2026-09-02-ins"]
+
+
+def test_layer3_pages_past_retros_that_outrank_every_insight(tmp_vault, tmp_path):
+    # 41 retros rank above 20 matching insights; one fetch of limit*2 rows would give 1 retro and nothing else.
+    for i in range(41):
+        _note(tmp_vault, f"retro-{i:02d}", ntype="claude-retro", body="zebrafish " * 30)
+    for i in range(20):
+        _note(tmp_vault, f"ins-{i:02d}", body="zebrafish once")
+    got = _related(_index(tmp_vault, tmp_path), summary="zebrafish")
+    assert len(got) == 20
+    assert len([g for g in got if g.startswith("retro")]) == 1
+    assert len([g for g in got if g.startswith("ins")]) == 19
+
+
+def test_query_related_notes_passes_max_retros_through(tmp_vault, tmp_path):
+    for i in range(4):
+        _note(tmp_vault, f"retro-{i}", ntype="claude-retro", session=SID)
+    db = _index(tmp_vault, tmp_path)
+    two = vault_index.query_related_notes(db, "demo", [SID], [], "", note_types=ALL_TYPES, max_retros=2)
+    assert len(two) == 2
+    none = vault_index.query_related_notes(db, "demo", [SID], [], "", note_types=ALL_TYPES, max_retros=0)
+    assert none == []
