@@ -415,7 +415,8 @@ def test_main_dispatches_like_the_skill(monkeypatch, argv, expected):
 
 
 @pytest.mark.parametrize("argv", [["bogus"], ["split"], ["split", "x"], ["merge", "1"],
-                                  ["merge", "1", "y"], ["--full", "extra"], ["stats", "1"]])
+                                  ["merge", "1", "y"], ["--full", "extra"], ["stats", "1"],
+                                  ["split", "1", "2"], ["merge", "1", "2", "3"], ["merge"]])
 def test_main_rejects_bad_args_with_usage(monkeypatch, capsys, argv):
     for name in ("run_consolidate", "run_stats", "run_split", "run_merge"):
         monkeypatch.setattr(consolidate_cli, name, lambda *a, **k: pytest.fail("dispatched on bad args"))
@@ -454,3 +455,68 @@ def test_main_exits_1_on_error_line(db, capsys, argv, marker):
     # A direct run that prints an ERROR line must not exit 0 (#460 forced-failure run).
     assert consolidate_cli.main(argv) == 1
     assert marker in capsys.readouterr().out
+
+
+# --- #460: main with the REAL run_merge/run_split (success paths exit 0) ---
+
+def test_main_merge_real_exits_0(db, capsys):
+    conn = sqlite3.connect(db)
+    for tid, name in [(1, "A"), (2, "B")]:
+        conn.execute("INSERT INTO themes (id,name,summary,centroid,note_count,created_date,updated_date,project) "
+                     "VALUES (?,?,?,?,?,?,?,?)", (tid, name, "s", json.dumps({"x": 1.0}), 1, "d", "d", "proj"))
+    conn.execute("INSERT INTO theme_members VALUES (1,'a.md',0.9,0.0,'2026-01-01')")
+    conn.execute("INSERT INTO theme_members VALUES (2,'b.md',0.9,0.0,'2026-01-01')")
+    conn.execute("INSERT INTO notes (path,type,project,title,body,mtime,tfidf_vector) "
+                 "VALUES ('a.md','session','proj','t','b',1.0,?)", (json.dumps({"x": 1.0}),))
+    conn.execute("INSERT INTO notes (path,type,project,title,body,mtime,tfidf_vector) "
+                 "VALUES ('b.md','session','proj','t','b',1.0,?)", (json.dumps({"y": 1.0}),))
+    conn.commit(); conn.close()
+    assert consolidate_cli.main(["merge", "1", "2"]) == 0
+    assert "MERGED" in capsys.readouterr().out
+
+
+def test_main_split_real_exits_0(db, capsys):
+    conn = sqlite3.connect(db)
+    conn.execute("INSERT INTO themes (id,name,summary,centroid,note_count,created_date,updated_date,project) "
+                 "VALUES (1,'Mixed','s','{}',6,'d','d','proj')")
+    for path, vec in [("a1.md", {"a": 1.0}), ("a2.md", {"a": 1.0}), ("a3.md", {"a": 1.0}),
+                      ("b1.md", {"b": 1.0}), ("b2.md", {"b": 1.0}), ("b3.md", {"b": 1.0})]:
+        conn.execute("INSERT INTO notes (path,type,project,title,body,mtime,tfidf_vector) "
+                     "VALUES (?,'session','proj','t','b',1.0,?)", (path, json.dumps(vec)))
+        conn.execute("INSERT INTO theme_members VALUES (1,?,0.9,0.0,'d')", (path,))
+    conn.commit(); conn.close()
+    with patch("consolidate_cli.generate_theme_names", _fake_names):
+        assert consolidate_cli.main(["split", "1"]) == 0
+    assert "SPLIT theme=" in capsys.readouterr().out
+
+
+def test_main_split_cohesive_real_exits_0(db, capsys):
+    conn = sqlite3.connect(db)
+    conn.execute("INSERT INTO themes (id,name,summary,centroid,note_count,created_date,updated_date,project) "
+                 "VALUES (1,'Tight','s','{}',3,'d','d','proj')")
+    for p in ["a.md", "b.md", "c.md"]:
+        conn.execute("INSERT INTO notes (path,type,project,title,body,mtime,tfidf_vector) "
+                     "VALUES (?,'session','proj','t','b',1.0,?)", (p, json.dumps({"x": 1.0})))
+        conn.execute("INSERT INTO theme_members VALUES (1,?,0.9,0.0,'d')", (p,))
+    conn.commit(); conn.close()
+    with patch("consolidate_cli.generate_theme_names", _fake_names):
+        assert consolidate_cli.main(["split", "1"]) == 0
+    assert "NO_SPLIT" in capsys.readouterr().out
+
+
+def test_direct_run_valid_command_exits_0(tmp_vault, tmp_path):
+    """Subprocess `stats` with HOME and the DB isolated in tmp (never ~/.claude)."""
+    import subprocess
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True)
+    cfg = home / ".claude" / "obsidian-brain-config.json"
+    cfg.write_text(json.dumps({"vault_path": str(tmp_vault)}))
+    cfg.chmod(0o600)
+    dbp = str(tmp_path / "idx.db")
+    vault_index.ensure_index(str(tmp_vault), ["claude-sessions"], db_path=dbp)
+    script = os.path.join(os.path.dirname(__file__), "..", "hooks", "consolidate_cli.py")
+    env = {**os.environ, "HOME": str(home), "OBSIDIAN_BRAIN_DB": dbp}
+    proc = subprocess.run([sys.executable, script, "stats"], capture_output=True, text=True,
+                          stdin=subprocess.DEVNULL, timeout=60, env=env)
+    assert proc.returncode == 0, proc.stderr
+    assert "UNASSIGNED=" in proc.stdout
