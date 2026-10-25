@@ -13,6 +13,7 @@ SORT length(rows) DESC
 ```dataview
 TABLE date, project
 FROM "claude-insights"
-WHERE type = "claude-error-fix"
+WHERE type = "claude-error-fix" AND (!status OR !startswith(lower(string(status)), "provisional"))
 SORT date DESC
+LIMIT 50
 ```

@@ -90,6 +90,9 @@ def run_consolidate(full: bool = False) -> None:
         conn = _connect(db)
         try:
             conn.execute("BEGIN IMMEDIATE")
+            # #458: drop provisional members of existing themes (0 when none are provisional;
+            # a note demoted later is removed at the next run).
+            pruned = themes.prune_provisional_members(conn, now)
             if full:
                 conn.execute("DELETE FROM theme_members")
                 conn.execute("DELETE FROM themes")
@@ -100,6 +103,7 @@ def run_consolidate(full: bool = False) -> None:
         finally:
             conn.close()
 
+        print(f"PRUNED_PROVISIONAL={pruned}")
         created = len(plan)
         conn = _connect(db)
         try:

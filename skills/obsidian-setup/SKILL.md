@@ -210,7 +210,7 @@ LIMIT 20
 \```dataview
 TABLE date, project, tags
 FROM "claude-insights"
-WHERE type = "claude-insight"
+WHERE type = "claude-insight" AND (!status OR !startswith(lower(string(status)), "provisional"))
 SORT date DESC
 LIMIT 10
 \```
@@ -221,6 +221,7 @@ TABLE date, project
 FROM "claude-insights"
 WHERE type = "claude-decision" AND status = "active"
 SORT date DESC
+LIMIT 20
 \```
 ```
 
@@ -242,8 +243,9 @@ SORT length(rows) DESC
 \```dataview
 TABLE date, project
 FROM "claude-insights"
-WHERE type = "claude-error-fix"
+WHERE type = "claude-error-fix" AND (!status OR !startswith(lower(string(status)), "provisional"))
 SORT date DESC
+LIMIT 50
 \```
 ```
 
@@ -255,8 +257,9 @@ SORT date DESC
 \```dataview
 TABLE date, project, type
 FROM "claude-sessions" OR "claude-insights"
-WHERE date >= date(today) - dur(7 days)
+WHERE date >= date(today) - dur(7 days) AND (!status OR !startswith(lower(string(status)), "provisional"))
 SORT date DESC
+LIMIT 100
 \```
 ```
 
@@ -268,6 +271,7 @@ SORT date DESC
 ## Topics by Frequency
 \```dataviewjs
 let pages = dv.pages('"claude-insights"')
+    .where(p => !p.status || !String(p.status).toLowerCase().startsWith("provisional"))
     .where(p => p.tags);
 
 let topics = {};
@@ -302,6 +306,7 @@ LIMIT 10
 ## Error Patterns (Most Common)
 \```dataviewjs
 let pages = dv.pages('"claude-insights"')
+    .where(p => !p.status || !String(p.status).toLowerCase().startsWith("provisional"))
     .where(p => p.type === "claude-error-fix");
 
 let topics = {};
@@ -337,14 +342,16 @@ TABLE date, project
 FROM "claude-insights"
 WHERE type = "claude-decision" AND status = "active"
 SORT date DESC
+LIMIT 50
 \```
 
 ## All Decisions (Chronological)
 \```dataview
 TABLE date, project, status
 FROM "claude-insights"
-WHERE type = "claude-decision"
+WHERE type = "claude-decision" AND (!status OR !startswith(lower(string(status)), "provisional"))
 SORT date DESC
+LIMIT 50
 \```
 
 ## Superseded Decisions
@@ -353,13 +360,14 @@ TABLE date, project
 FROM "claude-insights"
 WHERE type = "claude-decision" AND status = "superseded"
 SORT date DESC
+LIMIT 50
 \```
 
 ## Decisions by Project
 \```dataview
 TABLE length(rows) AS "Decisions", min(rows.date) AS "First", max(rows.date) AS "Last"
 FROM "claude-insights"
-WHERE type = "claude-decision"
+WHERE type = "claude-decision" AND (!status OR !startswith(lower(string(status)), "provisional"))
 GROUP BY project
 SORT length(rows) DESC
 \```

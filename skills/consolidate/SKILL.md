@@ -49,9 +49,12 @@ from consolidate_cli import run_consolidate; run_consolidate(full=(len(sys.argv)
 ' "$@"
 ```
 
-Report the `UNASSIGNED=` (or `SCANNED=` for `--full`), `CREATED=`, and
-`THEMES_TOTAL=` lines. If `CREATED=0`, tell the user no clusters of 3+ similar
+Report the `UNASSIGNED=` (or `SCANNED=` for `--full`), `PRUNED_PROVISIONAL=`,
+`CREATED=`, and `THEMES_TOTAL=` lines. If `CREATED=0`, tell the user no clusters of 3+ similar
 notes were found (themes need at least 3 notes above the similarity threshold).
+Provisional auto notes never join a theme. `PRUNED_PROVISIONAL=<n>` is how many
+were removed from existing themes on this run. It is 0 when no themed note
+is provisional; a themed note that `capture_select` demotes later is removed on the next run.
 
 ### Step 3 — Stats
 
