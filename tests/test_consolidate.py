@@ -1,4 +1,4 @@
-import os, sys, json, sqlite3
+import os, re, sys, json, sqlite3
 from unittest.mock import patch
 import pytest
 
@@ -487,7 +487,7 @@ def test_main_split_real_exits_0(db, capsys):
     conn.commit(); conn.close()
     with patch("consolidate_cli.generate_theme_names", _fake_names):
         assert consolidate_cli.main(["split", "1"]) == 0
-    assert "SPLIT theme=" in capsys.readouterr().out
+    assert re.search(r"^SPLIT theme=\d+ into=\d+$", capsys.readouterr().out, re.M)  # not NO_SPLIT
 
 
 def test_main_split_cohesive_real_exits_0(db, capsys):
