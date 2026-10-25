@@ -443,3 +443,14 @@ def test_direct_run_is_not_a_silent_noop():
                           stdin=subprocess.DEVNULL, timeout=60)
     assert proc.returncode == 2
     assert "usage: consolidate_cli.py" in proc.stderr
+
+
+@pytest.mark.parametrize("argv, marker", [
+    (["split", "99999"], "ERROR theme 99999 not found"),
+    (["merge", "99998", "99999"], "ERROR theme(s) not found"),
+    (["merge", "5", "5"], "ERROR cannot merge a theme with itself"),
+])
+def test_main_exits_1_on_error_line(db, capsys, argv, marker):
+    # A direct run that prints an ERROR line must not exit 0 (#460 forced-failure run).
+    assert consolidate_cli.main(argv) == 1
+    assert marker in capsys.readouterr().out
