@@ -29,7 +29,7 @@ bar are in issue #458. This plan fixes the mechanics; each choice is marked **Ru
 6. **Themes never take a provisional note.** `get_unassigned_notes`, `get_all_vectorized_notes`
    and `assign_to_theme` skip provisional rows. A note promoted later has no theme row, so the
    next incremental `/consolidate` picks it up. Nothing else changes for promoted notes.
-7. **One-time cleanup, run by `/consolidate`.** New `themes.prune_provisional_members(conn, now)`
+7. **Cleanup, run by every `/consolidate`.** New `themes.prune_provisional_members(conn, now)`
    removes every provisional member: it reverse-folds the note out of the centroid
    (`_reverse_fold_centroid`, as `_delete_note` does), decrements `note_count`, and deletes a theme
    left with no members. It runs inside `run_consolidate`'s write transaction, before the new

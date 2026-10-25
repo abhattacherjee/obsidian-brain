@@ -28,6 +28,8 @@ def _has_positive_status(where):
     """A `status = "<x>"` (x not provisional, any case) AND-joined to the rest of the WHERE."""
     if re.search(r"\bOR\b", where, re.I):
         return False
+    if re.search(r"!|\bNOT\b", where, re.I):
+        return False  # a negated equality admits provisional notes
     return bool(re.search(r'\bstatus = "(?!provisional)', where, re.I))
 
 
@@ -52,6 +54,12 @@ def test_the_walk_finds_the_expected_insight_blocks():
     ('status = "Provisional"', False),
     ('status = "provisional"', False),
     ('status = "promoted"', True),
+    ('!(status = "active")', False),
+    ('!status = "active"', False),
+    ('NOT (status = "active")', False),
+    ('NOT status = "active"', False),
+    ('status != "active"', False),
+    ('type = "claude-insight" AND NOT status = "active"', False),
 ])
 def test_positive_status_exemption(where, ok):
     assert _has_positive_status(where) is ok

@@ -639,7 +639,7 @@
           "files": [
             "hooks/consolidate_cli.py"
           ],
-          "purpose": "Thin CLI backing /consolidate: gathers unassigned (or all, with --full) non-provisional note vectors, clusters per-project, names via Haiku, persists themes + theme_members; stats/split/merge. In the same write transaction, before any --full wipe or new theme, themes.prune_provisional_members drops provisional members of existing themes and prints PRUNED_PROVISIONAL=<n>, 0 once done (#458)."
+          "purpose": "Thin CLI backing /consolidate: gathers unassigned (or all, with --full) non-provisional note vectors, clusters per-project, names via Haiku, persists themes + theme_members; stats/split/merge. In the same write transaction, before any --full wipe or new theme, themes.prune_provisional_members drops provisional members of existing themes and prints PRUNED_PROVISIONAL=<n>: 0 when no themed note is provisional; a note demoted later is removed at the next run (#458)."
         },
         {
           "id": "clustering",
