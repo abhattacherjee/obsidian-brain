@@ -217,3 +217,38 @@ def run_split(theme_id: int) -> None:
     except (sqlite3.Error, RuntimeError, ValueError, TypeError) as exc:
         print(f"ERROR {exc}", file=sys.stderr)
         sys.exit(1)
+
+
+USAGE = "usage: consolidate_cli.py [--full] | stats | split <theme_id> | merge <a> <b>"
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Dispatch a direct run the same way the /consolidate skill does (#460).
+
+    Before this, running the file directly did nothing and exited 0.
+    """
+    args = sys.argv[1:] if argv is None else argv
+    # Parse every argument before dispatching, so a ValueError from config
+    # inside a run_* call is never reported as a usage error.
+    try:
+        if not args or args == ["--full"]:
+            call = lambda: run_consolidate(full=bool(args))  # noqa: E731
+        elif args == ["stats"]:
+            call = run_stats
+        elif len(args) == 2 and args[0] == "split":
+            theme_id = int(args[1])
+            call = lambda: run_split(theme_id)  # noqa: E731
+        elif len(args) == 3 and args[0] == "merge":
+            a, b = int(args[1]), int(args[2])
+            call = lambda: run_merge(a, b)  # noqa: E731
+        else:
+            raise ValueError(args)
+    except ValueError:
+        print(USAGE, file=sys.stderr)
+        return 2
+    call()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

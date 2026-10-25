@@ -646,3 +646,28 @@ def test_a_narrower_window_cannot_push_a_session_over_the_cap(vault):
     assert len(_promoted(vault, names[6:])) == 10 - len(outside)
     _apply_window(vault, "2026-10-21", "2026-10-21", rescored)  # and a repeat changes nothing
     assert _promoted(vault, names) == got
+
+
+def test_apply_prints_progress_around_ensure_index(vault, capsys, monkeypatch, tmp_path):
+    # #461: ensure_index ran ~9 minutes silent on the live vault; the script now
+    # says when it starts and how long it took.
+    monkeypatch.setattr(capture_backlog.subprocess, "run", lambda argv, **kw: subprocess.CompletedProcess(
+        argv, 0, json.dumps([{"i": i, "score": 5} for i in range(20)]), ""))
+    seen = []
+
+    def fake_ensure_index(*a, **kw):
+        seen.append(capsys.readouterr().err)  # what was printed before indexing began
+        return kw.get("db_path")
+
+    monkeypatch.setattr(vault_index, "ensure_index", fake_ensure_index)
+    rc, _, err = _run(capsys, "--db", vault["db"], "--scores", str(vault["scores_file"]), "--apply",
+                      "--backup-dir", str(tmp_path / "bk"))
+    assert rc == 0, err
+    assert len(seen) == 1 and seen[0].rstrip().endswith("indexing vault...")
+    assert re.search(r"^indexed vault in \d+\.\ds$", err, re.M)
+
+
+def test_dry_run_prints_no_index_progress(vault, capsys, monkeypatch):
+    _no_model(monkeypatch)
+    rc, _, err = _run(capsys, "--db", vault["db"], "--scores", str(vault["scores_file"]))
+    assert rc == 0 and "indexing vault" not in err

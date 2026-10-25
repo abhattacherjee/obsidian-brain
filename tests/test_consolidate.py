@@ -393,3 +393,53 @@ def test_merge_self_emits_distinct_message(db, capsys):
     out = capsys.readouterr().out
     assert "cannot merge a theme with itself" in out
     assert "theme(s) not found" not in out
+
+
+# --- #460: a direct run dispatches like the skill, or prints usage and exits 2 ---
+
+@pytest.mark.parametrize("argv, expected", [
+    ([], ("consolidate", False)),
+    (["--full"], ("consolidate", True)),
+    (["stats"], ("stats",)),
+    (["split", "7"], ("split", 7)),
+    (["merge", "3", "4"], ("merge", 3, 4)),
+])
+def test_main_dispatches_like_the_skill(monkeypatch, argv, expected):
+    calls = []
+    monkeypatch.setattr(consolidate_cli, "run_consolidate", lambda full=False: calls.append(("consolidate", full)))
+    monkeypatch.setattr(consolidate_cli, "run_stats", lambda: calls.append(("stats",)))
+    monkeypatch.setattr(consolidate_cli, "run_split", lambda t: calls.append(("split", t)))
+    monkeypatch.setattr(consolidate_cli, "run_merge", lambda a, b: calls.append(("merge", a, b)))
+    assert consolidate_cli.main(argv) == 0
+    assert calls == [expected]
+
+
+@pytest.mark.parametrize("argv", [["bogus"], ["split"], ["split", "x"], ["merge", "1"],
+                                  ["merge", "1", "y"], ["--full", "extra"], ["stats", "1"]])
+def test_main_rejects_bad_args_with_usage(monkeypatch, capsys, argv):
+    for name in ("run_consolidate", "run_stats", "run_split", "run_merge"):
+        monkeypatch.setattr(consolidate_cli, name, lambda *a, **k: pytest.fail("dispatched on bad args"))
+    assert consolidate_cli.main(argv) == 2
+    assert "usage: consolidate_cli.py" in capsys.readouterr().err
+
+
+def test_main_config_valueerror_is_not_a_usage_error(monkeypatch):
+    def boom(t):
+        raise ValueError("bad config value")
+    monkeypatch.setattr(consolidate_cli, "run_split", boom)
+    with pytest.raises(ValueError, match="bad config value"):
+        consolidate_cli.main(["split", "5"])
+
+
+def test_main_stats_prints_real_output(db, capsys):
+    assert consolidate_cli.main(["stats"]) == 0
+    assert "UNASSIGNED=" in capsys.readouterr().out
+
+
+def test_direct_run_is_not_a_silent_noop():
+    import subprocess
+    script = os.path.join(os.path.dirname(__file__), "..", "hooks", "consolidate_cli.py")
+    proc = subprocess.run([sys.executable, script, "bogus"], capture_output=True, text=True,
+                          stdin=subprocess.DEVNULL, timeout=60)
+    assert proc.returncode == 2
+    assert "usage: consolidate_cli.py" in proc.stderr
