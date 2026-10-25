@@ -144,10 +144,11 @@ def run_stats() -> None:
         sys.exit(1)
 
 
-def run_merge(a: int, b: int) -> None:
+def run_merge(a: int, b: int) -> bool:
+    """Return False when nothing was merged, so a direct run can exit 1 (#460)."""
     if a == b:
         print(f"ERROR cannot merge a theme with itself a={a}")
-        return
+        return False
     db = _default_db_path()
     try:
         ok = themes.merge_themes(db, a, b, _now_iso())
@@ -163,12 +164,14 @@ def run_merge(a: int, b: int) -> None:
             finally:
                 conn.close()
         print(f"MERGED a={a} b={b}" if ok else f"ERROR theme(s) not found a={a} b={b}")
+        return bool(ok)
     except (sqlite3.Error, RuntimeError, ValueError, TypeError) as exc:
         print(f"ERROR {exc}", file=sys.stderr)
         sys.exit(1)
 
 
-def run_split(theme_id: int) -> None:
+def run_split(theme_id: int) -> bool:
+    """Return False when the theme is not found, so a direct run can exit 1 (#460)."""
     config = load_config()
     db = _default_db_path()
     threshold = float(config.get("consolidate_cluster_threshold", 0.5))
@@ -181,7 +184,7 @@ def run_split(theme_id: int) -> None:
         if row is None:
             conn.close()
             print(f"ERROR theme {theme_id} not found")
-            return
+            return False
         project = row[0]
         items = themes._theme_member_vectors(conn, theme_id)
         conn.close()
@@ -189,7 +192,7 @@ def run_split(theme_id: int) -> None:
         subclusters = clustering.cluster_vectors(items, threshold=split_threshold, min_cluster_size=min_size)
         if len(subclusters) < 2:
             print(f"NO_SPLIT theme={theme_id} subclusters={len(subclusters)}")
-            return
+            return True
 
         vec_by_path = dict(items)
         centroids = [themes.compute_centroid([vec_by_path[p] for p in c]) for c in subclusters]
@@ -213,7 +216,43 @@ def run_split(theme_id: int) -> None:
         finally:
             conn.close()
         print(f"SPLIT theme={theme_id} into={len(subclusters)}")
+        return True
 
     except (sqlite3.Error, RuntimeError, ValueError, TypeError) as exc:
         print(f"ERROR {exc}", file=sys.stderr)
         sys.exit(1)
+
+
+USAGE = "usage: consolidate_cli.py [--full] | stats | split <theme_id> | merge <a> <b>"
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Dispatch a direct run the same way the /consolidate skill does (#460).
+
+    Before this, running the file directly did nothing and exited 0.
+    """
+    args = sys.argv[1:] if argv is None else argv
+    # Parse every argument before dispatching, so a ValueError from config
+    # inside a run_* call is never reported as a usage error.
+    try:
+        if not args or args == ["--full"]:
+            call = lambda: run_consolidate(full=bool(args))  # noqa: E731
+        elif args == ["stats"]:
+            call = run_stats
+        elif len(args) == 2 and args[0] == "split":
+            theme_id = int(args[1])
+            call = lambda: run_split(theme_id)  # noqa: E731
+        elif len(args) == 3 and args[0] == "merge":
+            a, b = int(args[1]), int(args[2])
+            call = lambda: run_merge(a, b)  # noqa: E731
+        else:
+            raise ValueError(args)
+    except ValueError:
+        print(USAGE, file=sys.stderr)
+        return 2
+    # run_split/run_merge return False on a not-found or self-merge ERROR line.
+    return 1 if call() is False else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

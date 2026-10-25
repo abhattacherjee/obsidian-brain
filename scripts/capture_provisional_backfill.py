@@ -45,6 +45,7 @@ import argparse
 import datetime
 import json
 import sys
+import time
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -112,7 +113,11 @@ def main(argv=None) -> int:
         scores = {**capture_backlog.load_scores(args.scores), **cached}
         if args.apply:
             backup = capture_backlog.backup_db(db, args.backup_dir)
+            # ensure_index can run for minutes on a large vault with no output (#461).
+            print("indexing vault...", file=sys.stderr, flush=True)
+            started = time.monotonic()
             vault_index.ensure_index(config["vault_path"], indexed_folders(config), db_path=db)
+            print(f"indexed vault in {time.monotonic() - started:.1f}s", file=sys.stderr, flush=True)
         if args.score or args.apply:
             notes = capture_backlog.notes_in_window(config, args.since, args.until)
             capture_backlog.score_missing(notes, scores, cache)
