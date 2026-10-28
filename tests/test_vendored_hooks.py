@@ -379,6 +379,39 @@ def test_unbound_token_does_not_authorize_a_commit(repo, expiry):
     assert _run_hook(repo, "require-preflight.py", "git commit -m x").verdict == "allow"
 
 
+def _write_manifests(root, plugin_version, market_version):
+    plugin_dir = root / ".claude-plugin"
+    plugin_dir.mkdir(exist_ok=True)
+    (plugin_dir / "plugin.json").write_text(json.dumps(
+        {"name": "probe", "version": plugin_version}), encoding="utf-8")
+    (plugin_dir / "marketplace.json").write_text(json.dumps(
+        {"plugins": [{"name": "probe", "version": market_version}]}), encoding="utf-8")
+
+
+@pytest.mark.parametrize("flags", [
+    pytest.param(["--docs-only"], id="docs-only"),
+    pytest.param(["--skip-tests", "probe"], id="skip-tests"),
+    pytest.param(["--auto"], id="auto"),
+])
+@pytest.mark.parametrize("market,expected_rc", [
+    pytest.param("1.0.0", 0, id="in-sync-control"),
+    pytest.param("0.0.0", 1, id="mismatch"),
+])
+def test_version_sync_runs_before_every_skip_mode(repo, flags, market, expected_rc):
+    """Repo part of the vendored preflight: no skip flag bypasses version sync."""
+    _write_manifests(repo.root, "1.0.0", market)
+    _git(repo, "add", ".claude-plugin")
+    proc = subprocess.run(
+        ["bash", str(repo.root / "scripts" / "commit-preflight.sh"), *flags],
+        cwd=repo.root, env=repo.env, capture_output=True, text=True, timeout=60,
+        stdin=subprocess.DEVNULL,
+    )
+    assert proc.returncode == expected_rc, proc.stdout[-800:] + proc.stderr[-400:]
+    assert repo.token.exists() is (expected_rc == 0), "a failed preflight must leave no token"
+    if expected_rc:
+        assert "MISMATCH" in proc.stdout
+
+
 def test_staging_and_commit_in_one_call_cannot_reuse_a_checked_tree(repo):
     """G-20: a valid token for the pre-add tree cannot approve add && commit."""
     _stage(repo, repo.root)
