@@ -98,6 +98,8 @@ When writing new hooks, skills, or scripts, follow these rules:
 - Releases branch from `develop`, merge to both `main` and `develop`
 - Hotfixes branch from `main`, merge to both `main` and `develop`
 - Run `./scripts/commit-preflight.sh` before every commit
+- Stage first, then commit in a separate Bash call. The preflight token binds the staged tree, so the hooks refuse a commit that could stage files in the same call (`git add … && git commit …`, `git commit -a`, `-m "$(…)"`).
+- The five `.claude/hooks/*.py` gates are vendored unchanged from harden-repo (v1.3.0, `892d0f5`). Fix them upstream, never by hand; `tests/test_security.py` checks the bytes.
 
 ## Distribution & Release
 

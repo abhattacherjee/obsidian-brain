@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 .claude/hooks/prevent-direct-push.py",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/prevent-direct-push.py\"",
             "timeout": 10
           }
         ]
@@ -16,7 +16,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 .claude/hooks/require-preflight.py",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/require-preflight.py\"",
             "timeout": 10
           }
         ]
@@ -26,7 +26,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 .claude/hooks/validate-branch-name.py",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/validate-branch-name.py\"",
             "timeout": 10
           }
         ]
@@ -36,7 +36,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 .claude/hooks/update-changelog-before-pr.py",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/update-changelog-before-pr.py\"",
             "timeout": 10
           }
         ]
@@ -46,7 +46,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 .claude/hooks/enforce-pr-base-branch.py",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/enforce-pr-base-branch.py\"",
             "timeout": 10
           }
         ]
