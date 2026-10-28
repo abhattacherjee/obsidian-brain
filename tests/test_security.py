@@ -309,6 +309,28 @@ def _static_int(node, consts):
     return None
 
 
+def _parse_hook_verdict(stdout, hook):
+    """``(decision, reason)`` from a hook's stdout. Empty stdout is the hooks'
+    own "allow" convention. Anything else must be JSON with
+    a ``hookSpecificOutput`` object (as tests/test_vendored_hooks.py
+    ``_run_hook`` reads it). A missing ``permissionDecision`` there means
+    "allow", as with the preflight hook's ``additionalContext`` note. Any other
+    stdout fails the test, because reading it as "allow" would hide a broken
+    gate."""
+    if not stdout.strip():
+        return "allow", ""
+    try:
+        out = json.loads(stdout)["hookSpecificOutput"]
+        decision = out.get("permissionDecision", "allow")
+        reason = out.get("permissionDecisionReason", "")
+    except (ValueError, KeyError, TypeError, AttributeError):
+        pytest.fail(f"{hook} wrote stdout that is not a hook result: "
+                    f"{stdout[:400]!r}")
+    if decision not in ("allow", "deny"):
+        pytest.fail(f"{hook} wrote an unknown permissionDecision: {stdout[:400]!r}")
+    return decision, reason
+
+
 def _vendored_hook_constant(hook, name):
     """Module-level int constant *name* of a vendored hook, read with ``ast``
     (the hook is never imported, so nothing in it runs)."""
@@ -473,29 +495,36 @@ class TestStdinCap:
     def _int_constants(tree):
         """``{NAME: value}`` for every unambiguous ``NAME = <int>`` binding.
 
-        A name bound more than once is deliberately EXCLUDED rather than
-        resolved last-write-wins: this walk flattens every scope in the module
-        into one namespace, so a function-local ``CAP = 500`` and a
-        module-level ``CAP = 10**9`` would otherwise collapse into whichever
-        the walk happened to reach last — and half of those guesses resolve a
-        read to a bound it does not actually have. Unresolvable is the safe
-        answer: it reports the site as an offender rather than passing it.
+        This walk flattens every scope in the module into one namespace, so a
+        name can be bound in several places. A name is resolved only when EVERY
+        binding of it folds to the same int. Otherwise it is left out, and so
+        is anything folded from it: a function-local ``SIZE = 1`` next to a
+        module-level ``SIZE = 10_000_000`` must not let ``LIMIT = 8 * SIZE``
+        resolve to 8. Unresolvable is the safe answer: it reports the site as
+        an offender rather than passing it.
+
+        Works to a fixed point, so ambiguity carries through chains
+        (``C = 2 * B``, ``B = 8 * A``) whatever order the walk meets them in.
         """
-        seen = {}
-        ambiguous = set()
+        bindings = []
         for node in ast.walk(tree):
             if isinstance(node, ast.Assign):
-                # Folded against the names bound so far, so `B = 8 * A`
-                # resolves once `A = <int>` has been seen.
-                value = _static_int(node.value, seen)
-                if value is not None:
-                    for target in node.targets:
-                        if not isinstance(target, ast.Name):
-                            continue
-                        if target.id in seen and seen[target.id] != value:
-                            ambiguous.add(target.id)
-                        seen[target.id] = value
-        return {k: v for k, v in seen.items() if k not in ambiguous}
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        bindings.append((target.id, node.value))
+        resolved = {}
+        for _ in range(len(bindings) + 2):
+            values = {}
+            for name, value_node in bindings:
+                values.setdefault(name, []).append(_static_int(value_node, resolved))
+            updated = {
+                name: vals[0] for name, vals in values.items()
+                if vals[0] is not None and all(v == vals[0] for v in vals)
+            }
+            if updated == resolved:
+                return resolved
+            resolved = updated
+        return {}  # never settled: resolve nothing, so every read is flagged
 
     @classmethod
     def _resolve_bound(cls, arg, consts):
@@ -556,6 +585,54 @@ class TestStdinCap:
             type(self), "_source_modules", classmethod(lambda cls: [offender])
         )
         assert self._all_stdin_reads(), "planted read was not discovered"
+        with pytest.raises(AssertionError, match="Uncapped or over-cap stdin read"):
+            self.test_every_stdin_read_is_capped()
+
+    _DECOY = (
+        "def decoy():\n    SIZE = 1\n    return SIZE\n"
+    )
+    _BASE = "SIZE = 10_000_000\n"
+    _READER = (
+        "def reader():\n    LIMIT = 8 * SIZE\n"
+        "    return sys.stdin.buffer.read(LIMIT)\n"
+    )
+
+    def _planted_reads(self, tmp_path, body):
+        planted = tmp_path / "planted_entry_point.py"
+        planted.write_text("import sys\n" + body, encoding="utf-8")
+        return self._int_constants(ast.parse(planted.read_text(encoding="utf-8"))), planted
+
+    def test_an_ambiguous_name_poisons_what_is_folded_from_it(self, tmp_path, monkeypatch):
+        """``SIZE`` is 10 MB in one scope and 1 in another. ``LIMIT = 8 * SIZE``
+        must not resolve to 8, or an 80 MB read passes the cap guard."""
+        for label, body in (
+            ("decoy after", self._BASE + self._READER + self._DECOY),
+            ("decoy before", self._DECOY + self._BASE + self._READER),
+        ):
+            consts, planted = self._planted_reads(tmp_path, body)
+            assert "LIMIT" not in consts and "SIZE" not in consts, label
+            monkeypatch.setattr(
+                type(self), "_source_modules", classmethod(lambda cls: [planted])
+            )
+            reads = self._all_stdin_reads()
+            assert len(reads) == 1 and reads[0][2] is None, label
+            with pytest.raises(AssertionError, match="Uncapped or over-cap stdin read"):
+                self.test_every_stdin_read_is_capped()
+
+    def test_ambiguity_carries_through_a_chain(self, tmp_path):
+        consts, _ = self._planted_reads(
+            tmp_path,
+            self._BASE + "B = 8 * SIZE\nC = 2 * B\n" + self._DECOY)
+        assert "B" not in consts and "C" not in consts
+
+    def test_the_same_source_without_the_decoy_resolves(self, tmp_path, monkeypatch):
+        """Control: with no decoy, LIMIT is 80_000_000, over the cap."""
+        consts, planted = self._planted_reads(tmp_path, self._BASE + self._READER)
+        assert consts["LIMIT"] == 80_000_000
+        monkeypatch.setattr(
+            type(self), "_source_modules", classmethod(lambda cls: [planted])
+        )
+        assert self._all_stdin_reads()[0][2] == 80_000_000
         with pytest.raises(AssertionError, match="Uncapped or over-cap stdin read"):
             self.test_every_stdin_read_is_capped()
 
@@ -1200,6 +1277,8 @@ class TestHookBlockingPathsFire:
             # GIT_DIR/GIT_WORK_TREE in the ambient env override cwd entirely and
             # would silently point every git call back at the real repo.
             if not k.startswith(("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX"))
+            # A shortened hook deadline would cut timed runs off early.
+            and k != "HARDEN_HOOK_DEADLINE"
         }
         env.update(
             GIT_CONFIG_GLOBAL=os.devnull,
@@ -1239,12 +1318,7 @@ class TestHookBlockingPathsFire:
             f"{hook} exited {proc.returncode}; a non-zero exit is a non-blocking "
             f"error and the command PROCEEDS: {proc.stderr[-400:]!r}"
         )
-        try:
-            out = json.loads(proc.stdout)["hookSpecificOutput"]
-            return (out.get("permissionDecision", "allow"),
-                    out.get("permissionDecisionReason", ""))
-        except (ValueError, KeyError, TypeError, AttributeError):
-            return "allow", ""
+        return _parse_hook_verdict(proc.stdout, hook)
 
     # (hook, command, expected). Fragments, see the class docstring.
     CASES = (
@@ -1999,6 +2073,18 @@ _GROWTH_MAX_RATIO = 3.0
 # A miss at twice the bound or more is a regression, not queueing noise.
 _TIMING_GROSS_FACTOR = 2.0
 
+# The vendored hooks deny and exit 0 once they pass their own 7 s deadline
+# (#418, `_arm_deadline`). A timed run that ends that way did not finish its
+# work: it was cut off. The timing tests count it like a subprocess timeout,
+# or a hang would read as a 7 s decision. On the GitHub runner the growth
+# sweep's planted quadratic hit the deadline at 900 KB and passed this way.
+_HOOK_DEADLINE_REASON = "This guard ran out of time checking this command"
+
+
+def _hit_hook_deadline(proc):
+    """True when *proc*'s hook was cut off by its own deadline."""
+    return _HOOK_DEADLINE_REASON in proc.stdout
+
 
 class _TimingMiss(NamedTuple):
     """A timing check that missed: what to say, and how far over the bound.
@@ -2091,6 +2177,8 @@ def _growth_gate(work_dir, env, unit, timeout_s):
                 f"prevent-direct-push exited {proc.returncode}: "
                 f"{proc.stderr[-400:]!r}"
             )
+            if _hit_hook_deadline(proc):
+                continue  # cut off, not finished: see _HOOK_DEADLINE_REASON
             elapsed = (time.perf_counter() - start) * 1000
             best = elapsed if best is None else min(best, elapsed)
         return best
@@ -2120,7 +2208,7 @@ def _growth_gate(work_dir, env, unit, timeout_s):
             if elapsed is None:
                 return _TimingMiss(
                     f"prevent-direct-push did not finish {unit!r} at {kb}KB "
-                    f"within {cap_s:.1f}s -- superlinear "
+                    f"within {cap_s:.1f}s or its own 7 s deadline -- superlinear "
                     f"growth over separator or quote density (the cap is "
                     f"{_GROWTH_MAX_RATIO}x the previous cell's work plus "
                     f"the baseline and 1 s)",
@@ -2493,6 +2581,8 @@ class TestDecisionTimeIsBounded:
             assert proc.returncode == 0, (
                 f"{hook} exited {proc.returncode}: {proc.stderr[-400:]!r}"
             )
+            if _hit_hook_deadline(proc):
+                continue  # cut off, not finished: see _HOOK_DEADLINE_REASON
             best = elapsed_ms if best is None else min(best, elapsed_ms)
             if best < ceiling_ms:
                 break
@@ -2609,23 +2699,81 @@ class TestDecisionTimeIsBounded:
         # command.count run len//1000 times, but that is only ~10-160 ms of
         # work per cell: at a load average of ~160 on 12 CPUs one of the two
         # runs passed on noise 3 times in 8. This control proves the gate's
-        # failure path is wired, so it plants a term that dominates
-        # (len//50, ~0.4-6 s). len//100 was enough against our old hooks, but
-        # next to the vendored hook's larger linear cost (#418) its ratio sat
-        # near 3.1, and it failed only on the old flat 2 s cap, which the
-        # sweep no longer uses. A mild quadratic under heavy load can still
-        # pass one run, and one passing run is enough: that is the cost of
-        # the retry (see _retry_timing_once).
+        # failure path is wired, so it plants a term that dominates.
+        # On the GitHub runner the old len//50 plant passed (#418): at 900 KB
+        # it ran into the vendored hook's own 7 s deadline, which denies and
+        # exits 0, so the cell read as a 7 s finish and the ratio as mild.
+        # The sweep now counts a deadline cut-off as "did not finish" (see
+        # _HOOK_DEADLINE_REASON). The plant sleeps for a quadratic time,
+        # 0.75 s at 225 KB, 3 s at 450 KB and 12 s at 900 KB, the same on
+        # any machine, so the 900 KB cell always hits the deadline or its
+        # cap. One rep per cell, since a sleep has no noise to take the best
+        # of. The deadline check itself has its own control below.
         # The vendored hook's module-level line right after the size check.
         anchor = '_note_command(command, "git pu' + 'sh")'
         assert src.count(anchor) == 1, "the plant's anchor line moved"
-        plant = '_ = [command.count("x") for _ in range(len(command) // 50)]'
+        plant = ('__import__("time").sleep('
+                 '3.0 * (len(command) / (450 * 1024)) ** 2)')
         hook.write_text(src.replace(anchor, anchor + "\n" + plant),
                         encoding="utf-8")
+        monkeypatch.setitem(globals(), "_GROWTH_REPS", 1)
         monkeypatch.setenv("CI", "true")
         with pytest.raises(pytest.fail.Exception):
             _growth_gate(work_dir, env, "bare separators",
                          self.SUBPROCESS_TIMEOUT_S)
+
+    def test_a_cell_cut_off_by_the_hook_deadline_fails_the_growth_sweep(
+            self, tmp_path, monkeypatch):
+        """A growth cell the hook's own 7 s deadline cut off (#418) fails the
+        sweep. The plant sleeps 0.8 s at 225 KB and 2 s at 450 KB, a ratio
+        under 3.0, and at 900 KB it sleeps past the deadline. Every cell's
+        cap is at least 10 s here, so the deadline, not a cap, ends that
+        cell. Deleting the ``_hit_hook_deadline`` check in
+        ``_growth_gate`` turns this red: the cut-off reads as a 7 s finish,
+        under 3x the 450 KB cell."""
+        work_dir, env = TestHookBlockingPathsFire._repo(tmp_path)
+        hook = work_dir / ".claude/hooks/prevent-direct-push.py"
+        src = hook.read_text(encoding="utf-8")
+        anchor = '_note_command(command, "git pu' + 'sh")'
+        assert src.count(anchor) == 1, "the plant's anchor line moved"
+        plant = ('__import__("time").sleep(30 if len(command) > 600000 else '
+                 '2.0 if len(command) > 300000 else '
+                 '0.8 if len(command) > 100000 else 0)')
+        hook.write_text(src.replace(anchor, anchor + "\n" + plant),
+                        encoding="utf-8")
+        monkeypatch.setitem(globals(), "_GROWTH_REPS", 1)
+        monkeypatch.setenv("CI", "true")
+        # A 10 s floor on every cell's cap, over the 7 s deadline: under load
+        # the 225 KB cell ran past the usual 2 s first-cell cap and failed for
+        # the wrong reason, and the match below would not see the deadline.
+        with pytest.raises(pytest.fail.Exception, match="at 900KB"):
+            _growth_gate(work_dir, env, "bare separators", 10)
+
+    def test_a_run_cut_off_by_the_hook_deadline_is_not_a_finish(self, tmp_path):
+        """A run the vendored hook's own deadline cut off (#418) counts as
+        not finished in ``_best_ms``, not as a fast decision. Deleting the
+        ``_hit_hook_deadline`` check there turns this red: the 0.5 s cut-off
+        would read as a best time well under the 5 s ceiling."""
+        work, env = TestHookBlockingPathsFire._repo(tmp_path)
+        hook = work / ".claude/hooks/prevent-direct-push.py"
+        src = hook.read_text(encoding="utf-8")
+        anchor = '_note_command(command, "git pu' + 'sh")'
+        assert src.count(anchor) == 1, "the plant's anchor line moved"
+        hook.write_text(
+            src.replace(anchor, anchor + '\n__import__("time").sleep(30)'),
+            encoding="utf-8")
+        env = dict(env, HARDEN_HOOK_DEADLINE="0.5")
+        command = "git pu" + "sh origin feature/probe"
+        # Control: the plant is reached and the deadline is what ends it.
+        proc = subprocess.run(
+            [sys.executable, str(hook)],
+            input=json.dumps({"tool_name": "Bash",
+                              "tool_input": {"command": command},
+                              "cwd": str(work)}),
+            capture_output=True, text=True, timeout=10, cwd=work, env=env)
+        assert proc.returncode == 0 and _hit_hook_deadline(proc), proc.stdout
+        assert self._best_ms(work, env, "prevent-direct-push", command,
+                             5000) is None
 
 
 class TestUnparseableTextResolvesTowardGating:
@@ -2910,12 +3058,7 @@ class TestScopeGuardCannotBeBypassed:
         )
         if proc.returncode == 2:
             return "deny"
-        try:
-            return json.loads(proc.stdout)["hookSpecificOutput"].get(
-                "permissionDecision", "allow"
-            )
-        except (ValueError, KeyError, TypeError):
-            return "allow"
+        return _parse_hook_verdict(proc.stdout, hook)[0]
 
     @pytest.fixture
     def probe(self, tmp_path):
@@ -4848,12 +4991,7 @@ class TestPreflightTokenSurvivesADeniedCall:
         )
         # Exit 1 is a NON-blocking error: the command would run.
         assert proc.returncode == 0, proc.stderr[-400:]
-        try:
-            out = json.loads(proc.stdout)["hookSpecificOutput"]
-            return (out.get("permissionDecision", "allow"),
-                    out.get("permissionDecisionReason", ""))
-        except (ValueError, KeyError, TypeError, AttributeError):
-            return "allow", ""
+        return _parse_hook_verdict(proc.stdout, "require-preflight")
 
     def _worktree(self, work, env):
         wt = work / ".claude" / "worktrees" / "wt"
@@ -4957,6 +5095,31 @@ class TestPreflightTokenSurvivesADeniedCall:
         self._release_claim(token)
         over = f"git {self.C} --amend -m " + "x" * (cap + 1)
         decision, reason = self._decide_with_reason(work, env, over)
+        assert decision == "deny"
+        assert "larger than 2 MB" in reason, reason[:200]
+        assert token.exists(), "a refused oversize command spent the token"
+
+    @pytest.mark.parametrize("filler", ["x", "\u00e9"], ids=["ascii", "two_byte"])
+    def test_command_size_boundary_is_measured_in_utf8_bytes(self, repo, filler):
+        """The hook refuses a command over _MAX_COMMAND_BYTES UTF-8 BYTES
+        (``>``, not ``>=``). A command of exactly that many bytes is judged as
+        a command (``git status`` is allowed), and one byte more is refused,
+        in ASCII and in two-byte characters (where the character count is about
+        half the cap). A plain ``git status`` carries the padding in a comment
+        because a commit this long is never kept on the safe-command path
+        (_SAFE_COMMAND_CAP), which would make the at-cap verdict depend on
+        something other than the size check."""
+        work, env, token = repo
+        cap = _vendored_hook_constant("require-preflight", "_MAX_COMMAND_BYTES")
+        self._write_token(work, env, token)
+        prefix = "git status # "
+        room = cap - len(prefix.encode("utf-8"))
+        width = len(filler.encode("utf-8"))
+        exact = prefix + filler * (room // width) + "x" * (room % width)
+        assert len(exact.encode("utf-8")) == cap
+        decision, reason = self._decide_with_reason(work, env, exact)
+        assert decision == "allow", reason[:200]
+        decision, reason = self._decide_with_reason(work, env, exact + "x")
         assert decision == "deny"
         assert "larger than 2 MB" in reason, reason[:200]
         assert token.exists(), "a refused oversize command spent the token"

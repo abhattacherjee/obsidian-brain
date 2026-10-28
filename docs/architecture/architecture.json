@@ -3,7 +3,7 @@
   "displayName": "Obsidian Brain",
   "version": "3.9.1",
   "tagline": "A Claude Code plugin that turns an Obsidian vault into a persistent brain across sessions — auto-logging, curated knowledge capture, snapshot-on-compact, and fast cross-project recall, all via direct filesystem writes.",
-  "lastUpdated": "2026-10-27",
+  "lastUpdated": "2026-10-28",
   "repository": "https://github.com/abhattacherjee/obsidian-brain",
   "defaultBranch": "main",
   "techStack": {
@@ -1214,7 +1214,7 @@
           "files": [
             "scripts/commit-preflight.sh"
           ],
-          "purpose": "Vendored from harden-repo v1.3.0 (892d0f5) plus three repo parts: the plugin manifest version sync (always on, before every skip-mode exit), --allow-empty (an empty commit only: refuses when anything is staged or a tracked file is modified) and the pytest block with cov-fail-under 90. Writes a 5-minute token at /tmp/.preflight-token-<md5 of git-common-dir>, bound to HEAD, the staged tree and the checkout, so a linked worktree's own preflight authorises its own commit (#418). require-preflight keeps the token on approval, holds it for 5 s after a claim, and refuses a commit that could stage files in the same call. Other checks: secret scan, assertion-strength gate (warn), template drift (advisory). Flags: --docs-only, --skip-tests, --auto, --allow-empty."
+          "purpose": "Vendored from harden-repo v1.3.0 (892d0f5) plus three repo parts: the plugin manifest version sync (always on, before every skip-mode exit), --allow-empty (an empty commit only: refuses when anything is staged or a tracked file is modified) and the pytest block with cov-fail-under 90. Writes a 5-minute token at /tmp/.preflight-token-<first 8 hex characters of the md5 of git-common-dir>, bound to HEAD, the staged tree and the checkout, so a linked worktree's own preflight authorises its own commit (#418). require-preflight keeps the token on approval, holds it for 5 s after a claim, and refuses a commit that could stage files in the same call. Other checks: secret scan, assertion-strength gate (warn), template drift (advisory). Flags: --docs-only, --skip-tests, --auto, --allow-empty."
         },
         {
           "id": "ops-ci",
