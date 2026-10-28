@@ -2066,7 +2066,7 @@ def _growth_gate(work_dir, env, unit, timeout_s):
     """The growth sweep for one input shape: measure, retry once, then fail
     (or skip under load, see ``_fail_timing``). Skips when it compared
     nothing. Lives at module level so a test can run it on a planted hook."""
-    def measure(command):
+    def measure(command, cap_s=timeout_s):
         best = None
         for _ in range(_GROWTH_REPS):
             start = time.perf_counter()
@@ -2078,7 +2078,7 @@ def _growth_gate(work_dir, env, unit, timeout_s):
                                       "tool_input": {"command": command},
                                       "cwd": str(work_dir)}),
                     capture_output=True, text=True,
-                    timeout=timeout_s, cwd=work_dir,
+                    timeout=cap_s, cwd=work_dir,
                     env=env,
                 )
             except subprocess.TimeoutExpired:
@@ -2106,13 +2106,24 @@ def _growth_gate(work_dir, env, unit, timeout_s):
             # load the cell sees moves its baseline too (#413).
             baseline = measure("git pu" + "sh origin feature/probe")
             assert baseline is not None, "the baseline command itself timed out"
-            elapsed = measure(_matrix_command(f"{unit} @ {kb}KB"))
+            # The cap for a cell is what the previous cell's work would cost
+            # at the growth bound, plus the baseline and 1 s, and never under
+            # timeout_s. A flat 2 s cap read linear work on a slower machine
+            # as "superlinear": on CI the vendored hook (#418) passes 2 s at
+            # 900 KB while doubling cleanly. Over this cap, the work really
+            # grew past _GROWTH_MAX_RATIO, so the message below stays true.
+            cap_s = timeout_s
+            if works:
+                cap_s = max(timeout_s,
+                            (works[-1][1] * _GROWTH_MAX_RATIO + baseline) / 1000 + 1)
+            elapsed = measure(_matrix_command(f"{unit} @ {kb}KB"), cap_s)
             if elapsed is None:
                 return _TimingMiss(
                     f"prevent-direct-push did not finish {unit!r} at {kb}KB "
-                    f"within {timeout_s}s -- superlinear "
-                    f"growth over separator or quote density (the fixed "
-                    f"code costs single-digit milliseconds of work here)",
+                    f"within {cap_s:.1f}s -- superlinear "
+                    f"growth over separator or quote density (the cap is "
+                    f"{_GROWTH_MAX_RATIO}x the previous cell's work plus "
+                    f"the baseline and 1 s)",
                     float("inf"))
             works.append((kb, max(elapsed - baseline, 0.0), baseline))
 
@@ -2599,13 +2610,16 @@ class TestDecisionTimeIsBounded:
         # work per cell: at a load average of ~160 on 12 CPUs one of the two
         # runs passed on noise 3 times in 8. This control proves the gate's
         # failure path is wired, so it plants a term that dominates
-        # (len//100, ~0.1-1.6 s). A mild quadratic under heavy load can still
+        # (len//50, ~0.4-6 s). len//100 was enough against our old hooks, but
+        # next to the vendored hook's larger linear cost (#418) its ratio sat
+        # near 3.1, and it failed only on the old flat 2 s cap, which the
+        # sweep no longer uses. A mild quadratic under heavy load can still
         # pass one run, and one passing run is enough: that is the cost of
         # the retry (see _retry_timing_once).
         # The vendored hook's module-level line right after the size check.
         anchor = '_note_command(command, "git pu' + 'sh")'
         assert src.count(anchor) == 1, "the plant's anchor line moved"
-        plant = '_ = [command.count("x") for _ in range(len(command) // 100)]'
+        plant = '_ = [command.count("x") for _ in range(len(command) // 50)]'
         hook.write_text(src.replace(anchor, anchor + "\n" + plant),
                         encoding="utf-8")
         monkeypatch.setenv("CI", "true")
