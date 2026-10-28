@@ -912,8 +912,13 @@ def _sync(conn: sqlite3.Connection, vault_path: str, folders: list[str]) -> dict
                 ):
                     # A relocation may finish after rglob's listing but before
                     # the indexed-path snapshot. Keep a row whose file is now
-                    # present even though the stale listing missed it.
-                    if os.path.exists(abs_path_str):
+                    # present even though the stale listing missed it. Files
+                    # under _rejected/ are left out of disk_files on purpose,
+                    # so they never qualify.
+                    if os.path.exists(abs_path_str) and not any(
+                        "_rejected" in indexed_path.relative_to(root).parts
+                        for root in scanned_roots if _is_under(indexed_path, root)
+                    ):
                         continue
                     _delete_note(conn, abs_path_str)
                     stats["deleted"] += 1

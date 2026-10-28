@@ -50,6 +50,19 @@ def _writer_failed(what: str, output: str) -> Exception:
     return RuntimeError(f"{what} failed: {output}")
 
 
+def _other_home(config: dict, abs_path: Path) -> Path | None:
+    """The same basename in the note's other R1 home, or None outside both homes."""
+    try:
+        _, root = note_placement._insights_root(config)
+        path = Path(abs_path).resolve()
+        if not note_placement._is_r1_home(path, root):
+            return None
+    except ValueError:
+        return None
+    other_dir = root if path.parent != root else root / note_placement.PROVISIONAL_DIR
+    return other_dir / path.name
+
+
 class Candidate(TypedDict):
     type: str
     title: str
@@ -414,29 +427,42 @@ def save_candidate(
     if match and _updates_today(match, today) >= MAX_UPDATES_PER_NOTE_PER_DAY:
         row["capped_update_of"] = match
         match = None
-    sink = io.StringIO()
-    if match:
-        heading = f"## Update ({today}) — auto-capture {cid}"
-        abs_path = str(Path(vault) / match)
-        with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
-            rc = note_writer.run_append_update(vault, abs_path, f"{heading}\n\n**{title}**\n\n{_demote_headings(body)}\n\n{end_marker(cid)}\n",
-                                               last_updated=today, add_tags_csv="claude/auto")
-        if rc != 0:
-            raise _writer_failed("append-update", sink.getvalue().strip())
-        row.update(kind="updated", note_path=match, update_heading=heading)
-    else:
-        if session_note is None:
-            session_note = session_note_for(session_id, project, config)
-        content = _frontmatter(c, session_id=session_id, project=project,
-                               session_note=session_note, today=today) + f"\n# {title}\n\n{body}\n"
-        filename = new_filename(vault, folder, today, title)
-        home = _new_note_home(config, filename, PROVISIONAL)
-        folder = home.parent.relative_to(Path(vault).resolve()).as_posix()
-        _ensure_note_dir(vault, folder)
-        with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
-            rc = note_writer.run_write(vault, folder, filename, content)
-        if rc != 0:
-            raise _writer_failed("write", sink.getvalue().strip())
-        row.update(kind="new", note_path=f"{folder}/{filename}")
-    capture_state.ledger_append(row)
+    # Hold the note's other R1 home for the whole append and ledger write, so
+    # a relocation (which needs both homes) cannot move the note in between and
+    # leave the row naming the old path.
+    other_lock = None
+    other = _other_home(config, Path(vault) / match) if match else None
+    if other is not None:
+        other.parent.mkdir(mode=0o700, exist_ok=True)
+        other_lock, lock_error = note_writer._acquire_lock(other)
+        if lock_error:
+            raise _writer_failed("append-update", lock_error)
+    try:
+        sink = io.StringIO()
+        if match:
+            heading = f"## Update ({today}) — auto-capture {cid}"
+            abs_path = str(Path(vault) / match)
+            with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
+                rc = note_writer.run_append_update(vault, abs_path, f"{heading}\n\n**{title}**\n\n{_demote_headings(body)}\n\n{end_marker(cid)}\n",
+                                                   last_updated=today, add_tags_csv="claude/auto")
+            if rc != 0:
+                raise _writer_failed("append-update", sink.getvalue().strip())
+            row.update(kind="updated", note_path=match, update_heading=heading)
+        else:
+            if session_note is None:
+                session_note = session_note_for(session_id, project, config)
+            content = _frontmatter(c, session_id=session_id, project=project,
+                                   session_note=session_note, today=today) + f"\n# {title}\n\n{body}\n"
+            filename = new_filename(vault, folder, today, title)
+            home = _new_note_home(config, filename, PROVISIONAL)
+            folder = home.parent.relative_to(Path(vault).resolve()).as_posix()
+            _ensure_note_dir(vault, folder)
+            with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
+                rc = note_writer.run_write(vault, folder, filename, content)
+            if rc != 0:
+                raise _writer_failed("write", sink.getvalue().strip())
+            row.update(kind="new", note_path=f"{folder}/{filename}")
+        capture_state.ledger_append(row)
+    finally:
+        note_writer._release_lock(other_lock)
     return row

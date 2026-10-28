@@ -1870,3 +1870,19 @@ def test_sync_stale_listing_keeps_note_moved_before_index_snapshot(tmp_vault, tm
         assert [row[0] for row in conn.execute("SELECT note_path FROM access_log")] == [str(new)]
     finally:
         conn.close()
+
+
+def test_sync_prunes_a_row_whose_file_sits_under_rejected(tmp_vault, tmp_path):
+    """X-005: the keep-if-file-exists guard must not keep _rejected/ rows."""
+    note = tmp_vault / "claude-insights" / "_rejected" / "gone.md"
+    note.parent.mkdir(parents=True, exist_ok=True)
+    _write_note(note, {"type": "claude-insight", "status": "provisional"}, "# Gone\n\nBody.")
+    db = vault_index.ensure_index(str(tmp_vault), ["claude-insights"], db_path=str(tmp_path / "rej.db"))
+    assert vault_index.index_note(db, str(note))
+    conn = vault_index._connect(db)
+    try:
+        stats = vault_index._sync(conn, str(tmp_vault), ["claude-insights"])
+        assert stats["deleted"] == 1
+        assert conn.execute("SELECT COUNT(*) FROM notes WHERE path = ?", (str(note),)).fetchone()[0] == 0
+    finally:
+        conn.close()

@@ -151,7 +151,9 @@ def test_move_bookkeeping_and_roundtrip(env):
     assert note_placement.place(env.config, env.new, "provisional", env.db) == env.new
     assert env.ledger.read_bytes() == ledger_after
     # The supplied frontmatter status wins over the stale provisional DB cache.
+    _write_note(env.new, "promoted")  # the file's own status is re-read under the locks
     assert note_placement.place(env.config, env.new, "promoted", env.db) == env.old
+    env.old.write_text(env.old.read_text().replace("status: promoted", "status: provisional"))
     assert _snapshot(env.db) == before
     assert capture_state._merged_rows() == merged_before
     _assert_no_locks(env)
@@ -405,3 +407,15 @@ def test_symlinked_vault_keeps_the_index_path_form(env, tmp_path):
             "SELECT note_path FROM access_log WHERE note_path LIKE '%linked.md'")] == [expected]
     finally:
         conn.close()
+
+
+def test_demotion_is_refused_when_the_file_already_says_promoted(env, capsys):
+    """X-002: a hand promotion landing after the caller read its status wins."""
+    _write_note(env.old, "promoted")
+    before, ledger = _snapshot(env.db), env.ledger.read_bytes()
+    assert note_placement.place(env.config, env.old, "provisional", env.db) == env.old
+    assert note_placement.relocate(env.config, env.old, env.new, env.db) == env.old
+    assert env.old.is_file() and not env.new.exists()
+    assert _snapshot(env.db) == before and env.ledger.read_bytes() == ledger
+    assert "status changed" in capsys.readouterr().err
+    _assert_no_locks(env)

@@ -346,7 +346,11 @@ def _apply(e: dict, config: dict, db: str, project: str, sid: str) -> str | None
     unrecorded = not fm.get("capture_merit")  # first selection: record the parts once
     newly_sticky = e["kind"] == "sticky" and not fm.get("promoted_by")
     if was == want and not (unrecorded or newly_sticky):
-        return None  # a rank change alone does not rewrite the file (Ruling 7)
+        # A rank change alone does not rewrite the file (Ruling 7). A placement
+        # refused after an earlier status write is retried here; place() does
+        # nothing when the note is already home.
+        e["path"] = note_placement.place(config, e["path"], obsidian_utils.normalize_status(was), db)
+        return None
     wrote = []
     note_writer.set_frontmatter_fields(config["vault_path"], str(e["path"]), e["fields"], stat_out=wrote)
     vault_index.update_note_status(db, str(e["path"]), *wrote)

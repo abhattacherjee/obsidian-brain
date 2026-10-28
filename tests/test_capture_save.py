@@ -735,3 +735,27 @@ def test_failed_capped_write_never_logs_a_success(capture_env, monkeypatch):
             _save_for_cap(capture_env)
     assert target.read_bytes() == before and len(capture_state.ledger_list()) == 3
     assert _save_for_cap(capture_env)["capped_update_of"] == rel  # retry still takes the capped path
+
+
+def test_relocation_between_append_and_ledger_write_cannot_orphan_the_row(capture_env, monkeypatch):
+    """X-003: the update row never names a path that a concurrent move emptied."""
+    import note_placement
+    import vault_index
+    rel, target = _cap_target(capture_env, monkeypatch)
+    vault = capture_env["vault_path"]
+    db = vault_index.ensure_index(vault, [capture_env["insights_folder"]],
+                                  db_path=str(capture_state.capture_dir().parent / "reloc.db"))
+    real, attempts = capture_state.ledger_append, []
+
+    def append_after_a_move_attempt(row):
+        if not attempts:
+            attempts.append(note_placement.place(capture_env, target, "provisional", db))
+        return real(row)
+
+    monkeypatch.setattr(capture_state, "ledger_append", append_after_a_move_attempt)
+    row = _save_for_cap(capture_env)
+    assert attempts, "the move attempt never ran"
+    assert row["kind"] == "updated"
+    merged = {r["id"]: r for r in capture_state._merged_rows()}
+    assert (Path(vault) / merged[row["id"]]["note_path"]).is_file()
+    assert not list(Path(vault).rglob("*.ob-lock"))

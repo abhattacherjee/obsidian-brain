@@ -143,7 +143,7 @@ def test_apply_places_every_note_preserves_stores_and_rerun_is_noop(env, capsys)
     ledger_prefix = env.ledger.read_bytes()
     code, report, _ = _run(env, capsys, "--apply")
     assert code == 0 and report["moved"] == 4
-    assert report["verification"] == {"provisional_in_insights": 0,
+    assert report["verification"] == {"provisional_in_insights": 0, "non_provisional_in_provisional": 0,
                                       "access_log_rows": 0, "theme_members_rows": 0}
     backup = Path(report["db_backup"])
     assert _db_rows(backup) == before_rows
@@ -252,6 +252,18 @@ def test_verification_failure_when_place_does_nothing(env, monkeypatch, capsys):
     code, report, _ = _run(env, capsys, "--apply")
     assert code == 1 and report["verification"]["provisional_in_insights"] == 1
     assert not (env.capture / "PAUSED").exists()
+
+
+def test_refused_promotion_move_fails_verification(env, monkeypatch, capsys):
+    """X-004: a promoted note left in _provisional/ must not verify clean."""
+    real_place = note_placement.place
+    monkeypatch.setattr(note_placement, "place", lambda config, path, status, db: (
+        Path(path) if Path(path).name == "up.md" else real_place(config, path, status, db)))
+    code, report, _ = _run(env, capsys, "--apply")
+    assert code == 1
+    assert report["verification"]["non_provisional_in_provisional"] == 1
+    assert report["verification"]["provisional_in_insights"] == 0
+    assert env.paths["up"].is_file()
 
 
 @pytest.mark.parametrize("table", ["access_log", "theme_members"])

@@ -13,6 +13,7 @@ from pathlib import Path
 
 import capture_state
 import note_writer
+import obsidian_utils
 import vault_index
 
 PROVISIONAL_DIR = "_provisional"
@@ -94,6 +95,15 @@ def relocate(config: dict, old_abs: str | Path, new_abs: str | Path, db: str | P
             return old
         if not old_exists and not new_exists:
             raise FileNotFoundError(f"neither note exists: {old} or {new}")
+        if old_exists:
+            # The caller's status was read before it released its note lock;
+            # a hand edit may have landed since. The file under both locks wins.
+            current = obsidian_utils.normalize_status(
+                obsidian_utils._peek_frontmatter_fields(old, ("status",))["status"])
+            if home_for(config, old, current) != new:
+                print(f"[note-placement] status changed under the lock: {old} stays; nothing moved",
+                      file=sys.stderr)
+                return old
 
         # vault_index._sync keys rows on the configured (unresolved) vault
         # path. Write that form, and match either form, so a symlinked vault

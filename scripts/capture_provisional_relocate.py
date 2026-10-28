@@ -223,10 +223,12 @@ def _rebase_copy(config: dict, db: str) -> None:
 
 def _verify(config: dict, db: str, moved: set[Path]) -> dict[str, int]:
     _, root = note_placement._insights_root(config)
-    remaining = sum(path.resolve().parent == root and status == "provisional"
-                    for path, status in _notes(config))
+    notes = _notes(config)
+    remaining = sum(path.resolve().parent == root and status == "provisional" for path, status in notes)
+    stranded = sum(path.resolve().parent != root and status != "provisional" for path, status in notes)
     with _read_db(db) as conn:
         return {"provisional_in_insights": remaining,
+                "non_provisional_in_provisional": stranded,
                 **_path_counts(conn, _path_forms(config, moved))}
 
 

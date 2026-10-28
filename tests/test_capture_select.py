@@ -169,11 +169,24 @@ def test_selection_rerun_does_not_call_placement(placement_env, monkeypatch):
     capture_select.run_selection(SID, "demo", env.config, db=env.db)
     before = {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in env.vault.rglob("*.md")}
     ledger = capture_state._ledger_path().read_bytes()
-    monkeypatch.setattr(note_placement, "place", lambda *a: pytest.fail("unchanged selection placed a note"))
     assert capture_select.run_selection(SID, "demo", env.config, db=env.db) == {
         "promoted": 0, "demoted": 0, "picked": 1}
     assert {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in env.vault.rglob("*.md")} == before
     assert capture_state._ledger_path().read_bytes() == ledger
+
+
+def test_refused_placement_is_retried_on_the_next_selection(placement_env, monkeypatch):
+    """X-001: a promoted note left in _provisional/ by a refused move goes home on a rerun."""
+    env = placement_env
+    old = _placement_note(env)
+    real = note_placement.place
+    monkeypatch.setattr(note_placement, "place", lambda config, path, status, db: Path(path))
+    assert capture_select.run_selection(SID, "demo", env.config, db=env.db)["promoted"] == 1
+    assert old.is_file() and obsidian_utils._peek_frontmatter_fields(old, ("status",))["status"] == "promoted"
+    monkeypatch.setattr(note_placement, "place", real)
+    assert capture_select.run_selection(SID, "demo", env.config, db=env.db) == {
+        "promoted": 0, "demoted": 0, "picked": 1}
+    assert not old.exists() and (env.folder / old.name).is_file()
 
 
 @pytest.mark.parametrize("in_provisional", [True, False])
