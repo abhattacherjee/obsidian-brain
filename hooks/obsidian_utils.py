@@ -3660,7 +3660,8 @@ def gather_session_evidence(
     """Discover and load all artifacts written during this session.
 
     Returns a structured bundle of snapshots (from sessions_folder) and
-    insights/decisions/error-fixes/retros (from insights_folder) whose
+    insights/decisions/error-fixes/retros (recursively from insights_folder,
+    excluding _rejected directories) whose
     frontmatter `source_session` matches `session_id` OR any id in
     `also_session_ids`.
 
@@ -3778,7 +3779,8 @@ def gather_session_evidence(
             key=lambda s: (0 if s["hhmmss"] == "??????" else 1, s["stem"]),
         )
     insights_path = Path(vault_path) / insights_folder
-    if insights_path.is_dir():
+    vault_root = Path(vault_path).resolve()
+    if insights_path.is_dir() and insights_path.resolve().is_relative_to(vault_root):
         type_buckets = {
             "claude-insight": bundle["insights"],
             "claude-decision": bundle["decisions"],
@@ -3789,7 +3791,22 @@ def gather_session_evidence(
         # index only lets a note it proves irrelevant skip the metadata read
         # (#447). None = no index: read every note, as before.
         indexed = _indexed_rows_under(insights_path)
-        for note_path in sorted(insights_path.glob("*.md")):
+        for note_path in sorted(insights_path.rglob("*.md"), key=lambda p: (p.name, str(p))):
+            if "_rejected" in note_path.relative_to(insights_path).parts:
+                continue
+            try:
+                real = note_path.resolve()
+            except (OSError, RuntimeError) as exc:
+                bundle["discovery_errors"].append(
+                    f"{note_path.name}: {_UNREADABLE_REASON_PREFIX} "
+                    f"{getattr(exc, 'strerror', None) or type(exc).__name__}"
+                )
+                continue
+            # A file symlink must not escape the vault or alias a rejected note.
+            if not real.is_relative_to(vault_root):
+                continue
+            if "_rejected" in real.relative_to(vault_root).parts:
+                continue
             row = _fresh_index_row(indexed, note_path)
             if row is not None and row["source_session"] not in id_set:
                 continue

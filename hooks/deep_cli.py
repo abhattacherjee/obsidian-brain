@@ -10,6 +10,7 @@ import os
 import re
 import sys
 import time
+from pathlib import Path
 
 from open_item_dedup import (
     anchor_text_matches,
@@ -310,11 +311,18 @@ def run_build_checkoffs() -> None:
             candidates = [
                 os.path.join(vault_root, sessions_folder, file_field),
                 os.path.join(vault_root, insights_folder, file_field),
+                os.path.join(vault_root, insights_folder, "_provisional", file_field),
             ]
         for cand in candidates:
             real = os.path.realpath(cand)
             # containment check
-            if not (real == vault_root or real.startswith(vault_root + os.sep)):
+            root = Path(vault_root)
+            resolved = Path(real)
+            lexical = Path(os.path.abspath(cand))
+            if not resolved.is_relative_to(root) or not lexical.is_relative_to(root):
+                continue
+            if ("_rejected" in lexical.relative_to(root).parts
+                    or "_rejected" in resolved.relative_to(root).parts):
                 continue
             if os.path.isfile(real):
                 return real

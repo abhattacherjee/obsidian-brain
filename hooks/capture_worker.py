@@ -347,6 +347,9 @@ def run_batch(sid: str, transcript_path: Path, project: str, config: dict | None
     one to save goes up after each save, so a batch that stops halfway
     resumes with the rest on retry: no second model call, no duplicate notes.
     """
+    if capture_state.is_paused():
+        capture_state.append_capture_log(project, sid, "paused")
+        return "paused"
     token = capture_state.claim(sid)
     if not token:
         capture_state.append_capture_log(project, sid, "claimed")
@@ -354,6 +357,10 @@ def run_batch(sid: str, transcript_path: Path, project: str, config: dict | None
     outcome, saved, slices, detail = "empty", 0, 0, ""
     moved = {"promoted": 0, "demoted": 0}
     try:
+        # A migration may pause and drain claims between the first check and
+        # our claim. Recheck while claimed so it cannot miss a starting batch.
+        if capture_state.is_paused():
+            raise _BatchStop("paused")
         config = config or obsidian_utils.load_config()
         session_note = repo = None
         for _ in range(MAX_SLICES_PER_RUN):
@@ -476,6 +483,8 @@ def launch(sid: str, transcript_path: Path | None, project: str | None, if_due: 
     """Start a detached ``run-batch`` for ``sid`` when one is due. Never raises."""
     try:
         if obsidian_utils.is_capture_worker() or os.environ.get(DISABLE_ENV_VAR) == "1":
+            return False
+        if capture_state.is_paused():
             return False
         config = config or obsidian_utils.load_config()
         if not config.get("auto_capture_enabled", True) or not config.get("vault_path"):

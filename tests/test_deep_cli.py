@@ -367,3 +367,160 @@ def test_guard_a_preserves_line_ending(tmp_vault, monkeypatch, capsys):
     text = note.read_text()
     assert "- [x] First item that is long enough to anchor cleanly here\n" in text
     assert "- [ ] Second item that should remain untouched entirely\n" in text
+
+
+@pytest.mark.parametrize("insights_folder", ["claude-insights", "knowledge/insights"])
+@pytest.mark.parametrize("subfolder, found", [
+    ("", True), ("_provisional", True), ("_rejected", False),
+])
+@pytest.mark.parametrize("path_form", ["basename", "absolute"])
+def test_checkoffs_resolve_insight_homes(
+    tmp_vault, monkeypatch, capsys, insights_folder, subfolder, found, path_form,
+):
+    config = _patch_config(monkeypatch, tmp_vault)
+    config["insights_folder"] = insights_folder
+    folder = tmp_vault / insights_folder / subfolder
+    folder.mkdir(parents=True, exist_ok=True)
+    note = folder / "2026-05-03-finding.md"
+    text = "Preserve the session evidence during provisional note relocation"
+    original = f"- [ ] {text}\n"
+    note.write_text(original, encoding="utf-8")
+    file_field = note.name if path_form == "basename" else str(note)
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps([
+        {"file": file_field, "line": 1, "text": text},
+    ])))
+
+    deep_cli.run_build_checkoffs()
+    result = json.loads(capsys.readouterr().out)
+
+    assert result["edits"] == ([[str(note.resolve()), original.rstrip(),
+                                original.rstrip().replace("[ ]", "[x]", 1)]] if found else [])
+    assert len(result["skipped"]) == (0 if found else 1)
+    assert note.read_text(encoding="utf-8") == original
+
+
+@pytest.mark.parametrize("target_folder", ["outside", "vault/claude-insights/_rejected"])
+def test_checkoffs_refuse_provisional_symlink_targets(
+    tmp_path, monkeypatch, capsys, target_folder,
+):
+    vault = tmp_path / "vault"
+    provisional = vault / "claude-insights" / "_provisional"
+    provisional.mkdir(parents=True)
+    target_dir = tmp_path / target_folder
+    target_dir.mkdir(parents=True)
+    target = target_dir / "target.md"
+    text = "Preserve the session evidence during provisional note relocation"
+    target.write_text(f"- [ ] {text}\n", encoding="utf-8")
+    alias = provisional / "alias.md"
+    alias.symlink_to(target)
+
+    result = json.loads(_run_build_checkoffs(
+        monkeypatch, vault, [{"file": alias.name, "line": 1, "text": text}], capsys,
+    ))
+    assert result["edits"] == []
+    assert len(result["skipped"]) == 1
+
+
+def _write_reader_note(path, body=""):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "---\ntype: claude-insight\nstatus: provisional\nsource_session: SID-A\n---\n\n"
+        "# Queue concurrency durability\n\n"
+        "Queue concurrency durability transactions isolation serialization.\n" + body,
+        encoding="utf-8",
+    )
+
+
+@pytest.mark.parametrize("insights_folder", ["claude-insights", "knowledge/insights"])
+@pytest.mark.parametrize("subfolder, found", [
+    ("", True), ("_provisional", True), ("_rejected", False),
+])
+def test_similarity_resolves_insight_homes(
+    tmp_path, monkeypatch, insights_folder, subfolder, found,
+):
+    import open_item_dedup
+
+    vault = tmp_path / "vault"
+    note = vault / insights_folder / subfolder / "2026-05-03-finding.md"
+    peer = vault / insights_folder / "2026-05-03-peer.md"
+    _write_reader_note(note)
+    _write_reader_note(peer)
+    monkeypatch.setattr(open_item_dedup, "_resolve_project_paths", lambda: {})
+    output = tmp_path / "pipeline.json"
+    result = open_item_dedup.deep_analysis_pipeline(
+        [note.name, peer.name], "[]", str(output), str(vault),
+        "sessions", insights_folder, db_path=str(tmp_path / "reader.db"),
+    )
+    assert result == "OK:0:0:0:0"
+    data = json.loads(output.read_text(encoding="utf-8"))
+    suggestions = data["merge_suggestions"] + data["link_suggestions"]
+    assert len(suggestions) == (1 if found else 0)
+    if found:
+        assert {suggestions[0]["note_a"], suggestions[0]["note_b"]} == {note.stem, peer.stem}
+
+
+@pytest.mark.parametrize("insights_folder", ["claude-insights", "knowledge/insights"])
+@pytest.mark.parametrize("subfolder, found", [
+    ("", True), ("_provisional", True), ("_rejected", False),
+])
+def test_presentation_resolves_insight_homes(tmp_path, insights_folder, subfolder, found):
+    import open_item_dedup
+
+    vault = tmp_path / "vault"
+    note = vault / insights_folder / subfolder / "2026-05-03-finding.md"
+    peer = vault / insights_folder / "2026-05-03-peer.md"
+    _write_reader_note(note, f"See [[{peer.stem}]].\n")
+    _write_reader_note(peer)
+    pipeline = tmp_path / "pipeline.json"
+    pipeline.write_text("{}", encoding="utf-8")
+    classifications = tmp_path / "classifications.json"
+    classifications.write_text("[]", encoding="utf-8")
+
+    result = open_item_dedup.build_deep_presentation(
+        str(pipeline), str(classifications), json.dumps([note.name, peer.name]),
+        str(vault), "sessions", insights_folder,
+    )
+
+    assert (f"- [[{note.stem}]]" in result) is found
+    assert (f"- [[{peer.stem}]]" in result) is not found
+
+
+@pytest.mark.parametrize("bad_input", ["outside-symlink", "rejected-symlink", "traversal", "absolute"])
+def test_deep_readers_refuse_unsafe_basenames(tmp_path, monkeypatch, bad_input):
+    import open_item_dedup
+    import vault_index
+
+    vault = tmp_path / "vault"
+    insights = vault / "insights"
+    target = (insights / "_rejected" if bad_input == "rejected-symlink"
+              else tmp_path / "outside") / "hidden.md"
+    _write_reader_note(target)
+    _write_reader_note(insights / "peer.md")
+    if bad_input.endswith("symlink"):
+        provisional = insights / "_provisional"
+        provisional.mkdir()
+        (provisional / "alias.md").symlink_to(target)
+        basename = "alias.md"
+    elif bad_input == "traversal":
+        basename = "../../outside/hidden.md"
+    else:
+        basename = str(target)
+
+    # Isolate these resolver checks from the indexer's separate file scan.
+    db = str(tmp_path / "reader.db")
+    monkeypatch.setattr(vault_index, "ensure_index", lambda *args, **kwargs: db)
+    monkeypatch.setattr(open_item_dedup, "_resolve_project_paths", lambda: {})
+    output = tmp_path / "pipeline.json"
+    status = open_item_dedup.deep_analysis_pipeline(
+        [basename, "peer.md"], "[]", str(output), str(vault), "sessions", "insights", db_path=db,
+    )
+    assert status == "OK:0:0:0:0"
+    data = json.loads(output.read_text(encoding="utf-8"))
+    assert data["merge_suggestions"] == []
+    assert data["link_suggestions"] == []
+
+    result = open_item_dedup.build_deep_presentation(
+        str(output), str(tmp_path / "absent-classifications.json"),
+        json.dumps([basename]), str(vault), "sessions", "insights",
+    )
+    assert "## Orphaned Notes" not in result
