@@ -26,9 +26,11 @@ import json
 import os
 import re
 import sys
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Iterator
 
 from . import Issue, Result, session_is_live
 
@@ -44,6 +46,83 @@ _EXTRA_INSIGHT_FOLDERS = [
     "claude-error-fixes",
     "claude-retros",
 ]
+
+
+def _iter_note_paths(
+    folder: Path, *, recursive: bool = False, root: Path | None = None
+) -> Iterator[Path]:
+    """List notes without swallowing directory errors or following symlinks.
+
+    Only insight readers opt into recursion; session folders remain flat.
+    Prune rejected directories at every depth, before trying to list them.
+    Unlike glob/rglob, iterdir propagates unreadable-directory errors so a
+    partial scan cannot silently look complete.
+    """
+    root = (root if root is not None else folder).resolve()
+    relative = folder.resolve().relative_to(root)
+    if "_rejected" in relative.parts or folder.name == "_rejected" or folder.is_symlink():
+        return
+    for entry in sorted(folder.iterdir()):
+        if entry.name == "_rejected" or entry.is_symlink():
+            continue
+        if entry.is_file() and entry.suffix == ".md":
+            yield entry
+        elif recursive and entry.is_dir():
+            yield from _iter_note_paths(entry, recursive=True, root=root)
+
+
+def _backup_note(
+    issue: Issue,
+    backup_root: str,
+    check_name: str = "",
+    *,
+    legacy_relative: Path | str | None = None,
+    flat: bool = False,
+) -> Path:
+    """Back up atomically, using the vault context supplied by scan.
+
+    Hand-built/older Issues without vault context keep their legacy layout.
+    ``flat`` preserves the fence check's existing top-level backup contract.
+    Containment is checked before creating any directories or copying data.
+    """
+    note_path = Path(issue.note_path)
+    vault_path = issue.extra.get("vault_path")
+    if vault_path:
+        vault_root = Path(vault_path).resolve()
+        relative = note_path.resolve().relative_to(vault_root)
+        if "_rejected" in relative.parts:
+            raise ValueError("backup refused for a note under _rejected")
+        if flat:
+            relative = Path(note_path.name)
+    else:
+        relative = legacy_relative or Path(note_path.parent.name) / note_path.name
+
+    backup_path = Path(backup_root) / check_name / relative
+    if not backup_path.resolve().is_relative_to(Path(backup_root).resolve()):
+        raise ValueError(f"backup path {backup_path} would escape backup_root {backup_root}")
+
+    # mkdir(parents=True, mode=...) applies mode only to the leaf directory.
+    # Create each missing parent explicitly so all new directories are 0700.
+    missing = []
+    parent = backup_path.parent
+    while not parent.exists():
+        missing.append(parent)
+        parent = parent.parent
+    for directory in reversed(missing):
+        directory.mkdir(mode=0o700, exist_ok=True)
+
+    fd, tmp = tempfile.mkstemp(dir=backup_path.parent, prefix=".vd-backup-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(note_path.read_bytes())
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp, backup_path)  # mkstemp creates an owner-only file.
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+    return backup_path
+
 
 # Regex helpers for minimal frontmatter parsing (stdlib only — no yaml dep)
 _FRONT_RE = re.compile(r"^---\n(.*?)\n---\n", re.DOTALL)
@@ -605,9 +684,9 @@ def scan(
         folder_path = vault / folder
         if not folder_path.is_dir():
             continue
-        for note in folder_path.iterdir():
-            if not note.name.endswith(".md"):
-                continue
+        for note in _iter_note_paths(
+            folder_path, recursive=folder == insights_folder, root=vault
+        ):
             try:
                 mtime = os.path.getmtime(note)
             except OSError:
@@ -743,6 +822,7 @@ def scan(
                                 ),
                                 confidence=0.99,
                                 extra={
+                                    "vault_path": str(vault.resolve()),
                                     "proposed_sid": current_sid,
                                     "basename_only": True,
                                     "capture_signal": capture_signal,
@@ -1010,11 +1090,9 @@ def apply(issues, backup_root) -> list[Result]:
     Unresolved issues are skipped. Missing proposed_sid in extra yields
     status='error'. All writes are atomic (temp file + os.replace).
     """
-    import shutil
     import tempfile
 
     results: list[Result] = []
-    os.makedirs(backup_root, exist_ok=True)
 
     for issue in issues:
         if issue.extra.get("unresolved"):
@@ -1062,25 +1140,9 @@ def apply(issues, backup_root) -> list[Result]:
         # cannot cause the backup write to escape backup_root. The resolved
         # post-check below is defense-in-depth against any future helper bug.
         try:
-            # Preserve the source folder name in the backup path to prevent
-            # basename collisions across insight-type folders (e.g., an
-            # insight and a retro both named 2026-04-10-foo.md would otherwise
-            # clobber each other's backups). The resulting layout is
-            # <backup_root>/<project>/<folder>/<basename>.
-            note_path = Path(issue.note_path)
-            source_folder = note_path.parent.name  # e.g., "claude-insights"
-            project_backup_dir = (
-                Path(backup_root) / _safe_project_slug(issue.project) / source_folder
-            )
-            project_backup_dir.mkdir(parents=True, exist_ok=True)
-            backup_path = project_backup_dir / note_path.name
-            resolved_root = Path(backup_root).resolve()
-            resolved_backup = backup_path.resolve()
-            if resolved_root not in resolved_backup.parents:
-                raise ValueError(
-                    f"backup path {backup_path} would escape backup_root {backup_root}"
-                )
-            shutil.copy2(issue.note_path, backup_path)
+            # Keep every vault-relative component, including _provisional,
+            # so notes with the same basename have independent backups.
+            backup_path = _backup_note(issue, backup_root, _safe_project_slug(issue.project))
         except (OSError, ValueError) as exc:
             results.append(
                 Result(

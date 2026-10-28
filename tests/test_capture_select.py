@@ -15,6 +15,8 @@ import pytest
 import capture_save
 import capture_select
 import capture_state
+import note_placement
+import note_writer
 import obsidian_utils
 import vault_index
 
@@ -63,9 +65,14 @@ def _note(config, i, *, score=5, ntype="insight", sid=SID, ts=None, status=None,
     return row
 
 
+def _current_note_path(config, row):
+    current = capture_state.ledger_get(row["id"]) if row.get("id") else None
+    return Path(config["vault_path"]) / (current or row)["note_path"]
+
+
 def _fm(config, row) -> dict:
     return obsidian_utils._peek_frontmatter_fields(
-        Path(config["vault_path"]) / row["note_path"],
+        _current_note_path(config, row),
         ("status", "capture_score", "capture_novelty", "capture_merit", "capture_rank", "promoted_by", "demoted_by"))
 
 
@@ -84,6 +91,269 @@ def _access(db, row, config, context, ts):
                  (str(Path(config["vault_path"]) / row["note_path"]), ts, context, "demo"))
     conn.commit()
     conn.close()
+
+
+@pytest.fixture(params=["claude-insights", "knowledge/insights"])
+def placement_env(tmp_path, monkeypatch, request):
+    vault = tmp_path / "vault"
+    folder = vault / request.param
+    folder.mkdir(parents=True, mode=0o700)
+    ledger = tmp_path / "ledger"
+    ledger.mkdir(mode=0o700)
+    monkeypatch.setattr(capture_state, "capture_dir", lambda: ledger)
+    config = {"vault_path": str(vault), "insights_folder": request.param}
+    db = vault_index.ensure_index(str(vault), [request.param], db_path=str(tmp_path / "placement.db"))
+    return SimpleNamespace(config=config, vault=vault, folder=folder, db=db)
+
+
+def _placement_note(env, status="provisional", *, in_provisional=True):
+    path = env.folder / "_provisional" / "placed.md" if in_provisional else env.folder / "placed.md"
+    path.parent.mkdir(mode=0o700, exist_ok=True)
+    path.write_text(f"---\ntype: claude-insight\nstatus: {status}\nproject: demo\n"
+                    f"created_at: {CREATED}\ndate: 2026-10-23\nsource_session: {SID}\n"
+                    "---\n\n# Placed\n\nA durable lesson.\n")
+    path.chmod(0o600)
+    assert vault_index.index_note(env.db, str(path))
+    conn = vault_index._connect(env.db)
+    try:
+        conn.execute("INSERT INTO access_log (note_path, timestamp, context_type) VALUES (?, ?, 'search')",
+                     (str(path), CREATED_TS - 1))
+        conn.execute("INSERT INTO themes (id, name, note_count, created_date, updated_date) "
+                     "VALUES (1, 'Placement', 1, '2026-10-23', '2026-10-23')")
+        conn.execute("INSERT INTO theme_members (theme_id, note_path, similarity, added_date) "
+                     "VALUES (1, ?, 0.8, '2026-10-23')", (str(path),))
+        conn.commit()
+    finally:
+        conn.close()
+    for cid, kind, ts in (("placed-new", "new", CREATED_TS), ("placed-update", "updated", CREATED_TS + 1)):
+        capture_state.ledger_append({"id": cid, "kind": kind, "ts": ts, "status": "active",
+                                     "session_id": SID, "project": "demo", "type": "insight", "score": 9,
+                                     "about_issue": 7, "repo": str(env.vault),
+                                     "note_path": path.relative_to(env.vault).as_posix()})
+    return path
+
+
+def _assert_placement(env, old, new, status):
+    assert not old.exists() and new.is_file()
+    assert obsidian_utils._peek_frontmatter_fields(new, ("status",))["status"] == status
+    conn = vault_index._connect(env.db)
+    try:
+        for table, column in (("notes", "path"), ("access_log", "note_path"), ("theme_members", "note_path")):
+            assert [r[0] for r in conn.execute(f"SELECT {column} FROM {table}")] == [str(new)]
+        assert conn.execute("SELECT status FROM notes").fetchone()[0] == status
+    finally:
+        conn.close()
+    rows = capture_state._merged_rows()
+    assert {r["note_path"] for r in rows} == {new.relative_to(env.vault).as_posix()}
+    assert {r["id"]: r["ts"] for r in rows} == {"placed-new": CREATED_TS, "placed-update": CREATED_TS + 1}
+    assert new.stat().st_mode & 0o777 == 0o600
+    assert not list(env.vault.rglob("*.ob-lock"))
+
+
+def test_selection_places_both_status_changes_and_carries_entry_path(placement_env):
+    env = placement_env
+    old = _placement_note(env)
+    entry, = capture_select.plan_session(SID, env.config, env.db)
+    assert capture_select._apply(entry, env.config, env.db, "demo", SID) == "promoted"
+    promoted = env.folder / old.name
+    assert entry["path"] == promoted
+    _assert_placement(env, old, promoted, "promoted")
+    capture_state.ledger_update("placed-new", duplicate_of="another-note")
+    assert capture_select.run_selection(SID, "demo", env.config, db=env.db)["demoted"] == 1
+    _assert_placement(env, promoted, old, "provisional")
+
+
+def test_selection_rerun_does_not_call_placement(placement_env, monkeypatch):
+    env = placement_env
+    _placement_note(env)
+    capture_select.run_selection(SID, "demo", env.config, db=env.db)
+    before = {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in env.vault.rglob("*.md")}
+    ledger = capture_state._ledger_path().read_bytes()
+    monkeypatch.setattr(note_placement, "place", lambda *a: pytest.fail("unchanged selection placed a note"))
+    assert capture_select.run_selection(SID, "demo", env.config, db=env.db) == {
+        "promoted": 0, "demoted": 0, "picked": 1}
+    assert {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in env.vault.rglob("*.md")} == before
+    assert capture_state._ledger_path().read_bytes() == ledger
+
+
+@pytest.mark.parametrize("in_provisional", [True, False])
+def test_plan_session_resolves_the_other_r1_home(placement_env, in_provisional):
+    env = placement_env
+    actual = _placement_note(env, in_provisional=in_provisional)
+    stale = env.folder / actual.name if in_provisional else env.folder / "_provisional" / actual.name
+    capture_state.ledger_update("placed-new", note_path=stale.relative_to(env.vault).as_posix())
+    entry, = capture_select.plan_session(SID, env.config, env.db)
+    assert entry["path"] == actual and entry["want"] == "promoted"
+
+
+@pytest.mark.parametrize("relative", ["elsewhere/placed.md", "claude-insights/_rejected/placed.md",
+                                     "claude-insights/nested/placed.md", "../placed.md"])
+def test_stale_ledger_fallback_stays_within_r1_homes(placement_env, relative):
+    env = placement_env
+    _placement_note(env)
+    capture_state.ledger_update("placed-new", note_path=relative)
+    assert capture_select.plan_session(SID, env.config, env.db) == []
+
+
+def test_promote_used_finds_migrated_access_history(placement_env):
+    env = placement_env
+    old = _placement_note(env, in_provisional=False)
+    path = note_placement.place(env.config, old, "provisional", env.db)
+    conn = vault_index._connect(env.db)
+    try:
+        conn.execute("UPDATE access_log SET timestamp = ?", (CREATED_TS + 60,))
+        conn.commit()
+    finally:
+        conn.close()
+    assert capture_select.promote_used(env.config, now=CREATED_TS + 120, db=env.db) == {
+        "checked": 1, "promoted": 1}
+    _assert_placement(env, path, old, "promoted")
+    assert capture_select.promote_used(env.config, now=CREATED_TS + 120, db=env.db)["promoted"] == 0
+
+
+def test_demote_closed_finds_stale_ledger_and_places_note(placement_env):
+    env = placement_env
+    old = _placement_note(env, "promoted", in_provisional=False)
+    new = env.folder / "_provisional" / old.name
+    capture_state.ledger_update("placed-new", note_path=new.relative_to(env.vault).as_posix())
+    assert capture_select.demote_closed("demo", env.config, now=CREATED_TS + 86400, run=_gh(), db=env.db) == {
+        "checked": 1, "demoted": 1}
+    _assert_placement(env, old, new, "provisional")
+
+
+@pytest.mark.parametrize("ntype,status,want", [
+    ("claude-insight", "'Provisional' # pending", "promoted"),
+    ("claude-decision", "provisional", "active"),
+])
+def test_cli_hand_promotion_places_after_unlock_and_prints_final_path(placement_env, monkeypatch, capsys,
+                                                                   ntype, status, want):
+    import io
+    import sys
+
+    env = placement_env
+    old = _placement_note(env, status)
+    note_writer.set_frontmatter_fields(str(env.vault), str(old), {"type": ntype})
+    new = env.folder / old.name
+    monkeypatch.setenv("OBSIDIAN_BRAIN_DB", env.db)
+    monkeypatch.setattr(obsidian_utils, "load_config", lambda: {**env.config, "vault_path": "/wrong-vault"})
+    monkeypatch.setattr(vault_index, "ensure_index", lambda *a, **kw: pytest.fail("existing DB needs no vault sync"))
+    monkeypatch.setattr(sys, "argv", ["note_writer.py", "append-update", str(env.vault), str(old)])
+    monkeypatch.setattr(sys, "stdin", io.StringIO("## Update (2026-10-24)\n\nA hand update.\n"))
+    with pytest.raises(SystemExit) as exc:
+        note_writer.main()
+    assert exc.value.code == 0
+    assert capsys.readouterr().out == f"OK: {new}\n"
+    assert "A hand update." in new.read_text()
+    _assert_placement(env, old, new, want)
+
+
+def test_cli_promotion_initializes_explicit_missing_db(placement_env, tmp_path, monkeypatch, capsys):
+    env = placement_env
+    old = _placement_note(env)
+    db = str(tmp_path / "fresh-cli.db")
+    monkeypatch.setenv("OBSIDIAN_BRAIN_DB", db)
+    monkeypatch.setattr(obsidian_utils, "load_config", lambda: env.config)
+    assert note_writer.run_append_update(str(env.vault), str(old), "## Update (2026-10-24)\n\nHand.\n",
+                                         promote_provisional=True) == 0
+    final = env.folder / old.name
+    assert capsys.readouterr().out == f"OK: {final}\n" and not old.exists()
+    assert _index_stat(db, str(final))["status"] == "promoted"
+    assert {r["note_path"] for r in capture_state._merged_rows()} == {final.relative_to(env.vault).as_posix()}
+
+
+def test_cli_subprocess_promotes_with_isolated_config_db_and_ledger(placement_env, tmp_path, monkeypatch):
+    import sys
+
+    env = placement_env
+    old = _placement_note(env)
+    home = tmp_path / "cli-home"
+    config_dir = home / ".claude"
+    config_dir.mkdir(parents=True, mode=0o700)
+    config_file = config_dir / "obsidian-brain-config.json"
+    config_file.write_text(json.dumps(env.config))
+    config_file.chmod(0o600)
+    ledger = config_dir / "obsidian-brain" / "capture"
+    ledger.mkdir(parents=True, mode=0o700)
+    ledger_file = ledger / capture_state.LEDGER_NAME
+    ledger_file.write_bytes(capture_state._ledger_path().read_bytes())
+    ledger_file.chmod(0o600)
+    process_env = {**os.environ, "HOME": str(home), "OBSIDIAN_BRAIN_DB": env.db}
+    result = subprocess.run([sys.executable, str(Path(note_writer.__file__)), "append-update", str(env.vault),
+                             str(old)], input="## Update (2026-10-24)\n\nFresh process.\n",
+                            env=process_env, capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    final = env.folder / old.name
+    assert result.stdout == f"OK: {final}\n"
+    monkeypatch.setattr(capture_state, "capture_dir", lambda: ledger)
+    _assert_placement(env, old, final, "promoted")
+
+
+@pytest.mark.parametrize("promote,status", [(True, "promoted"), (False, "provisional")])
+def test_append_without_status_change_does_not_place_or_index(placement_env, monkeypatch, capsys, promote, status):
+    env = placement_env
+    path = _placement_note(env, status, in_provisional=status == "provisional")
+    ledger = capture_state._ledger_path().read_bytes()
+    monkeypatch.setattr(note_placement, "place", lambda *a: pytest.fail("no status change"))
+    monkeypatch.setattr(vault_index, "ensure_index", lambda *a, **kw: pytest.fail("no promotion to index"))
+    assert note_writer.run_append_update(str(env.vault), str(path), "## Update (2026-10-24)\n\nHand.\n",
+                                         promote_provisional=promote) == 0
+    assert capsys.readouterr().out == f"OK: {path}\n" and path.is_file()
+    assert capture_state._ledger_path().read_bytes() == ledger
+
+
+def test_cli_placement_failure_reports_saved_update_and_exits_one(placement_env, monkeypatch, capsys):
+    env = placement_env
+    path = _placement_note(env)
+    monkeypatch.setenv("OBSIDIAN_BRAIN_DB", env.db)
+    monkeypatch.setattr(obsidian_utils, "load_config", lambda: env.config)
+
+    def fail(*args):
+        raise OSError("placement unavailable")
+
+    monkeypatch.setattr(note_placement, "place", fail)
+    assert note_writer.run_append_update(str(env.vault), str(path), "## Update (2026-10-24)\n\nHand.\n",
+                                         promote_provisional=True) == 1
+    out = capsys.readouterr()
+    assert out.out == "" and "update saved but placement failed" in out.err
+    assert "Hand." in path.read_text() and not list(env.vault.rglob("*.ob-lock"))
+
+
+def test_selection_places_with_missing_ledger_and_stale_db_status(placement_env):
+    env = placement_env
+    old = _placement_note(env)
+    conn = vault_index._connect(env.db)
+    try:
+        conn.execute("UPDATE notes SET status = 'superseded'")
+        conn.commit()
+    finally:
+        conn.close()
+    row = capture_state.ledger_get("placed-new")
+    capture_state._ledger_path().unlink()
+    entry, = capture_select.plan_session(SID, env.config, env.db, rows=[{**row, "novelty": 0.4}])
+    assert capture_select._apply(entry, env.config, env.db, "demo", SID) == "promoted"
+    assert entry["path"] == env.folder / old.name and not old.exists()
+    assert not capture_state._ledger_path().exists()
+    assert _index_stat(env.db, str(entry["path"]))["status"] == "promoted"
+
+
+@pytest.mark.parametrize("stage", ["source", "destination"])
+def test_stale_ledger_fallback_refuses_symlinks_outside_vault(placement_env, tmp_path, stage):
+    env = placement_env
+    actual = _placement_note(env)
+    outside = tmp_path / "outside.md"
+    outside.write_bytes(actual.read_bytes())
+    top = env.folder / actual.name
+    if stage == "source":
+        top.symlink_to(outside)  # A matching, safe alternative must not rescue an escaping source.
+    else:
+        actual.unlink()
+        actual.symlink_to(outside)
+    capture_state.ledger_update("placed-new", note_path=top.relative_to(env.vault).as_posix())
+    assert capture_select.plan_session(SID, env.config, env.db) == []
+    run = _gh()
+    assert capture_select.demote_closed("demo", env.config, now=CREATED_TS + 86400, run=run,
+                                        db=env.db) == {"checked": 0, "demoted": 0}
+    assert run.calls == []
 
 
 # --- pure core -----------------------------------------------------------------
@@ -253,7 +523,7 @@ def test_cosine_backstop_skips_a_reworded_duplicate(mock_config, db):
 def test_second_run_writes_nothing(mock_config, db):
     rows = [_note(mock_config, i, score=3 + i % 5) for i in range(14)]
     capture_select.run_selection(SID, "demo", mock_config, db=db)
-    paths = [Path(mock_config["vault_path"]) / r["note_path"] for r in rows]
+    paths = [_current_note_path(mock_config, r) for r in rows]
     before = [(p.stat().st_mtime_ns, p.read_bytes()) for p in paths]
     lines, ledger = len(_log_lines()), capture_state._ledger_path().read_text()
     assert capture_select.run_selection(SID, "demo", mock_config, db=db) == {"promoted": 0, "demoted": 0, "picked": 10}

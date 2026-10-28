@@ -818,7 +818,7 @@
           "files": [
             "hooks/capture_state.py"
           ],
-          "purpose": "Per-session capture state under <secure dir>/capture/: read offset, transcript path, project and last batch time (<sid>.json, 0600, atomic); O_EXCL claims with a 900 s TTL takeover; the PreCompact flush flag; installed_at (no backfill before first use); the flock-guarded captures.jsonl ledger (append, merged reads, update, notes_created_by); and the 'Capture' line in the hook log."
+          "purpose": "Per-session capture state under <secure dir>/capture/: read offset, transcript path, project and last batch time (<sid>.json, 0600, atomic); O_EXCL claims with a 900 s TTL takeover; the PreCompact flush flag; installed_at (no backfill before first use); the flock-guarded captures.jsonl ledger (append, merged reads, update, notes_created_by); and the 'Capture' line in the hook log. #465: pause(reason)/resume()/is_paused()/active_claims(); a PAUSED flag under PAUSE_TTL_SECONDS (7200) stops launch, sweep and run_batch."
         },
         {
           "id": "capture-slice",
@@ -836,7 +836,7 @@
           "files": [
             "hooks/capture_save.py"
           ],
-          "purpose": "Turns one candidate {type, title, body, topic} into a note. Runs /compress Step 3.5's dedup (curated types only, _rejected/ excluded, is_high_confidence_match) with two #427 rules: notes the candidate's own session created are skipped (auto-captured per capture_state.notes_created_by, or by hand per the note file's frontmatter source_session), and the top note is scored by its original text (strip_auto_updates: frontmatter and auto-capture update sections removed) against auto_capture_update_min_cosine (default 0.35); an empty query vector, unreadable note or empty original-text vector gives a new note, and so does any error from find_match (logged once as match-failed); a match gets an '## Update (<date>) — auto-capture <id>' section via note_writer append-update, its body headings demoted to ### or below (outside code fences) and the section closed by an <!-- /auto-capture <id> --> marker, anything else a new note from templates/<type>.md tagged claude/auto with source: auto-capture. Appends one ledger row either way. A locked, changed or failed note write raises TransientSaveError (an OSError) so the worker retries it. #455: a new note is written status: provisional (the decision template's status: active is replaced), and the ledger row also keeps score, about_issue and repo. An update never counts toward the cap. capture_split writes its notes with the template's status (status=None)."
+          "purpose": "Turns one candidate {type, title, body, topic} into a note. Runs /compress Step 3.5's dedup (curated types only, _rejected/ excluded, is_high_confidence_match) with two #427 rules: notes the candidate's own session created are skipped (auto-captured per capture_state.notes_created_by, or by hand per the note file's frontmatter source_session), and the top note is scored by its original text (strip_auto_updates: frontmatter and auto-capture update sections removed) against auto_capture_update_min_cosine (default 0.35); an empty query vector, unreadable note or empty original-text vector gives a new note, and so does any error from find_match (logged once as match-failed); a match gets an '## Update (<date>) — auto-capture <id>' section via note_writer append-update, its body headings demoted to ### or below (outside code fences) and the section closed by an <!-- /auto-capture <id> --> marker, anything else a new note from templates/<type>.md tagged claude/auto with source: auto-capture. Appends one ledger row either way. A locked, changed or failed note write raises TransientSaveError (an OSError) so the worker retries it. #455: a new note is written status: provisional (the decision template's status: active is replaced), and the ledger row also keeps score, about_issue and repo. An update never counts toward the cap. capture_split writes its notes with the template's status (status=None). #465: new notes go to <insights>/_provisional/; new_filename checks both homes; at most MAX_UPDATES_PER_NOTE_PER_DAY (3) appended updates per note basename per local day, after which the capture is saved as a new provisional note with capped_update_of."
         },
         {
           "id": "capture-reject",
@@ -903,6 +903,24 @@
             "scripts/capture_provisional_backfill.py"
           ],
           "purpose": "One-off #455 backlog: auto notes (source: auto-capture, not _rejected, not yet selected) whose date is in --since..--until (default 2026-10-18..2026-10-23, both inclusive), grouped by source_session, go through the same per-session selection. Rubric v2 scores come from --scores FILE (read-only, e.g. the spike's scores_v2.json) and a cache (capture/backlog-scores.json) that --score or --apply fills with Haiku in batches of 20 (capture_worker.worker_argv('haiku'): no tools, --strict-mcp-config, project settings, the worker cwd; each note fenced in <note-NONCE> tags, with a per-batch random nonce, and framed as data, not instructions (a closer-shaped string in a note is defused); an is_error envelope or a non-zero exit scores nothing). Ever-opened notes stay promoted outside the cap: a search/tool-open access after creation, a hand update, or another session's Read in any transcript under ~/.claude/projects modified since --since. The dry run (default) reads only, calls no model, and prints counts per project and session plus a token estimate for the unscored. --apply backs up the DB (SQLite backup API, 0600, row counts checked; removed on failure) and copies each touched note to capture/backlog-backup-<UTC>/ (0700), then writes status, the score parts, selected_by: backlog and demoted_by: backlog (the recoverable flag) or promoted_by, refreshes the index row and the ledger's score/novelty. No note is deleted. Exit 0 ok, 1 refused or failed (no vault, no DB, unreadable scores, failed backup, a note that failed), 2 usage. A re-run over the same window is idempotent: notes this tool selected earlier are scored and selected again, notes the live selection promoted are skipped but count against their session's cap of 10, and a path that resolves outside the vault is skipped (apply reports a bad note and goes on). apply() writes demotions first; if a demotion fails, that session gets no promotion in the run (reported, exit 1). A session's cap counts every promoted, selected, non-sticky auto note of the session at any date, so the window only limits candidates."
+        },
+        {
+          "id": "note-placement",
+          "name": "note_placement.py",
+          "kind": "module",
+          "files": [
+            "hooks/note_placement.py"
+          ],
+          "purpose": "#465: the only code that moves insight notes. home_for gives a note's R1 home from its frontmatter status (provisional -> <insights>/_provisional/, anything else -> <insights>/); notes elsewhere are never moved. relocate takes both note locks, refuses collisions, and in one BEGIN IMMEDIATE transaction re-keys notes.path, access_log.note_path and theme_members.note_path (in the configured, unresolved vault path form the index uses), renames the file, commits, then appends ledger rows with the new vault-relative note_path. A rerun after a crash repairs the stores. place = home_for + relocate; called after every status write in capture_select, capture_backlog and note_writer append-update."
+        },
+        {
+          "id": "capture-relocate",
+          "name": "capture_provisional_relocate.py",
+          "kind": "cli",
+          "files": [
+            "scripts/capture_provisional_relocate.py"
+          ],
+          "purpose": "#465 one-off migration. Dry run (default) prints JSON counts (provisional notes at the top level, non-provisional in _provisional/, access_log/theme_members/ledger rows on those paths, collisions) and writes nothing; --vault/--db/--ledger take copies. --apply: DB backup, capture_state.pause, wait --wait s (default 600) for active_claims, repair interrupted moves, ensure_index, place every note, verify, resume in finally. Exit 0 ok, 1 verification/run failure, 2 usage, 3 capture still active."
         }
       ]
     },
@@ -2304,6 +2322,60 @@
           "from": "capture-backlog",
           "to": "note-writer-cli",
           "label": "--apply: status, parts, demoted_by: backlog"
+        }
+      ]
+    },
+    {
+      "id": "note-placement",
+      "name": "Status change places the note",
+      "description": "#465: every status write is followed by place(), so provisional notes stay in _provisional/ (excluded from Obsidian Sync) and every path-keyed store follows the file.",
+      "steps": [
+        {
+          "from": "capture-select",
+          "to": "note-writer-cli",
+          "label": "set status (promote/demote)"
+        },
+        {
+          "from": "capture-select",
+          "to": "note-placement",
+          "label": "place(path, status)"
+        },
+        {
+          "from": "note-placement",
+          "to": "db-index",
+          "label": "BEGIN IMMEDIATE: re-key notes, access_log, theme_members; rename inside"
+        },
+        {
+          "from": "note-placement",
+          "to": "db-vault",
+          "label": "rename <insights>/<name> <-> <insights>/_provisional/<name>"
+        },
+        {
+          "from": "note-placement",
+          "to": "db-capture",
+          "label": "append ledger rows with the new note_path"
+        }
+      ]
+    },
+    {
+      "id": "capture-relocate",
+      "name": "Provisional relocation migration",
+      "description": "#465 one-off: move existing notes to the home their frontmatter status calls for.",
+      "steps": [
+        {
+          "from": "capture-relocate",
+          "to": "db-index",
+          "label": "--apply: DB backup"
+        },
+        {
+          "from": "capture-relocate",
+          "to": "capture-state",
+          "label": "pause, wait for active_claims, resume in finally"
+        },
+        {
+          "from": "capture-relocate",
+          "to": "note-placement",
+          "label": "place every note; verify zero left"
         }
       ]
     }

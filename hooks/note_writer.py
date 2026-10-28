@@ -1012,6 +1012,10 @@ def run_append_update(
     byte-identical (no write attempt is made until every check upstream of
     it has already succeeded).
 
+    After a hand promotion, placement runs after releasing the append lock.
+    If placement fails, the update is already saved: return 1 and report that
+    explicitly, without printing a misleading success path.
+
     Prints ``OK: <resolved path>`` to stdout and returns 0 on success.
 
     Line endings: read/written with ``newline=""`` so no universal-newline
@@ -1046,12 +1050,40 @@ def run_append_update(
     if lock_err:
         print(f"ERROR: {lock_err}", file=sys.stderr)
         return 1
+    promoted = []
     try:
-        return _append_update_locked(
-            resolved, note_path, update_text, last_updated, add_tags, promote_provisional
+        result = _append_update_locked(
+            resolved, note_path, update_text, last_updated, add_tags, promote_provisional,
+            promoted_out=promoted,
         )
     finally:
         _release_lock(lock)
+    if result:
+        return result
+    if promoted:
+        # note_placement imports note_writer for its locks. Import it here,
+        # after our write and unlock, to avoid both a cycle and self-contention.
+        import note_placement
+        import obsidian_utils
+        import vault_index
+        from obsidian_utils import indexed_folders
+
+        try:
+            config = {**(obsidian_utils.load_config() or {}), "vault_path": vault_path}
+            db = vault_index._default_db_path()
+            if not os.path.isfile(db):
+                db = vault_index.ensure_index(vault_path, indexed_folders(config), db_path=db)
+            else:
+                # Keep the configured vault spelling used by the index, even
+                # when _resolve_note_path followed a symlink to the vault.
+                indexed_path = Path(vault_path) / resolved.relative_to(Path(vault_path).resolve())
+                vault_index.update_note_status(db, str(indexed_path))
+            resolved = note_placement.place(config, resolved, promoted[0], db)
+        except Exception as exc:
+            print(f"ERROR: update saved but placement failed for {resolved}: {exc}", file=sys.stderr)
+            return 1
+    print(f"OK: {resolved}")
+    return 0
 
 
 def _append_update_locked(
@@ -1061,6 +1093,7 @@ def _append_update_locked(
     last_updated,
     add_tags: list[str],
     promote_provisional: bool = False,
+    promoted_out: list[str] | None = None,
 ) -> int:
     """The read-modify-write half of run_append_update, run while holding the
     note's lock. Split out purely so the lock has one obvious scope and one
@@ -1100,6 +1133,7 @@ def _append_update_locked(
         print(f"ERROR: {tags_merge_err}", file=sys.stderr)
         return 1
 
+    top = None
     if promote_provisional and normalize_status(_fm_scalar(fm_lines, "status")) == "provisional":
         top = "active" if _fm_scalar(fm_lines, "type") == "claude-decision" else "promoted"
         fm_lines = _set_fields(fm_lines, {"status": top, "promoted_by": "hand-update", "demoted_by": None}, eol)
@@ -1141,7 +1175,8 @@ def _append_update_locked(
         print(f"ERROR: {write_err}", file=sys.stderr)
         return 1
 
-    print(f"OK: {resolved}")
+    if top is not None and promoted_out is not None:
+        promoted_out.append(top)
     return 0
 
 

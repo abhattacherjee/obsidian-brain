@@ -313,6 +313,7 @@ Machine-local config at `~/.claude/obsidian-brain-config.json`:
 ## Multi-Device Support
 
 - **Obsidian Sync:** Works seamlessly — all vault writes are new markdown files (no conflict risk). Config lives at `~/.claude/` (machine-local, outside the vault).
+- **Exclude `claude-insights/_provisional/` from Obsidian Sync** (Settings → Sync → Excluded folders). Auto-capture keeps the notes it did not promote there; `/vault-ask` and `/recall` skip them anyway, and leaving them out keeps thousands of files off your other devices. Run `python3 scripts/capture_provisional_relocate.py` (a dry run) and then `--apply` once to move notes captured before #465.
 - **New machine setup:** Install the plugin, run `/obsidian-setup` with your vault path on that machine.
 
 ## Troubleshooting

@@ -1,7 +1,11 @@
 """Tests for hooks/capture_save.py (#425)."""
 
+import datetime
 import re
+import stat
+import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -41,7 +45,7 @@ def test_new_insight_uses_template_fields(mock_config, tmp_vault, no_match):
                                       today="2026-10-18", config=mock_config)
     assert row["kind"] == "new" and row["status"] == "active"
     assert row["summary"] and "\n" not in row["summary"] and len(row["summary"]) <= capture_save.SUMMARY_CHARS
-    name = row["note_path"].split("/", 1)[1]
+    name = Path(row["note_path"]).name
     assert re.match(r"^\d{4}-\d{2}-\d{2}-[a-z0-9-]{1,50}-[0-9a-f]{4}\.md$", name)
     front, text = _front(tmp_vault / row["note_path"])
     assert "type: claude-insight" in front
@@ -518,3 +522,216 @@ def test_auto_heading_quoted_in_a_fence_stays_original_text():
     text = f"# T\n\nHow a section looks:\n\n```markdown\n{quoted}\n\nquoted body\n```\n\nAfter the fence.\n"
     out = capture_save.strip_auto_updates(text)
     assert quoted in out and "quoted body" in out and "After the fence." in out
+
+
+# --- #465: provisional placement and the local-day update cap -----------------
+
+@pytest.fixture
+def capture_env(mock_config, tmp_path, monkeypatch):
+    """All new placement/cap tests use an explicit temporary DB and ledger."""
+    monkeypatch.setenv("OBSIDIAN_BRAIN_DB", str(tmp_path / "capture-test.db"))
+    monkeypatch.setattr(capture_save.obsidian_utils, "_SECURE_DIR", str(tmp_path / "capture-state"))
+    monkeypatch.setattr(capture_save, "find_match", lambda *a, **k: None)
+    return mock_config
+
+
+def _capture_clock(monkeypatch, day="2026-10-28"):
+    date = datetime.date.fromisoformat(day)
+    midnight = datetime.datetime.combine(date, datetime.time.min).timestamp()
+    now = datetime.datetime.combine(date, datetime.time(12)).timestamp()
+
+    class FakeDate(datetime.date):
+        @classmethod
+        def today(cls):
+            return date
+
+    class FakeDatetime(datetime.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime.datetime.fromtimestamp(now, tz)
+
+    monkeypatch.setattr(capture_save, "datetime", SimpleNamespace(
+        date=FakeDate, datetime=FakeDatetime, time=datetime.time))
+    monkeypatch.setattr(capture_state, "time", SimpleNamespace(time=lambda: now))
+    return midnight, now
+
+
+def _cap_target(config, monkeypatch, provisional=False):
+    folder = Path(config["insights_folder"])
+    if provisional:
+        folder /= "_provisional"
+    rel = (folder / "target.md").as_posix()
+    path = Path(config["vault_path"]) / rel
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path.write_text("---\ntype: claude-insight\nstatus: provisional\ntags: [claude/insight]\n---\n\n# Target\n\nOriginal.\n")
+    monkeypatch.setattr(capture_save, "find_match", lambda *a, **k: rel)
+    return rel, path
+
+
+def _save_for_cap(config):
+    return capture_save.save_candidate(_cand(), session_id=SID, project="p", session_note="", config=config)
+
+
+@pytest.mark.parametrize("folder", ["claude-insights", "custom/insights"])
+def test_new_capture_uses_private_provisional_home(capture_env, folder):
+    capture_env["insights_folder"] = folder
+    ledger = capture_state.capture_dir() / capture_state.LEDGER_NAME
+    assert not ledger.exists()  # missing ledger is a normal first capture
+    row = _save_for_cap(capture_env)
+    note = Path(capture_env["vault_path"]) / row["note_path"]
+    assert row["note_path"] == f"{folder}/_provisional/{note.name}"
+    assert "status: provisional\n" in note.read_text()
+    assert stat.S_IMODE(note.stat().st_mode) == 0o600
+    assert stat.S_IMODE(note.parent.stat().st_mode) == 0o700
+    assert capture_state.ledger_get(row["id"])["note_path"] == row["note_path"]
+    assert "capped_update_of" not in row
+
+
+@pytest.mark.parametrize("home", ["", "_provisional"])
+@pytest.mark.parametrize("occupied_by", ["file", "directory", "dangling-symlink"])
+def test_new_filename_checks_both_r1_homes(capture_env, monkeypatch, home, occupied_by):
+    folder = Path(capture_env["vault_path"]) / capture_env["insights_folder"]
+    (folder / home).mkdir(mode=0o700, exist_ok=True)
+    occupied = folder / home / "2026-10-28-collision-dead.md"
+    if occupied_by == "directory":
+        occupied.mkdir()
+    elif occupied_by == "dangling-symlink":
+        occupied.symlink_to(occupied.parent / "missing.md")
+    else:
+        occupied.write_text("existing")
+    hashes = iter(["dead", "beef"])
+    monkeypatch.setattr(capture_save, "_hash4", lambda: next(hashes))
+    assert capture_save.new_filename(str(folder.parent), folder.name, "2026-10-28", "collision") == \
+        "2026-10-28-collision-beef.md"
+
+
+def test_three_updates_append_and_fourth_is_new(capture_env, monkeypatch):
+    _capture_clock(monkeypatch)
+    rel, target = _cap_target(capture_env, monkeypatch)
+    assert capture_save.MAX_UPDATES_PER_NOTE_PER_DAY == 3
+    rows = [_save_for_cap(capture_env) for _ in range(3)]
+    assert all(row["kind"] == "updated" and row["note_path"] == rel for row in rows)
+    before = target.read_bytes()
+    capped = _save_for_cap(capture_env)
+    assert target.read_bytes() == before
+    assert before.count(b"## Update (") == 3
+    assert capped["kind"] == "new" and capped["capped_update_of"] == rel
+    assert Path(capped["note_path"]).parent.as_posix() == "claude-insights/_provisional"
+    assert "update_heading" not in capped
+    assert capture_state.ledger_get(capped["id"])["capped_update_of"] == rel
+    assert "status: provisional\n" in (target.parents[1] / capped["note_path"]).read_text()
+
+
+def test_old_home_rows_still_cap_a_moved_note(capture_env, monkeypatch):
+    _, now = _capture_clock(monkeypatch)
+    rel, target = _cap_target(capture_env, monkeypatch, provisional=True)
+    for _ in range(3):
+        capture_state.ledger_append({"kind": "updated", "note_path": "claude-insights/target.md",
+                                     "status": "active", "ts": now})
+    before = target.read_bytes()
+    capped = _save_for_cap(capture_env)
+    assert capped["kind"] == "new" and capped["capped_update_of"] == rel
+    assert target.read_bytes() == before
+
+
+def test_rejected_update_and_new_rows_do_not_count(capture_env, monkeypatch):
+    _, now = _capture_clock(monkeypatch)
+    rel, _ = _cap_target(capture_env, monkeypatch)
+    ids = [capture_state.ledger_append({"kind": "updated", "note_path": rel,
+                                       "status": "active", "ts": now}) for _ in range(3)]
+    capture_state.ledger_update(ids[-1], status="rejected")
+    capture_state.ledger_append({"kind": "new", "note_path": rel, "status": "active", "ts": now})
+    third = _save_for_cap(capture_env)
+    assert third["kind"] == "updated" and "capped_update_of" not in third
+    assert _save_for_cap(capture_env)["kind"] == "new"
+
+
+def test_cap_reads_past_default_ledger_limit(capture_env, monkeypatch):
+    _, now = _capture_clock(monkeypatch)
+    rel, _ = _cap_target(capture_env, monkeypatch)
+    ids = [capture_state.ledger_append({"kind": "updated", "note_path": rel,
+                                       "status": "active", "ts": now - 10}) for _ in range(3)]
+    # A superseding row is the same update; it keeps its original timestamp.
+    capture_state.ledger_update(ids[0], note_path="claude-insights/_provisional/target.md", ts=now)
+    for _ in range(205):
+        capture_state.ledger_append({"kind": "updated", "note_path": "claude-insights/unrelated.md",
+                                     "status": "active", "ts": now})
+    assert _save_for_cap(capture_env)["capped_update_of"] == rel
+
+
+@pytest.mark.parametrize("day", ["2026-10-28", "2026-03-08", "2026-11-01"])
+def test_update_cap_resets_at_local_midnight(capture_env, monkeypatch, day):
+    # Explicit non-UTC local time, including both DST changes. Midnight's
+    # offset may differ from noon's, so reusing now().utcoffset() is wrong.
+    try:
+        with monkeypatch.context() as local:
+            local.setenv("TZ", "MST7MDT,M3.2.0,M11.1.0")
+            time.tzset()
+            midnight, _ = _capture_clock(local, day)
+            rel, _ = _cap_target(capture_env, local)
+            for offset in (-1, 0, 1):
+                capture_state.ledger_append({"kind": "updated", "note_path": rel,
+                                             "status": "active", "ts": midnight + offset})
+            # Two count (inclusive since); the pre-midnight row does not.
+            assert _save_for_cap(capture_env)["kind"] == "updated"
+            assert _save_for_cap(capture_env)["capped_update_of"] == rel
+    finally:
+        time.tzset()
+
+
+def test_superseding_yesterdays_update_does_not_make_it_today(capture_env, monkeypatch):
+    midnight, now = _capture_clock(monkeypatch)
+    rel, _ = _cap_target(capture_env, monkeypatch)
+    cid = capture_state.ledger_append({"kind": "updated", "note_path": rel, "status": "active", "ts": midnight - 1})
+    capture_state.ledger_update(cid, ts=now, note_path="claude-insights/_provisional/target.md")
+    for _ in range(2):
+        capture_state.ledger_append({"kind": "updated", "note_path": rel, "status": "active", "ts": now})
+    assert _save_for_cap(capture_env)["kind"] == "updated"
+
+
+def test_unreadable_cap_ledger_never_appends_unchecked(capture_env, monkeypatch):
+    _capture_clock(monkeypatch)
+    _, target = _cap_target(capture_env, monkeypatch)
+    before = target.read_bytes()
+
+    def unreadable(*args, **kwargs):
+        raise OSError("ledger unreadable")
+
+    monkeypatch.setattr(capture_state, "ledger_list", unreadable)
+    with pytest.raises(OSError, match="ledger unreadable"):
+        _save_for_cap(capture_env)
+    assert target.read_bytes() == before
+
+
+@pytest.mark.parametrize("folder", ["../escape", ".obsidian/plugins", "/absolute"])
+def test_invalid_provisional_folder_creates_nothing(capture_env, folder):
+    capture_env["insights_folder"] = folder
+    with pytest.raises(ValueError):
+        _save_for_cap(capture_env)
+    assert capture_state.ledger_list() == []
+
+
+def test_provisional_home_symlink_cannot_escape(capture_env, tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    vault = tmp_path / "vault"
+    (vault / "insights").mkdir(parents=True)
+    (vault / "insights" / "_provisional").symlink_to(outside, target_is_directory=True)
+    capture_env.update(vault_path=str(vault), insights_folder="insights")
+    with pytest.raises(ValueError):
+        _save_for_cap(capture_env)
+    assert list(outside.iterdir()) == [] and capture_state.ledger_list() == []
+
+
+def test_failed_capped_write_never_logs_a_success(capture_env, monkeypatch):
+    _, now = _capture_clock(monkeypatch)
+    rel, target = _cap_target(capture_env, monkeypatch)
+    for _ in range(3):
+        capture_state.ledger_append({"kind": "updated", "note_path": rel, "status": "active", "ts": now})
+    before = target.read_bytes()
+    with monkeypatch.context() as failure:
+        failure.setattr(capture_save.note_writer, "run_write", lambda *a, **k: 1)
+        with pytest.raises(RuntimeError, match="write failed"):
+            _save_for_cap(capture_env)
+    assert target.read_bytes() == before and len(capture_state.ledger_list()) == 3
+    assert _save_for_cap(capture_env)["capped_update_of"] == rel  # retry still takes the capped path
