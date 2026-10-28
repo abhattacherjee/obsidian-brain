@@ -3,7 +3,7 @@
   "displayName": "Obsidian Brain",
   "version": "3.9.1",
   "tagline": "A Claude Code plugin that turns an Obsidian vault into a persistent brain across sessions — auto-logging, curated knowledge capture, snapshot-on-compact, and fast cross-project recall, all via direct filesystem writes.",
-  "lastUpdated": "2026-10-24",
+  "lastUpdated": "2026-10-28",
   "repository": "https://github.com/abhattacherjee/obsidian-brain",
   "defaultBranch": "main",
   "techStack": {
@@ -1214,7 +1214,7 @@
           "files": [
             "scripts/commit-preflight.sh"
           ],
-          "purpose": "Creates a 5-minute token, tied to the current HEAD, for the require-preflight hook. A commit is allowed only while HEAD still matches (an amend: while HEAD's first parent matches). The hook keeps the token on approval only for an exactly-parsed, allowlisted command run in the project's own checkout, so a call another hook denies does not spend it; any other command spends it on approval (#408). Enforces (always-on) manifest version sync, then secret scan, then pytest with cov-fail-under 90. Flags: --docs-only, --skip-tests, --auto, --allow-empty (an empty commit only: refuses when anything is staged or a tracked file is modified)."
+          "purpose": "Vendored from harden-repo v1.3.0 (892d0f5) plus three repo parts: the plugin manifest version sync (always on, before every skip-mode exit), --allow-empty (an empty commit only: refuses when anything is staged or a tracked file is modified) and the pytest block with cov-fail-under 90. Writes a 5-minute token at /tmp/.preflight-token-<first 8 hex characters of the md5 of git-common-dir>, bound to HEAD, the staged tree and the checkout, so a linked worktree's own preflight authorises its own commit (#418). require-preflight keeps the token on approval, holds it for 5 s after a claim, and refuses a commit that could stage files in the same call. Other checks: secret scan, assertion-strength gate (warn), template drift (advisory). Flags: --docs-only, --skip-tests, --auto, --allow-empty."
         },
         {
           "id": "ops-ci",
@@ -2533,7 +2533,7 @@
       "Direct filesystem writes only — no MCP server, no REST API, no daemon; the vault works even when Obsidian is closed.",
       "Hooks are pure stdlib, deterministic, and always exit 0; they never import the index (indexing is a skill-side concern).",
       "Everything is recoverable: the SQLite index is derived and fully rebuildable from the markdown vault.",
-      "Defense in depth on writes: path containment, atomic temp+rename, 0600/0700 perms, secret scrubbing, 1 MB stdin caps. The stdin-cap AST guard walks all three in-repo Python trees — hooks/, scripts/ and .claude/hooks/ — after #289 retired the opt-in OB_SCAN_RESOLVED_INSTALL walk over the resolved plugin-cache tree (a no-op in both configurations that occur, and upstream-dominated by this repo walk since every cache is populated from a release cut here). The five .claude/hooks/ PreToolUse gates read through a shared _read_hook_input() helper that fails CLOSED on every unusable input: a read error (non-UTF-8 or OSError), overflow past the cap, any parse failure including RecursionError, and a payload that parses but is not an object (or whose tool_input is not an object) all emit permissionDecision: deny at exit 0 — never a non-zero exit, which is a non-blocking error that lets the tool call proceed. #351 closed a class of bypasses where a global option ahead of the verb (git -C/-c/--no-pager, gh -R/--repo) skipped a gate's verb match entirely: a shared _GLOBAL_OPTS regex fragment is now spliced into each hook's verb pattern (_PUSH_VERB, _CHECKOUT_VERB, _COMMIT_VERB, _PR_CREATE_VERB, _PR_MERGE_VERB); gh -R/--repo is deliberately not descoped the way git -C is. prevent-direct-push alone splits a compound command into one invocation per push before any of that runs, and its quoted-span scanner (_quoted_spans) is what decides whether a given ;/&/| is a real separator or sits inside a closed quoted run; a bisect over the sorted span offsets keeps that split linear rather than quadratic in separators x spans. It additionally denies --mirror/--prune/--all/--branches outright (_all_ref_flags, prefix-matched against git's own abbreviation rules) and any refspec whose destination glob could match a protected ref (_branch_glob_refspecs, via fnmatch), decides a protected push or delete target on ref tokens anywhere in the argument list rather than adjacency to the remote (_protected_push_refs/_protected_delete_refs), and anchors its tag allowlist to a single ref token below the deletion gates (_is_tag_ref/_VERSION_TAG) instead of three unanchored substring tests that used to run ahead of it. Known gaps, all pre-existing and not regressions: three quoted spellings of a global-option token remain fail-open (pinned as strict xfail rows so a future fix can't pass silently), and those rows sample a wider class rather than bounding it - the executable and verb words themselves can be quoted or escaped (git \"push\", git p'u'sh, \"git\" push) and are not normalised, so a mangled verb skips the entry test on all five gates; a #-comment, an unbalanced quote inside one, a case ... ) pattern, or a heredoc body ahead of a git -C are blind spots in the shared _shell_scan scoping helper and now cost a fail-closed false deny on legitimate cross-repo -C work; and a mirror configured via remote.<name>.mirror rather than the --mirror flag is invisible to command text."
+      "Defense in depth on writes: path containment, atomic temp+rename, 0600/0700 perms, secret scrubbing, and stdin caps (1 MB in hooks/ and scripts/; the five .claude/hooks/ gates read up to 16 MiB and judge the whole payload). The stdin-cap AST guard walks all three in-repo Python trees: hooks/, scripts/ and .claude/hooks/. The five .claude/hooks/ PreToolUse gates (prevent-direct-push, require-preflight, validate-branch-name, update-changelog-before-pr, enforce-pr-base-branch) are vendored unchanged from harden-repo v1.3.0 (892d0f5); tests/test_vendored_hooks.py pins their sha256, so a fix goes upstream, not here (#418). They share one shell-scanner block that is kept byte-identical across the five files. Every unusable input fails closed with permissionDecision: deny at exit 0. A verb mentioned only as data (a heredoc body, a quoted argument) is allowed (#343), a quoted or escaped command name is judged like the plain one (#366), and the scope guard is linear in the number of cd and -C prefixes (#353). Known costs, accepted when vendoring: a cd or -C target that does not exist counts as in scope; staging and committing in one Bash call is refused; and a command word built from an unresolved variable next to the words push or commit is denied (harden-repo#138)."
     ],
     "constraints": [
       "Python stdlib only — no pip dependencies (hooks run at session boundaries where install state is unknown).",
@@ -2661,7 +2661,7 @@
     },
     {
       "name": "commit-preflight.sh",
-      "command": "preflight gate: manifest-sync + secret-scan + pytest cov>=90; mints the require-preflight token"
+      "command": "preflight gate (harden-repo v1.3.0 + repo parts): manifest-sync + secret-scan + pytest cov>=90; mints the require-preflight token bound to HEAD, staged tree and checkout"
     },
     {
       "name": "pre-commit.sh",
@@ -2724,7 +2724,7 @@
         ]
       }
     ],
-    "preflight": "./scripts/commit-preflight.sh — manifest-sync (always-on) + secret-scan + pytest cov>=90; required before every commit",
+    "preflight": "./scripts/commit-preflight.sh — manifest-sync (always-on) + secret-scan + pytest cov>=90; required before every commit, staged and committed in separate calls",
     "plugin": "abhattacherjee/git-flow",
     "currentVersion": "3.4.2"
   },
