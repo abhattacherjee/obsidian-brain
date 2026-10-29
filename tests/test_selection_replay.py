@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import os
 import sqlite3
 import subprocess
 import sys
@@ -153,7 +154,7 @@ def test_ambiguous_and_unmapped_prefixes_counted_once(tmp_path, capsys):
 
 
 @pytest.mark.parametrize("store", ["db", "ledger"])
-@pytest.mark.parametrize("form", ["direct", "symlink", "relative"])
+@pytest.mark.parametrize("form", ["direct", "symlink", "hardlink", "relative"])
 def test_refuses_live_paths_before_any_read(tmp_path, monkeypatch, capsys, store, form):
     case = _write_case(tmp_path)
     live_dir = tmp_path / "secure" / "capture"
@@ -167,6 +168,10 @@ def test_refuses_live_paths_before_any_read(tmp_path, monkeypatch, capsys, store
     if form == "symlink":
         alias = tmp_path / "alias"
         alias.symlink_to(live)
+        case[store] = alias
+    elif form == "hardlink":
+        alias = tmp_path / "hardalias"
+        os.link(live, alias)
         case[store] = alias
     elif form == "relative":
         case[store] = "./" + str(live.relative_to(tmp_path))
@@ -473,3 +478,24 @@ def test_uri_quoting_and_real_cli_from_another_directory(tmp_path):
     report = json.loads(result.stdout)
     assert report["inputs"]["db"] == str(special)
     assert report["arms"][0]["total_moves"] == 6
+
+
+def test_intermediate_slice_moves_are_replayed(tmp_path, capsys):
+    # One batch of three slices: promoted/demoted lines at slice times (10, 20),
+    # a single saved line at the end (30). Rows arrive between the slices.
+    rows = [_row("a"), _row("b", 15, novelty=0.5), _row("c", 25, novelty=0.6)]
+    logs = [_log(10, "promoted", detail="cid=a;merit=.68;rank=1;why=pick"),
+            _log(20, "demoted", detail="cid=a;merit=.68;rank=2;why=displaced"),
+            _log(20, "promoted", detail="cid=b;merit=.71;rank=1;why=pick"),
+            _log(30, "saved:3")]
+    report = _report(_write_case(tmp_path, rows=rows, logs=logs), capsys)
+    moves = report["arms"][0]["sessions"][SESSION]["moves_by_note"]
+    # Replays at 10, 20, 30: a picked, then b displaces a, then c excludes b and a returns.
+    assert moves == {"a": 3, "b": 2, "c": 1}
+
+
+def test_fractional_ledger_ts_counts_in_same_second_selection(tmp_path, capsys):
+    rows = [_row("a", 0.25)]
+    logs = [_log(0, "saved:1")]
+    report = _report(_write_case(tmp_path, rows=rows, logs=logs), capsys)
+    assert report["arms"][0]["sessions"][SESSION]["final_picks"] == ["a"]

@@ -75,6 +75,12 @@ def test_step3_search_vault_opts_into_or_fill(skill):
         assert "include_provisional=False," in call.group(1)
 
 
+def test_vault_search_step3_does_not_hide_provisional_notes():
+    call = re.search(r"results = search_vault\((.*?)\n\)", _step("vault-search", "3"), re.S)
+    assert call
+    assert "include_provisional=False" not in call.group(1)
+
+
 def test_vault_ask_step4_drops_excluded_paths_from_grep_union():
     step = _step("vault-ask", "4")
     rule = ("After collecting the union from Agents 1–3, drop every path containing "

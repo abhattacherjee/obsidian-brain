@@ -22,9 +22,11 @@ checkout is the live plugin and stays on `develop`).
   `merit + INCUMBENT_BONUS` for a candidate whose frontmatter status is already its promoted tier;
   the stored `capture_merit` keeps the base merit. The replay adds the bonus the same way.
   `INCUMBENT_BONUS = 0.2`, from the T2 sweep on the 2026-10-25..29 sessions: notes moved more than
-  once 149 → 37 (75.2%), none more than twice, mean final merit −0.0194. 0.15 cut only 68%; 0.25
-  lost 0.029 merit. The spike bar is an absolute merit drop ≤ 0.02; the first draft's δ/2 bar was
-  dropped because it passes δ = 1, which freezes the first picks.
+  once 154 → 39 (74.7%), none more than twice, mean final merit −0.0206 (after the review fix that
+  replays every slice, not only the batch's `saved` line). 0.19 cut only 71.4%; 0.21 lost 0.0232
+  merit. No value meets both bars (≥ 75% fewer, merit drop ≤ 0.02); 0.2 misses each by one note and
+  0.0006, and the user chose to keep it. The first draft's δ/2 bar was dropped because it passes
+  δ = 1, which freezes the first picks.
 - **R6 — measurement scripts never touch live stores.** Both scripts refuse the default DB path and
   the live ledger path (also through symlinks and relative forms), and never call `ensure_index`,
   `plan_session` or `ledger_update`. Their own SQL opens the copy read-only; `search_vault` uses
@@ -45,8 +47,8 @@ checkout is the live plugin and stays on `develop`).
    notes moved, moved more than once, moved more than twice, max moves, and the mean merit of each
    session's final picks. Tests: refuses live paths; a planted three-slice session where today's
    arm flips a note and a bonus arm does not.
-3. **T3 hysteresis** — `plan_session` incumbents (R5), with `INCUMBENT_BONUS` from T2. Tests: a challenger within δ does not displace an incumbent; one
-   beyond δ does; bonus 0 reproduces today's picks; the duplicate (`dup_cos`) rule still wins over
+3. **T3 hysteresis** — `plan_session` incumbents (R5), with `INCUMBENT_BONUS` from T2. Tests: a challenger within `INCUMBENT_BONUS` does not displace an incumbent; one
+   beyond it does; bonus 0 reproduces today's picks; the duplicate (`dup_cos`) rule still wins over
    the bonus.
 4. **T4 OR fill + Grep exclusion** — R1, R2, R4. Tests: AND below `min_results` adds OR-only rows
    after AND rows, flagged `or_fallback=True`, no duplicates; `min_results=0` is byte-identical to
@@ -72,7 +74,8 @@ checkout is the live plugin and stays on `develop`).
   must be empty.
 - **Inputs:** `retrieval_eval.py` reads only the DB copy (source of truth: a `.backup` of the live
   DB taken before the run). `selection_replay.py` reads the ledger copy, the DB copy and hook-log
-  copies; a stale or missing log gives "0 sessions in window" and exit 1, tested. `select()` reads
-  `incumbent` from the item dict; a missing key means not an incumbent, tested.
+  copies; a stale or missing log gives "0 sessions in window" and exit 1, tested. `plan_session` adds `INCUMBENT_BONUS`
+  to merit for a note whose frontmatter status is its promoted tier (R5); a missing or other status
+  means not an incumbent, tested. `select()` reads no incumbent key.
 - **Bypass routes (R6 is a guard):** passing the default DB through a symlink or a relative path —
   the check resolves both sides (`Path.resolve()`); tests cover a symlink and `./` forms.

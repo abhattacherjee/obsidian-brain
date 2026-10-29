@@ -1,6 +1,7 @@
 """Known-answer eval stays on the explicit DB copy and supports the old API."""
 
 import json
+import os
 import sqlite3
 import subprocess
 import sys
@@ -85,7 +86,7 @@ def test_markdown(index, capsys):
     assert "underfilled (n < 5 and or_candidates >= 5)=1" in output
 
 
-@pytest.mark.parametrize("form", ["direct", "symlink", "relative"])
+@pytest.mark.parametrize("form", ["direct", "symlink", "hardlink", "relative"])
 def test_refuses_resolved_default(tmp_path, monkeypatch, capsys, form):
     live = tmp_path / "live.db"
     live.write_bytes(b"must never open this")
@@ -95,6 +96,10 @@ def test_refuses_resolved_default(tmp_path, monkeypatch, capsys, form):
     if form == "symlink":
         alias = tmp_path / "alias.db"
         alias.symlink_to(live)
+        db_arg = str(alias)
+    elif form == "hardlink":
+        alias = tmp_path / "hard.db"
+        os.link(live, alias)
         db_arg = str(alias)
     elif form == "relative":
         db_arg = "./live.db"

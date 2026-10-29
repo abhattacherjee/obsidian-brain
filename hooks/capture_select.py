@@ -45,7 +45,7 @@ from tfidf import _cosine_similarity
 
 CAP = 10
 LAMBDA = 0.5
-INCUMBENT_BONUS = 0.2  # picked by scripts/selection_replay.py on the 2026-10-25..29 sessions (notes moved more than once 149 -> 37, mean final merit -0.019).
+INCUMBENT_BONUS = 0.2  # picked by scripts/selection_replay.py on the 2026-10-25..29 sessions (notes moved more than once 154 -> 39, mean final merit -0.021).
 DUP_COS = 0.6  # the lexical backstop for reworded duplicates the worker missed
 TYPE_BONUS = {"error-fix": 0.02, "decision": 0.02}
 NOVELTY_MISSING = 0.5  # no vector to compare: neither novel nor stale

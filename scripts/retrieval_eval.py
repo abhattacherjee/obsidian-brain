@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sqlite3
 import sys
 import time
@@ -131,7 +132,8 @@ def main(argv=None) -> int:
             Path(vault_index._default_db_path()).expanduser().resolve(),
             Path("~/.claude/obsidian-brain-vault.db").expanduser().resolve(),
         }
-        if db in refused:
+        if db in refused or any(live.exists() and db.exists() and os.path.samefile(db, live)
+                                for live in refused):
             print(f"ERROR: refusing live/default DB: {db}; use a DB copy", file=sys.stderr)
             return 2
         if not db.is_file():

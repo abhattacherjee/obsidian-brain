@@ -1198,3 +1198,14 @@ def test_update_note_status_goes_by_the_stat_the_setter_took_under_its_lock(mock
     body = conn.execute("SELECT body FROM notes WHERE path = ?", (str(path),)).fetchone()["body"]
     conn.close()
     assert _words(4, 20) in body
+
+
+@pytest.mark.parametrize("incumbent_at_cap", ["insight", "decision", "error-fix"], indirect=True)
+@pytest.mark.parametrize("gap,challenger_wins", [(0.19, False), (0.21, True)])
+def test_incumbent_bonus_is_pinned_at_0_2(mock_config, db, incumbent_at_cap, gap, challenger_wins):
+    assert capture_select.INCUMBENT_BONUS == 0.2
+    incumbent, ntype, _top = incumbent_at_cap
+    challenger = _note(mock_config, capture_select.CAP, score=5, novelty=gap / 0.3, ntype=ntype)
+    entries = {e["row"]["id"]: e for e in capture_select.plan_session(SID, mock_config, db)}
+    assert entries[challenger["id"]]["why"] == ("pick" if challenger_wins else "below-cap")
+    assert entries[incumbent["id"]]["why"] == ("displaced" if challenger_wins else "pick")

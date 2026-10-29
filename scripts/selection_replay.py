@@ -16,6 +16,7 @@ import argparse
 import datetime as dt
 import json
 import math
+import os
 import re
 import sqlite3
 import sys
@@ -37,6 +38,8 @@ LIMITATIONS = [
     "Only access-log stickiness is reconstructed; hand edits, issue closures and historical frontmatter are unavailable.",
     "Final merit averages sessions with nonempty final selection picks; sticky notes are outside those picks.",
     "Skipped sid counts count distinct saved-line prefixes; rows_without_vector counts distinct eligible ledger rows.",
+    "Replay times are saved lines plus promoted/demoted lines: a slice whose selection moved nothing writes no line, so it is not replayed on its own; its rows join the next replayed selection.",
+    "Ledger ts is fractional but log times are whole seconds: a row created later in the same second as a selection is counted in it.",
 ]
 
 
@@ -94,8 +97,14 @@ def _read_ledger(path: Path, skipped: Counter) -> list[dict]:
     return list(merged.values())
 
 
-def _read_logs(paths: list[Path]) -> tuple[float, dict[str, list[float]], dict[str, Counter]]:
+def _row_in(row_ts: float, when: float) -> bool:
+    """Ledger ts is fractional; hook-log times are truncated to whole seconds."""
+    return math.floor(row_ts) <= when
+
+
+def _read_logs(paths: list[Path]) -> tuple[float, dict[str, list[float]], dict[str, Counter], dict[str, list[float]]]:
     saved = defaultdict(list)
+    move_times = defaultdict(list)
     moves = defaultdict(Counter)
     first = None
     for path in paths:
@@ -130,13 +139,14 @@ def _read_logs(paths: list[Path]) -> tuple[float, dict[str, list[float]], dict[s
                                   if "=" in part) if detail else {}
                     if not values.get("cid") or not values.get("why"):
                         raise ValueError(f"{path}:{line}: move needs cid and why")
+                    move_times[sid].append(timestamp)
                     if values["why"] in ("pick", "displaced", "below-cap"):
                         moves[sid][values["cid"]] += 1
     if not saved:
         raise ValueError("0 sessions in window: no saved lines in hook logs")
     for times in saved.values():
         times.sort()
-    return first, saved, moves
+    return first, saved, moves, move_times
 
 
 def _read_db(db: Path, basenames: set[str]) -> tuple[dict, dict]:
@@ -184,7 +194,7 @@ def _replay(items: list[dict], times: list[float], bonus: float) -> dict:
     """Selection moves only: becoming sticky freezes a note without adding a move."""
     promoted, counts, picks = set(), Counter(), []
     for timestamp in times:
-        pool = [item for item in items if item["ts"] <= timestamp < item["sticky_at"]]
+        pool = [item for item in items if _row_in(item["ts"], timestamp) and timestamp < item["sticky_at"]]
         picks = capture_select.select([
             {key: item[key] for key in ("id", "vector", "ts")}
             | {"merit": item["merit"] + (bonus if item["id"] in promoted else 0.0)}
@@ -214,7 +224,7 @@ def _evaluate(ledger: Path, db: Path, logs: list[Path], bonuses: list[float]) ->
                            sessions_without_vectors=0, sessions_without_candidates=0,
                            invalid_ledger_rows=0))
     rows = _read_ledger(ledger, skipped)
-    first_log, saved, live_moves = _read_logs(logs)
+    first_log, saved, live_moves, move_times = _read_logs(logs)
     by_session, prefixes, first_new = defaultdict(list), defaultdict(set), {}
     for row in rows:
         session = row.get("session_id")
@@ -244,7 +254,7 @@ def _evaluate(ledger: Path, db: Path, logs: list[Path], bonuses: list[float]) ->
         elif not matches:
             skipped["unmapped_sid"] += 1
         else:
-            mapped[next(iter(matches))] = times
+            mapped[next(iter(matches))] = sorted(set(times) | set(move_times.get(sid, ())))
     if not mapped:
         raise ValueError(f"0 sessions in window map to ledger; skipped={dict(skipped)}")
 
@@ -252,7 +262,7 @@ def _evaluate(ledger: Path, db: Path, logs: list[Path], bonuses: list[float]) ->
     vectors, sticky = _read_db(db, basenames)
     arms = [{"bonus": bonus, "sessions": {}} for bonus in dict.fromkeys([0.0, *bonuses])]
     for session, times in sorted(mapped.items()):
-        available = [row for row in by_session[session] if row["ts"] <= times[-1]]
+        available = [row for row in by_session[session] if _row_in(row["ts"], times[-1])]
         if not available:
             skipped["sessions_without_candidates"] += 1
             continue
@@ -349,7 +359,12 @@ def main(argv=None) -> int:
         refused_ledgers = {(Path(capture_state.obsidian_utils._SECURE_DIR) / "capture"
                             / capture_state.LEDGER_NAME).expanduser().resolve(),
                            Path("~/.claude/obsidian-brain/capture/captures.jsonl").expanduser().resolve()}
-        if db in refused_dbs or ledger in refused_ledgers:
+        def same_file(path, live_paths):
+            return any(live.exists() and path.exists() and os.path.samefile(path, live)
+                       for live in live_paths)
+
+        if (db in refused_dbs or ledger in refused_ledgers
+                or same_file(db, refused_dbs) or same_file(ledger, refused_ledgers)):
             print("ERROR: refusing live/default DB or ledger; use copies", file=sys.stderr)
             return 2
         logs = [path.expanduser().resolve() for path in args.log]
