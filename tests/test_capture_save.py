@@ -759,3 +759,40 @@ def test_relocation_between_append_and_ledger_write_cannot_orphan_the_row(captur
     merged = {r["id"]: r for r in capture_state._merged_rows()}
     assert (Path(vault) / merged[row["id"]]["note_path"]).is_file()
     assert not list(Path(vault).rglob("*.ob-lock"))
+
+
+def test_promotion_refused_during_update_is_replaced_afterwards(capture_env, monkeypatch):
+    """X-006: a hand promotion that lost the lock race is retried once save_candidate lets go."""
+    import note_placement
+    import vault_index
+    rel, target = _cap_target(capture_env, monkeypatch, provisional=True)
+    vault = capture_env["vault_path"]
+    db = vault_index.ensure_index(vault, [capture_env["insights_folder"]], db_path=vault_index._default_db_path())  # the autouse tmp DB save_candidate uses
+    real, attempts = capture_state.ledger_append, []
+
+    def promote_during_append(row):
+        if not attempts:
+            target.write_text(target.read_text().replace("status: provisional", "status: promoted"))
+            attempts.append(note_placement.place(capture_env, target, "promoted", db))
+        return real(row)
+
+    monkeypatch.setattr(capture_state, "ledger_append", promote_during_append)
+    row = _save_for_cap(capture_env)
+    assert attempts and attempts[0] == target.resolve(), "the in-window move must be refused"
+    new = Path(vault) / capture_env["insights_folder"] / "target.md"
+    assert new.is_file() and not target.exists()
+    conn = vault_index._connect(db)
+    try:
+        paths = [r[0] for r in conn.execute("SELECT path FROM notes WHERE path LIKE '%target.md'")]
+    finally:
+        conn.close()
+    assert paths and all("_provisional" not in p for p in paths)
+    merged = {r["id"]: r for r in capture_state._merged_rows()}
+    assert (Path(vault) / merged[row["id"]]["note_path"]).resolve() == new.resolve()
+
+
+def test_plain_update_to_a_provisional_note_stays_put(capture_env, monkeypatch):
+    rel, target = _cap_target(capture_env, monkeypatch, provisional=True)
+    row = _save_for_cap(capture_env)
+    assert row["kind"] == "updated" and target.is_file()
+    assert row["note_path"] == rel

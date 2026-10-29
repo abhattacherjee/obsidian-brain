@@ -465,4 +465,21 @@ def save_candidate(
         capture_state.ledger_append(row)
     finally:
         note_writer._release_lock(other_lock)
+    if row.get("kind") == "updated":
+        _replace_after_update(config, Path(vault) / match, project, session_id)
     return row
+
+
+def _replace_after_update(config: dict, path: Path, project: str, session_id: str) -> None:
+    """Re-place an updated note by its current status.
+
+    A hand append that promoted the note while our companion lock was held had
+    its own placement refused, and nothing retries it. A failure here never
+    undoes the saved update.
+    """
+    try:
+        status = obsidian_utils.normalize_status(
+            obsidian_utils._peek_frontmatter_fields(path, ("status",))["status"])
+        note_placement.place(config, path, status, vault_index._default_db_path())
+    except Exception as exc:  # noqa: BLE001 -- the update is already saved
+        capture_state.append_capture_log(project, session_id, "place-failed", f"{type(exc).__name__}: {exc}"[:160])
