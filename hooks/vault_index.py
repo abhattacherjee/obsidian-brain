@@ -2188,6 +2188,7 @@ def search_vault(
     include_vectors: bool = False,
     log_access: bool = True,
     include_provisional: bool = True,
+    min_results: int = 0,
 ) -> list[dict]:
     """Full-text search over the vault index.
 
@@ -2198,7 +2199,11 @@ def search_vault(
 
     Candidates are retrieved with BM25 column weighting (title=10x,
     tags=5x), then reranked with a 7-signal scorer for context relevance.
-    Falls back to OR-mode if the AND query returns no results.
+    Falls back to OR-mode if the AND query returns no candidates. With
+    ``min_results > 0``, also fills from OR-mode when AND returns fewer than
+    ``min_results`` candidates, reranking each leg separately and keeping AND
+    results first, up to ``limit``. Nonpositive values (default 0) disable
+    this extra fill.
 
     The optional ``caller`` parameter (e.g. 'vault-search', 'standup')
     drives task-context detection for context-adaptive type scoring.
@@ -2209,8 +2214,8 @@ def search_vault(
     vector pay no overhead and the key is absent (backward-compatible).
 
     Every result dict carries an ``or_fallback`` boolean: ``True`` when the
-    row was retrieved via the OR-fallback branch (AND returned 0 results),
-    ``False`` on the normal AND path.
+    row was retrieved via OR-mode (fallback or opt-in fill), ``False`` on
+    the normal AND path.
 
     Each returned hit is logged as a ``search`` access, which feeds ACT-R
     activation in the rerank. Pass ``log_access=False`` from any search that
@@ -2276,6 +2281,7 @@ def search_vault(
         for c in candidates:
             c["or_fallback"] = False
 
+        or_candidates: list[dict] = []
         # OR fallback when AND returns nothing
         if not candidates:
             or_query = _sanitize_fts_query_or(query)
@@ -2290,12 +2296,36 @@ def search_vault(
                 # are rejected (fail-closed) to prevent false-positive dedup matches.
                 for c in candidates:
                     c["or_fallback"] = True
+        elif len(candidates) < min_results:
+            or_query = _sanitize_fts_query_or(query)
+            if or_query:
+                or_params = [or_query] + filter_params + [candidate_limit]
+                try:
+                    rows = conn.execute(sql, or_params).fetchall()
+                except sqlite3.Error as exc:
+                    # Fill is optional: preserve the successful AND leg.
+                    print(f"[vault-index] search_vault OR fill failed: {exc}",
+                          file=sys.stderr)
+                else:
+                    and_paths = {c["path"] for c in candidates}
+                    for row in rows:
+                        if row["path"] not in and_paths:
+                            c = dict(row)
+                            c["or_fallback"] = True
+                            or_candidates.append(c)
 
         task_context = detect_task_context(caller_skill=caller) if caller else None
         results = rerank_results(
             candidates, query_terms, limit,
             db_path=db_path, task_context=task_context,
         )
+        if or_candidates:
+            # BM25 ranks from distinct MATCH queries are not comparable.
+            or_results = rerank_results(
+                or_candidates, query_terms, limit,
+                db_path=db_path, task_context=task_context,
+            )
+            results = (results + or_results)[:limit]
         # Log access for returned results (single connection, one commit).
         # Per-row project preserves each note's project attribution for
         # per-project analytics, even when the search itself was unscoped.

@@ -1465,6 +1465,215 @@ class TestBM25AndFallback:
         assert "Feasibility" in results[0]["title"]
 
 
+class TestSearchVaultOrFill:
+    """Opt-in recall fill preserves AND priority and legacy dedup behavior."""
+
+    def _populate_vault(self, tmp_vault, and_count=1):
+        metadata = {
+            "type": "claude-insight",
+            "date": date.today().isoformat(),
+            "project": "proj",
+            "status": "summarized",
+            "tags": ["claude/insight"],
+        }
+        for i in range(and_count):
+            _write_note(
+                tmp_vault / "claude-insights" / f"and-{i}.md",
+                metadata,
+                body=f"# Intersection {i}\n\nAlpha beta together.",
+            )
+        for i, term in enumerate(["alpha", "alpha", "alpha", "beta", "beta"]):
+            _write_note(
+                tmp_vault / "claude-insights" / f"or-{i}.md",
+                {**metadata, "status": "provisional" if i == 4 else "summarized"},
+                body=f"# Partial {i}\n\n{term} alone.",
+            )
+        db = str(tmp_vault / "test.db")
+        vault_index.ensure_index(str(tmp_vault), ["claude-insights"], db_path=db)
+        return db
+
+    @pytest.fixture
+    def fill_index(self, tmp_vault):
+        return self._populate_vault(tmp_vault)
+
+    @pytest.mark.parametrize("limit", [3, 10])
+    @pytest.mark.parametrize("include_vectors", [False, True])
+    def test_fill_appends_unique_or_rows_after_and(
+        self, tmp_vault, fill_index, limit, include_vectors
+    ):
+        results = vault_index.search_vault(
+            fill_index, "alpha beta", limit=limit, min_results=5,
+            include_vectors=include_vectors, log_access=False,
+        )
+        assert len(results) == min(limit, 1 + 5)
+        assert results[0]["path"] == str(tmp_vault / "claude-insights" / "and-0.md")
+        assert results[0]["or_fallback"] is False
+        assert all(r["or_fallback"] is True for r in results[1:])
+        assert len({r["path"] for r in results}) == len(results)
+        for r in results:
+            assert "body" not in r
+            if include_vectors:
+                assert isinstance(r["tfidf_vector"], dict)
+                assert r["tfidf_vector"]
+            else:
+                assert "tfidf_vector" not in r
+
+    @pytest.mark.parametrize("min_results", [0, -5])
+    def test_default_and_nonpositive_threshold_keep_legacy_and_only(
+        self, tmp_vault, fill_index, min_results
+    ):
+        # Pin the pre-fill result, so two equally wrong code paths cannot pass.
+        expected = [(str(tmp_vault / "claude-insights" / "and-0.md"), False)]
+        with patch.object(
+            vault_index, "_sanitize_fts_query_or",
+            side_effect=AssertionError("legacy AND hits must not trigger OR"),
+        ):
+            default = vault_index.search_vault(fill_index, "alpha beta", log_access=False)
+            explicit = vault_index.search_vault(
+                fill_index, "alpha beta", min_results=min_results, log_access=False,
+            )
+        assert [(r["path"], r["or_fallback"]) for r in default] == expected
+        assert explicit == default
+
+    @pytest.mark.parametrize("min_results", [1, 3])
+    def test_enough_and_candidates_do_not_trigger_fill(self, tmp_vault, min_results):
+        db = self._populate_vault(tmp_vault, and_count=3)
+        with patch.object(
+            vault_index, "_sanitize_fts_query_or",
+            side_effect=AssertionError("threshold is met before reranking/truncation"),
+        ):
+            results = vault_index.search_vault(
+                db, "alpha beta", limit=2, min_results=min_results, log_access=False,
+            )
+        assert len(results) == 2
+        assert all(r["or_fallback"] is False for r in results)
+        assert {r["path"] for r in results} <= {
+            str(tmp_vault / "claude-insights" / f"and-{i}.md") for i in range(3)
+        }
+
+    @pytest.mark.parametrize("min_results", [0, 5])
+    def test_zero_and_keeps_legacy_or_fallback(self, tmp_vault, fill_index, min_results):
+        default = vault_index.search_vault(
+            fill_index, "alpha zygomorphic", log_access=False,
+        )
+        explicit = vault_index.search_vault(
+            fill_index, "alpha zygomorphic", min_results=min_results, log_access=False,
+        )
+        assert explicit == default
+        assert {r["path"] for r in default} == {
+            str(tmp_vault / "claude-insights" / name)
+            for name in ("and-0.md", "or-0.md", "or-1.md", "or-2.md")
+        }
+        assert all(r["or_fallback"] is True for r in default)
+
+    def test_fill_reranks_each_leg_with_its_own_candidate_budget(self, fill_index):
+        with patch.object(vault_index, "rerank_results", wraps=vault_index.rerank_results) as rerank:
+            results = vault_index.search_vault(
+                fill_index, "alpha beta", limit=2, min_results=5,
+                caller="vault-search", log_access=False,
+            )
+        assert rerank.call_count == 2
+        and_call, or_call = rerank.call_args_list
+        and_rows, or_rows = and_call.args[0], or_call.args[0]
+        assert len(and_rows) == 1
+        # OR gets all six candidates (limit * 3), then removes the AND duplicate.
+        assert len(or_rows) == 5
+        assert all(r["or_fallback"] is False for r in and_rows)
+        assert all(r["or_fallback"] is True for r in or_rows)
+        assert {r["path"] for r in and_rows}.isdisjoint(r["path"] for r in or_rows)
+        for call in (and_call, or_call):
+            assert call.args[1:] == (["alpha", "beta"], 2)
+            assert call.kwargs == {"db_path": fill_index, "task_context": "search"}
+        assert [r["or_fallback"] for r in results] == [False, True]
+
+    def test_or_query_error_keeps_and_results_and_logs_them(
+        self, tmp_vault, fill_index, monkeypatch, capsys
+    ):
+        expected = vault_index.search_vault(
+            fill_index, "alpha beta", include_vectors=True, log_access=False,
+        )
+        real_connect = vault_index._connect
+        connections = []
+
+        class FailOrConnection:
+            def __init__(self, conn):
+                self.conn = conn
+                self.matches = []
+
+            def execute(self, sql, params=()):
+                if "WHERE notes_fts MATCH ?" in sql:
+                    self.matches.append((sql, list(params)))
+                    if len(self.matches) == 2:
+                        assert params[0] == '"alpha" OR "beta"'
+                        raise sqlite3.OperationalError("OR fill unavailable")
+                return self.conn.execute(sql, params)
+
+            def __getattr__(self, name):
+                return getattr(self.conn, name)
+
+        def connect(db_path):
+            conn = FailOrConnection(real_connect(db_path))
+            connections.append(conn)
+            return conn
+
+        monkeypatch.setattr(vault_index, "_connect", connect)
+        capsys.readouterr()
+        results = vault_index.search_vault(
+            fill_index, "alpha beta", min_results=5, include_vectors=True, log_access=True,
+        )
+        assert results == expected
+        assert len(connections[0].matches) == 2
+        assert connections[0].matches[0][0] == connections[0].matches[1][0]
+        stderr = capsys.readouterr().err.splitlines()
+        assert len(stderr) == 1
+        assert stderr[0].startswith("[vault-index]")
+        assert "OR fill unavailable" in stderr[0]
+        conn = sqlite3.connect(fill_index)
+        rows = conn.execute("SELECT note_path, context_type FROM access_log").fetchall()
+        conn.close()
+        assert rows == [(str(tmp_vault / "claude-insights" / "and-0.md"), "search")]
+
+    def test_fill_reuses_provisional_project_and_type_filters(self, tmp_vault, fill_index):
+        for name, project, note_type in [
+            ("other-project", "other", "claude-insight"),
+            ("other-type", "proj", "claude-session"),
+        ]:
+            _write_note(
+                tmp_vault / "claude-insights" / f"{name}.md",
+                {"type": note_type, "project": project, "status": "summarized"},
+                body="# Excluded\n\nAlpha alone.",
+            )
+        vault_index.ensure_index(str(tmp_vault), ["claude-insights"], db_path=fill_index)
+        unfiltered = vault_index.search_vault(
+            fill_index, "alpha beta", min_results=5, log_access=False,
+        )
+        assert len(unfiltered) == 8
+        results = vault_index.search_vault(
+            fill_index, "alpha beta", min_results=5, include_provisional=False,
+            project="proj", note_type="claude-insight", log_access=False,
+        )
+        assert {r["path"] for r in results} == {
+            str(tmp_vault / "claude-insights" / name)
+            for name in ("and-0.md", "or-0.md", "or-1.md", "or-2.md", "or-3.md")
+        }
+        assert results[0]["or_fallback"] is False
+        assert all(r["or_fallback"] is True for r in results[1:])
+
+    @pytest.mark.parametrize("log_access", [False, True])
+    def test_access_log_contains_exactly_returned_results(self, fill_index, log_access):
+        results = vault_index.search_vault(
+            fill_index, "alpha beta", limit=3, min_results=5, log_access=log_access,
+        )
+        assert len(results) == 3
+        conn = sqlite3.connect(fill_index)
+        rows = conn.execute(
+            "SELECT note_path, context_type, project FROM access_log"
+        ).fetchall()
+        conn.close()
+        expected = [(r["path"], "search", r["project"]) for r in results] if log_access else []
+        assert sorted(rows) == sorted(expected)
+
+
 # ---------------------------------------------------------------------------
 # Task 4: Python reranker — 5-signal scoring
 # ---------------------------------------------------------------------------

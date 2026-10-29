@@ -118,6 +118,7 @@ results = search_vault(
     sys.argv[1],
     project=sys.argv[2] if len(sys.argv) > 2 and sys.argv[2] != "None" else None,
     limit=20,
+    min_results=5,
 )
 print(json.dumps(results))
 ' "$QUERY" "$PROJECT"

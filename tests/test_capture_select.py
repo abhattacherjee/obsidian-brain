@@ -468,6 +468,66 @@ def test_duplicate_is_skipped_and_superseded_is_demoted(mock_config, db):
     assert not any(f"cid={dup['id']}" in ln for ln in _log_lines())  # never promoted, so never demoted
 
 
+@pytest.fixture
+def incumbent_at_cap(mock_config, db, monkeypatch, request):
+    """Cached novelty and missing vectors isolate the merit gap from MMR penalties."""
+    ntype = request.param
+    top = capture_select.promoted_status(ntype)
+    incumbent = _note(mock_config, 0, score=5, novelty=0.0, ntype=ntype, status=top)
+    for i in range(1, capture_select.CAP):
+        _note(mock_config, i, score=10, novelty=1.0, ntype=ntype, status=top)
+    monkeypatch.setattr(capture_select, "_fresh_index_rows", lambda db, paths: {})
+    return incumbent, ntype, top
+
+
+@pytest.mark.parametrize("incumbent_at_cap", ["insight", "decision", "error-fix"], indirect=True)
+@pytest.mark.parametrize("gap", [0.1, 0.3])
+def test_incumbent_bonus_controls_displacement_at_cap(mock_config, db, incumbent_at_cap, gap):
+    incumbent, ntype, top = incumbent_at_cap
+    challenger = _note(mock_config, capture_select.CAP, score=5, novelty=gap / 0.3, ntype=ntype)
+    entries = {e["row"]["id"]: e for e in capture_select.plan_session(SID, mock_config, db)}
+    stays = gap < capture_select.INCUMBENT_BONUS
+    assert entries[challenger["id"]]["merit"] - entries[incumbent["id"]]["merit"] == pytest.approx(gap)
+    assert entries[incumbent["id"]]["why"] == ("pick" if stays else "displaced")
+    assert entries[challenger["id"]]["why"] == ("below-cap" if stays else "pick")
+    assert capture_select.run_selection(SID, "demo", mock_config, db=db) == {
+        "promoted": 0 if stays else 1, "demoted": 0 if stays else 1, "picked": capture_select.CAP}
+    assert _status(mock_config, incumbent) == (top if stays else "provisional")
+    assert _status(mock_config, challenger) == ("provisional" if stays else top)
+    # Check the file written by run_selection, including when the incumbent stays put.
+    assert float(_fm(mock_config, incumbent)["capture_merit"]) == capture_select.merit(5, 0.0, ntype)
+
+
+@pytest.mark.parametrize("incumbent_at_cap", ["insight", "decision", "error-fix"], indirect=True)
+def test_zero_incumbent_bonus_restores_challenger_win(mock_config, db, monkeypatch, incumbent_at_cap):
+    incumbent, ntype, top = incumbent_at_cap
+    challenger = _note(mock_config, capture_select.CAP, score=5, novelty=1 / 3, ntype=ntype)
+    before = {e["row"]["id"]: e for e in capture_select.plan_session(SID, mock_config, db)}
+    assert before[incumbent["id"]]["want"] == top
+    assert before[challenger["id"]]["want"] == "provisional"
+    monkeypatch.setattr(capture_select, "INCUMBENT_BONUS", 0.0)
+    after = {e["row"]["id"]: e for e in capture_select.plan_session(SID, mock_config, db)}
+    assert after[incumbent["id"]]["want"] == "provisional"
+    assert after[incumbent["id"]]["why"] == "displaced"
+    assert after[challenger["id"]]["want"] == top
+    assert capture_select.run_selection(SID, "demo", mock_config, db=db)["promoted"] == 1
+    assert _status(mock_config, challenger) == top
+
+
+def test_duplicate_incumbent_is_skipped_after_a_stronger_pick(mock_config, db):
+    incumbent = _note(mock_config, 0, score=1, novelty=1.0, status="promoted", body=_words(0, 20))
+    challenger = _note(mock_config, 1, score=10, novelty=1.0, body=_words(0, 20) + " again")
+    entries = {e["row"]["id"]: e for e in capture_select.plan_session(SID, mock_config, db)}
+    old, new = entries[incumbent["id"]], entries[challenger["id"]]
+    assert old["kind"] == new["kind"] == "candidate"
+    assert capture_select._cosine_similarity(old["vector"], new["vector"]) >= capture_select.DUP_COS
+    assert old["want"] == "provisional" and old["why"] == "displaced"
+    assert new["want"] == "promoted"
+    assert capture_select.run_selection(SID, "demo", mock_config, db=db) == {
+        "promoted": 1, "demoted": 1, "picked": 1}
+    assert _status(mock_config, incumbent) == "provisional"
+
+
 def test_later_slice_displaces_an_earlier_pick(mock_config, db):
     rows = [_note(mock_config, i, score=5) for i in range(10)]
     assert capture_select.run_selection(SID, "demo", mock_config, db=db)["promoted"] == 10

@@ -45,6 +45,7 @@ from tfidf import _cosine_similarity
 
 CAP = 10
 LAMBDA = 0.5
+INCUMBENT_BONUS = 0.2  # picked by scripts/selection_replay.py on the 2026-10-25..29 sessions (notes moved more than once 149 -> 37, mean final merit -0.019).
 DUP_COS = 0.6  # the lexical backstop for reworded duplicates the worker missed
 TYPE_BONUS = {"error-fix": 0.02, "decision": 0.02}
 NOVELTY_MISSING = 0.5  # no vector to compare: neither novel nor stale
@@ -270,6 +271,7 @@ def plan_session(session_id: str, config: dict, db: str, *, rows: list[dict] | N
     ``fields`` is what the note's frontmatter should hold (``want`` is its
     status, or None to leave the note alone). Ledger novelty is cached as a
     side effect, since it is computed only once per note.
+    Candidates already at their promoted tier receive an incumbent bonus only for selection.
     """
     if rows is None:
         rows = capture_state.ledger_list(session=session_id, limit=10**9)
@@ -305,7 +307,10 @@ def plan_session(session_id: str, config: dict, db: str, *, rows: list[dict] | N
             if e["sticky_by"]:
                 e["kind"] = "sticky"
     cands = [e for e in live if e["kind"] == "candidate"]
-    picks = select([{"id": e["row"]["id"], "merit": e["merit"], "vector": e["vector"],
+    picks = select([{"id": e["row"]["id"],
+                     "merit": e["merit"] + (INCUMBENT_BONUS if e["fm"].get("status") ==
+                                             promoted_status(e["row"].get("type")) else 0.0),
+                     "vector": e["vector"],
                      "ts": e["row"].get("ts")} for e in cands])
     pick_rank = {cid: i + 1 for i, cid in enumerate(picks)}
     rest = sorted((e for e in cands if e["row"]["id"] not in pick_rank),

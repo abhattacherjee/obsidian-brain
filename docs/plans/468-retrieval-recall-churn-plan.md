@@ -18,13 +18,17 @@ checkout is the live plugin and stays on `develop`).
   match, pruned during the walk). The vault-ask skill passes `--exclude-dir _provisional
   --exclude-dir _rejected` and tells the Grep-tool path to drop any path containing
   `/_provisional/` or `/_rejected/` before Step 5.
-- **R5 — hysteresis, not a time window.** `select()` takes `incumbent_bonus: float = 0.0`; an item
-  with `incumbent: True` scores `merit + bonus - lam*sim`. `plan_session` marks a candidate an
-  incumbent when its frontmatter status is already the promoted tier. δ (`INCUMBENT_BONUS`) is
-  picked from the replay sweep (T2) and recorded here before T3 lands.
+- **R5 — hysteresis, not a time window.** `select()` is unchanged. `plan_session` passes
+  `merit + INCUMBENT_BONUS` for a candidate whose frontmatter status is already its promoted tier;
+  the stored `capture_merit` keeps the base merit. The replay adds the bonus the same way.
+  `INCUMBENT_BONUS = 0.2`, from the T2 sweep on the 2026-10-25..29 sessions: notes moved more than
+  once 149 → 37 (75.2%), none more than twice, mean final merit −0.0194. 0.15 cut only 68%; 0.25
+  lost 0.029 merit. The spike bar is an absolute merit drop ≤ 0.02; the first draft's δ/2 bar was
+  dropped because it passes δ = 1, which freezes the first picks.
 - **R6 — measurement scripts never touch live stores.** Both scripts refuse the default DB path and
-  the live ledger path, open the DB copy read-only, and never call `ensure_index`, `plan_session`
-  or `ledger_update`.
+  the live ledger path (also through symlinks and relative forms), and never call `ensure_index`,
+  `plan_session` or `ledger_update`. Their own SQL opens the copy read-only; `search_vault` uses
+  its normal connection on the copy, which is disposable.
 
 ## Tasks
 
@@ -41,8 +45,7 @@ checkout is the live plugin and stays on `develop`).
    notes moved, moved more than once, moved more than twice, max moves, and the mean merit of each
    session's final picks. Tests: refuses live paths; a planted three-slice session where today's
    arm flips a note and a bonus arm does not.
-3. **T3 hysteresis** — `select(..., incumbent_bonus)` and `plan_session` incumbents, with
-   `INCUMBENT_BONUS` from T2. Tests: a challenger within δ does not displace an incumbent; one
+3. **T3 hysteresis** — `plan_session` incumbents (R5), with `INCUMBENT_BONUS` from T2. Tests: a challenger within δ does not displace an incumbent; one
    beyond δ does; bonus 0 reproduces today's picks; the duplicate (`dup_cos`) rule still wins over
    the bonus.
 4. **T4 OR fill + Grep exclusion** — R1, R2, R4. Tests: AND below `min_results` adds OR-only rows
