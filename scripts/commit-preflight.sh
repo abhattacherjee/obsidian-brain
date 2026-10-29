@@ -597,7 +597,16 @@ echo "🧪 Running tests..."
 if [ -d "tests" ]; then
     if command -v pytest &>/dev/null; then
         echo "🧪 Running pytest with coverage..."
-        if pytest tests/ -v --tb=short --cov=hooks --cov-report=term-missing --cov-fail-under=90; then
+        # _run_pytest (above) runs on half the cores when pytest-xdist is
+        # installed; a bare `pytest` here ran all ~6,500 tests on one core
+        # (16 min, now about 4). The wall-clock budget tests run alone
+        # afterwards: next to busy workers a 2,000 ms hang backstop measured
+        # 2,042 ms. The second pass appends to the first pass's coverage data
+        # and applies the 90% gate to both together.
+        _TIMED=tests/test_security.py::TestDecisionTimeIsBounded
+        if _run_pytest tests/ -v --tb=short --cov=hooks --cov-report= --deselect "$_TIMED" \
+            && python3 -m pytest "$_TIMED" -v --tb=short --cov=hooks --cov-append \
+                --cov-report=term-missing --cov-fail-under=90; then
             CHECKS_RUN="${CHECKS_RUN}tests,"
         else
             echo "❌ Tests failed or coverage below 90%"

@@ -14,7 +14,7 @@ Two commands:
 Usage::
 
     python3 vault_scan.py grep <vault> <folder> [<folder> ...] --pattern=<regex>
-                          [--ignore-case] [--frontmatter-only]
+                          [--ignore-case] [--frontmatter-only] [--exclude-dir NAME] ...
     python3 vault_scan.py meta <vault> <file> [<file> ...]
 
 ``grep`` matches one line at a time, like ripgrep behind the Grep tool, so
@@ -29,6 +29,10 @@ counts directories that could not be listed (permissions), including a folder
 named on the command line; their notes are not scanned. Under ``--frontmatter-only`` a
 note with no frontmatter at all is scanned (it cannot match), not skipped;
 only a fence that does not close counts as ``bad_frontmatter``.
+
+Repeat ``--exclude-dir NAME`` to prune subdirectories with that exact basename
+at any depth; their files are not scanned or counted. NAME must be nonempty,
+contain no ``/``, and differ from ``.`` and ``..``.
 
 Exit codes: 0 on success (with or without matches); 2 for bad arguments and
 1 for an unexpected error or a missing dependency module. On exit 2 or 1,
@@ -82,6 +86,8 @@ def _build_parser() -> argparse.ArgumentParser:
     g.add_argument("--pattern", required=True)
     g.add_argument("--ignore-case", action="store_true")
     g.add_argument("--frontmatter-only", action="store_true")
+    g.add_argument("--exclude-dir", action="append", default=[], metavar="NAME",
+                   help="exclude subdirectories by exact basename (repeatable)")
 
     m = sub.add_parser("meta", help="print frontmatter fields of notes as JSON Lines")
     m.add_argument("vault")
@@ -123,7 +129,8 @@ def _folder_dirs(vault: str, root: Path, folders: list[str]) -> list[Path]:
     return dirs
 
 
-def _iter_md(folder: Path, symlinked_dirs: set[str], unreadable_dirs: set[str]):
+def _iter_md(folder: Path, symlinked_dirs: set[str], unreadable_dirs: set[str],
+             exclude_dirs: set[str]):
     # followlinks=False: a symlinked subdirectory is never descended. Each one
     # is recorded in ``symlinked_dirs`` so the summary can count it. A directory
     # that cannot be listed is recorded in ``unreadable_dirs``: os.walk drops it
@@ -133,7 +140,7 @@ def _iter_md(folder: Path, symlinked_dirs: set[str], unreadable_dirs: set[str]):
 
     for dirpath, dirnames, filenames in os.walk(folder, followlinks=False,
                                                 onerror=_on_error):
-        dirnames.sort()
+        dirnames[:] = sorted(name for name in dirnames if name not in exclude_dirs)
         for name in dirnames:
             sub = os.path.join(dirpath, name)
             if os.path.islink(sub):
@@ -156,13 +163,17 @@ def _line_matches(regex: re.Pattern, lines) -> bool:
 
 
 def grep_files(vault: str, folders: list[str], regex: re.Pattern,
-               frontmatter_only: bool = False):
+               frontmatter_only: bool = False, exclude_dirs: list[str] | None = None):
     """Return ``(matches, scanned, skipped)``.
 
     ``matches`` is sorted. ``skipped`` maps each name in ``SKIP_KINDS`` to a
     count; ``symlinked_dirs`` counts subdirectories that were not descended and
     ``unreadable_dirs`` counts directories that could not be listed.
     """
+    excluded = set(exclude_dirs or [])
+    for name in excluded:
+        if not name or "/" in name or name in (".", ".."):
+            raise _UsageError(f"invalid excluded directory basename: {name!r}")
     root = _check_vault(vault)
     dirs = _folder_dirs(vault, root, folders)
     seen: set[str] = set()
@@ -172,7 +183,7 @@ def grep_files(vault: str, folders: list[str], regex: re.Pattern,
     scanned = 0
     skipped = dict.fromkeys(SKIP_KINDS, 0)
     for d in dirs:
-        for path in _iter_md(d, symlinked_dirs, unreadable_dirs):
+        for path in _iter_md(d, symlinked_dirs, unreadable_dirs, excluded):
             key = os.path.normpath(str(path))
             if key in seen:
                 continue
@@ -422,7 +433,7 @@ def _run_grep(args) -> int:
     except re.error as exc:
         raise _UsageError(f"invalid regex {args.pattern!r}: {exc}")
     matches, scanned, skipped = grep_files(
-        args.vault, args.folders, regex, args.frontmatter_only,
+        args.vault, args.folders, regex, args.frontmatter_only, args.exclude_dir,
     )
     for m in matches:
         print(m)

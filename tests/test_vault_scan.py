@@ -61,6 +61,66 @@ def _main(capsys, *args):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("excluded", [
+    ["_provisional"],
+    ["_provisional", "_rejected"],
+])
+def test_grep_exclude_dir_prunes_exact_basenames_at_any_depth(
+        capsys, tmp_path, monkeypatch, excluded):
+    v = tmp_path / "vault"
+    folder = v / "notes"
+    relative_paths = [
+        "_provisional/top.md",
+        "nested/_provisional/deeper/hidden.md",
+        "nested/_rejected/hidden.md",
+        "nested/deeper/_rejected/hidden.md",
+        "_provisional.md",
+        "contains_provisional_word.md",
+        "prefix_provisional_suffix/keep.md",
+        "_provisional-backup/keep.md",
+        "_rejected-backup/keep.md",
+        "visible.md",
+    ]
+    for rel in relative_paths:
+        note = folder / rel
+        note.parent.mkdir(parents=True, exist_ok=True)
+        note.write_text("capture\n")
+    walked = []
+    real_walk = os.walk
+
+    def tracking_walk(*args, **kwargs):
+        for entry in real_walk(*args, **kwargs):
+            walked.append(Path(entry[0]))
+            yield entry
+
+    monkeypatch.setattr(vault_scan.os, "walk", tracking_walk)
+    # Exercise both accepted flag forms and repeatability.
+    flags = ["--exclude-dir", excluded[0]]
+    flags.extend(f"--exclude-dir={name}" for name in excluded[1:])
+    rc, out, err = _main(capsys, "grep", v, "notes", "--pattern=capture", *flags)
+    expected = sorted(str(folder / rel) for rel in relative_paths
+                      if not set(Path(rel).parts[:-1]).intersection(excluded))
+    assert rc == 0
+    assert out.splitlines() == expected
+    assert err.strip() == (
+        f"vault_scan: {len(expected)} match(es), {len(expected)} file(s) scanned, "
+        "0 skipped (too_large=0, unreadable=0, outside_vault=0, "
+        "bad_frontmatter=0, symlinked_dirs=0, unreadable_dirs=0)"
+    )
+    assert all(not set(path.relative_to(folder).parts).intersection(excluded)
+               for path in walked)
+
+
+@pytest.mark.parametrize("name", ["a/b", ".", "..", ""])
+def test_grep_exclude_dir_invalid_basename_is_usage_error(vault, name):
+    r = _run("grep", vault, "claude-sessions", "--pattern=Redis",
+             f"--exclude-dir={name}")
+    assert r.returncode == 2
+    assert r.stdout == ""
+    assert r.stderr.startswith("ERROR: invalid excluded directory basename:")
+    assert len(r.stderr.splitlines()) == 1
+
+
 def test_grep_subprocess_content_match(vault):
     r = _run("grep", vault, "claude-sessions", "claude-insights", "--pattern", "Redis")
     assert r.returncode == 0, r.stderr

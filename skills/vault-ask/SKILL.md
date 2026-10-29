@@ -169,12 +169,13 @@ results = search_vault(
     project=sys.argv[2] if len(sys.argv) > 2 and sys.argv[2] != "None" else None,
     limit=15,
     include_provisional=False,
+    min_results=5,
 )
 print(json.dumps(results))
 ' "$SEARCH_TERMS_JOINED" "$PROJECT"
 ```
 
-`include_provisional=False` leaves out auto-captured notes that capture selection did not promote (`status: provisional`). They stay on disk and `/vault-search` still finds them.
+`include_provisional=False` leaves out auto-captured notes that capture selection did not promote (`status: provisional`). They stay on disk and `/vault-search` still finds them. When AND matches fewer than 5 notes, OR matches fill the remaining results up to `limit`, after the AND hits.
 
 If the output is a non-empty JSON array with 5+ results: extract the `path` field from each result and use those file paths as `CANDIDATE_FILES`. Skip the Grep searches in Step 4, but still run its memory search, then go to Step 5.
 
@@ -210,6 +211,8 @@ Grep(pattern="claude/topic/.*<term>", path=INSIGHTS_DIR, glob="*.md", output_mod
 ```
 Collect all file paths returned.
 
+After collecting the union from Agents 1–3, drop every path containing `/_provisional/` or `/_rejected/` before Step 5.
+
 **If the Grep tool is not available in this session**, run the same searches with `vault_scan.py grep` instead (#375). It walks the folders recursively, matches one line at a time like the Grep tool, and prints one matching path per line. Run one call per pattern, passing both folder names (`<sessions_folder>` and `<insights_folder>` from Step 1). Use `--pattern='<term>'` for Agents 1 and 2 and `--pattern='claude/topic/.*<term>'` for Agent 3; `--ignore-case` stands for `-i=true`. Always write `--pattern=` with the equals sign: with a space, a term that starts with `-` (such as `--no-verify`) is read as a flag and the call fails. Paste each value inside single quotes as shown. If a value itself contains a `'`, write it as `'\''`.
 
 Check each call before you use its output. It succeeded only if it exited 0 and stderr has the `vault_scan: N match(es), M file(s) scanned, K skipped (...)` summary line; then stdout is the file list, and an empty stdout means no match. Anything else is a failure, not "no match": show the `ERROR:` line (or the whole stderr if there is none) to the user and stop. If K is more than 0, add this line to what you show the user: "K note(s) were not searched (see the breakdown) — run /vault-doctor".
@@ -237,8 +240,10 @@ def _ob_hooks():
 print(_ob_hooks())
 ")
 test -f "$HOOKS/vault_scan.py" || { echo "ERROR: vault_scan.py not found under $HOOKS - resolution checks the marketplace registered install location first, then falls back to the plugin cache; neither path produced a hooks directory containing it. Verify the obsidian-brain install resolved at $HOOKS is complete (git pull for a directory-source checkout, or run /plugin marketplace update for a cache install), then retry." >&2; exit 1; }
-python3 "$HOOKS/vault_scan.py" grep '<vault_path>' '<sessions_folder>' '<insights_folder>' '<wiki_folder>' --pattern='<term>' --ignore-case
+python3 "$HOOKS/vault_scan.py" grep '<vault_path>' '<sessions_folder>' '<insights_folder>' '<wiki_folder>' --pattern='<term>' --ignore-case --exclude-dir=_provisional --exclude-dir=_rejected
 ```
+
+Exclude these directories because provisional notes are dropped in Step 5 anyway, and their frontmatter (`capture_merit:`, `capture_score:`) matches words such as `merit` and `capture`, which would add thousands of paths.
 
 **Memory search.** The memory search runs on every ask that reaches Step 3 (a fresh wiki answer from Step 2b stops before it, by design), even when Step 3 skipped the Grep searches. Skip it only on `WIKI_MISSING`. For each term in `SEARCH_TERMS`, write `{"pattern": "<term>"}` to a payload file (as in Step 2b) and run `python3 "<hooks_dir>/wiki.py" memgrep`. It prints `{"host": ..., "matches": [{"name": ..., "path": ...}], "skipped": [{"path": ..., "error": ...}]}`: `matches` are this host's memory files that contain the term (case-insensitive, a fixed string, not a regex), and `skipped` are files or folders that could not be read. Add each `path` in `matches` to `CANDIDATE_FILES` as type `claude-memory`, and keep its `name` for citing. When `skipped` is non-empty, show one line: "N memory file(s) could not be read" with the first `path` (count each path once across all terms). When `host` is not `claude-code`, say once that this host has no memory files. On exit 1 or 2, show the `ERROR:` line and continue without memory files.
 

@@ -23,6 +23,7 @@ _FALLBACK_CMD = {
     "vault-ask": (
         "python3 \"$HOOKS/vault_scan.py\" grep '<vault_path>' '<sessions_folder>' "
         "'<insights_folder>' '<wiki_folder>' --pattern='<term>' --ignore-case"
+        " --exclude-dir=_provisional --exclude-dir=_rejected"
     ),
     "vault-search": (
         "python3 \"$HOOKS/vault_scan.py\" grep '<vault_path>' '<sessions_folder>' "
@@ -63,6 +64,38 @@ def _scan_calls(text: str) -> list[str]:
 def test_step4_fallback_command_is_exact(skill):
     section = _fallback_section(skill)
     assert _scan_calls(section) == [_FALLBACK_CMD[skill]]
+
+
+@pytest.mark.parametrize("skill", sorted(SKILLS))
+def test_step3_search_vault_opts_into_or_fill(skill):
+    call = re.search(r"results = search_vault\((.*?)\n\)", _step(skill, "3"), re.S)
+    assert call
+    assert "min_results=5," in call.group(1)
+    if skill == "vault-ask":
+        assert "include_provisional=False," in call.group(1)
+
+
+def test_vault_search_step3_does_not_hide_provisional_notes():
+    call = re.search(r"results = search_vault\((.*?)\n\)", _step("vault-search", "3"), re.S)
+    assert call
+    # search_vault defaults to include_provisional=True (hooks/vault_index.py), so
+    # passing the argument in any spelling risks hiding provisional notes.
+    assert "include_provisional" not in call.group(1)
+
+
+def test_vault_ask_step4_drops_excluded_paths_from_grep_union():
+    step = _step("vault-ask", "4")
+    rule = ("After collecting the union from Agents 1–3, drop every path containing "
+            "`/_provisional/` or `/_rejected/` before Step 5.")
+    assert rule in step
+    assert step.index(rule) < step.index(_FALLBACK_HEAD)
+
+
+def test_vault_search_keeps_provisional_notes_searchable():
+    text = SKILLS["vault-search"].read_text(encoding="utf-8")
+    assert "--exclude-dir" not in text
+    assert not re.search(r"[^\n]*(?:drop|exclude|filter)[^\n]*_provisional", text, re.I)
+    assert not re.search(r"[^\n]*_provisional[^\n]*(?:drop|exclude|filter)", text, re.I)
 
 
 def test_vault_search_tag_command_does_not_satisfy_the_fallback_pin():
