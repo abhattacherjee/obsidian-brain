@@ -1822,3 +1822,67 @@ class TestEdgeCases:
         result = vault_index._sanitize_fts_query('hello "unmatched')
         assert '"hello"' in result
         assert '"unmatched"' in result
+
+
+def test_sync_stale_listing_keeps_note_moved_before_index_snapshot(tmp_vault, tmp_path, monkeypatch):
+    """A real move after rglob's snapshot must not be pruned by that stale listing."""
+    from pathlib import Path
+
+    import capture_state
+    import note_placement
+
+    config = {"vault_path": str(tmp_vault), "insights_folder": "claude-insights"}
+    old = tmp_vault / "claude-insights" / "moving.md"
+    new = old.parent / "_provisional" / old.name
+    _write_note(old, {"type": "claude-insight", "status": "provisional"}, "# Moving\n\nBody.")
+    old.chmod(0o600)
+    db = vault_index.ensure_index(str(tmp_vault), ["claude-insights"], db_path=str(tmp_path / "race.db"))
+    ledger_dir = tmp_path / "capture"
+    ledger_dir.mkdir(mode=0o700)
+    monkeypatch.setattr(capture_state, "capture_dir", lambda: ledger_dir)
+    conn = vault_index._connect(db)
+    try:
+        conn.execute(
+            "INSERT INTO access_log (note_path, timestamp, context_type) VALUES (?, 1, 'search')",
+            (str(old),),
+        )
+        conn.commit()
+        before = dict(conn.execute("SELECT rowid, * FROM notes").fetchone())
+        real_rglob = Path.rglob
+        moved = []
+
+        def stale_rglob(path, pattern):
+            listing = list(real_rglob(path, pattern))
+            assert listing == [old]
+            # Finish the move while _sync still holds a pre-move file listing,
+            # before it reads the index and takes its own write transaction.
+            assert note_placement.relocate(config, old, new, db) == new
+            moved.append(new)
+            return iter(listing)
+
+        monkeypatch.setattr(Path, "rglob", stale_rglob)
+        stats = vault_index._sync(conn, str(tmp_vault), ["claude-insights"])
+        assert moved == [new] and new.is_file() and not old.exists()
+        assert stats["deleted"] == 0
+        assert stats["inserted"] == 0  # Reinsertion cannot hide a mistaken prune.
+        rows = [dict(row) for row in conn.execute("SELECT rowid, * FROM notes")]
+        assert rows == [{**before, "path": str(new)}]
+        assert [row[0] for row in conn.execute("SELECT note_path FROM access_log")] == [str(new)]
+    finally:
+        conn.close()
+
+
+def test_sync_prunes_a_row_whose_file_sits_under_rejected(tmp_vault, tmp_path):
+    """X-005: the keep-if-file-exists guard must not keep _rejected/ rows."""
+    note = tmp_vault / "claude-insights" / "_rejected" / "gone.md"
+    note.parent.mkdir(parents=True, exist_ok=True)
+    _write_note(note, {"type": "claude-insight", "status": "provisional"}, "# Gone\n\nBody.")
+    db = vault_index.ensure_index(str(tmp_vault), ["claude-insights"], db_path=str(tmp_path / "rej.db"))
+    assert vault_index.index_note(db, str(note))
+    conn = vault_index._connect(db)
+    try:
+        stats = vault_index._sync(conn, str(tmp_vault), ["claude-insights"])
+        assert stats["deleted"] == 1
+        assert conn.execute("SELECT COUNT(*) FROM notes WHERE path = ?", (str(note),)).fetchone()[0] == 0
+    finally:
+        conn.close()

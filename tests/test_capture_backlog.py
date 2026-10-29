@@ -77,12 +77,16 @@ def vault(mock_config, tmp_path):
     return {"vault": v, "db": db, "notes": notes, "scores": scores, "scores_file": scores_file, "config": mock_config}
 
 
+def _current_note_path(path):
+    return path if path.exists() else path.parent / "_provisional" / path.name
+
+
 def _status(path):
-    return obsidian_utils._peek_frontmatter_fields(path, ("status",))["status"]
+    return obsidian_utils._peek_frontmatter_fields(_current_note_path(path), ("status",))["status"]
 
 
 def _fields(path):
-    return obsidian_utils._peek_frontmatter_fields(path, ("status", "demoted_by", "promoted_by", "capture_merit",
+    return obsidian_utils._peek_frontmatter_fields(_current_note_path(path), ("status", "demoted_by", "promoted_by", "capture_merit",
                                                           "capture_rank", "capture_score"))
 
 
@@ -97,6 +101,99 @@ def _no_model(monkeypatch):
     monkeypatch.setattr(capture_backlog.subprocess, "run",
                         lambda *a, **k: calls.append(a) or pytest.fail("a model was called"))
     return calls
+
+
+def test_apply_places_both_status_changes_and_keeps_ledger_scores(tmp_path, monkeypatch):
+    vault = tmp_path / "vault"
+    folder = "knowledge/insights"
+    ledger = tmp_path / "ledger"
+    ledger.mkdir(mode=0o700)
+    monkeypatch.setattr(capture_state, "capture_dir", lambda: ledger)
+    config = {"vault_path": str(vault), "insights_folder": folder}
+    rise = _note(vault, "rise", status="provisional", folder=f"{folder}/_provisional", i=1)
+    fall = _note(vault, "fall", status="promoted", folder=folder, i=2)
+    db = vault_index.ensure_index(str(vault), [folder], db_path=str(tmp_path / "backlog.db"))
+    conn = vault_index._connect(db)
+    try:
+        conn.execute("INSERT INTO themes (id, name, note_count, created_date, updated_date) "
+                     "VALUES (1, 'Backlog', 2, '2026-10-20', '2026-10-20')")
+        for path in (rise, fall):
+            conn.execute("INSERT INTO access_log (note_path, timestamp, context_type) VALUES (?, 1, 'search')",
+                         (str(path),))
+            conn.execute("INSERT INTO theme_members (theme_id, note_path, similarity, added_date) "
+                         "VALUES (1, ?, 0.8, '2026-10-20')", (str(path),))
+            capture_state.ledger_append({"kind": "updated", "note_path": path.relative_to(vault).as_posix(),
+                                         "status": "active", "ts": 2})
+        conn.commit()
+    finally:
+        conn.close()
+    before = capture_state._merged_rows()
+    planned = {"notes": [
+        {"path": path, "session": S1, "fm": {"status": was}, "want": want,
+         "fields": {"status": want}, "score": score, "novelty": 0.4}
+        for path, was, want, score in ((rise, "provisional", "promoted", 9), (fall, "promoted", "provisional", 3))
+    ]}
+    result = capture_backlog.apply(config, planned, db)
+    assert result["written"] == 2 and result["errors"] == []
+    destinations = {str(rise): str(vault / folder / rise.name),
+                    str(fall): str(vault / folder / "_provisional" / fall.name)}
+    assert [str(n["path"]) for n in planned["notes"]] == [destinations[str(rise)], destinations[str(fall)]]
+    assert not rise.exists() and not fall.exists()
+    conn = vault_index._connect(db)
+    try:
+        for table, column in (("notes", "path"), ("access_log", "note_path"), ("theme_members", "note_path")):
+            assert {r[0] for r in conn.execute(f"SELECT {column} FROM {table}")} == set(destinations.values())
+        assert {r["status"] for r in conn.execute("SELECT status FROM notes")} == {"provisional", "promoted"}
+    finally:
+        conn.close()
+    for row in before:
+        after = capture_state.ledger_get(row["id"])
+        final = Path(destinations[str(vault / row["note_path"])])
+        assert after["note_path"] == final.relative_to(vault).as_posix()
+        assert after["ts"] == row["ts"]
+        if row["kind"] == "new":
+            assert after["score"] == (9 if final.name == "rise.md" else 3) and after["novelty"] == 0.4
+    assert len(capture_state._merged_rows()) == len(before)
+
+
+def test_apply_keeps_returned_old_path_when_placement_refuses_collision(vault):
+    planned = _plan(vault)
+    note = next(n for n in planned["notes"] if n["want"] == "provisional")
+    planned["notes"] = [note]
+    old = note["path"]
+    collision = old.parent / "_provisional" / old.name
+    collision.parent.mkdir(mode=0o700)
+    collision.write_text("Existing destination must survive.\n")
+    row = next(r for r in capture_state.ledger_list(limit=10**9)
+               if r["note_path"] == old.relative_to(vault["vault"]).as_posix())
+    result = capture_backlog.apply(vault["config"], planned, vault["db"])
+    assert result["written"] == 1 and result["errors"] == []
+    assert note["path"] == old and old.is_file()
+    assert collision.read_text() == "Existing destination must survive.\n"
+    merged = capture_state.ledger_get(row["id"])
+    assert merged["note_path"] == row["note_path"] and merged["score"] == note["score"]
+    conn = vault_index._connect(vault["db"])
+    try:
+        assert conn.execute("SELECT status FROM notes WHERE path = ?", (str(old),)).fetchone()[0] == "provisional"
+        assert conn.execute("SELECT 1 FROM notes WHERE path = ?", (str(collision),)).fetchone() is None
+    finally:
+        conn.close()
+
+
+def test_apply_reports_placement_failure_and_defers_session_promotions(vault, monkeypatch):
+    planned = _plan(vault)
+
+    def fail(config, path, status, db):
+        if status == "provisional":
+            raise OSError("placement unavailable")
+        return path
+
+    monkeypatch.setattr(capture_backlog.note_placement, "place", fail)
+    result = capture_backlog.apply(vault["config"], planned, vault["db"])
+    s1_promotions = [n for n in planned["notes"] if n["session"] == S1 and n["want"] == "promoted"]
+    assert result["skipped"] == len(s1_promotions) == 10
+    assert sum("placement unavailable" in e["error"] for e in result["errors"]) == 2
+    assert all(_status(n["path"]) is None for n in s1_promotions)
 
 
 # --- window ---------------------------------------------------------------------
@@ -336,7 +433,7 @@ def test_apply_backs_up_writes_and_deletes_nothing(vault, capsys, monkeypatch, t
     rc, out, err = _run(capsys, "--db", vault["db"], "--scores", str(vault["scores_file"]), "--apply",
                         "--backup-dir", str(tmp_path / "bk"))
     assert rc == 0, err
-    assert sorted(p for p in vault["vault"].rglob("*.md")) == files  # no note deleted or added
+    assert sorted(p.name for p in vault["vault"].rglob("*.md")) == sorted(p.name for p in files)  # only moved
     assert "written: 15; errors: 0" in out
     db_backup = next((tmp_path / "bk").glob("vault-db-backup-*-backlog-*.db"))
     assert oct(db_backup.stat().st_mode & 0o777) == "0o600"
@@ -349,7 +446,8 @@ def test_apply_backs_up_writes_and_deletes_nothing(vault, capsys, monkeypatch, t
     assert sorted(f["capture_rank"] for f in low) == ["11", "12"]
     assert _status(vault["notes"]["before"]) is None and _status(vault["notes"]["superseded"]) == "superseded"
     conn = vault_index._connect(vault["db"])
-    rows = conn.execute("SELECT status FROM notes WHERE path LIKE ?", ("%/claude-insights/a%",)).fetchall()
+    rows = conn.execute("SELECT status FROM notes WHERE path LIKE ? OR path LIKE ?",
+                        ("%/claude-insights/a%", "%/claude-insights/_provisional/a%")).fetchall()
     conn.close()
     assert [r["status"] for r in rows].count("provisional") == 2  # the index agrees with the files
     led = {r["note_path"]: r for r in capture_state.ledger_list(limit=10**9)}
@@ -361,10 +459,10 @@ def test_apply_twice_is_idempotent_and_never_exceeds_the_cap(vault, capsys, monk
     args = ("--db", vault["db"], "--scores", str(vault["scores_file"]), "--apply", "--backup-dir", str(tmp_path))
     _run(capsys, *args)
     names = [f"a{i}" for i in range(12)]
-    first = {n: (vault["notes"][n].read_bytes(), _fields(vault["notes"][n])) for n in names}
+    first = {n: (_current_note_path(vault["notes"][n]).read_bytes(), _fields(vault["notes"][n])) for n in names}
     rc, out, _ = _run(capsys, *args)
     assert rc == 0 and "errors: 0" in out
-    assert {n: (vault["notes"][n].read_bytes(), _fields(vault["notes"][n])) for n in names} == first
+    assert {n: (_current_note_path(vault["notes"][n]).read_bytes(), _fields(vault["notes"][n])) for n in names} == first
     assert [_status(vault["notes"][n]) for n in names].count("promoted") == 10
     rc, out, _ = _run(capsys, "--db", vault["db"], "--scores", str(vault["scores_file"]), "--json")
     assert json.loads(out)["sessions"][S1]["promoted"] == 10  # a dry run agrees with what is on disk

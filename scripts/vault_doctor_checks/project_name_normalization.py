@@ -12,12 +12,13 @@ from __future__ import annotations
 
 import os
 import re
-import shutil
 import sys
 import tempfile
 from pathlib import Path
 
 from . import Issue, Result
+from .encoding_corruption import _iter_md_files
+from .source_sessions import _backup_note
 
 # Path bootstrap: add hooks/ so we can import the plugin's shared modules
 _HOOKS_DIR = Path(__file__).resolve().parents[2] / "hooks"
@@ -41,11 +42,7 @@ def scan(
     issues: list[Issue] = []
 
     for folder in (sessions_folder, insights_folder):
-        folder_path = Path(vault_path) / folder
-        if not folder_path.is_dir():
-            continue
-
-        for md_file in sorted(folder_path.glob("*.md")):
+        for md_file in _iter_md_files(Path(vault_path), folder, recursive=folder == insights_folder):
             try:
                 content = md_file.read_text(encoding="utf-8", errors="replace")
             except OSError:
@@ -69,7 +66,8 @@ def scan(
                     proposed_source=f"project: {normalized}",
                     reason="underscore in project name; Claude Code uses hyphens",
                     confidence=1.0,
-                    extra={"original": note_project, "normalized": normalized},
+                    extra={"original": note_project, "normalized": normalized,
+                           "vault_path": str(Path(vault_path).resolve())},
                 ))
 
     return issues
@@ -141,14 +139,10 @@ def apply(issues: list[Issue], backup_root: str) -> list[Result]:
             ))
             continue
 
-        # Backup original (include source folder to avoid cross-folder collisions)
-        source_folder = Path(note_path).parent.name
-        backup_dir = Path(backup_root) / NAME / source_folder
-        backup_dir.mkdir(parents=True, exist_ok=True)
-        backup_path = backup_dir / Path(note_path).name
+        # Retain the full vault-relative path, including _provisional.
         try:
-            shutil.copy2(note_path, backup_path)
-        except OSError as exc:
+            backup_path = _backup_note(issue, backup_root, check_name=NAME)
+        except (OSError, ValueError) as exc:
             results.append(Result(
                 check=NAME,
                 note_path=note_path,

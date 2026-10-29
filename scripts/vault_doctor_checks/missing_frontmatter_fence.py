@@ -38,11 +38,12 @@ from __future__ import annotations
 
 import os
 import re
-import shutil
 import tempfile
 from pathlib import Path
 
 from . import Issue, Result
+from .encoding_corruption import _iter_md_files
+from .source_sessions import _backup_note
 
 NAME = "missing-frontmatter-fence"
 DESCRIPTION = (
@@ -223,12 +224,7 @@ def scan(
 
     for folder in [sessions_folder, insights_folder]:
         folder_path = vault_root / folder
-        if not folder_path.is_dir():
-            continue
-
-        for md_file in sorted(folder_path.glob("*.md")):
-            if not md_file.is_file():
-                continue
+        for md_file in _iter_md_files(vault_root, folder, recursive=folder == insights_folder):
             try:
                 # Strict decode: a note with invalid UTF-8 belongs to the
                 # encoding-corruption check. Repairing it here would mean
@@ -267,6 +263,8 @@ def scan(
                 extra={
                     "closing_fence_line": close_idx + 1,
                     "frontmatter_line_count": close_idx,
+                    "vault_path": str(vault_root.resolve()),
+                    "top_level": md_file.parent == folder_path,
                 },
             ))
 
@@ -307,12 +305,13 @@ def apply(issues: list[Issue], backup_root: str) -> list[Result]:
             ))
             continue
 
-        backup_dir = Path(backup_root) / NAME
         try:
-            backup_dir.mkdir(parents=True, exist_ok=True)
-            backup_path = backup_dir / Path(note_path).name
-            shutil.copy2(note_path, backup_path)
-        except OSError as exc:
+            backup_path = _backup_note(
+                issue, backup_root, check_name=NAME,
+                legacy_relative=Path(note_path).name,
+                flat=issue.extra.get("top_level", False),
+            )
+        except (OSError, ValueError) as exc:
             results.append(Result(
                 check=NAME,
                 note_path=note_path,

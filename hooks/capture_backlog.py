@@ -36,6 +36,7 @@ import capture_save
 import capture_select
 import capture_state
 import capture_worker
+import note_placement
 import note_writer
 import obsidian_utils
 import vault_index
@@ -382,8 +383,9 @@ def apply(config: dict, planned: dict, db: str) -> dict:
 
     Ledger rows of the notes get their score and novelty, so a live
     selection that runs again for one of these sessions agrees. A note that
-    fails is reported and left as it was; no note is ever deleted. If a
-    demotion fails, no note of its session is promoted in this run.
+    fails is reported; a placement failure can leave its new status in the
+    old home. No note is ever deleted. If a demotion fails, no note of its
+    session is promoted in this run.
     """
     stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     note_backup = capture_state.capture_dir() / f"backlog-backup-{stamp}"
@@ -411,14 +413,16 @@ def apply(config: dict, planned: dict, db: str) -> dict:
             with open(n["path"], encoding="utf-8", newline="") as fh:
                 capture_state._atomic_write(note_backup / rel.replace("/", "__"), fh.read())
             note_writer.set_frontmatter_fields(config["vault_path"], str(n["path"]), n["fields"], stat_out=wrote)
+            vault_index.update_note_status(db, str(n["path"]), *wrote)
+            n["path"] = note_placement.place(config, n["path"], n["want"], db)
+            if rel in ledger:
+                capture_state.ledger_update(ledger[rel], score=n["score"], novelty=n["novelty"],
+                                            note_path=Path(n["path"]).resolve().relative_to(vault).as_posix())
         except (OSError, ValueError) as exc:
             errors.append({"note": rel, "error": f"{type(exc).__name__}: {exc}"})
             if n["want"] == capture_select.PROVISIONAL and n["fm"].get("status") != capture_select.PROVISIONAL:
                 failed_sessions.add(n["session"])
             continue
-        vault_index.update_note_status(db, str(n["path"]), *wrote)
-        if rel in ledger:
-            capture_state.ledger_update(ledger[rel], score=n["score"], novelty=n["novelty"])
         written += 1
     for rel in skipped:
         errors.append({"note": rel, "error": "promotion skipped: a demotion in its session failed (retry the run)"})

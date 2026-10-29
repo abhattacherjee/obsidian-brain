@@ -205,6 +205,7 @@ def _note_content(row: dict, title: str, body: str, heading: str, config: dict, 
 
 def _write_split_note(vault: str, rel: str, content: str) -> None:
     folder, _, filename = rel.rpartition("/")
+    capture_save._ensure_note_dir(vault, folder)
     sink = io.StringIO()
     with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
         rc = note_writer.run_write(vault, folder, filename, content)
@@ -259,7 +260,17 @@ def _apply_note(path: Path, rel: str, plan_args: tuple, config: dict, backup: di
             row, heading = move["row"], move["row"]["update_heading"]
             try:
                 content = _note_content(row, move["title"], move["body"], heading, config, text, sessions)
-                new_rel = f"{folder}/{capture_save.new_filename(vault, folder, _day(heading, row.get('ts')), move['title'])}"
+                filename = capture_save.new_filename(vault, folder, _day(heading, row.get('ts')), move['title'])
+                # The template's frontmatter is the placement source of truth;
+                # the ledger's active/rejected status describes the capture.
+                _open, fields, _close, _body, error = frontmatter.split_frontmatter(
+                    frontmatter.split_lines_lf_crlf(content))
+                if error:
+                    raise ValueError(f"invalid split frontmatter: {error}")
+                status = obsidian_utils.normalize_status(
+                    obsidian_utils.parse_frontmatter_field("".join(fields), "status"))
+                home = capture_save._new_note_home(config, filename, status)
+                new_rel = home.relative_to(Path(vault).resolve()).as_posix()
                 # The ledger first: a crash after it leaves a row that names the note, which the next run writes.
                 capture_state.ledger_update(row["id"], kind="new", note_path=new_rel, update_heading=None,
                                             split_from=rel, split_heading=heading)

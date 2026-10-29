@@ -36,6 +36,7 @@ from pathlib import Path
 import capture_save
 import capture_slice
 import capture_state
+import note_placement
 import note_writer
 import obsidian_utils
 import vault_index
@@ -238,6 +239,30 @@ def _log(project: str, sid: str, outcome: str, cid: str, m, rank, why: str) -> N
     capture_state.append_capture_log(project, sid, outcome, f"cid={cid};merit={m};rank={rank};why={why}")
 
 
+def _ledger_note_path(config: dict, relative: str) -> Path | None:
+    """Resolve a ledger path, trying only its other R1 home when it is missing."""
+    vault = Path(config["vault_path"])
+    path = vault / relative
+    try:
+        root = vault.resolve()
+        if not path.resolve().is_relative_to(root):
+            return None
+        if path.is_file():
+            return path
+        for status in (PROVISIONAL, None):
+            other = note_placement.home_for(config, path, status)
+            if other is None or other == path.resolve():
+                continue
+            # Resolve again: either home may contain a symlink. The fallback
+            # must itself be an R1 home, as well as staying inside the vault.
+            if (other.resolve().is_relative_to(root) and other.is_file()
+                    and note_placement.home_for(config, other, status) is not None):
+                return vault / other.relative_to(root)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    return None
+
+
 def plan_session(session_id: str, config: dict, db: str, *, rows: list[dict] | None = None) -> list[dict]:
     """The selection outcome for each of the session's new notes, without writing anything.
 
@@ -246,16 +271,15 @@ def plan_session(session_id: str, config: dict, db: str, *, rows: list[dict] | N
     status, or None to leave the note alone). Ledger novelty is cached as a
     side effect, since it is computed only once per note.
     """
-    vault = Path(config["vault_path"])
     if rows is None:
         rows = capture_state.ledger_list(session=session_id, limit=10**9)
     rows = [r for r in rows if r.get("kind") == "new" and r.get("status") == "active"
             and isinstance(r.get("note_path"), str) and not capture_save._is_rejected(r["note_path"])]
     entries = []
     for row in sorted(rows, key=lambda r: (r.get("ts") or 0.0, r.get("id") or "")):
-        path = vault / row["note_path"]
-        if not path.resolve().is_relative_to(vault.resolve()) or not path.is_file():
-            continue  # deleted, moved or outside the vault
+        path = _ledger_note_path(config, row["note_path"])
+        if path is None:
+            continue  # deleted or outside the vault and the two R1 homes
         fm = obsidian_utils._peek_frontmatter_fields(path, _FM_FIELDS)
         entries.append({"row": row, "path": path, "fm": fm, "kind": _classify(row, fm),
                         "merit": None, "rank": None, "want": None, "why": None})
@@ -322,10 +346,15 @@ def _apply(e: dict, config: dict, db: str, project: str, sid: str) -> str | None
     unrecorded = not fm.get("capture_merit")  # first selection: record the parts once
     newly_sticky = e["kind"] == "sticky" and not fm.get("promoted_by")
     if was == want and not (unrecorded or newly_sticky):
-        return None  # a rank change alone does not rewrite the file (Ruling 7)
+        # A rank change alone does not rewrite the file (Ruling 7). A placement
+        # refused after an earlier status write is retried here; place() does
+        # nothing when the note is already home.
+        e["path"] = note_placement.place(config, e["path"], obsidian_utils.normalize_status(was), db)
+        return None
     wrote = []
     note_writer.set_frontmatter_fields(config["vault_path"], str(e["path"]), e["fields"], stat_out=wrote)
     vault_index.update_note_status(db, str(e["path"]), *wrote)
+    e["path"] = note_placement.place(config, e["path"], want, db)
     if was == want:
         return None
     outcome = "promoted" if want != PROVISIONAL else "demoted"
@@ -432,11 +461,12 @@ def promote_used(config: dict, *, now: float | None = None, db: str | None = Non
             note_writer.set_frontmatter_fields(config["vault_path"], str(path),
                                                {"status": top, "promoted_by": by, "demoted_by": None},
                                                stat_out=wrote)
+            vault_index.update_note_status(db, str(path), *wrote)
+            path = note_placement.place(config, path, top, db)
         except (OSError, ValueError) as exc:
             capture_state.append_capture_log(hit["project"] or "", hit["sid"], "select-write-failed",
                                              f"path={path.name};{type(exc).__name__}: {exc}"[:160])
             continue
-        vault_index.update_note_status(db, str(path), *wrote)
         _log(hit["project"] or "", hit["sid"], "promoted", row.get("id") or path.name,
              fm.get("capture_merit"), None, f"sticky-{by}")
         out["promoted"] += 1
@@ -565,8 +595,6 @@ def demote_closed(project: str, config: dict, *, now: float | None = None, run=N
     if 0 <= now - last < ISSUE_CHECK_EVERY_SECONDS:
         return {"skipped": "rate-limited", "demoted": 0}
     capture_state._atomic_write(state, json.dumps({"checked_at": now}))
-    vault = Path(config["vault_path"])
-    root = vault.resolve()
     todo = []
     for row in capture_state.ledger_list(limit=10**9, since=now - ISSUE_WINDOW_SECONDS):
         issue, repo = row.get("about_issue"), row.get("repo")
@@ -574,8 +602,8 @@ def demote_closed(project: str, config: dict, *, now: float | None = None, run=N
                 or not isinstance(issue, int) or isinstance(issue, bool) or not isinstance(repo, str)
                 or not isinstance(row.get("note_path"), str)):
             continue
-        path = vault / row["note_path"]
-        if not path.resolve().is_relative_to(root) or not path.is_file():
+        path = _ledger_note_path(config, row["note_path"])
+        if path is None:
             continue  # outside the vault (a ledger path with .. or a symlink) or gone
         fm = obsidian_utils._peek_frontmatter_fields(path, _FM_FIELDS)
         if (fm.get("status") != promoted_status(row.get("type")) or fm.get("promoted_by")
@@ -600,11 +628,12 @@ def demote_closed(project: str, config: dict, *, now: float | None = None, run=N
         try:
             note_writer.set_frontmatter_fields(config["vault_path"], str(path),
                                                {"status": PROVISIONAL, "demoted_by": ISSUE_CLOSED}, stat_out=wrote)
+            vault_index.update_note_status(db, str(path), *wrote)
+            path = note_placement.place(config, path, PROVISIONAL, db)
         except (OSError, ValueError) as exc:
             capture_state.append_capture_log(project, row.get("session_id"), "select-write-failed",
                                              f"cid={row['id']};{type(exc).__name__}: {exc}"[:160])
             continue
-        vault_index.update_note_status(db, str(path), *wrote)
         _log(project, row.get("session_id"), "demoted", row["id"], fm.get("capture_merit"), None,
              f"{ISSUE_CLOSED}:{row['about_issue']}")
         demoted += 1

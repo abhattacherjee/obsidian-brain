@@ -2,6 +2,7 @@
 
 import json
 import stat
+from pathlib import Path
 
 import pytest
 
@@ -552,3 +553,52 @@ def test_topic_survives_a_title_containing_three_dashes(mock_config, vault):
     text = ('---\ntype: claude-insight\ntitle: "a---b"\ntags:\n  - claude/insight\n  - claude/topic/ledgers\n---\n\n# T\n')
     assert capture_split._topic(text) == "ledgers"
     assert capture_split._topic("# no frontmatter\n") == "general"
+
+
+# --- #465: use the generated note's frontmatter status for placement ----------
+
+@pytest.fixture
+def split_env(mock_config, tmp_path, monkeypatch):
+    monkeypatch.setenv("OBSIDIAN_BRAIN_DB", str(tmp_path / "split-test.db"))
+    monkeypatch.setattr(capture_save.obsidian_utils, "_SECURE_DIR", str(tmp_path / "split-state"))
+    return mock_config
+
+
+@pytest.mark.parametrize("folder", ["claude-insights", "custom-insights"])
+@pytest.mark.parametrize("status", [None, "active", "promoted", "provisional"])
+def test_split_home_follows_generated_frontmatter(split_env, tmp_path, monkeypatch, folder, status):
+    split_env["insights_folder"] = folder
+    vault = Path(split_env["vault_path"])
+    (vault / folder).mkdir(mode=0o700, exist_ok=True)
+    rel = f"{folder}/source.md"
+    source = vault / rel
+    source.write_text(_front(extra=f"source_session: {S}\n") + f"# {ZEBRA[0]}\n\n{ZEBRA[1]}\n"
+                      + _section("abababababa1", *PELICAN))
+    _update_row("abababababa1", S, rel, PELICAN[0])
+    # Splits preserve the template's status (status=None in _frontmatter).
+    # In particular the ledger's active status cannot decide the R1 home.
+    templates = tmp_path / "templates"
+    templates.mkdir(mode=0o700)
+    template = (capture_save._TEMPLATES / "insight.md").read_text()
+    if status is not None:
+        template = template.replace("project: {{project}}\n", f"project: {{{{project}}}}\nstatus: {status}\n")
+    (templates / "insight.md").write_text(template)
+    monkeypatch.setattr(capture_save, "_TEMPLATES", templates)
+    # A link containing --- must not hide the status that follows it.
+    monkeypatch.setattr(capture_save, "session_note_for", lambda *a, **k: "2026-10-01-a---b-1234")
+    capture_save.vault_index.ensure_index(str(vault), [folder], db_path=str(tmp_path / "split-test.db"))
+    report = capture_split.split_updates(split_env, apply=True)
+    assert report["totals"]["moves"] == 1 and report["totals"]["failed"] == 0
+    row = capture_state.ledger_get("abababababa1")
+    dest = vault / row["note_path"]
+    expected_home = vault / folder / "_provisional" if status == "provisional" else vault / folder
+    assert dest.parent == expected_home
+    assert capture_save.obsidian_utils._peek_frontmatter_field(dest, "status") == status
+    assert row["status"] == "active" and PELICAN[1] not in source.read_text()
+    assert stat.S_IMODE(dest.stat().st_mode) == 0o600
+    if status == "provisional":
+        assert stat.S_IMODE(dest.parent.stat().st_mode) == 0o700
+    before = dest.read_bytes()
+    rerun = capture_split.split_updates(split_env, apply=True)
+    assert rerun["totals"]["moves"] == 0 and rerun["totals"]["repairs"] == 0
+    assert dest.read_bytes() == before

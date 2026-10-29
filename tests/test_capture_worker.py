@@ -694,3 +694,111 @@ def test_run_batch_logs_reads_of_vault_notes(tmp_path, fake_claude, saves, mock_
     rows = conn.execute("SELECT note_path, context_type FROM access_log").fetchall()
     conn.close()
     assert [tuple(r) for r in rows] == [(str(hand), "tool-open")]
+
+
+@pytest.fixture
+def pause_config(tmp_path, monkeypatch, mock_config):
+    """Give pause entry-point tests an explicit disposable DB and capture directory."""
+    monkeypatch.setenv("OBSIDIAN_BRAIN_DB", str(tmp_path / "pause-test.db"))
+    monkeypatch.setattr(capture_worker.obsidian_utils, "_SECURE_DIR", str(tmp_path / "secure"))
+    return mock_config
+
+
+def test_launch_paused_preserves_state_flush_and_never_spawns(transcript, popen, pause_config, monkeypatch):
+    capture_state.set_state(SID, transcript_path=str(transcript), project="demo", offset=42)
+    capture_state.set_flush(SID)
+    capture_state.pause("migration")
+    before = {p.name: p.read_bytes() for p in capture_state.capture_dir().iterdir()}
+    monkeypatch.setattr(capture_state, "claim", lambda *a: pytest.fail("claimed while paused"))
+    monkeypatch.setattr(capture_worker, "is_due", lambda *a: pytest.fail("checked due while paused"))
+    for if_due in (False, True):
+        assert capture_worker.launch(SID, transcript, "demo", if_due=if_due, config=pause_config) is False
+    assert popen == []
+    assert before == {p.name: p.read_bytes() for p in capture_state.capture_dir().iterdir()}
+
+
+def test_run_batch_paused_logs_without_claiming_or_reading(transcript, fake_claude, saves, pause_config,
+                                                         monkeypatch):
+    capture_state.set_state(SID, offset=42, pending={"end": 84, "candidates": [CAND], "next": 0})
+    before = capture_state.get_state(SID)
+    capture_state.pause("migration")
+    monkeypatch.setattr(capture_state, "claim", lambda *a: pytest.fail("claimed while paused"))
+    monkeypatch.setattr(capture_worker.capture_slice, "read_slice", lambda *a: pytest.fail("read while paused"))
+    assert capture_worker.run_batch(SID, transcript, "demo", pause_config) == "paused"
+    assert fake_claude.calls == [] and saves == []
+    assert capture_state.get_state(SID) == before
+    assert capture_state.active_claims() == []
+    assert "outcome=paused" in _log_text()
+
+
+def test_worker_spawned_before_pause_is_stopped_before_claiming(transcript, popen, fake_claude, saves,
+                                                              pause_config, monkeypatch):
+    assert capture_worker.launch(SID, transcript, "demo", if_due=False, config=pause_config) is True
+    assert len(popen) == 1
+    capture_state.pause("migration started after spawn")
+    monkeypatch.setattr(capture_state, "claim", lambda *a: pytest.fail("pre-spawned worker claimed while paused"))
+    assert capture_worker.run_batch(SID, transcript, "demo", pause_config) == "paused"
+    assert fake_claude.calls == [] and saves == []
+
+
+def test_pause_between_check_and_claim_stops_batch_and_releases_claim(transcript, fake_claude, saves,
+                                                                   pause_config, monkeypatch):
+    claim = capture_state.claim
+
+    def claim_during_pause(sid):
+        capture_state.pause("migration saw no active claims")
+        assert capture_state.active_claims() == []
+        return claim(sid)
+
+    monkeypatch.setattr(capture_state, "claim", claim_during_pause)
+    monkeypatch.setattr(capture_worker.capture_slice, "read_slice", lambda *a: pytest.fail("read after pause"))
+    assert capture_worker.run_batch(SID, transcript, "demo", pause_config) == "paused"
+    assert capture_state.active_claims() == [] and not capture_state.claim_is_live(SID)
+    assert capture_state.get_state(SID)["offset"] == 0
+    assert fake_claude.calls == [] and saves == []
+    assert "outcome=paused" in _log_text()
+
+
+def test_sweep_paused_does_not_scan_launch_or_claim(pause_config, monkeypatch):
+    import capture_cli
+    capture_state.pause("migration")
+    monkeypatch.setattr(capture_cli, "pending_sessions", lambda *a, **k: pytest.fail("scanned while paused"))
+    monkeypatch.setattr(capture_worker, "launch", lambda *a, **k: pytest.fail("launched while paused"))
+    monkeypatch.setattr(capture_state, "claim", lambda *a: pytest.fail("claimed while paused"))
+    assert capture_cli.sweep() == []
+
+
+@pytest.mark.parametrize("entry_point", ["launch", "sweep", "run-batch"])
+def test_stale_pause_does_not_block_entry_points(entry_point, transcript, popen, fake_claude, saves,
+                                               pause_config, monkeypatch):
+    import capture_cli
+    capture_state.pause("crashed migration")
+    created = (capture_state.capture_dir() / "PAUSED").stat().st_mtime
+    monkeypatch.setattr(capture_state.time, "time", lambda: created + 7201)
+    if entry_point == "launch":
+        assert capture_worker.launch(SID, transcript, "demo", if_due=False, config=pause_config) is True
+        assert len(popen) == 1
+    elif entry_point == "sweep":
+        monkeypatch.setattr(capture_cli, "pending_sessions", lambda *a, **k: [(SID, transcript)])
+        assert capture_cli.sweep() == [SID]
+        assert len(popen) == 1
+    else:
+        assert capture_worker.run_batch(SID, transcript, "demo", pause_config) == "saved:0"
+        assert len(fake_claude.calls) == 1 and saves == []
+        assert capture_state.get_state(SID)["offset"] == transcript.stat().st_size
+    assert "outcome=pause-expired" in _log_text()
+
+
+@pytest.mark.parametrize("argv, expected", [
+    (["launch", SID, "--if-due"], {"launched": False}),
+    (["sweep"], {"launched": []}),
+    (["run-batch", SID, "/unread/transcript.jsonl", "demo"], {"outcome": "paused"}),
+])
+def test_paused_cli_commands_exit_zero_with_json(argv, expected, pause_config, monkeypatch, capsys):
+    import capture_cli
+    capture_state.pause("migration")
+    monkeypatch.setattr(capture_state, "claim", lambda *a: pytest.fail("CLI claimed while paused"))
+    monkeypatch.setattr(capture_worker.subprocess, "Popen", lambda *a, **k: pytest.fail("CLI spawned while paused"))
+    assert capture_cli.main(argv) == 0
+    output = capsys.readouterr()
+    assert json.loads(output.out) == expected and output.err == ""

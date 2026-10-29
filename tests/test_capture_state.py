@@ -150,3 +150,110 @@ def test_append_capture_log_line(tmp_path, monkeypatch):
     cs.append_capture_log("demo project", SID, "saved:2", "batch one")
     line = (tmp_path / ".claude" / "obsidian-brain-hook.log").read_text().strip()
     assert " Capture project=demo_project sid=11111111 outcome=saved:2 detail=batch_one" in line
+
+
+def test_pause_is_atomic_private_and_keeps_reason_as_data(tmp_path, monkeypatch):
+    assert cs.is_paused() is False
+    now = 1_800_000_000.0
+    monkeypatch.setattr(cs.time, "time", lambda: now)
+    path = cs.capture_dir() / "PAUSED"
+    reason = "migration #465\n../outside/秘密"
+    replace = cs.os.replace
+    writes = []
+
+    def check_replace(src, dst):
+        source = cs.Path(src)
+        assert source.parent == path.parent and source != path
+        assert stat.S_IMODE(source.stat().st_mode) == 0o600
+        writes.append(json.loads(source.read_text()))
+        replace(src, dst)
+
+    monkeypatch.setattr(cs.os, "replace", check_replace)
+    cs.pause(reason)
+    assert json.loads(path.read_text()) == {"reason": reason, "ts": now}
+    assert writes == [{"reason": reason, "ts": now}]
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
+    assert {p.name for p in path.parent.iterdir()} == {"PAUSED"}
+    assert not (tmp_path / "outside").exists()
+
+
+@pytest.mark.parametrize("age, expected", [(7199, True), (7200, False), (7201, False)])
+def test_pause_ttl_boundary(monkeypatch, age, expected):
+    cs.pause("migration")
+    created = (cs.capture_dir() / "PAUSED").stat().st_mtime
+    monkeypatch.setattr(cs.time, "time", lambda: created + age)
+    assert cs.PAUSE_TTL_SECONDS == 7200
+    assert cs.is_paused() is expected
+
+
+def test_stale_pause_logs_once_and_a_new_pause_can_expire(monkeypatch):
+    cs.pause("first migration")
+    path = cs.capture_dir() / "PAUSED"
+    created = path.stat().st_mtime
+    monkeypatch.setattr(cs.time, "time", lambda: created + 7201)
+    assert cs.is_paused() is False
+    assert cs.is_paused() is False
+    log_path = cs._log_dir() / "obsidian-brain-hook.log"
+    lines = log_path.read_text().splitlines()
+    assert len(lines) == 1 and "outcome=pause-expired" in lines[0]
+    cs.pause("second migration")
+    created = path.stat().st_mtime
+    monkeypatch.setattr(cs.time, "time", lambda: created + 7199)
+    assert cs.is_paused() is True
+    monkeypatch.setattr(cs.time, "time", lambda: created + 7201)
+    assert cs.is_paused() is False
+    assert cs.is_paused() is False
+    assert len(log_path.read_text().splitlines()) == 2
+
+
+def test_resume_removes_only_pause_and_is_idempotent():
+    cs.set_state(SID, offset=42, pending={"end": 84, "candidates": [], "next": 0})
+    cs.claim(SID)
+    cs.set_flush(SID)
+    cs.ledger_append({"session_id": SID, "title": "keep"})
+    cs.installed_at()
+    cs._atomic_write(cs.capture_dir() / "cli_path", "keep this too")
+    before = {p.name: (p.read_bytes(), p.stat().st_mtime_ns) for p in cs.capture_dir().iterdir()}
+    cs.pause("migration")
+    assert cs.is_paused() is True
+    cs.resume()
+    assert cs.is_paused() is False
+    cs.resume()
+    after = {p.name: (p.read_bytes(), p.stat().st_mtime_ns) for p in cs.capture_dir().iterdir()}
+    assert after == before
+
+
+def test_active_claims_uses_existing_ttl_and_lists_only_claim_files(monkeypatch, tmp_path):
+    now = 1_800_000_000.0
+    monkeypatch.setattr(cs.time, "time", lambda: now)
+    for sid, age in [("live-z", 899), ("live-a", 0), ("boundary", 900), ("expired", 901)]:
+        cs.claim(sid)
+        path = cs.capture_dir() / f"{sid}.claim"
+        os.utime(path, (now - age, now - age))
+    cs.set_state("state-only", offset=42)
+    cs.pause("migration")
+    for name in ("not a sid.claim", "trailing-newline\n.claim"):
+        (cs.capture_dir() / name).write_text("not a claim")
+    (cs.capture_dir() / "directory.claim").mkdir()
+    external = tmp_path / "outside.claim"
+    external.write_text("not a capture claim")
+    (cs.capture_dir() / "external.claim").symlink_to(external)
+    before = {p.name: p.lstat().st_mtime_ns for p in cs.capture_dir().iterdir()}
+    assert cs.active_claims() == ["boundary", "live-a", "live-z"]
+    assert (cs.capture_dir() / "expired.claim").exists()
+    assert before == {p.name: p.lstat().st_mtime_ns for p in cs.capture_dir().iterdir()}
+    monkeypatch.setattr(cs.time, "time", lambda: now + cs.CLAIM_TTL_SECONDS + 1)
+    assert cs.active_claims() == []
+
+
+def test_active_claims_tolerates_a_claim_released_during_scan(monkeypatch):
+    cs.claim(SID)
+    claim_is_live = cs.claim_is_live
+
+    def released(sid):
+        (cs.capture_dir() / f"{sid}.claim").unlink()
+        return claim_is_live(sid)
+
+    monkeypatch.setattr(cs, "claim_is_live", released)
+    assert cs.active_claims() == []
