@@ -435,6 +435,11 @@ def test_relocate_when_new_path_is_already_indexed(env):
                      (str(env.new),))
         conn.execute("INSERT INTO theme_members (theme_id, note_path, similarity, added_date) "
                      "VALUES (1, ?, 0.8, '2026-10-28')", (str(env.new),))
+        # Theme 1 now has two members (old and new), so its count says 2.
+        conn.execute("UPDATE themes SET note_count = 2, centroid = ? WHERE id = 1",
+                     (json.dumps({"x": 0.5, "z": 0.5}),))
+        conn.execute("UPDATE notes SET tfidf_vector = ? WHERE path = ?", ('{"x":1.0}', str(env.old)))
+        conn.execute("UPDATE notes SET tfidf_vector = ? WHERE path = ?", ('{"z":1.0}', str(env.new)))
         conn.commit()
         assert conn.execute("SELECT COUNT(*) FROM notes WHERE path IN (?, ?)",
                             (str(env.old), str(env.new))).fetchone()[0] == 2
@@ -463,3 +468,38 @@ def test_relocate_when_new_path_is_already_indexed(env):
     hits = vault_index.search_vault(str(env.db), "Atomic", include_provisional=True, log_access=False)
     assert [h["path"] for h in hits if h["path"] in olds] == [str(env.new)]
     _assert_no_locks(env)
+
+
+def test_relocate_duplicate_membership_reverses_old_centroid_share(env):
+    env.new.parent.mkdir(mode=0o700, exist_ok=True)
+    env.new.write_bytes(env.old.read_bytes())
+    env.new.chmod(0o600)
+    folder = env.old.parent
+    vault_index.ensure_index(str(env.vault), [folder.relative_to(env.vault).as_posix()],
+                             db_path=str(env.db))
+    conn = vault_index._connect(env.db)
+    try:
+        conn.execute("UPDATE notes SET tfidf_vector = ? WHERE path = ?", ('{"x":1.0}', str(env.old)))
+        conn.execute("UPDATE notes SET tfidf_vector = ? WHERE path = ?", ('{"z":1.0}', str(env.new)))
+        conn.execute("INSERT INTO themes (id, name, centroid, note_count, created_date, updated_date) "
+                     "VALUES (3, 'Shared', ?, 2, '2026-10-28', '2026-10-28')",
+                     (json.dumps({"x": 0.5, "z": 0.5}),))
+        for path in (env.old, env.new):
+            conn.execute("INSERT INTO theme_members (theme_id, note_path, similarity, added_date) "
+                         "VALUES (3, ?, 0.8, '2026-10-28')", (str(path),))
+        conn.commit()
+    finally:
+        conn.close()
+    env.old.unlink()
+    note_placement.relocate(env.config, env.old, env.new, env.db)
+    conn = vault_index._connect(env.db)
+    try:
+        rows = conn.execute("SELECT note_path FROM theme_members WHERE theme_id = 3").fetchall()
+        assert [r[0] for r in rows] == [str(env.new)]
+        theme = conn.execute("SELECT centroid, note_count FROM themes WHERE id = 3").fetchone()
+        assert theme["note_count"] == len(rows)
+        centroid = json.loads(theme["centroid"])
+        assert centroid.get("x", 0.0) == pytest.approx(0.0, abs=1e-9)
+        assert centroid["z"] == pytest.approx(1.0)
+    finally:
+        conn.close()

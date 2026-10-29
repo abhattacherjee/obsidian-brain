@@ -121,14 +121,18 @@ def relocate(config: dict, old_abs: str | Path, new_abs: str | Path, db: str | P
                 conn.execute("UPDATE access_log SET note_path = ? WHERE note_path IN (?, ?)", (db_new, *olds))
                 if new_indexed:
                     # The row at the new path is canonical. Memberships it
-                    # already has win; leftovers are duplicates, deleted
-                    # directly so no theme centroid is reversed.
+                    # already has win. A leftover membership of an old notes
+                    # row goes through _delete_note, which reverses that
+                    # note's share of the theme centroid and count. With no
+                    # notes row there is no vector to reverse, so the
+                    # leftover rows are deleted directly.
                     conn.execute("UPDATE OR IGNORE theme_members SET note_path = ? "
                                  "WHERE note_path IN (?, ?)", (db_new, *olds))
-                    conn.execute("DELETE FROM theme_members WHERE note_path IN (?, ?)", olds)
                     for form in dict.fromkeys(olds):
                         if conn.execute("SELECT 1 FROM notes WHERE path = ?", (form,)).fetchone():
                             vault_index._delete_note(conn, form)
+                        else:
+                            conn.execute("DELETE FROM theme_members WHERE note_path = ?", (form,))
                 else:
                     conn.execute("UPDATE theme_members SET note_path = ? WHERE note_path IN (?, ?)", (db_new, *olds))
                 if old_exists:
