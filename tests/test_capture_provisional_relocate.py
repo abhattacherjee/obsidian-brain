@@ -502,3 +502,20 @@ def test_copies_with_original_absolute_db_paths(env, capsys):
     finally:
         conn.close()
     assert (_files(env.vault), _db_rows(env.db), env.ledger.read_bytes()) == sources
+
+
+def test_apply_succeeds_when_new_path_is_already_indexed(env, capsys):
+    old, new = env.paths["down"], env.folder / "_provisional" / "down.md"
+    new.write_bytes(old.read_bytes())
+    new.chmod(0o600)
+    vault_index.ensure_index(str(env.vault), [env.folder.relative_to(env.vault).as_posix()],
+                             db_path=env.db)
+    old.unlink()
+    code, report, err = _run(env, capsys, "--apply")
+    assert code == 0, err
+    conn = vault_index._connect(env.db)
+    try:
+        assert [r[0] for r in conn.execute(
+            "SELECT path FROM notes WHERE path IN (?, ?)", (str(old), str(new)))] == [str(new)]
+    finally:
+        conn.close()

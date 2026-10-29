@@ -419,3 +419,47 @@ def test_demotion_is_refused_when_the_file_already_says_promoted(env, capsys):
     assert _snapshot(env.db) == before and env.ledger.read_bytes() == ledger
     assert "status changed" in capsys.readouterr().err
     _assert_no_locks(env)
+
+
+def test_relocate_when_new_path_is_already_indexed(env):
+    # Both homes were indexed, then the duplicate at the old home was deleted.
+    env.new.parent.mkdir(mode=0o700, exist_ok=True)
+    env.new.write_bytes(env.old.read_bytes())
+    env.new.chmod(0o600)
+    folder = env.old.parent
+    vault_index.ensure_index(str(env.vault), [folder.relative_to(env.vault).as_posix()],
+                             db_path=str(env.db))
+    conn = vault_index._connect(env.db)
+    try:
+        conn.execute("INSERT INTO access_log (note_path, timestamp, context_type) VALUES (?, 5, 'search')",
+                     (str(env.new),))
+        conn.execute("INSERT INTO theme_members (theme_id, note_path, similarity, added_date) "
+                     "VALUES (1, ?, 0.8, '2026-10-28')", (str(env.new),))
+        conn.commit()
+        assert conn.execute("SELECT COUNT(*) FROM notes WHERE path IN (?, ?)",
+                            (str(env.old), str(env.new))).fetchone()[0] == 2
+        before_access = conn.execute("SELECT COUNT(*) FROM access_log WHERE note_path IN (?, ?)",
+                                     (str(env.old), str(env.new))).fetchone()[0]
+    finally:
+        conn.close()
+    env.old.unlink()
+    assert note_placement.relocate(env.config, env.old, env.new, env.db) == env.new
+    conn = vault_index._connect(env.db)
+    try:
+        olds = (str(env.old), str(env.new))
+        assert [r[0] for r in conn.execute(
+            "SELECT path FROM notes WHERE path IN (?, ?)", olds)] == [str(env.new)]
+        assert conn.execute("SELECT COUNT(*) FROM access_log WHERE note_path = ?",
+                            (str(env.new),)).fetchone()[0] == before_access
+        assert conn.execute("SELECT COUNT(*) FROM access_log WHERE note_path = ?",
+                            (str(env.old),)).fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM theme_members WHERE note_path = ?",
+                            (str(env.old),)).fetchone()[0] == 0
+        members = conn.execute("SELECT theme_id FROM theme_members WHERE note_path = ? ORDER BY theme_id",
+                               (str(env.new),)).fetchall()
+        assert [m[0] for m in members] == [1, 2]
+    finally:
+        conn.close()
+    hits = vault_index.search_vault(str(env.db), "Atomic", include_provisional=True, log_access=False)
+    assert [h["path"] for h in hits if h["path"] in olds] == [str(env.new)]
+    _assert_no_locks(env)

@@ -114,9 +114,23 @@ def relocate(config: dict, old_abs: str | Path, new_abs: str | Path, db: str | P
         try:
             conn.execute("BEGIN IMMEDIATE")
             try:
-                conn.execute("UPDATE notes SET path = ? WHERE path IN (?, ?)", (db_new, *olds))
+                new_indexed = conn.execute(
+                    "SELECT 1 FROM notes WHERE path = ?", (db_new,)).fetchone() is not None
+                if not new_indexed:
+                    conn.execute("UPDATE notes SET path = ? WHERE path IN (?, ?)", (db_new, *olds))
                 conn.execute("UPDATE access_log SET note_path = ? WHERE note_path IN (?, ?)", (db_new, *olds))
-                conn.execute("UPDATE theme_members SET note_path = ? WHERE note_path IN (?, ?)", (db_new, *olds))
+                if new_indexed:
+                    # The row at the new path is canonical. Memberships it
+                    # already has win; leftovers are duplicates, deleted
+                    # directly so no theme centroid is reversed.
+                    conn.execute("UPDATE OR IGNORE theme_members SET note_path = ? "
+                                 "WHERE note_path IN (?, ?)", (db_new, *olds))
+                    conn.execute("DELETE FROM theme_members WHERE note_path IN (?, ?)", olds)
+                    for form in dict.fromkeys(olds):
+                        if conn.execute("SELECT 1 FROM notes WHERE path = ?", (form,)).fetchone():
+                            vault_index._delete_note(conn, form)
+                else:
+                    conn.execute("UPDATE theme_members SET note_path = ? WHERE note_path IN (?, ?)", (db_new, *olds))
                 if old_exists:
                     os.rename(old, new)
                 conn.commit()
