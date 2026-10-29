@@ -537,3 +537,126 @@ def test_fractional_ledger_ts_counts_in_same_second_selection(tmp_path, capsys):
     logs = [_log(0, "saved:1")]
     report = _report(_write_case(tmp_path, rows=rows, logs=logs), capsys)
     assert report["arms"][0]["sessions"][SESSION]["final_picks"] == ["a"]
+
+
+def test_selected_lines_are_exact_replay_times(tmp_path, capsys, monkeypatch):
+    # Two selections one second apart with the same pool: the heuristic would merge them,
+    # selected lines say live ran both. A saved line after the first selected line adds no time.
+    rows = [_row("a"), _row("b", 15, novelty=0.5)]
+    logs = [_log(10, "promoted", detail="cid=a;merit=.68;rank=1;why=pick"),
+            _log(10, "selected", detail="candidates=1;picked=1;promoted=1;demoted=0"),
+            _log(20, "demoted", detail="cid=a;merit=.68;rank=2;why=displaced"),
+            _log(20, "promoted", detail="cid=b;merit=.71;rank=1;why=pick"),
+            _log(20, "selected", detail="candidates=2;picked=1;promoted=1;demoted=1"),
+            _log(21, "selected", detail="candidates=2;picked=1;promoted=0;demoted=0"),
+            _log(22, "saved:3")]
+    real, calls = replay.capture_select.select, []
+
+    def counting(candidates, *args, **kwargs):
+        calls.append(len(candidates))
+        return real(candidates, *args, **kwargs)
+
+    monkeypatch.setattr(replay.capture_select, "select", counting)
+    report = _report(_write_case(tmp_path, rows=rows, logs=logs), capsys, "--bonus", "0.05")
+    assert len(calls) == 3 * len(report["arms"])  # 10, 20, 21; not the move or saved lines
+    assert report["arms"][0]["sessions"][SESSION]["moves_by_note"] == {"a": 2, "b": 1}
+
+
+def test_lines_before_the_first_selected_line_still_use_the_heuristic(tmp_path, capsys, monkeypatch):
+    # An older batch logged no selected lines (before #468); a later batch does.
+    rows = [_row("a"), _row("b", 15, novelty=0.5), _row("c", 25, novelty=0.6)]
+    logs = [_log(10, "promoted", detail="cid=a;merit=.68;rank=1;why=pick"),
+            _log(10, "saved:1"),
+            _log(30, "selected", detail="candidates=3;picked=2;promoted=2;demoted=0")]
+    real, calls = replay.capture_select.select, []
+
+    def counting(candidates, *args, **kwargs):
+        calls.append(len(candidates))
+        return real(candidates, *args, **kwargs)
+
+    monkeypatch.setattr(replay.capture_select, "select", counting)
+    report = _report(_write_case(tmp_path, rows=rows, logs=logs), capsys)
+    assert calls[:2] == [1, 3]  # 10 (move and saved line merged), then 30
+    assert len(calls) == 2 * len(report["arms"])
+
+
+def test_move_lines_just_before_the_first_selected_line_are_that_selection(tmp_path, capsys, monkeypatch):
+    # run_selection writes its moves, then its selected line, which can fall in the next second.
+    rows = [_row("a")]
+    logs = [_log(10, "promoted", detail="cid=a;merit=.68;rank=1;why=pick"),
+            _log(11, "selected", detail="candidates=1;picked=1;promoted=1;demoted=0"),
+            _log(11, "saved:1")]
+    real, calls = replay.capture_select.select, []
+
+    def counting(candidates, *args, **kwargs):
+        calls.append(len(candidates))
+        return real(candidates, *args, **kwargs)
+
+    monkeypatch.setattr(replay.capture_select, "select", counting)
+    report = _report(_write_case(tmp_path, rows=rows, logs=logs), capsys, "--bonus", "0.05")
+    assert len(calls) == len(report["arms"])  # one selection per arm, at 11
+    assert report["arms"][0]["sessions"][SESSION]["moves_by_note"] == {"a": 1}
+
+
+def test_an_older_batch_just_before_the_first_selected_line_is_kept(tmp_path, capsys, monkeypatch):
+    # Legacy batch selects and saves at 10; a challenger arrives at 11; the new batch selects at 12.
+    rows = [_row("a"), _row("b", 11, novelty=0.5)]
+    logs = [_log(10, "promoted", detail="cid=a;merit=.68;rank=1;why=pick"),
+            _log(10, "saved:1"),
+            _log(12, "selected", detail="candidates=2;picked=1;promoted=0;demoted=0")]
+    real, calls = replay.capture_select.select, []
+
+    def counting(candidates, *args, **kwargs):
+        calls.append(len(candidates))
+        return real(candidates, *args, **kwargs)
+
+    monkeypatch.setattr(replay.capture_select, "select", counting)
+    _report(_write_case(tmp_path, rows=rows, logs=logs), capsys)
+    assert calls[:2] == [1, 2]  # the legacy selection at 10 runs, then the selected line at 12
+
+
+def test_move_lines_after_an_older_saved_line_belong_to_the_selected_batch(tmp_path, capsys, monkeypatch):
+    # Legacy batch at 5; the new batch moves at 10 and logs its selected line at 11.
+    rows = [_row("a"), _row("b", 8, novelty=0.5)]
+    logs = [_log(5, "promoted", detail="cid=a;merit=.68;rank=1;why=pick"),
+            _log(5, "saved:1"),
+            _log(10, "demoted", detail="cid=a;merit=.68;rank=2;why=displaced"),
+            _log(10, "promoted", detail="cid=b;merit=.71;rank=1;why=pick"),
+            _log(11, "selected", detail="candidates=2;picked=1;promoted=1;demoted=1")]
+    real, calls = replay.capture_select.select, []
+
+    def counting(candidates, *args, **kwargs):
+        calls.append(len(candidates))
+        return real(candidates, *args, **kwargs)
+
+    monkeypatch.setattr(replay.capture_select, "select", counting)
+    report = _report(_write_case(tmp_path, rows=rows, logs=logs), capsys, "--bonus", "0.05")
+    assert len(calls) == 2 * len(report["arms"])  # 5 and 11; the move lines at 10 are 11's own
+
+
+def test_without_selected_lines_a_move_after_the_last_saved_line_is_replayed(tmp_path, capsys, monkeypatch):
+    # An older batch that selected but never logged its saved line (it failed, or the log was copied mid-batch).
+    rows = [_row("a"), _row("b", 15, novelty=0.5)]
+    logs = [_log(10, "promoted", detail="cid=a;merit=.68;rank=1;why=pick"),
+            _log(10, "saved:1"),
+            _log(20, "demoted", detail="cid=a;merit=.68;rank=2;why=displaced"),
+            _log(20, "promoted", detail="cid=b;merit=.71;rank=1;why=pick")]
+    report = _report(_write_case(tmp_path, rows=rows, logs=logs), capsys)
+    assert report["arms"][0]["sessions"][SESSION]["moves_by_note"] == {"a": 2, "b": 1}
+
+
+def test_an_older_multi_slice_batch_keeps_its_intermediate_moves(tmp_path, capsys, monkeypatch):
+    # Legacy batch: a slice selects at 10, its saved line comes at 20; the new batch selects at 30.
+    rows = [_row("a"), _row("b", 15, novelty=0.5)]
+    logs = [_log(10, "promoted", detail="cid=a;merit=.68;rank=1;why=pick"),
+            _log(20, "saved:2"),
+            _log(30, "selected", detail="candidates=2;picked=1;promoted=0;demoted=0")]
+    real, calls = replay.capture_select.select, []
+
+    def counting(candidates, *args, **kwargs):
+        calls.append(len(candidates))
+        return real(candidates, *args, **kwargs)
+
+    monkeypatch.setattr(replay.capture_select, "select", counting)
+    _report(_write_case(tmp_path, rows=rows, logs=logs), capsys)
+    assert calls[:3] == [1, 2, 2]  # 10, 20, 30

@@ -38,9 +38,9 @@ LIMITATIONS = [
     "Final merged ledger fields and DB vectors apply at every run; creation ts does not date field changes.",
     "Only access-log stickiness is reconstructed; hand edits, issue closures and historical frontmatter are unavailable.",
     "Final merit averages sessions with nonempty final selection picks; sticky notes are outside those picks.",
-    "Skipped sid counts count distinct saved-line prefixes; rows_without_vector counts distinct eligible ledger rows.",
-    "Replay times are saved lines plus promoted/demoted lines: a slice whose selection moved nothing writes no line, so it is not replayed on its own; its rows join the next replayed selection.",
-    "A replay time is skipped when its pool equals the previous replayed pool and it is at most 2 s after it (the move lines and saved line of one selection). A real slice with an unchanged pool that logged moves within 2 s of the previous selection is merged into it.",
+    "Skipped sid counts count distinct saved- or selected-line prefixes; rows_without_vector counts distinct eligible ledger rows.",
+    "From a session's first selected line on, each selected line is one replay time and nothing is merged. Before it (move lines followed by a saved line before the first selected line; later move lines are that batch's own), replay times are saved lines plus promoted/demoted lines: a slice whose selection moved nothing writes no line, so it is not replayed on its own; its rows join the next replayed selection.",
+    "Before the first selected line, a replay time is skipped when its pool equals the previous replayed pool and it is at most 2 s after it (the move lines and saved line of one selection). A real slice with an unchanged pool that logged moves within 2 s of the previous selection is merged into it.",
     "Ledger ts is fractional but log times are whole seconds: a row created later in the same second as a selection is counted in it.",
 ]
 
@@ -104,8 +104,10 @@ def _row_in(row_ts: float, when: float) -> bool:
     return math.floor(row_ts) <= when
 
 
-def _read_logs(paths: list[Path]) -> tuple[float, dict[str, list[float]], dict[str, Counter], dict[str, list[float]]]:
+def _read_logs(paths: list[Path]) -> tuple[float, dict[str, list[float]], dict[str, Counter], dict[str, list[float]],
+                                            dict[str, list[float]]]:
     saved = defaultdict(list)
+    selections = defaultdict(list)
     move_times = defaultdict(list)
     moves = defaultdict(Counter)
     first = None
@@ -114,7 +116,7 @@ def _read_logs(paths: list[Path]) -> tuple[float, dict[str, list[float]], dict[s
             for line, raw in enumerate(source, 1):
                 parts = raw.split(maxsplit=2)
                 relevant = (len(parts) >= 2 and parts[1] == "Capture"
-                            and re.search(r"\boutcome=(?:saved|promoted|demoted)\b", raw))
+                            and re.search(r"\boutcome=(?:saved|selected|promoted|demoted)\b", raw))
                 try:
                     when = dt.datetime.fromisoformat(parts[0])
                     if when.tzinfo is None:
@@ -135,6 +137,8 @@ def _read_logs(paths: list[Path]) -> tuple[float, dict[str, list[float]], dict[s
                     if not re.fullmatch(r"saved:\d+", outcome):
                         raise ValueError(f"{path}:{line}: invalid saved outcome")
                     saved[sid].append(timestamp)
+                elif outcome == "selected":
+                    selections[sid].append(timestamp)
                 elif outcome in ("promoted", "demoted"):
                     detail = re.search(r"\bdetail=(.*)", raw)
                     values = dict(part.split("=", 1) for part in detail[1].strip().split(";")
@@ -144,11 +148,11 @@ def _read_logs(paths: list[Path]) -> tuple[float, dict[str, list[float]], dict[s
                     move_times[sid].append(timestamp)
                     if values["why"] in ("pick", "displaced", "below-cap"):
                         moves[sid][values["cid"]] += 1
-    if not saved:
+    if not saved and not selections:
         raise ValueError("0 sessions in window: no saved lines in hook logs")
-    for times in saved.values():
+    for times in (*saved.values(), *selections.values()):
         times.sort()
-    return first, saved, moves, move_times
+    return first, saved, moves, move_times, selections
 
 
 def _read_db(db: Path, basenames: set[str]) -> tuple[dict, dict]:
@@ -192,14 +196,18 @@ def _read_db(db: Path, basenames: set[str]) -> tuple[dict, dict]:
     return vectors, sticky
 
 
-def _replay(items: list[dict], times: list[float], bonus: float) -> dict:
-    """Selection moves only: becoming sticky freezes a note without adding a move."""
+def _replay(items: list[dict], times: list[float], bonus: float, exact_from: float = math.inf) -> dict:
+    """Selection moves only: becoming sticky freezes a note without adding a move.
+
+    Times from ``exact_from`` on come from selected lines: each is one selection, never merged.
+    """
     promoted, counts, picks = set(), Counter(), []
     previous_pool, previous_time = None, None
     for timestamp in times:
         pool = [item for item in items if _row_in(item["ts"], timestamp) and timestamp < item["sticky_at"]]
         pool_ids = {item["id"] for item in pool}
-        if pool_ids == previous_pool and timestamp - previous_time <= SAME_SELECTION_SECONDS:
+        if (timestamp < exact_from and pool_ids == previous_pool
+                and timestamp - previous_time <= SAME_SELECTION_SECONDS):
             continue  # the same selection seen twice: its move lines, then the batch's saved line
         previous_pool, previous_time = pool_ids, timestamp
         picks = capture_select.select([
@@ -231,7 +239,7 @@ def _evaluate(ledger: Path, db: Path, logs: list[Path], bonuses: list[float]) ->
                            sessions_without_vectors=0, sessions_without_candidates=0,
                            invalid_ledger_rows=0))
     rows = _read_ledger(ledger, skipped)
-    first_log, saved, live_moves, move_times = _read_logs(logs)
+    first_log, saved, live_moves, move_times, selections = _read_logs(logs)
     by_session, prefixes, first_new = defaultdict(list), defaultdict(set), {}
     for row in rows:
         session = row.get("session_id")
@@ -253,15 +261,23 @@ def _evaluate(ledger: Path, db: Path, logs: list[Path], bonuses: list[float]) ->
                         and "_rejected" not in Path(row["note_path"]).parts):
                     by_session[session].append(row)
 
-    mapped = {}
-    for sid, times in saved.items():
+    mapped, exact_from = {}, {}
+    for sid in sorted(set(saved) | set(selections)):
         matches = prefixes[sid]
         if len(matches) > 1:
             skipped["ambiguous_sid"] += 1
         elif not matches:
             skipped["unmapped_sid"] += 1
         else:
-            mapped[next(iter(matches))] = sorted(set(times) | set(move_times.get(sid, ())))
+            session = next(iter(matches))
+            exact = selections.get(sid, [])
+            start = exact[0] if exact else math.inf
+            # A batch logs its saved line after all its selections, so a move line with no saved
+            # line between it and the first selected line belongs to that selected batch.
+            old_saved = [t for t in saved.get(sid, ()) if t < start]
+            guessed = set(old_saved) | {t for t in move_times.get(sid, ())
+                                        if not exact or (t < start and old_saved and old_saved[-1] >= t)}
+            mapped[session], exact_from[session] = sorted(guessed) + exact, start
     if not mapped:
         raise ValueError(f"0 sessions in window map to ledger; skipped={dict(skipped)}")
 
@@ -286,7 +302,7 @@ def _evaluate(ledger: Path, db: Path, logs: list[Path], bonuses: list[float]) ->
             skipped["sessions_without_vectors"] += 1
             continue
         for arm in arms:
-            arm["sessions"][session] = _replay(items, times, arm["bonus"])
+            arm["sessions"][session] = _replay(items, times, arm["bonus"], exact_from[session])
     if not arms[0]["sessions"]:
         raise ValueError(f"0 replayable sessions in window; skipped={dict(skipped)}")
 

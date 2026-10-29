@@ -375,7 +375,8 @@ def run_selection(session_id: str, project: str, config: dict, *, db: str | None
     ``detail=demotion-write`` and adds ``deferred: True`` to the counts), so a
     failure never leaves more than ``CAP`` picks promoted; the next slice
     retries. Any other note that cannot be written (locked, changed under us)
-    keeps its status and is retried next slice.
+    keeps its status and is retried next slice. A run with candidates logs
+    one ``selected`` line after its moves.
     """
     db = db or vault_index.ensure_index(config["vault_path"], indexed_folders(config))
     entries = plan_session(session_id, config, db)
@@ -400,6 +401,11 @@ def run_selection(session_id: str, project: str, config: dict, *, db: str | None
         capture_state.append_capture_log(project, session_id, "select-failed",
                                          f"detail=demotion-write;cid={demotion_failed}")
         counts["deferred"] = True
+    if entries:  # one line per selection run, so a replay can tell selections apart (#468)
+        capture_state.append_capture_log(
+            project, session_id, "selected",
+            f"candidates={len(entries)};picked={counts['picked']};promoted={counts['promoted']};"
+            f"demoted={counts['demoted']}" + (";deferred=1" if demotion_failed else ""))
     return counts
 
 

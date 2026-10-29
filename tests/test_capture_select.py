@@ -598,10 +598,11 @@ def test_second_run_writes_nothing(mock_config, db):
     capture_select.run_selection(SID, "demo", mock_config, db=db)
     paths = [_current_note_path(mock_config, r) for r in rows]
     before = [(p.stat().st_mtime_ns, p.read_bytes()) for p in paths]
-    lines, ledger = len(_log_lines()), capture_state._ledger_path().read_text()
+    lines, ledger = _log_lines(), capture_state._ledger_path().read_text()
     assert capture_select.run_selection(SID, "demo", mock_config, db=db) == {"promoted": 0, "demoted": 0, "picked": 10}
     assert [(p.stat().st_mtime_ns, p.read_bytes()) for p in paths] == before
-    assert len(_log_lines()) == lines and capture_state._ledger_path().read_text() == ledger
+    new = _log_lines()[len(lines):]  # only the run's own selected line, no move line
+    assert len(new) == 1 and "outcome=selected" in new[0] and capture_state._ledger_path().read_text() == ledger
 
 
 def test_parts_are_recorded_and_logged(mock_config, db):
@@ -1209,3 +1210,19 @@ def test_incumbent_bonus_is_pinned_at_0_2(mock_config, db, incumbent_at_cap, gap
     entries = {e["row"]["id"]: e for e in capture_select.plan_session(SID, mock_config, db)}
     assert entries[challenger["id"]]["why"] == ("pick" if challenger_wins else "below-cap")
     assert entries[incumbent["id"]]["why"] == ("displaced" if challenger_wins else "pick")
+
+
+def test_each_selection_run_logs_one_selected_line(mock_config, db):
+    rows = [_note(mock_config, i, score=9) for i in range(3)]
+    capture_select.run_selection(SID, "demo", mock_config, db=db)
+    capture_select.run_selection(SID, "demo", mock_config, db=db)  # moves nothing, still one selection
+    lines = [ln for ln in _log_lines() if "outcome=selected" in ln]
+    assert len(lines) == 2
+    assert "detail=candidates=3;picked=3;promoted=3;demoted=0" in lines[0]
+    assert "detail=candidates=3;picked=3;promoted=0;demoted=0" in lines[1]
+    assert len(rows) == 3
+
+
+def test_a_run_with_no_candidates_logs_no_selected_line(mock_config, db):
+    capture_select.run_selection(SID, "demo", mock_config, db=db)
+    assert not any("outcome=selected" in ln for ln in _log_lines())
