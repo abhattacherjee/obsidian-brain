@@ -494,6 +494,26 @@ def test_intermediate_slice_moves_are_replayed(tmp_path, capsys):
     assert moves == {"a": 3, "b": 2, "c": 1}
 
 
+def test_saved_line_after_last_move_with_same_pool_is_not_a_separate_selection(tmp_path, capsys, monkeypatch):
+    # Last move at 20, saved line at 21, no ledger row between: live ran no selection at 21.
+    rows = [_row("a"), _row("b", 15, novelty=0.5)]
+    logs = [_log(10, "promoted", detail="cid=a;merit=.68;rank=1;why=pick"),
+            _log(20, "demoted", detail="cid=a;merit=.68;rank=2;why=displaced"),
+            _log(20, "promoted", detail="cid=b;merit=.71;rank=1;why=pick"),
+            _log(21, "saved:2")]
+    real, calls = replay.capture_select.select, []
+
+    def counting(candidates, *args, **kwargs):
+        calls.append(len(candidates))
+        return real(candidates, *args, **kwargs)
+
+    monkeypatch.setattr(replay.capture_select, "select", counting)
+    report = _report(_write_case(tmp_path, rows=rows, logs=logs), capsys, "--bonus", "0.05")
+    # Replays at 10 and 20 only; the saved time 21 has the same pool as 20. One run per arm per time.
+    assert len(calls) == 2 * len(report["arms"])
+    assert report["arms"][0]["sessions"][SESSION]["moves_by_note"] == {"a": 2, "b": 1}
+
+
 def test_fractional_ledger_ts_counts_in_same_second_selection(tmp_path, capsys):
     rows = [_row("a", 0.25)]
     logs = [_log(0, "saved:1")]

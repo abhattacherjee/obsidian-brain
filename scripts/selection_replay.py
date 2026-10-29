@@ -39,6 +39,7 @@ LIMITATIONS = [
     "Final merit averages sessions with nonempty final selection picks; sticky notes are outside those picks.",
     "Skipped sid counts count distinct saved-line prefixes; rows_without_vector counts distinct eligible ledger rows.",
     "Replay times are saved lines plus promoted/demoted lines: a slice whose selection moved nothing writes no line, so it is not replayed on its own; its rows join the next replayed selection.",
+    "A replay time whose pool equals the previous replayed pool is skipped, because live runs one selection per slice.",
     "Ledger ts is fractional but log times are whole seconds: a row created later in the same second as a selection is counted in it.",
 ]
 
@@ -193,8 +194,13 @@ def _read_db(db: Path, basenames: set[str]) -> tuple[dict, dict]:
 def _replay(items: list[dict], times: list[float], bonus: float) -> dict:
     """Selection moves only: becoming sticky freezes a note without adding a move."""
     promoted, counts, picks = set(), Counter(), []
+    previous_pool = None
     for timestamp in times:
         pool = [item for item in items if _row_in(item["ts"], timestamp) and timestamp < item["sticky_at"]]
+        pool_ids = {item["id"] for item in pool}
+        if pool_ids == previous_pool:
+            continue  # live runs one selection per slice; no new rows or stickiness change means no new run
+        previous_pool = pool_ids
         picks = capture_select.select([
             {key: item[key] for key in ("id", "vector", "ts")}
             | {"merit": item["merit"] + (bonus if item["id"] in promoted else 0.0)}

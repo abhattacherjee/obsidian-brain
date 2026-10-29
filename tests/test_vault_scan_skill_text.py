@@ -78,7 +78,9 @@ def test_step3_search_vault_opts_into_or_fill(skill):
 def test_vault_search_step3_does_not_hide_provisional_notes():
     call = re.search(r"results = search_vault\((.*?)\n\)", _step("vault-search", "3"), re.S)
     assert call
-    assert "include_provisional=False" not in call.group(1)
+    # search_vault defaults to include_provisional=True (hooks/vault_index.py), so
+    # passing the argument in any spelling risks hiding provisional notes.
+    assert "include_provisional" not in call.group(1)
 
 
 def test_vault_ask_step4_drops_excluded_paths_from_grep_union():
