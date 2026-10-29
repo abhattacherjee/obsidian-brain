@@ -514,6 +514,24 @@ def test_saved_line_after_last_move_with_same_pool_is_not_a_separate_selection(t
     assert report["arms"][0]["sessions"][SESSION]["moves_by_note"] == {"a": 2, "b": 1}
 
 
+def test_same_pool_replayed_60_seconds_later_is_a_separate_selection(tmp_path, capsys, monkeypatch):
+    # A later batch adds no rows, so the pool is unchanged, but it is a real second selection.
+    rows = [_row("a"), _row("b", 15, novelty=0.5)]
+    logs = [_log(10, "promoted", detail="cid=a;merit=.68;rank=1;why=pick"),
+            _log(20, "demoted", detail="cid=a;merit=.68;rank=2;why=displaced"),
+            _log(20, "promoted", detail="cid=b;merit=.71;rank=1;why=pick"),
+            _log(80, "saved:2")]
+    real, calls = replay.capture_select.select, []
+
+    def counting(candidates, *args, **kwargs):
+        calls.append(len(candidates))
+        return real(candidates, *args, **kwargs)
+
+    monkeypatch.setattr(replay.capture_select, "select", counting)
+    report = _report(_write_case(tmp_path, rows=rows, logs=logs), capsys, "--bonus", "0.05")
+    assert len(calls) == 3 * len(report["arms"])
+
+
 def test_fractional_ledger_ts_counts_in_same_second_selection(tmp_path, capsys):
     rows = [_row("a", 0.25)]
     logs = [_log(0, "saved:1")]
