@@ -1,6 +1,7 @@
 """Closed-issue suggestions use tracked refs and never call live GitHub."""
 import json
 import subprocess
+import threading
 
 import pytest
 
@@ -58,6 +59,47 @@ def test_open(tmp_path):
     gh, _ = fake_gh(state="OPEN")
     assert rt.closed_candidates(str(tmp_path), "insights", gh=gh) == {
         "candidates": [], "errors": []}
+
+
+def test_distinct_refs_looked_up_in_parallel(tmp_path):
+    for number in (5, 7, 9):
+        path = note(tmp_path, f"{number}-retro-demo.md")
+        path.write_text(path.read_text().replace("#5", f"#{number}")
+                        .replace("/5)", f"/{number})"), encoding="utf-8")
+    barrier = threading.Barrier(3, timeout=5)
+    gh, _ = fake_gh()
+
+    def blocking_gh(args):
+        barrier.wait()
+        return gh(args)
+
+    result = rt.closed_candidates(str(tmp_path), "insights", gh=blocking_gh)
+    assert result["errors"] == []
+    assert {c["ref"] for c in result["candidates"]} == {"o/r#5", "o/r#7", "o/r#9"}
+    assert len(result["candidates"]) == 3
+
+
+def test_shared_ref_looked_up_once(tmp_path):
+    for number in range(3):
+        note(tmp_path, f"{number}-retro-demo.md")
+    lock = threading.Lock()
+    gh, calls = fake_gh()
+
+    def counted_gh(args):
+        with lock:
+            return gh(args)
+
+    result = rt.closed_candidates(str(tmp_path), "insights", gh=counted_gh)
+    assert result["errors"] == []
+    assert len(result["candidates"]) == 3
+    assert len(calls) == 1
+
+
+def test_unexpected_gh_exception_propagates(tmp_path):
+    note(tmp_path)
+    gh, _ = fake_gh(exception=RuntimeError("unexpected gh failure"))
+    with pytest.raises(RuntimeError, match="unexpected gh failure"):
+        rt.closed_candidates(str(tmp_path), "insights", gh=gh)
 
 
 @pytest.mark.parametrize("failure", [

@@ -1,6 +1,7 @@
 """Parse and atomically record outcomes for retro Process Improvements."""
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 from pathlib import Path
@@ -30,6 +31,7 @@ _PATH = re.compile(r"`(?P<path>[^`\r\n]+)`" + _SUFFIX)
 _ITEM = re.compile(r"^- \[([ xX])\] ")
 _TRACKED = re.compile(r"^tracked_issues\s*:")
 GH_TIMEOUT_SECONDS = 10
+GH_MAX_WORKERS = 8
 
 
 class TraceError(ValueError):
@@ -147,6 +149,26 @@ def _run_gh(args: list[str]) -> subprocess.CompletedProcess:
     )
 
 
+def _lookup_ref(gh, ref) -> tuple[dict | None, str | None]:
+    """Look up one issue's state, returning data or a lookup error."""
+    repo, number = ref.rsplit("#", 1)
+    try:
+        result = gh(["issue", "view", number, "--repo", repo,
+                     "--json", "state,stateReason"])
+        if result.returncode:
+            return None, f"gh exited with code {result.returncode}"
+        data = json.loads(result.stdout)
+        if not isinstance(data, dict) or not isinstance(data.get("state"), str):
+            return None, "gh JSON has no string state"
+        return data, None
+    except subprocess.TimeoutExpired:
+        return None, "gh timed out"
+    except OSError as exc:
+        return None, str(exc)[:200]
+    except json.JSONDecodeError:
+        return None, "gh returned invalid JSON"
+
+
 def closed_candidates(vault_path: str, insights_folder: str,
                       project: str | None = None, gh=None) -> dict:
     """Suggest ticks for open items whose tracked issue is closed on GitHub."""
@@ -154,6 +176,8 @@ def closed_candidates(vault_path: str, insights_folder: str,
     candidates = []
     errors = []
     states = {}
+    eligible = []
+    refs = set()
     vault = Path(vault_path).resolve()
     folder = Path(vault_path, insights_folder).resolve()
     # A folder outside the vault or missing is a setup error, not "no candidates".
@@ -190,38 +214,29 @@ def closed_candidates(vault_path: str, insights_folder: str,
             ref = trace["ref"]
             if ref not in tracked:
                 continue
-            if ref not in states:
-                # Cache failures too, so each ref produces at most one error.
-                states[ref] = None
-                repo, number = ref.rsplit("#", 1)
-                try:
-                    result = gh(["issue", "view", number, "--repo", repo,
-                                 "--json", "state,stateReason"])
-                    if result.returncode:
-                        errors.append({"ref": ref, "error": f"gh exited with code {result.returncode}"})
-                        continue
-                    data = json.loads(result.stdout)
-                    if not isinstance(data, dict) or not isinstance(data.get("state"), str):
-                        errors.append({"ref": ref, "error": "gh JSON has no string state"})
-                        continue
-                    states[ref] = data
-                except subprocess.TimeoutExpired:
-                    errors.append({"ref": ref, "error": "gh timed out"})
-                except OSError as exc:
-                    errors.append({"ref": ref, "error": str(exc)[:200]})
-                except json.JSONDecodeError:
-                    errors.append({"ref": ref, "error": "gh returned invalid JSON"})
-            data = states[ref]
-            if data is None or data["state"].upper() != "CLOSED":
-                continue
-            reason = data.get("stateReason") or ""
-            preselect = isinstance(reason, str) and reason.upper() == "COMPLETED"
-            candidates.append({
-                "file": str(path.resolve()), "line": item["start"] + 1,
-                "text": item["text"].split("\n", 1)[0], "ref": ref,
-                "state_reason": reason, "preselect": preselect,
-                "label": "[closed on GH]" if preselect else "[closed on GH: not planned]",
-            })
+            eligible.append((path, item, ref))
+            refs.add(ref)
+    if refs:
+        # Look up distinct refs in parallel for #65.
+        with ThreadPoolExecutor(max_workers=min(GH_MAX_WORKERS, len(refs))) as executor:
+            futures = {ref: executor.submit(_lookup_ref, gh, ref) for ref in refs}
+            for ref, future in futures.items():
+                data, error = future.result()
+                states[ref] = data
+                if error is not None:
+                    errors.append({"ref": ref, "error": error})
+    for path, item, ref in eligible:
+        data = states[ref]
+        if data is None or data["state"].upper() != "CLOSED":
+            continue
+        reason = data.get("stateReason") or ""
+        preselect = isinstance(reason, str) and reason.upper() == "COMPLETED"
+        candidates.append({
+            "file": str(path.resolve()), "line": item["start"] + 1,
+            "text": item["text"].split("\n", 1)[0], "ref": ref,
+            "state_reason": reason, "preselect": preselect,
+            "label": "[closed on GH]" if preselect else "[closed on GH: not planned]",
+        })
     return {"candidates": sorted(candidates, key=lambda c: (c["file"], c["line"])),
             "errors": sorted(errors, key=lambda e: e["ref"])}
 
