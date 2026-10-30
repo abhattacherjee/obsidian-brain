@@ -785,14 +785,30 @@ For each item the user kept selected (default-selected for HIGH+DONE, opt-in for
 
 The confirmed `=== Closed on GitHub ===` candidates go through the same four steps, using each candidate's `file` (absolute path) and `line`. They take no part in the cascade below, because they come from retro notes, not session-note groups. On a dry run they are shown and none are flipped.
 
-Record every closed candidate you flipped (each one's `file`, `line`, `text`, `ref`) as JSON for Step 9. Put the list in `CLOSED_FLIPPED` (use `[]` when none were flipped, or on a dry run) and run:
+Record every closed candidate you flipped (each one's `file`, `line`, `text`, `ref`) as JSON for Step 9. Replace `<CLOSED_FLIPPED_JSON>` below with that JSON list, pasted literally: `[]` when none were flipped, or on a dry run. Shell variables do not carry over between Bash calls, so the list must sit inside this block. Substitute 4 random hex characters for `<eof4>` in both the opener and the terminator. The block refuses to write (error on stderr, exit 1) if the placeholder is still there, the text is not valid JSON, or it is not a list of objects.
 
 ```bash
-SCOPE_PATH="$scope_path" CLOSED_FLIPPED='[]' python3 << 'PYEOF'
-import json, os, tempfile
+CLOSED_FLIPPED=$(cat <<'OB_FLIPPED_EOF_<eof4>'
+<CLOSED_FLIPPED_JSON>
+OB_FLIPPED_EOF_<eof4>
+)
+SCOPE_PATH="$scope_path" CLOSED_FLIPPED="$CLOSED_FLIPPED" python3 << 'PYEOF'
+import json, os, sys, tempfile
 
 scope_path = os.environ["SCOPE_PATH"]
-flipped = json.loads(os.environ.get("CLOSED_FLIPPED") or "[]")
+raw = os.environ.get("CLOSED_FLIPPED", "")
+placeholder = "<CLOSED_" + "FLIPPED_JSON>"
+if placeholder in raw:
+    print(f"ERROR: replace {placeholder} with the flipped list ([] when none)", file=sys.stderr)
+    sys.exit(1)
+try:
+    flipped = json.loads(raw)
+except ValueError as exc:
+    print(f"ERROR: CLOSED_FLIPPED is not valid JSON: {exc}", file=sys.stderr)
+    sys.exit(1)
+if not isinstance(flipped, list) or not all(isinstance(i, dict) for i in flipped):
+    print("ERROR: CLOSED_FLIPPED must be a JSON list of objects", file=sys.stderr)
+    sys.exit(1)
 out = os.path.join(os.path.dirname(scope_path), "closed_applied.json")
 fd, tmp = tempfile.mkstemp(dir=os.path.dirname(out), prefix="closed_applied-", suffix=".tmp")
 with os.fdopen(fd, "w") as f:

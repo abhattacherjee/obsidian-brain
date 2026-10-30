@@ -138,20 +138,88 @@ def test_step_8_writes_and_step_9_reads_closed_applied():
     assert "closed_on_github=closed_applied" in step9
 
 
-def test_step_8_closed_applied_block_writes_owner_only_json(tmp_path):
+def _step_8_block() -> str:
     step8 = _section(CHECK_ITEMS, "## Step 8", "## Step 9")
     block = step8.split("```bash\n", 1)[1].split("\n```", 1)[0]
     assert "closed_applied.json" in block
-    # The skill ships an inline `[]` default; the caller replaces it.
-    block = block.replace("CLOSED_FLIPPED='[]' ", "")
+    return block
+
+
+def _run_step_8(tmp_path, block: str):
     scope = tmp_path / "scope.json"
     scope.write_text("{}", encoding="utf-8")
+    script = f"scope_path={scope}\n{block}\n"
+    return subprocess.run(["bash", "-c", script], env=dict(os.environ), capture_output=True,
+                          text=True, timeout=30, stdin=subprocess.DEVNULL, cwd=tmp_path)
+
+
+def test_step_8_closed_applied_block_writes_owner_only_json(tmp_path):
     flipped = [{"file": "/v/n.md", "line": 8, "text": "- [x] t", "ref": "o/r#5"}]
-    env = {**os.environ, "CLOSED_FLIPPED": json.dumps(flipped)}
-    script = f'scope_path={scope}\n{block}\n'
-    proc = subprocess.run(["bash", "-c", script], env=env, capture_output=True,
-                          text=True, timeout=30, stdin=subprocess.DEVNULL)
+    block = _step_8_block().replace("\n<CLOSED_FLIPPED_JSON>\n", "\n" + json.dumps(flipped) + "\n")
+    block = block.replace("<eof4>", "a1b2")
+    proc = _run_step_8(tmp_path, block)
     assert proc.returncode == 0, proc.stderr
     out = tmp_path / "closed_applied.json"
     assert json.loads(out.read_text()) == flipped
     assert stat.S_IMODE(out.stat().st_mode) == 0o600
+
+
+def test_step_8_block_refuses_when_placeholder_left_in(tmp_path):
+    block = _step_8_block().replace("<eof4>", "a1b2")
+    proc = _run_step_8(tmp_path, block)
+    assert proc.returncode != 0
+    assert "CLOSED_FLIPPED_JSON" in proc.stderr
+    assert not (tmp_path / "closed_applied.json").exists()
+
+
+def test_step_8_block_refuses_bad_json_and_non_lists(tmp_path):
+    for bad in ("{not json", '{"a": 1}', "[1, 2]"):
+        block = _step_8_block().replace("\n<CLOSED_FLIPPED_JSON>\n", "\n" + bad + "\n").replace("<eof4>", "a1b2")
+        proc = _run_step_8(tmp_path, block)
+        assert proc.returncode == 1, (bad, proc.stderr)
+        assert not (tmp_path / "closed_applied.json").exists()
+
+
+def _step_75_apply_block() -> str:
+    for part in STEP_75.split("```bash\n")[1:]:
+        block = part.split("\n```", 1)[0]
+        if 'retro_trace.py" apply' in block:
+            return block
+    raise AssertionError("apply bash block not found in Step 7.5")
+
+
+def _run_step_75_apply(tmp_path, swap: bool):
+    home = tmp_path / "home"
+    (home / ".claude" / "plugins").mkdir(parents=True)
+    (home / ".claude" / "plugins" / "known_marketplaces.json").write_text(json.dumps(
+        {"obsidian-brain": {"source": {"source": "directory", "path": str(REPO_ROOT)},
+                            "installLocation": str(REPO_ROOT)}}), encoding="utf-8")
+    vault = tmp_path / "vault"
+    (vault / "claude-insights").mkdir(parents=True)
+    note = vault / "claude-insights" / "retro.md"
+    note.write_text(
+        "---\ntype: claude-retro\nproject: demo\ntags:\n  - claude/retro\n---\n"
+        "\n## Process Improvements\n- [ ] One untraced item.\n", encoding="utf-8")
+    block = _step_75_apply_block().replace("<eof4>", "c0de")
+    vault_arg, note_arg = '"$VAULT_PATH"', "'<NOTE_PATH>'"
+    assert vault_arg in block and note_arg in block
+    if swap:  # scratch copy only; the SKILL file is untouched
+        block = block.replace(vault_arg, "@@V@@").replace(note_arg, vault_arg).replace("@@V@@", note_arg)
+    block = block.replace('"$VAULT_PATH"', f"'{vault}'").replace("'<NOTE_PATH>'", f"'{note}'")
+    env = {**os.environ, "HOME": str(home)}
+    proc = subprocess.run(["bash", "-c", block], env=env, capture_output=True, text=True,
+                          timeout=60, stdin=subprocess.DEVNULL, cwd=tmp_path)
+    return proc, note
+
+
+def test_step_75_documented_apply_command_runs_and_traces_the_note(tmp_path):
+    proc, note = _run_step_75_apply(tmp_path, swap=False)
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout.strip().splitlines()[-1])["untraced"] == 0
+    assert retro_trace.parse_items(note.read_text(encoding="utf-8"))[0]["trace"] is not None
+
+
+def test_step_75_apply_test_catches_swapped_vault_and_note_arguments(tmp_path):
+    proc, note = _run_step_75_apply(tmp_path, swap=True)
+    assert proc.returncode != 0
+    assert retro_trace.parse_items(note.read_text(encoding="utf-8"))[0]["trace"] is None
