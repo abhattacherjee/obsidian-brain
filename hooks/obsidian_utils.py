@@ -346,13 +346,38 @@ def mark_retro_classification_pending(session_id: str, retro_path: str) -> str:
                 pass
 
 
-def clear_retro_classification_pending(session_id: str) -> bool:
+def retro_gate_untraced(session_id: str) -> int | None:
+    """How many Process Improvements items in the gated retro have no trace (#470).
+
+    None when no gate is armed for *session_id*, or its note cannot be read
+    (missing, unreadable, no frontmatter). Never raises.
+    """
+    pending = get_retro_classification_pending(session_id)
+    if pending is None:
+        return None
+    try:
+        # Imported here: retro_trace imports note_writer, which imports this module.
+        import retro_trace
+        return retro_trace.untraced_count(pending["retro_path"])
+    except Exception:
+        return None
+
+
+def clear_retro_classification_pending(session_id: str, force: bool = False) -> bool:
     """Delete the retro-classification-pending sentinel if present.
+
+    Without *force*, refuses (returns False, sentinel kept) while the gated
+    retro still has a Process Improvements item with no trace (#470). A note
+    that cannot be read does not hold the gate. The Stop hook's fail-open
+    paths pass ``force=True``.
 
     Returns True if the sentinel existed (and was removed), False otherwise.
     Never raises — swallows all errors.
     """
     if not session_id:
+        return False
+
+    if not force and (retro_gate_untraced(session_id) or 0) > 0:
         return False
 
     sanitized = _RETRO_SID_SAFE.sub("_", session_id)
