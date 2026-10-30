@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import re
+import subprocess
 import sys
 
 from frontmatter import split_frontmatter, split_lines_lf_crlf
@@ -27,6 +28,7 @@ _MEMORY = re.compile(r"memory `(?P<stem>[A-Za-z0-9_.-]+)`" + _SUFFIX)
 _PATH = re.compile(r"`(?P<path>[^`\r\n]+)`" + _SUFFIX)
 _ITEM = re.compile(r"^- \[([ xX])\] ")
 _TRACKED = re.compile(r"^tracked_issues\s*:")
+GH_TIMEOUT_SECONDS = 10
 
 
 class TraceError(ValueError):
@@ -118,6 +120,89 @@ def read_tracked_issues(text: str) -> list[str]:
 def _read_note(path) -> str:
     with open(path, "r", encoding="utf-8", newline="") as fh:
         return fh.read()
+
+
+def _run_gh(args: list[str]) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["gh", *args], stdin=subprocess.DEVNULL, capture_output=True,
+        text=True, timeout=GH_TIMEOUT_SECONDS,
+    )
+
+
+def closed_candidates(vault_path: str, insights_folder: str,
+                      project: str | None = None, gh=None) -> dict:
+    """Suggest ticks for open items whose tracked issue is closed on GitHub."""
+    gh = _run_gh if gh is None else gh
+    candidates = []
+    errors = []
+    states = {}
+    vault = Path(vault_path).resolve()
+    folder = Path(vault_path, insights_folder).resolve()
+    if not folder.is_relative_to(vault):
+        return {"candidates": [], "errors": []}
+    for path in sorted(folder.glob("*-retro-*.md")):
+        try:
+            if not path.resolve().is_relative_to(vault):
+                continue
+            text = _read_note(path)
+        except (OSError, UnicodeError):
+            continue
+        _, fm, _, _, error = split_frontmatter(split_lines_lf_crlf(text))
+        if error:
+            continue
+        if project is not None:
+            note_project = None
+            for line in fm:
+                match = re.match(r"^project\s*:\s*(.*?)\s*$", line)
+                if match:
+                    note_project = _unquote_tag(match[1]).strip()
+                    break
+            if note_project != project:
+                continue
+        tracked = read_tracked_issues(text)
+        if not tracked:
+            continue
+        for item in parse_items(text):
+            trace = item["trace"]
+            if item["checked"] or trace is None or trace["kind"] != "issue":
+                continue
+            ref = trace["ref"]
+            if ref not in tracked:
+                continue
+            if ref not in states:
+                # Cache failures too, so each ref produces at most one error.
+                states[ref] = None
+                repo, number = ref.rsplit("#", 1)
+                try:
+                    result = gh(["issue", "view", number, "--repo", repo,
+                                 "--json", "state,stateReason"])
+                    if result.returncode:
+                        errors.append({"ref": ref, "error": f"gh exited with code {result.returncode}"})
+                        continue
+                    data = json.loads(result.stdout)
+                    if not isinstance(data, dict) or not isinstance(data.get("state"), str):
+                        errors.append({"ref": ref, "error": "gh JSON has no string state"})
+                        continue
+                    states[ref] = data
+                except subprocess.TimeoutExpired:
+                    errors.append({"ref": ref, "error": "gh timed out"})
+                except OSError as exc:
+                    errors.append({"ref": ref, "error": str(exc)[:200]})
+                except json.JSONDecodeError:
+                    errors.append({"ref": ref, "error": "gh returned invalid JSON"})
+            data = states[ref]
+            if data is None or data["state"].upper() != "CLOSED":
+                continue
+            reason = data.get("stateReason") or ""
+            preselect = isinstance(reason, str) and reason.upper() == "COMPLETED"
+            candidates.append({
+                "file": str(path.resolve()), "line": item["start"] + 1,
+                "text": item["text"].split("\n", 1)[0], "ref": ref,
+                "state_reason": reason, "preselect": preselect,
+                "label": "[closed on GH]" if preselect else "[closed on GH: not planned]",
+            })
+    return {"candidates": sorted(candidates, key=lambda c: (c["file"], c["line"])),
+            "errors": sorted(errors, key=lambda e: e["ref"])}
 
 
 def untraced_count(path) -> int | None:
@@ -263,13 +348,16 @@ def apply_traces(vault_path: str, note_path: str, traces: list[dict]) -> dict:
 
 
 def main(argv=None) -> int:
-    """CLI for apply, untraced and items; JSON input is read only for apply."""
+    """CLI for retro traces; JSON input is read only for apply."""
     args = list(sys.argv[1:] if argv is None else argv)
     if not args or not (
         (args[0] == "apply" and len(args) == 3)
         or (args[0] in ("untraced", "items") and len(args) == 2)
+        or (args[0] == "closed-candidates" and (
+            len(args) == 3 or (len(args) == 5 and args[3] == "--project")))
     ):
-        print("usage: retro_trace.py apply <vault> <note> | untraced <note> | items <note>", file=sys.stderr)
+        print("usage: retro_trace.py apply <vault> <note> | untraced <note> | items <note>"
+              " | closed-candidates <vault> <insights_folder> [--project P]", file=sys.stderr)
         return 2
     try:
         if args[0] == "apply":
@@ -277,6 +365,9 @@ def main(argv=None) -> int:
             if not isinstance(payload, dict) or "traces" not in payload:
                 raise TraceError('expected JSON object with "traces" list')
             print(json.dumps(apply_traces(args[1], args[2], payload["traces"])))
+        elif args[0] == "closed-candidates":
+            print(json.dumps(closed_candidates(
+                args[1], args[2], project=args[4] if len(args) == 5 else None)))
         elif args[0] == "untraced":
             count = untraced_count(args[1])
             print("unreadable" if count is None else count)
