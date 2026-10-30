@@ -82,11 +82,11 @@ Delegate: claude — SKILL.md prose for two skills, with the cancel and declined
   2. Classify and file as today.
   3. Build the traces JSON: one entry per item, with the issue ref from the `gh issue create` URL, the memory file stem, the edited path, or `skipped: <reason>`. A declined item gets `skipped: user declined`.
   4. Pipe it to `retro_trace.py apply`, and show its output.
-  5. Clear the gate. When the clear prints `blocked`, re-run `untraced` and trace what is left.
+  5. Clear the gate. When the clear prints `blocked`, re-run `items` (not `untraced`) and trace what is left.
 
   A cancel (R6) writes nothing.
 - Check-items:
-  - Step 2b runs `closed-candidates` for the scope and prints each error line.
+  - Step 2b calls `closed_candidates()` in-process (not the CLI) for the scope and prints each error line.
   - Step 7 lists the candidates under `=== Closed on GitHub ===`, `[x]` when `preselect`, else `[ ]`, with the label and ref.
   - Step 8 flips the confirmed ones with the same read, verify and Edit procedure. Dry-run shows them and flips nothing.
 - Contract tests: Step 7.5 names `retro_trace.py apply` and `skipped: user declined`; the clear step handles `blocked`; check-items names `closed-candidates` and `[closed on GH]`.

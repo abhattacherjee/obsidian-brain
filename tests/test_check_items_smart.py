@@ -1971,6 +1971,26 @@ def test_dashboard_omits_gap_section_when_no_gaps(tmp_path):
     assert "## Evidence Gaps" not in body
 
 
+def test_dashboard_lists_closed_on_github_section(tmp_path):
+    """#470: ticks made from Closed-on-GitHub candidates get their own section."""
+    from check_items_report import write_check_items_dashboard
+    vault = tmp_path / "vault"
+    (vault / "claude-dashboards").mkdir(parents=True)
+    kwargs = dict(
+        vault_path=str(vault), scope_name="x", date_str="2026-05-11",
+        window_days=14, raw_count=0, group_count=0, classifications=[],
+        applied=1, cascaded=0, merges=[], semantic_merge_mode="ok",
+        classifier_mode="ok", dry_run=False,
+    )
+    closed = [{"file": "/v/n.md", "line": 8, "text": "- [x] File it", "ref": "o/r#5"}]
+    body = open(write_check_items_dashboard(closed_on_github=closed, **kwargs)).read()
+    assert "## Closed on GitHub (1 applied)" in body
+    assert "o/r#5" in body and "/v/n.md:8" in body
+    assert "applied: 1" in body
+    body = open(write_check_items_dashboard(**kwargs)).read()
+    assert "Closed on GitHub" not in body
+
+
 def test_dashboard_gap_frontmatter_field(tmp_path):
     """The frontmatter carries evidence_gaps: N (Dataview-queryable), even
     when N is 0 for a caller who passed a real (gap-free) dict -- distinct

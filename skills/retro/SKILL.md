@@ -542,7 +542,7 @@ python3 "$HOOKS/retro_trace.py" apply "$VAULT_PATH" '<NOTE_PATH>' <<'OB_TRACES_E
 OB_TRACES_EOF_<eof4>
 ```
 
-   `apply` checks every entry before it writes anything. Exit 0 prints `{"written": true, "untraced": 0, "tracked_issues": [...]}`. The note now carries ` → <trace>` on each item, and every item except an issue is ticked `- [x]`. Exit 2 means an entry was refused (a missing or extra item, an item that already has a trace, a bad ref, or a newline, `→` or backtick in a value). The note is unchanged; fix the JSON from the stderr message and run it again. Exit 1 means the note was locked or changed on disk; run it again once.
+   `apply` checks every entry before it writes anything. Exit 0 prints `{"written": true, "untraced": 0, "tracked_issues": [...]}`. The note now carries ` → <trace>` on each item, and every item except an issue is ticked `- [x]`. Exit 2 means an entry was refused (a missing or extra item, an item that already has a trace, a bad ref, or a newline, `→` or backtick in a value). The note is unchanged; fix the JSON from the stderr message and run it again. Exit 1 means the note could not be read or written, or was locked or changed on disk. Run it once more. If it fails again, check the note path from Step 7's `OK:` line and stop: treat it as a cancel and write nothing else.
 
    **Cancel is not decline.** If the user cancels classification, or `apply` keeps failing, write nothing: the note stays exactly as Step 7 wrote it and the gate stays armed. The Stop hook then blocks once and clears itself on the re-entry. Never invent a trace to get past the gate.
 5. **Clear the gate.** Once every item is filed and traced (step 4) — or there were no Process Improvements items — clear the gate so the turn can end:

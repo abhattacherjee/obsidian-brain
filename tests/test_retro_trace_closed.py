@@ -187,3 +187,37 @@ def test_missing_or_escaping_folder_is_an_error_not_an_empty_result(tmp_path, fo
 def test_cli_bad_usage(args, capsys):
     assert rt.main(["closed-candidates", *args]) == 2
     assert "closed-candidates" in capsys.readouterr().err
+
+
+def test_non_issue_and_untraced_items_never_looked_up(tmp_path):
+    body = "\n".join([
+        "- [ ] No trace at all",
+        "- [ ] Memory → memory `stem` (new)",
+        "- [ ] Path → `docs/guide.md`",
+        "- [ ] Skipped → skipped: already covered",
+    ])
+    note(tmp_path, body=body)
+    gh, calls = fake_gh()
+    assert rt.closed_candidates(str(tmp_path), "insights", gh=gh) == {
+        "candidates": [], "errors": []}
+    assert calls == []
+
+
+def test_retro_symlink_to_outside_vault_is_skipped(tmp_path):
+    vault = tmp_path / "vault"
+    outside = note(tmp_path / "elsewhere", "outside-retro-demo.md")
+    link = vault / "insights" / "link-retro-demo.md"
+    link.parent.mkdir(parents=True)
+    link.symlink_to(outside)
+    gh, calls = fake_gh()
+    assert rt.closed_candidates(str(vault), "insights", gh=gh) == {
+        "candidates": [], "errors": []}
+    assert calls == []
+
+
+def test_oserror_message_is_capped_at_200_chars(tmp_path):
+    note(tmp_path)
+    gh, _ = fake_gh(exception=OSError("x" * 500))
+    result = rt.closed_candidates(str(tmp_path), "insights", gh=gh)
+    assert len(result["errors"]) == 1
+    assert len(result["errors"][0]["error"]) == 200

@@ -13,6 +13,7 @@ from note_writer import (
     _acquire_lock,
     _atomic_rewrite,
     _detect_line_ending,
+    _read_stdin_capped,
     _release_lock,
     _resolve_note_path,
     _split_flow_items,
@@ -93,8 +94,27 @@ def parse_items(text: str) -> list[dict]:
     return items
 
 
+def _continuation_end(fm: list[str], start: int) -> int:
+    """Return the index after a key's block-list lines (YAML allows column 0).
+
+    Continuation lines are blank, indented, or start with ``- ``. Trailing
+    blank lines are left out: they belong to whatever follows.
+    """
+    end = start
+    j = start
+    while j < len(fm):
+        line = fm[j]
+        if line.strip():
+            if not (line.startswith((" ", "\t")) or line.startswith("- ")
+                    or line.rstrip("\r\n") == "-"):
+                break
+            end = j + 1
+        j += 1
+    return end
+
+
 def read_tracked_issues(text: str) -> list[str]:
-    """Read a flow or indented block list from valid frontmatter."""
+    """Read a flow or block list (indented or column 0) from valid frontmatter."""
     _, fm, _, _, error = split_frontmatter(split_lines_lf_crlf(text))
     if error:
         return []
@@ -107,10 +127,8 @@ def read_tracked_issues(text: str) -> list[str]:
             return [_unquote_tag(raw) for raw in _split_flow_items(value[1:-1])]
         refs = []
         if not value:
-            for continuation in fm[i + 1:]:
-                if not continuation.startswith((" ", "\t")):
-                    break
-                item = re.match(r"^[ \t]+-[ \t]+(.*?)\s*$", continuation)
+            for continuation in fm[i + 1:_continuation_end(fm, i + 1)]:
+                item = re.match(r"^[ \t]*-[ \t]+(.*?)\s*$", continuation)
                 if item:
                     refs.append(_unquote_tag(item[1]))
         return refs
@@ -209,7 +227,7 @@ def closed_candidates(vault_path: str, insights_folder: str,
 
 
 def untraced_count(path) -> int | None:
-    """Count unchecked outcomes (including checked boxes); None if unreadable."""
+    """Number of Process Improvements items with no trace, ticked or not; None if the note cannot be read or has no valid frontmatter."""
     try:
         text = _read_note(path)
     except (OSError, UnicodeError):
@@ -275,9 +293,7 @@ def _merge_field(fm: list[str], refs: list[str], eol: str) -> list[str]:
         if not placed:
             out.append(new_line)
             placed = True
-        i += 1
-        while i < len(fm) and fm[i].startswith((" ", "\t")):
-            i += 1
+        i = _continuation_end(fm, i + 1)
     if not placed:
         out.append(new_line)
     return out
@@ -364,7 +380,11 @@ def main(argv=None) -> int:
         return 2
     try:
         if args[0] == "apply":
-            payload = json.loads(sys.stdin.read(1_000_000))
+            raw, oversized = _read_stdin_capped()
+            if oversized:
+                print("apply: input over the stdin cap; nothing written", file=sys.stderr)
+                return 2
+            payload = json.loads(raw)
             if not isinstance(payload, dict) or "traces" not in payload:
                 raise TraceError('expected JSON object with "traces" list')
             print(json.dumps(apply_traces(args[1], args[2], payload["traces"])))

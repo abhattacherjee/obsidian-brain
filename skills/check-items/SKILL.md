@@ -785,6 +785,24 @@ For each item the user kept selected (default-selected for HIGH+DONE, opt-in for
 
 The confirmed `=== Closed on GitHub ===` candidates go through the same four steps, using each candidate's `file` (absolute path) and `line`. They take no part in the cascade below, because they come from retro notes, not session-note groups. On a dry run they are shown and none are flipped.
 
+Record every closed candidate you flipped (each one's `file`, `line`, `text`, `ref`) as JSON for Step 9. Put the list in `CLOSED_FLIPPED` (use `[]` when none were flipped, or on a dry run) and run:
+
+```bash
+SCOPE_PATH="$scope_path" CLOSED_FLIPPED='[]' python3 << 'PYEOF'
+import json, os, tempfile
+
+scope_path = os.environ["SCOPE_PATH"]
+flipped = json.loads(os.environ.get("CLOSED_FLIPPED") or "[]")
+out = os.path.join(os.path.dirname(scope_path), "closed_applied.json")
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(out), prefix="closed_applied-", suffix=".tmp")
+with os.fdopen(fd, "w") as f:
+    json.dump(flipped, f, indent=2)
+os.chmod(tmp, 0o600)
+os.replace(tmp, out)
+print(out)
+PYEOF
+```
+
 After the user-confirmed batch, write the source-skips tracking list to a tempfile and run cascade via `cascade_group_members` (which consumes the Step-3/Step-4 grouping output directly, so textually-divergent siblings clustered by distinctive tokens are also flipped — not just text-search re-discovery matches):
 
 ```bash
@@ -1125,6 +1143,18 @@ classifications = buckets.get("review", [])
 # silently drift from what Step 8 actually flipped.
 applied = sum(1 for c in classifications if c.get("applied"))
 
+# #470: ticks Step 8 made from the "Closed on GitHub" candidates are not in
+# `classifications`, so Step 8 recorded them in closed_applied.json. A missing
+# file means none were flipped (dry run, "none", or no candidates).
+closed_applied_path = os.path.join(os.path.dirname(scope_path), "closed_applied.json")
+try:
+    closed_applied = json.load(open(closed_applied_path))
+    if not isinstance(closed_applied, list):
+        closed_applied = []
+except (OSError, json.JSONDecodeError):
+    closed_applied = []
+applied += len(closed_applied)
+
 try:
     evidence_gaps = json.load(open(gaps_path))
 except (OSError, json.JSONDecodeError) as exc:
@@ -1175,6 +1205,7 @@ report_path = write_check_items_dashboard(
     dry_run=dry_run,
     skipped=skipped,
     evidence_gaps=evidence_gaps,
+    closed_on_github=closed_applied,
 )
 print(report_path)
 PYEOF

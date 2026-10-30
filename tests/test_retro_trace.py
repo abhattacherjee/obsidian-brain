@@ -294,7 +294,7 @@ def test_cli(tmp_path, monkeypatch, capsys):
 
     class CappedInput(io.StringIO):
         def read(self, size=-1):
-            assert size == 1_000_000
+            assert size == 1_000_001
             return super().read(size)
 
     monkeypatch.setattr("sys.stdin", CappedInput(json.dumps({"traces": TRACES})))
@@ -332,3 +332,81 @@ def test_cli_bad_json_or_validation(tmp_path, monkeypatch, capsys, payload):
 def test_cli_bad_usage(args, capsys):
     assert rt.main(args) == 2
     assert capsys.readouterr().err
+
+
+BLOCK_FORMS = {
+    "column0": "tracked_issues:\n- a/b#1\n- c/d#2\n",
+    "blank-between": "tracked_issues:\n  - a/b#1\n\n  - c/d#2\n",
+    "column0-blank-between": "tracked_issues:\n- a/b#1\n\n- c/d#2\n",
+}
+
+
+@pytest.mark.parametrize("form", BLOCK_FORMS)
+def test_read_block_list_column0_and_blank_lines(form):
+    text = HEADER.replace("tags:\n", BLOCK_FORMS[form] + "tags:\n") + BODY
+    assert rt.read_tracked_issues(text) == ["a/b#1", "c/d#2"]
+
+
+@pytest.mark.parametrize("form", BLOCK_FORMS)
+@pytest.mark.parametrize("trailing_blank", [False, True])
+def test_apply_block_list_leaves_no_orphans(tmp_path, form, trailing_blank):
+    import vault_index
+
+    field = BLOCK_FORMS[form] + ("\n" if trailing_blank else "")
+    text = HEADER.replace("tags:\n", field + "tags:\n") + BODY
+    path = make_note(tmp_path, text)
+    result = rt.apply_traces(str(tmp_path), path.name, TRACES)
+    assert result["tracked_issues"] == ["a/b#1", "c/d#2", "o/r#5"]
+    written = path.read_text()
+    fm_text = written.split("---\n")[1]
+    assert 'tracked_issues: ["a/b#1", "c/d#2", "o/r#5"]\n' in fm_text
+    assert "- a/b#1" not in fm_text and "- c/d#2" not in fm_text
+    # Trailing blank lines belong to whatever follows and are kept.
+    assert ("\n\ntags:" in fm_text) == trailing_blank
+    assert split_frontmatter(split_lines_lf_crlf(written))[4] is None
+    assert rt.read_tracked_issues(written) == ["a/b#1", "c/d#2", "o/r#5"]
+    meta = vault_index._parse_note(str(path))
+    assert meta is not None
+    assert meta["tags"] == "claude/retro,claude/project/demo"
+
+
+def test_cli_apply_oversized_stdin_writes_nothing(tmp_path, monkeypatch, capsys):
+    path = make_note(tmp_path)
+    before = snapshot(path)
+    # Valid and applicable once truncated, so only the overflow check stops it.
+    prefix = json.dumps({"traces": TRACES})
+    payload = prefix + " " * (1_000_001 - len(prefix))
+    assert len(payload) == 1_000_001
+    monkeypatch.setattr("sys.stdin", io.StringIO(payload))
+    assert rt.main(["apply", str(tmp_path), path.name]) == 2
+    output = capsys.readouterr()
+    assert output.err and not output.out
+    assert snapshot(path) == before
+
+
+@pytest.mark.parametrize("line", ["- [ ] x → skipped:reason", "- [ ] x → skipped:"])
+def test_skipped_needs_the_space(line):
+    assert rt.parse_trace(line) is None
+
+
+@pytest.mark.parametrize(("kind", "field", "build"), [
+    ("skipped", "reason", lambda v: "skipped: " + v),
+    ("memory", "stem", lambda v: f"memory `{v}`"),
+    ("path", "path", lambda v: f"`{v}`"),
+])
+def test_value_length_boundary_300_vs_301(tmp_path, kind, field, build):
+    value = "a" * 300
+    if kind == "path":
+        value = "d/" + "a" * 298
+    entry = {"item": 1, "kind": kind, field: value}
+    assert rt._render(entry) == build(value)
+    entry[field] = value + "a"
+    with pytest.raises(rt.TraceError):
+        rt._render(entry)
+
+
+def test_apply_on_crlf_note_rereads_every_trace(tmp_path):
+    path = make_note(tmp_path, (HEADER + BODY).replace("\n", "\r\n"))
+    rt.apply_traces(str(tmp_path), path.name, TRACES)
+    items = rt.parse_items(path.read_bytes().decode())
+    assert [i["trace"]["kind"] for i in items] == ["issue", "memory", "path", "skipped"]
