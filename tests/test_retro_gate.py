@@ -528,3 +528,111 @@ class TestRetroGateHelpers:
         result = obsidian_utils._reap_stale_retro_sentinels()
         assert result == 0
         assert non_json.exists(), ".tmp file must not be reaped"
+
+
+# ---------------------------------------------------------------------------
+# #470: the gate stays armed while a Process Improvements item has no trace
+# ---------------------------------------------------------------------------
+
+_UNTRACED_RETRO = """---
+type: claude-retro
+project: demo
+tags:
+  - claude/retro
+---
+
+# Retro
+
+## Process Improvements
+- [ ] Trace me. → skipped: covered elsewhere
+- [ ] Not traced yet.
+"""
+
+
+def _untraced_note(tmp_path: Path) -> Path:
+    vault = tmp_path / "vault"
+    (vault / "claude-insights").mkdir(parents=True)
+    note = vault / "claude-insights" / "2026-10-30-retro-ab12.md"
+    note.write_text(_UNTRACED_RETRO, encoding="utf-8")
+    return note
+
+
+def _trace_rest(note: Path) -> None:
+    import retro_trace
+    retro_trace.apply_traces(str(note.parents[1]), str(note),
+                             [{"item": 2, "kind": "skipped", "reason": "user declined"}])
+
+
+class TestRetroGateTraces:
+    @pytest.fixture(autouse=True)
+    def _redirect_home(self, tmp_path, monkeypatch):
+        self._tmp_home = tmp_path / "home"
+        self._tmp_home.mkdir()
+        monkeypatch.setenv("HOME", str(self._tmp_home))
+
+    def test_clear_refuses_while_an_item_is_untraced(self, tmp_path):
+        note = _untraced_note(tmp_path)
+        obsidian_utils.mark_retro_classification_pending(SID, str(note))
+        assert obsidian_utils.clear_retro_classification_pending(SID) is False
+        assert obsidian_utils.get_retro_classification_pending(SID) is not None
+
+    def test_clear_succeeds_once_every_item_is_traced(self, tmp_path):
+        note = _untraced_note(tmp_path)
+        obsidian_utils.mark_retro_classification_pending(SID, str(note))
+        _trace_rest(note)
+        assert obsidian_utils.clear_retro_classification_pending(SID) is True
+        assert obsidian_utils.get_retro_classification_pending(SID) is None
+
+    def test_force_clears_with_untraced_items(self, tmp_path):
+        note = _untraced_note(tmp_path)
+        obsidian_utils.mark_retro_classification_pending(SID, str(note))
+        assert obsidian_utils.clear_retro_classification_pending(SID, force=True) is True
+        assert obsidian_utils.get_retro_classification_pending(SID) is None
+
+    def test_missing_note_clears(self, tmp_path):
+        obsidian_utils.mark_retro_classification_pending(SID, str(tmp_path / "gone.md"))
+        assert obsidian_utils.clear_retro_classification_pending(SID) is True
+
+    def test_untraced_count_helper(self, tmp_path):
+        note = _untraced_note(tmp_path)
+        obsidian_utils.mark_retro_classification_pending(SID, str(note))
+        assert obsidian_utils.retro_gate_untraced(SID) == 1
+        _trace_rest(note)
+        assert obsidian_utils.retro_gate_untraced(SID) == 0
+        assert obsidian_utils.retro_gate_untraced("no-such-session") is None
+
+    def test_hook_blocks_naming_the_untraced_count(self, tmp_path):
+        note = _untraced_note(tmp_path)
+        _write_sentinel(self._tmp_home, SID, retro_path=str(note))
+        result = _run_hook({"session_id": SID, "stop_hook_active": False}, self._tmp_home)
+        data = json.loads(result.stdout.strip())
+        assert data["decision"] == "block"
+        assert "Step 7.5" in data["reason"]
+        assert "1 Process Improvements item(s) still have no trace" in data["reason"]
+
+    def test_hook_keeps_blocking_after_items_are_traced_until_cleared(self, tmp_path):
+        # The hook never auto-clears: Key Learnings are classified too and
+        # carry no traces, so the skill clears the gate itself.
+        note = _untraced_note(tmp_path)
+        _trace_rest(note)
+        sentinel = _write_sentinel(self._tmp_home, SID, retro_path=str(note))
+        result = _run_hook({"session_id": SID, "stop_hook_active": False}, self._tmp_home)
+        data = json.loads(result.stdout.strip())
+        assert data["decision"] == "block"
+        assert "still have no trace" not in data["reason"]
+        assert sentinel.exists()
+
+    def test_hook_fails_open_on_stop_hook_active_with_untraced_items(self, tmp_path):
+        note = _untraced_note(tmp_path)
+        sentinel = _write_sentinel(self._tmp_home, SID, retro_path=str(note))
+        result = _run_hook({"session_id": SID, "stop_hook_active": True}, self._tmp_home)
+        assert result.stdout.strip() == ""
+        assert not sentinel.exists()
+
+    def test_hook_fails_open_on_ttl_with_untraced_items(self, tmp_path):
+        note = _untraced_note(tmp_path)
+        sentinel = _write_sentinel(self._tmp_home, SID, retro_path=str(note),
+                                   created_at=time.time() - 3 * 3600)
+        result = _run_hook({"session_id": SID, "stop_hook_active": False}, self._tmp_home)
+        assert result.stdout.strip() == ""
+        assert not sentinel.exists()

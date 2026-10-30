@@ -241,9 +241,71 @@ print(out_path)
 echo "raw_path=$raw_path"
 ```
 
+## Step 2b — Items whose tracked issue is closed (#65, #470)
+
+`/retro` writes ` → [owner/repo#N](url)` on each Process Improvements item it filed as a GitHub issue, and lists the ref in the note's `tracked_issues` frontmatter. Such an item stays `- [ ]` until the issue closes. This step finds retro notes in scope whose tracked issue is now closed, and offers them for a tick in Step 7. The step makes one `gh issue view` call per distinct ref, and only for refs listed in `tracked_issues`. A `gh` failure for a ref (an error, a timeout, `gh` missing, bad output) offers nothing for that ref, and the failure is printed. A failure never produces a tick.
+
+```bash
+closed_path=$(SCOPE_PATH="$scope_path" python3 << 'PYEOF'
+import sys, os, glob, json, subprocess
+import glob, json, os, re, sys
+def _ob_hooks():
+    try:
+        for _m in json.load(open(os.path.expanduser("~/.claude/plugins/known_marketplaces.json"))).values():
+            _s = _m.get("source") if isinstance(_m, dict) else None
+            if not (isinstance(_s, dict) and _s.get("source") == "directory"):
+                continue
+            _i = _m.get("installLocation") if isinstance(_m, dict) else None
+            if not (isinstance(_i, str) and os.path.isabs(_i)):
+                continue
+            _h = os.path.join(_i, "hooks")
+            if os.path.isfile(os.path.join(_h, "obsidian_utils.py")):
+                return _h
+    except Exception:
+        pass
+    _c = [_d for _d in glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")) if re.fullmatch("[0-9]+([.][0-9]+)*", _d.split("/")[-2])]
+    return max(_c, key=lambda _p: ([int(_n) for _n in _p.split("/")[-2].split(".")], _p), default="hooks")
+sys.path.insert(0, _ob_hooks())
+from retro_trace import closed_candidates
+
+scope_path = os.environ["SCOPE_PATH"]
+scope = json.load(open(scope_path))
+config = json.load(open(os.path.expanduser("~/.claude/obsidian-brain-config.json")))
+vault_path = config["vault_path"]
+insights_folder = config.get("insights_folder", "claude-insights")
+if scope["mode"] == "vault":
+    project = None
+elif scope["mode"] == "project" and scope["project"]:
+    project = scope["project"]
+else:
+    res = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True)
+    project = os.path.basename(res.stdout.strip()) if res.returncode == 0 else None
+    if project is None:
+        print("ERROR: current-project mode needs a git repo; closed-issue lookup skipped", file=sys.stderr)
+result = {"candidates": [], "errors": []}
+if project or scope["mode"] == "vault":
+    try:
+        result = closed_candidates(vault_path, insights_folder, project=project)
+    except ValueError as exc:
+        print(f"!! closed-issue lookup skipped: {exc}", file=sys.stderr)
+for err in result["errors"]:
+    print(f"!! closed-issue lookup failed for {err['ref']}: {err['error']} (no tick offered)", file=sys.stderr)
+out = os.path.join(os.path.dirname(scope_path), "closed_candidates.json")
+with open(out, "w") as f:
+    json.dump(result, f, indent=2)
+os.chmod(out, 0o600)
+print(out)
+PYEOF
+)
+
+echo "closed_path=$closed_path"
+```
+
+Print every `!! closed-issue lookup failed` line to the user as it is. These candidates bypass Steps 3–6: the closed issue is the evidence, so no classifier runs on them.
+
 ## Step 3 — Coarse-group + cache partition (Stage 2a + cache load)
 
-Convention: each step is a `bash` block. Steps 1-2 use `python3 -c "..."` with positional argv tokens (inputs passed as `sys.argv` args, e.g. `python3 -c "..." "$scope_path"`). Steps 3-10 use `python3 << 'PYEOF' ... PYEOF` heredoc with inputs passed via environment variables (e.g. `SCOPE_PATH="$scope_path" python3 << 'PYEOF' ... PYEOF`); the Python reads them via `os.environ["VAR_NAME"]` — never via `sys.argv`. Both patterns produce a runnable shell block — never paste raw `python3` blocks that rely on `sys.argv` without an argv-passing wrapper, and never use env-var heredoc style for Steps 1-2 which expect positional args.
+Convention: each step is a `bash` block. Steps 1-2 use `python3 -c "..."` with positional argv tokens (inputs passed as `sys.argv` args, e.g. `python3 -c "..." "$scope_path"`). Steps 2b-10 use `python3 << 'PYEOF' ... PYEOF` heredoc with inputs passed via environment variables (e.g. `SCOPE_PATH="$scope_path" python3 << 'PYEOF' ... PYEOF`); the Python reads them via `os.environ["VAR_NAME"]` — never via `sys.argv`. Both patterns produce a runnable shell block — never paste raw `python3` blocks that rely on `sys.argv` without an argv-passing wrapper, and never use env-var heredoc style for Steps 1-2 which expect positional args.
 
 ```bash
 part_path=$(SCOPE_PATH="$scope_path" RAW_PATH="$raw_path" python3 << 'PYEOF'
@@ -708,6 +770,8 @@ PYEOF
 echo "buckets_path=$buckets_path"
 ```
 
+Then show the Step 2b candidates in their own group. Read `closed_path`. For each candidate print `  [x]` when `preselect` is true, else `  [ ]`, followed by `<label> <text>` and, on the next line, `      evidence: <ref> closed (<state_reason>)`, under the heading `=== Closed on GitHub ===`. `[closed on GH]` (closed as completed) is preselected. `[closed on GH: not planned]` is offered but not preselected, because the work was dropped, not done. When there are no candidates, print nothing for this group.
+
 If `scope.dry_run` is true OR the user types `none` at the confirm prompt: skip Step 8 (Edit + cascade) and go straight to Step 9 (dashboard). The dashboard is ALWAYS written.
 
 ## Step 8 — Apply confirmed checkoffs (Stage 6) + cascade (Stage 7)
@@ -718,6 +782,42 @@ For each item the user kept selected (default-selected for HIGH+DONE, opt-in for
 2. Verify the line matches the preview (memory `feedback_open_item_checkoff_verify_before_edit`).
 3. If mismatch: surface the diff, ABORT this item (do not flip), continue with the next.
 4. If match: use Edit tool to flip `- [ ]` → `- [x]` on that line only. After a successful flip, append `[full_file_path, line_number]` to a `source_skips` tracking list.
+
+The confirmed `=== Closed on GitHub ===` candidates go through the same four steps, using each candidate's `file` (absolute path) and `line`. They take no part in the cascade below, because they come from retro notes, not session-note groups. On a dry run they are shown and none are flipped.
+
+Record every closed candidate you flipped (each one's `file`, `line`, `text`, `ref`) as JSON for Step 9. Replace `<CLOSED_FLIPPED_JSON>` below with that JSON list, pasted literally: `[]` when none were flipped, or on a dry run. Shell variables do not carry over between Bash calls, so the list must sit inside this block. Substitute 4 random hex characters for `<eof4>` in both the opener and the terminator. The block refuses to write (error on stderr, exit 1) if the placeholder is still there, the text is not valid JSON, or it is not a list of objects.
+
+```bash
+CLOSED_FLIPPED=$(cat <<'OB_FLIPPED_EOF_<eof4>'
+<CLOSED_FLIPPED_JSON>
+OB_FLIPPED_EOF_<eof4>
+)
+SCOPE_PATH="$scope_path" CLOSED_FLIPPED="$CLOSED_FLIPPED" python3 << 'PYEOF'
+import json, os, sys, tempfile
+
+scope_path = os.environ["SCOPE_PATH"]
+raw = os.environ.get("CLOSED_FLIPPED", "")
+placeholder = "<CLOSED_" + "FLIPPED_JSON>"
+if placeholder in raw:
+    print(f"ERROR: replace {placeholder} with the flipped list ([] when none)", file=sys.stderr)
+    sys.exit(1)
+try:
+    flipped = json.loads(raw)
+except ValueError as exc:
+    print(f"ERROR: CLOSED_FLIPPED is not valid JSON: {exc}", file=sys.stderr)
+    sys.exit(1)
+if not isinstance(flipped, list) or not all(isinstance(i, dict) for i in flipped):
+    print("ERROR: CLOSED_FLIPPED must be a JSON list of objects", file=sys.stderr)
+    sys.exit(1)
+out = os.path.join(os.path.dirname(scope_path), "closed_applied.json")
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(out), prefix="closed_applied-", suffix=".tmp")
+with os.fdopen(fd, "w") as f:
+    json.dump(flipped, f, indent=2)
+os.chmod(tmp, 0o600)
+os.replace(tmp, out)
+print(out)
+PYEOF
+```
 
 After the user-confirmed batch, write the source-skips tracking list to a tempfile and run cascade via `cascade_group_members` (which consumes the Step-3/Step-4 grouping output directly, so textually-divergent siblings clustered by distinctive tokens are also flipped — not just text-search re-discovery matches):
 
@@ -1059,6 +1159,18 @@ classifications = buckets.get("review", [])
 # silently drift from what Step 8 actually flipped.
 applied = sum(1 for c in classifications if c.get("applied"))
 
+# #470: ticks Step 8 made from the "Closed on GitHub" candidates are not in
+# `classifications`, so Step 8 recorded them in closed_applied.json. A missing
+# file means none were flipped (dry run, "none", or no candidates).
+closed_applied_path = os.path.join(os.path.dirname(scope_path), "closed_applied.json")
+try:
+    closed_applied = json.load(open(closed_applied_path))
+    if not isinstance(closed_applied, list):
+        closed_applied = []
+except (OSError, json.JSONDecodeError):
+    closed_applied = []
+applied += len(closed_applied)
+
 try:
     evidence_gaps = json.load(open(gaps_path))
 except (OSError, json.JSONDecodeError) as exc:
@@ -1109,6 +1221,7 @@ report_path = write_check_items_dashboard(
     dry_run=dry_run,
     skipped=skipped,
     evidence_gaps=evidence_gaps,
+    closed_on_github=closed_applied,
 )
 print(report_path)
 PYEOF

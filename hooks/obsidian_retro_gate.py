@@ -41,6 +41,7 @@ try:
         RETRO_GATE_TTL_SECONDS,
         clear_retro_classification_pending,
         get_retro_classification_pending,
+        retro_gate_untraced,
     )
 except Exception as _exc:  # noqa: BLE001
     import hook_bootstrap as _boot  # noqa: E402
@@ -92,17 +93,24 @@ def main() -> None:
         if stop_hook_active:
             # Claude is already in a Stop-hook re-entry — clear and let it stop
             # to avoid an infinite block loop.
-            clear_retro_classification_pending(session_id)
+            clear_retro_classification_pending(session_id, force=True)
             return
 
         created_at = pending.get("created_at", 0)
         if time.time() - created_at > RETRO_GATE_TTL_SECONDS:
             # Sentinel is stale — don't hold the session hostage indefinitely.
-            clear_retro_classification_pending(session_id)
+            clear_retro_classification_pending(session_id, force=True)
             return
 
         # Block: sentinel is fresh and we're not already in a re-entry.
-        print(json.dumps({"decision": "block", "reason": _BLOCK_REASON}))
+        # Name the untraced count when the note can be read (#470); the hook
+        # never auto-clears, because Key Learnings carry no traces.
+        reason = _BLOCK_REASON
+        untraced = retro_gate_untraced(session_id)
+        if untraced:
+            reason += (f" {untraced} Process Improvements item(s) still have no trace: "
+                       "write each one back with `retro_trace.py apply` before clearing.")
+        print(json.dumps({"decision": "block", "reason": reason}))
 
     except Exception:
         # Fail-open: any unexpected error must not wedge Claude.

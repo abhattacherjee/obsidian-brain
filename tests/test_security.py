@@ -699,6 +699,9 @@ class TestStdinCap:
             "hooks/hook_bootstrap.py",
             # #395: the wiki CLI reads its JSON payload from stdin.
             "hooks/wiki.py",
+            # #470: `retro_trace.py apply` reads its traces JSON through
+            # note_writer._read_stdin_capped (overflow-detecting), so it has no
+            # direct stdin read of its own; note_writer.py above covers it.
         ):
             assert expected in paths, f"stdin read in {expected} no longer discovered"
         # Exact, not >=. What >= permits is SUBSTITUTION: an existing read

@@ -472,13 +472,80 @@ print(mark_retro_classification_pending(sys.argv[1], sys.argv[2]))
 
 The retro is **not done** when the file is written. The literal next action after arming the classification gate is to act on what the retro surfaced — **do not print the "saved" confirmation until this step is complete.** If Step 7's gate armed successfully (the printed output did not start with `Failed:`), it is a Stop-hook gate that blocks the turn from ending until you clear it here, so this is enforced, not merely advised. If Step 7's gate failed to arm, there is nothing blocking the turn — treat this step as **unenforced but still mandatory**, per Step 7's own instruction.
 
-1. **Extract** every item from the just-written **Process Improvements** and **Key Learnings** sections.
+1. **Extract** every item from the just-written **Process Improvements** and **Key Learnings** sections. Number the Process Improvements items with the parser the gate uses, so the numbers you trace in step 4 match it:
+
+```bash
+cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+HOOKS=$(python3 -c "
+import glob, json, os, re
+def _ob_hooks():
+    try:
+        for _m in json.load(open(os.path.expanduser('~/.claude/plugins/known_marketplaces.json'))).values():
+            _s = _m.get('source') if isinstance(_m, dict) else None
+            if not (isinstance(_s, dict) and _s.get('source') == 'directory'):
+                continue
+            _i = _m.get('installLocation') if isinstance(_m, dict) else None
+            if not (isinstance(_i, str) and os.path.isabs(_i)):
+                continue
+            _h = os.path.join(_i, 'hooks')
+            if os.path.isfile(os.path.join(_h, 'obsidian_utils.py')):
+                return _h
+    except Exception:
+        pass
+    _c = [_d for _d in glob.glob(os.path.expanduser('~/.claude/plugins/cache/*/obsidian-brain/*/hooks')) if re.fullmatch('[0-9]+([.][0-9]+)*', _d.split('/')[-2])]
+    return max(_c, key=lambda _p: ([int(_n) for _n in _p.split('/')[-2].split('.')], _p), default='hooks')
+print(_ob_hooks())
+")
+test -f "$HOOKS/retro_trace.py" || { echo "ERROR: retro_trace.py not found under $HOOKS - verify the obsidian-brain install resolved there is complete (git pull for a directory-source checkout, or /plugin marketplace update for a cache install), then retry." >&2; exit 1; }
+python3 "$HOOKS/retro_trace.py" items '<NOTE_PATH>'
+```
+
+   It prints one JSON object per item: `item` (the number), `line`, `checked`, `text` and `trace` (null until traced). Only `- [ ]`/`- [x]` lines in `## Process Improvements` are items; Key Learnings are classified below but carry no trace.
 2. **Classify** each item into exactly one bucket:
    - **Concrete deliverable** — a code change, doc edit, new flag, or SKILL.md section with a definable "done" state. If this project tracks work in an issue tracker, file it there (with `gh issue create`, sub-classified by target repo); otherwise record it wherever the project tracks TODOs.
    - **Behavioral discipline** — a do/don't-next-time rule ("verify before claiming X", "grep before citing Y"). Trackers don't enforce behavior; durable notes do. If a persistent memory index is available (e.g. Claude Code's `MEMORY.md`), add or extend an entry there — prefer an `## Update (date)` section on an existing entry over a duplicate; otherwise capture it as a vault insight with `/compress`.
    - **Skip / already covered** — informational learnings that aren't actionable, plus anything already tracked elsewhere (cite the artifact). Most **Key Learnings** belong here unless genuinely actionable; do not manufacture issues from informational insights.
-3. **Confirm via an in-turn tool, then file.** Surface the proposed classification (each item → bucket → target) and get the user's go-ahead **using `AskUserQuestion`** — do *not* end your turn to ask, because the Step 7 gate will block a turn-end before classification is done. In a non-interactive / auto-run context, file the clear-cut items directly and surface only judgment calls (which repo, which priority) for a one-line confirm; never skip tracking. After filing **2 or more** issues, run `/github-board:triage-issues` (when available) for labels/priority.
-4. **Clear the gate.** Once every item is filed — or the user declined, or there were no actionable items — clear the gate so the turn can end:
+3. **Confirm via an in-turn tool, then file.** Surface the proposed classification (each item → bucket → target) and get the user's go-ahead **using `AskUserQuestion`** — do *not* end your turn to ask, because the Step 7 gate will block a turn-end before classification is done. In a non-interactive / auto-run context, file the clear-cut items directly and surface only judgment calls (which repo, which priority) for a one-line confirm; never skip tracking. After filing **2 or more** issues, run `/github-board:triage-issues` (when available) for labels/priority. An item the user **declines** is still an outcome: it gets the trace `skipped: user declined` in step 4.
+4. **Write each item's tracking back into the note (#470).** Build one JSON entry per Process Improvements item whose `trace` is null:
+   - filed as a GitHub issue: `{"item": N, "kind": "issue", "ref": "owner/repo#123"}` (owner, repo and number from the URL `gh issue create` printed). The item stays `- [ ]` and the ref goes into the note's `tracked_issues` frontmatter, so `/check-items` can offer the tick once the issue closes;
+   - a memory entry: `{"item": N, "kind": "memory", "stem": "<memory file name without .md>", "note": "new"}` (or `"note": "Update YYYY-MM-DD"` for an `## Update` section);
+   - a direct doc or skill edit: `{"item": N, "kind": "path", "path": "<path you edited>"}`;
+   - skipped, already covered or declined: `{"item": N, "kind": "skipped", "reason": "<why, citing the artifact>"}`.
+
+   Then pipe `{"traces": [...]}` to `apply`. Substitute 4 random hex characters for `<eof4>` in both the opener and the terminator, as in Step 7:
+
+```bash
+cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+HOOKS=$(python3 -c "
+import glob, json, os, re
+def _ob_hooks():
+    try:
+        for _m in json.load(open(os.path.expanduser('~/.claude/plugins/known_marketplaces.json'))).values():
+            _s = _m.get('source') if isinstance(_m, dict) else None
+            if not (isinstance(_s, dict) and _s.get('source') == 'directory'):
+                continue
+            _i = _m.get('installLocation') if isinstance(_m, dict) else None
+            if not (isinstance(_i, str) and os.path.isabs(_i)):
+                continue
+            _h = os.path.join(_i, 'hooks')
+            if os.path.isfile(os.path.join(_h, 'obsidian_utils.py')):
+                return _h
+    except Exception:
+        pass
+    _c = [_d for _d in glob.glob(os.path.expanduser('~/.claude/plugins/cache/*/obsidian-brain/*/hooks')) if re.fullmatch('[0-9]+([.][0-9]+)*', _d.split('/')[-2])]
+    return max(_c, key=lambda _p: ([int(_n) for _n in _p.split('/')[-2].split('.')], _p), default='hooks')
+print(_ob_hooks())
+")
+test -f "$HOOKS/retro_trace.py" || { echo "ERROR: retro_trace.py not found under $HOOKS - verify the obsidian-brain install resolved there is complete (git pull for a directory-source checkout, or /plugin marketplace update for a cache install), then retry." >&2; exit 1; }
+python3 "$HOOKS/retro_trace.py" apply "$VAULT_PATH" '<NOTE_PATH>' <<'OB_TRACES_EOF_<eof4>'
+{"traces": [{"item": 1, "kind": "skipped", "reason": "<why>"}]}
+OB_TRACES_EOF_<eof4>
+```
+
+   `apply` checks every entry before it writes anything. Exit 0 prints `{"written": true, "untraced": 0, "tracked_issues": [...]}`. The note now carries ` → <trace>` on each item, and every item except an issue is ticked `- [x]`. Exit 2 means an entry was refused (a missing or extra item, an item that already has a trace, a bad ref, or a newline, `→` or backtick in a value). The note is unchanged; fix the JSON from the stderr message and run it again. Exit 1 means the note could not be read or written, or was locked or changed on disk. Run it once more. If it fails again, check the note path from Step 7's `OK:` line and stop: treat it as a cancel and write nothing else.
+
+   **Cancel is not decline.** If the user cancels classification, or `apply` keeps failing, write nothing: the note stays exactly as Step 7 wrote it and the gate stays armed. The Stop hook then blocks once and clears itself on the re-entry. Never invent a trace to get past the gate.
+5. **Clear the gate.** Once every item is filed and traced (step 4) — or there were no Process Improvements items — clear the gate so the turn can end:
 
    ```bash
    cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
@@ -502,11 +569,18 @@ The retro is **not done** when the file is written. The literal next action afte
        _c = [_d for _d in glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")) if re.fullmatch("[0-9]+([.][0-9]+)*", _d.split("/")[-2])]
        return max(_c, key=lambda _p: ([int(_n) for _n in _p.split("/")[-2].split(".")], _p), default="hooks")
    sys.path.insert(0, _ob_hooks())
-   from obsidian_utils import clear_retro_classification_pending
-   print("cleared" if clear_retro_classification_pending(sys.argv[1]) else "no-gate")
+   from obsidian_utils import clear_retro_classification_pending, retro_gate_untraced
+   untraced = retro_gate_untraced(sys.argv[1])
+   if clear_retro_classification_pending(sys.argv[1]):
+       print("cleared")
+   elif untraced:
+       print(f"blocked: {untraced} Process Improvements item(s) have no trace")
+   else:
+       print("no-gate")
    ' "<current-session-id>"
    ```
-5. Only after the gate is cleared **and** the filed actions are reflected in the user-facing summary do you proceed to Step 8.
+   `blocked: N ...` means step 4 has not traced every item. Run `items` again, trace the rest, and clear again. The gate does not clear while any item has no trace.
+6. Only after the gate is cleared **and** the filed actions are reflected in the user-facing summary do you proceed to Step 8.
 
 **Hard-fail signal:** if you are about to print "Retrospective saved!" with the gate still armed, you have skipped this step. The Stop hook will catch it — but classify proactively rather than relying on the block.
 
@@ -527,4 +601,5 @@ Otherwise print:
 > - Exists: `<the ls -l output line>`
 > - Tags: `claude/retro`, `claude/project/<name>`
 > - Filed from Process Improvements / Key Learnings: `<N>` GH issue(s), `<M>` memory entr(ies) (or "none — no actionable items")
+> - Traced: `<T>` of `<T>` Process Improvements item(s) (from `apply`'s `untraced: 0`)
 > - Open in Obsidian to review and track process improvements over time.
