@@ -282,7 +282,12 @@ else:
     project = os.path.basename(res.stdout.strip()) if res.returncode == 0 else None
     if project is None:
         print("ERROR: current-project mode needs a git repo; closed-issue lookup skipped", file=sys.stderr)
-result = closed_candidates(vault_path, insights_folder, project=project) if (project or scope["mode"] == "vault") else {"candidates": [], "errors": []}
+result = {"candidates": [], "errors": []}
+if project or scope["mode"] == "vault":
+    try:
+        result = closed_candidates(vault_path, insights_folder, project=project)
+    except ValueError as exc:
+        print(f"!! closed-issue lookup skipped: {exc}", file=sys.stderr)
 for err in result["errors"]:
     print(f"!! closed-issue lookup failed for {err['ref']}: {err['error']} (no tick offered)", file=sys.stderr)
 out = os.path.join(os.path.dirname(scope_path), "closed_candidates.json")

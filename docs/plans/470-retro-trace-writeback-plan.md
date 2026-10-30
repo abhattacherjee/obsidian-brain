@@ -29,7 +29,7 @@ The backfill of old items and the cross-session rollup are #471. Cites are at `d
   - `apply <vault> <note>` reads the JSON on stdin (capped at 1,000,000 bytes) and prints `{"written": bool, "untraced": int, "tracked_issues": [...]}`. Exit 0 on success, 2 on a validation error (the note untouched, the error on stderr), 1 on a lock or write error.
   - `untraced <note>` prints the count, or `unreadable` with exit 1.
   - `items <note>` prints the parsed items as JSON (item, line, checked, text, trace), so the skill can number them.
-  - `closed-candidates <vault> <insights_folder> [--project P]` prints `{"candidates": [...], "errors": [...]}` and always exits 0. The skill reports any errors.
+  - `closed-candidates <vault> <insights_folder> [--project P]` prints `{"candidates": [...], "errors": [...]}`. It exits 0 when every lookup worked, 1 when any ref could not be checked (the JSON is still printed), and 1 when the insights folder is missing or outside the vault. The skill reports any errors. (Changed in Phase 6: the forced-failure run showed exit 0 with `gh` missing.)
 
 ## Tasks
 
@@ -107,7 +107,7 @@ Delegate: claude — runs the architecture-page scripts under `~/.claude/skills/
    - `untraced_count` returning None for an unreadable note clears the gate. This is deliberate, matches the gate's fail-open contract, and is tested in Task 3.
    - `closed_candidates` on any `gh` failure offers no tick: Task 2 failure tests.
    - A note the parser cannot split (no frontmatter) gives `TraceError`, not a silent no-op: Task 1.
-2. **Exit codes.** `apply` returns 2 on a validation error and 1 on a write error, never 0. `untraced` exits 1 on an unreadable note. `closed-candidates` exits 0 but always prints `errors`, and the skill must print them. Tests in Tasks 1 and 2.
+2. **Exit codes.** `apply` returns 2 on a validation error and 1 on a write error, never 0. `untraced` exits 1 on an unreadable note. `closed-candidates` exits 1 when any lookup failed or the folder is missing, and the skill prints every error. Tests in Tasks 1 and 2.
 3. **Date boundaries.** None. Traces carry free-text notes only, and no date arithmetic is added. The gate TTL is unchanged.
 4. **Doc counts.** The CHANGELOG and PR body state counts (items, tests). Count them from the diff and the live survey command in this plan, not from memory.
 5. **Broken Markdown.** The CHANGELOG entry goes inside `[Unreleased]`'s existing block. The new SKILL.md steps keep their fences closed. A contract test reads both SKILL files.

@@ -138,8 +138,11 @@ def closed_candidates(vault_path: str, insights_folder: str,
     states = {}
     vault = Path(vault_path).resolve()
     folder = Path(vault_path, insights_folder).resolve()
+    # A folder outside the vault or missing is a setup error, not "no candidates".
     if not folder.is_relative_to(vault):
-        return {"candidates": [], "errors": []}
+        raise ValueError(f"insights folder escapes the vault: {insights_folder!r}")
+    if not folder.is_dir():
+        raise ValueError(f"insights folder not found: {folder}")
     for path in sorted(folder.glob("*-retro-*.md")):
         try:
             if not path.resolve().is_relative_to(vault):
@@ -366,8 +369,15 @@ def main(argv=None) -> int:
                 raise TraceError('expected JSON object with "traces" list')
             print(json.dumps(apply_traces(args[1], args[2], payload["traces"])))
         elif args[0] == "closed-candidates":
-            print(json.dumps(closed_candidates(
-                args[1], args[2], project=args[4] if len(args) == 5 else None)))
+            try:
+                result = closed_candidates(
+                    args[1], args[2], project=args[4] if len(args) == 5 else None)
+            except ValueError as exc:
+                print(f"closed-candidates: {exc}", file=sys.stderr)
+                return 1
+            print(json.dumps(result))
+            # Printed either way; a ref that could not be checked is not a clean run.
+            return 1 if result["errors"] else 0
         elif args[0] == "untraced":
             count = untraced_count(args[1])
             print("unreadable" if count is None else count)

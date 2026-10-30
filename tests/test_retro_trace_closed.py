@@ -162,9 +162,23 @@ def test_cli(tmp_path, monkeypatch, capsys):
     assert len(calls) == 1
     assert rt.main(["closed-candidates", str(tmp_path), "insights"]) == 0
     assert len(json.loads(capsys.readouterr().out)["candidates"]) == 2
+    # A lookup that failed is not a clean run: the JSON is still printed,
+    # but the exit code says some refs could not be checked.
     monkeypatch.setattr(rt, "_run_gh", fake_gh(returncode=1)[0])
-    assert rt.main(["closed-candidates", str(tmp_path), "insights"]) == 0
+    assert rt.main(["closed-candidates", str(tmp_path), "insights"]) == 1
     assert len(json.loads(capsys.readouterr().out)["errors"]) == 1
+
+
+@pytest.mark.parametrize("folder", ["no-such-folder", "../outside"])
+def test_missing_or_escaping_folder_is_an_error_not_an_empty_result(tmp_path, folder, capsys):
+    (tmp_path / "vault").mkdir()
+    (tmp_path / "outside").mkdir()
+    gh, calls = fake_gh()
+    with pytest.raises(ValueError):
+        rt.closed_candidates(str(tmp_path / "vault"), folder, gh=gh)
+    assert rt.main(["closed-candidates", str(tmp_path / "vault"), folder]) == 1
+    assert "closed-candidates:" in capsys.readouterr().err
+    assert calls == []
 
 
 @pytest.mark.parametrize("args", [[], ["vault"], ["vault", "insights", "--project"],
