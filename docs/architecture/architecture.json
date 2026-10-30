@@ -3,7 +3,7 @@
   "displayName": "Obsidian Brain",
   "version": "3.9.1",
   "tagline": "A Claude Code plugin that turns an Obsidian vault into a persistent brain across sessions — auto-logging, curated knowledge capture, snapshot-on-compact, and fast cross-project recall, all via direct filesystem writes.",
-  "lastUpdated": "2026-10-29",
+  "lastUpdated": "2026-10-30",
   "repository": "https://github.com/abhattacherjee/obsidian-brain",
   "defaultBranch": "main",
   "techStack": {
@@ -196,7 +196,7 @@
           "files": [
             "hooks/obsidian_retro_gate.py"
           ],
-          "purpose": "ENFORCE. Uses the payload's transcript path before inherited Codex markers and skips Codex rollouts with SKIPPED_CODEX_HOST stderr telemetry until host adapters ship. For Claude, blocks turn-end until /retro Step 7.5 classification clears the session-scoped retro-gate sentinel (returns {decision: block} with the classify-Process-Improvements reminder). Fail-open on any error; stop_hook_active re-entry and a 2h TTL both auto-clear so it can never wedge a session."
+          "purpose": "ENFORCE. Uses the payload's transcript path before inherited Codex markers and skips Codex rollouts with SKIPPED_CODEX_HOST stderr telemetry until host adapters ship. For Claude, blocks turn-end until /retro Step 7.5 classification clears the session-scoped retro-gate sentinel (returns {decision: block} with the classify-Process-Improvements reminder). Fail-open on any error; stop_hook_active re-entry and a 2h TTL both auto-clear so it can never wedge a session. Since #470 the block reason names how many Process Improvements items still have no trace, and the stop_hook_active and TTL clears pass force=True. The hook never auto-clears, because Key Learnings carry no traces."
         },
         {
           "id": "hooks-registration",
@@ -339,7 +339,7 @@
           "files": [
             "hooks/obsidian_utils.py"
           ],
-          "purpose": "The retro-gate sentinel primitives backing the Stop hook: mark writes a session-scoped JSON sentinel under ~/.claude/obsidian-brain/retro-gate/ (sanitized sid, path-contained, atomic os.replace); get reads it (with created_at for TTL); clear removes it. /retro arms via mark after saving the note and disarms via clear once Step 7.5 classification is filed. mark refuses outright when the session id is empty, whitespace, or 'unknown', returning a \"Failed:\" string the skill echoes rather than writing a sentinel (#330): the Stop hook looks up the HARNESS id and would never find a gate filed under 'unknown', so arming there looks armed to the skill while enforcing nothing. Since #330 the arm side resolves via layer 0, the same id the harness puts in the Stop hook's stdin, so the two agree by construction."
+          "purpose": "The retro-gate sentinel primitives backing the Stop hook: mark writes a session-scoped JSON sentinel under ~/.claude/obsidian-brain/retro-gate/ (sanitized sid, path-contained, atomic os.replace); get reads it (with created_at for TTL); clear removes it. /retro arms via mark after saving the note and disarms via clear once Step 7.5 classification is filed. mark refuses outright when the session id is empty, whitespace, or 'unknown', returning a \"Failed:\" string the skill echoes rather than writing a sentinel (#330): the Stop hook looks up the HARNESS id and would never find a gate filed under 'unknown', so arming there looks armed to the skill while enforcing nothing. Since #330 the arm side resolves via layer 0, the same id the harness puts in the Stop hook's stdin, so the two agree by construction. Since #470, clear(force=False) refuses while retro_gate_untraced() reports a positive count for the gated note (retro_trace.untraced_count), so the gate stays armed until every Process Improvements item carries a trace. A note that cannot be read does not hold it. The Stop hook's fail-open paths pass force=True."
         },
         {
           "id": "telemetry-log",
@@ -376,6 +376,15 @@
             "hooks/note_writer.py"
           ],
           "purpose": "CLI backing deterministic vault note persistence for skills (#269): two subcommands, both reading note content from stdin (1 MB cap) and validating path safety before any filesystem side effect. write validates folder/filename (rejects absolute/home/'..'/dot-segment paths and non-bare-.md filenames, e.g. blocking a write into .obsidian/plugins/**) then delegates the write itself entirely to write_vault_note() for the atomic mkstemp+chmod 0600+rename. append-update (used by /compress's update-existing path) resolves and validates an EXISTING note path (containment + dot-segment reject + must-already-exist), then applies the update-text insertion (before the first trailing marker like '## Tool Usage'), an optional last_updated bump, and an optional tag merge (block- or flow-style tags:) in ONE atomic rewrite — never touching date/source_session/source_session_note/type, and preserving the note's own CRLF/LF line ending for every line it adds. Invoked via subprocess by 7 SKILL.md files (compress, decide, error-log, retro, standup, vault-import, vault-stats) instead of a Write tool call, so note persistence no longer depends on a context-blind helper sub-agent choosing to save. Both subcommands also validate the CONTENT they are handed, not just their arguments: empty/whitespace-only stdin, a note body without a '---' frontmatter fence pair, oversize stdin (rejected, never truncated), an empty or non-YYYY-MM-DD --last-updated, and a tag containing whitespace/':'/'#'/quotes (which would inject a frontmatter key or break tag indexing) are all ERROR + exit 1 with no filesystem side effect. write additionally refuses to replace an existing note unless --overwrite is passed (only /standup's in-place session-note upgrade passes it), restoring the collision loudness the Write tool used to provide. append-update takes promote_provisional (the CLI passes True): a note whose normalized status is provisional (quotes, case and an inline # comment ignored) becomes promoted (active for a decision) with promoted_by hand-update in the same locked write; capture_save's auto update leaves it provisional. set_frontmatter_fields can report the (mtime_ns, size) of what it wrote. #465: calls note_placement.place after each status write."
+        },
+        {
+          "id": "retro-trace-cli",
+          "name": "retro_trace.py",
+          "kind": "module",
+          "files": [
+            "hooks/retro_trace.py"
+          ],
+          "purpose": "Retro Process Improvements tracking (#470, folds #65). parse_items() numbers the top-level - [ ]/- [x] items of a retro note's '## Process Improvements' section (indented continuation lines belong to the item above). parse_trace() reads a trace: the text after the LAST ' → ' on an item's last line, end-anchored to one of four forms, [owner/repo#N](url) | memory `stem` | `path` | skipped: reason. Prose such as '→ `/dev-test restore` before merge' is not a trace. apply_traces() validates one entry per untraced item before writing anything: a refusal leaves the note byte-equal. Under note_writer's lock it then appends each trace, ticks every item except an issue one, merges issue refs into the tracked_issues frontmatter flow list, and rewrites atomically with the pre-read stat check. untraced_count() backs the retro gate. closed_candidates() reads retro notes in <insights_folder> (direct children), looks up each distinct ref listed in tracked_issues once with gh issue view --json state,stateReason (stdin closed, 10 s timeout), and offers each open item whose issue is closed. Closed as completed is preselected; any other reason is offered unselected. A gh failure offers nothing for that ref and is reported. CLI: apply (JSON on stdin, 1 MB cap; exit 0/2 refused/1 lock or write), untraced, items, closed-candidates."
         },
         {
           "id": "vault-scan-cli",
@@ -1425,6 +1434,21 @@
         },
         {
           "from": "sk-retro",
+          "to": "retro-trace-cli",
+          "label": "Step 7.5: items numbers the Process Improvements items; apply writes one trace per item into the note (#470)"
+        },
+        {
+          "from": "retro-trace-cli",
+          "to": "db-vault",
+          "label": "atomic rewrite under the note lock: traces, ticks, tracked_issues"
+        },
+        {
+          "from": "retro-gate-sentinel",
+          "to": "retro-trace-cli",
+          "label": "clear refuses while untraced_count(retro_path) > 0 (#470)"
+        },
+        {
+          "from": "sk-retro",
           "to": "retro-gate-sentinel",
           "label": "clear_retro_classification_pending once Step 7.5 is filed"
         }
@@ -2394,6 +2418,28 @@
           "from": "capture-relocate",
           "to": "note-placement",
           "label": "place every note; verify zero left"
+        }
+      ]
+    },
+    {
+      "id": "check-items-closed-issues",
+      "name": "/check-items ticks for closed tracked issues",
+      "description": "Step 2b offers a tick for each open retro Process Improvements item whose tracked GitHub issue is closed (#65, #470). Step 8 flips the confirmed ones with the usual read, verify and Edit procedure.",
+      "steps": [
+        {
+          "from": "sk-check-items",
+          "to": "retro-trace-cli",
+          "label": "Step 2b: closed_candidates(vault, insights_folder, project)"
+        },
+        {
+          "from": "retro-trace-cli",
+          "to": "db-vault",
+          "label": "read retro notes' tracked_issues and issue-traced open items"
+        },
+        {
+          "from": "retro-trace-cli",
+          "to": "sk-check-items",
+          "label": "candidates ([closed on GH] preselected only when completed) + errors (printed, no tick)"
         }
       ]
     }
