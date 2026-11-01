@@ -491,9 +491,10 @@ def _print_table(rep: dict) -> None:
             continue
         print(f"\n## {titles[bucket]} ({len(rows)})")
         for l in rows[:25]:
-            track = f" · {l['tracking_ref']}" if l["tracking_ref"] else ""
+            track = l["tracking_ref"] or "no tracking"
             ms = f" · milestone {l['issue_milestone']}" if l.get("issue_milestone") else ""
-            print(f"- {l['recent_sessions']}/{l['sessions']} sessions · {len(l['projects'])} projects"
+            print(f"- {len(l['members'])} items · {l['recent_sessions']}/{l['sessions']} sessions · "
+                  f"{len(l['projects'])} projects · {l['first_seen']} to {l['last_seen']} · "
                   f"{track}{ms} · {l['name']}")
     dormant = sum(1 for l in rep["lessons"] if l["dormant"])
     print(f"\n{len(rep['lessons'])} lessons, {dormant} dormant; totals {json.dumps(rep['totals'], sort_keys=True)}")

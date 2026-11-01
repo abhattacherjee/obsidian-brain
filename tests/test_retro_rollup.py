@@ -695,3 +695,15 @@ def test_split_child_with_a_new_id_keeps_the_since_of_the_lesson_it_came_from(gr
     for rec in s["lessons"].values():
         assert rec["tracking"]["since"] == "2026-10-05"
         assert rec["classify"]["bucket"] == "quiet"
+
+
+def test_report_table_shows_items_dates_and_tracking(env, capsys):
+    # #471 C.2: the read-only table names item count, sessions, projects, first/last seen and tracking.
+    vault, state, base = env
+    _trace_items(vault, "2026-10-01-retro-a1.md", {"Grep callers first RULE-B": "memory `feedback_grep`"})
+    assert run(base, "update") == 0
+    capsys.readouterr()
+    assert run(base, "report") == 0
+    out = capsys.readouterr().out
+    assert re.search(r"^- 3 items · \d+/3 sessions · 2 projects · 2026-10-01 to 2026-10-15 · no tracking · ", out, re.M), out
+    assert re.search(r"^- 2 items · \d+/2 sessions · 2 projects · 2026-10-01 to 2026-10-08 · feedback_grep · ", out, re.M), out
