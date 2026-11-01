@@ -23,7 +23,6 @@ import sys
 from collections import Counter, defaultdict
 from contextlib import closing
 from pathlib import Path
-from urllib.parse import quote
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "hooks"))
@@ -157,8 +156,7 @@ def _read_logs(paths: list[Path]) -> tuple[float, dict[str, list[float]], dict[s
 
 def _read_db(db: Path, basenames: set[str]) -> tuple[dict, dict]:
     vectors, sticky, seen = {}, {}, set()
-    quoted_path = quote(str(db), safe="/")
-    conn = sqlite3.connect('file:' + quoted_path + '?mode=ro', uri=True)  # noqa: vault-db-connect -- read only the explicit copy; no creation, migrations or vault access
+    conn = vault_index.connect_read_only(str(db))
     with closing(conn):
         for path, raw in conn.execute("SELECT path, tfidf_vector FROM notes"):
             if not isinstance(path, str):

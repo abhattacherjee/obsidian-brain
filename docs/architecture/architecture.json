@@ -1358,7 +1358,7 @@
           "files": [
             ".github/workflows/ci.yml"
           ],
-          "purpose": "Adaptive cost-optimized CI: secret-scan, changelog-check (PRs to main), python-tests (3.12, cov>=90), python-tests-py39 (whole suite on 3.9, the macOS system python3; no coverage gate, #371), no-default-db AST guard, security-tests, and an advisory detect-release-merge check."
+          "purpose": "Adaptive cost-optimized CI: secret-scan, changelog-check (PRs to main), python-tests (3.12, cov>=90), python-tests-py39 (suite on 3.9 minus the timed tests, the macOS system python3; no coverage gate, #371), both on pytest-xdist, plus timed-tests (the wall-clock budget tests run serially in two shards per Python, each on its own runner, for 3.12 and 3.9, #485), no-default-db AST guard, security-tests, and an advisory detect-release-merge check."
         },
         {
           "id": "ops-no-default-db",

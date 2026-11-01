@@ -57,7 +57,9 @@ def db(tmp_path) -> str:
 
 
 def _rows(path: str) -> list[tuple]:
-    conn = vault_index._connect(path)
+    # Read-only, so reading a backup never turns it back into WAL mode or
+    # leaves -wal/-shm files beside it (macOS SQLite keeps them, #485).
+    conn = vault_index.connect_read_only(path)
     try:
         return [tuple(r) for r in conn.execute(
             "SELECT note_path, timestamp, context_type FROM access_log ORDER BY id"

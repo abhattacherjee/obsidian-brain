@@ -5,7 +5,8 @@ snippets run bare ``python3``. A PEP 604 union (``str | None``) that is
 evaluated at runtime raises ``TypeError`` at import on 3.9 — which took down
 every lifecycle hook in v3.6.0. Local preflight runs 3.12+, where the same
 line is legal, so this static check is what catches it before a PR. The
-``python-tests-py39`` CI job then runs the whole suite on 3.9.
+``python-tests-py39`` and ``timed-tests`` CI jobs then run the whole suite
+on 3.9 between them.
 
 A union is evaluated at runtime when it sits outside an annotation, or inside
 an annotation in a module without ``from __future__ import annotations``.

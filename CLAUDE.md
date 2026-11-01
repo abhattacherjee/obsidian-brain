@@ -100,7 +100,7 @@ When writing new hooks, skills, or scripts, follow these rules:
 - Hotfixes branch from `main`, merge to both `main` and `develop`
 - Run `./scripts/commit-preflight.sh` before every commit
 - Stage first, then commit in a separate Bash call. The preflight token binds the staged tree, so the hooks refuse a commit that could stage files in the same call (`git add … && git commit …`, `git commit -a`, `-m "$(…)"`).
-- The five `.claude/hooks/*.py` gates are vendored unchanged from harden-repo (v1.3.0, `892d0f5`). Fix them upstream, never by hand. `tests/test_vendored_hooks.py::test_hook_bytes_match_harden_repo_v130` pins their sha256; `scripts/commit-preflight.sh` is upstream's template plus repo parts and is not pinned.
+- The five `.claude/hooks/*.py` gates are vendored unchanged from harden-repo (v1.3.1, release commit `f2574b5`; `commit-preflight.sh` is still the v1.3.0 template, unchanged in v1.3.1). Fix them upstream, never by hand. `tests/test_vendored_hooks.py::test_hook_bytes_match_harden_repo_v131` pins their sha256; `scripts/commit-preflight.sh` is upstream's template plus repo parts and is not pinned.
 
 ## Distribution & Release
 

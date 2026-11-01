@@ -219,8 +219,8 @@ def test_no_writing_helpers_or_note_reads(tmp_path, monkeypatch, capsys):
     calls = []
 
     def read_only_connect(database, **kwargs):
-        assert database.startswith("file:") and database.endswith("?mode=ro")
-        assert kwargs == {"uri": True}
+        assert database.startswith("file:") and database.endswith("?mode=ro&immutable=1")
+        assert kwargs == {"uri": True, "timeout": 5.0}
         conn = connect(database, **kwargs)
         with pytest.raises(sqlite3.OperationalError, match="readonly"):
             conn.execute("CREATE TABLE forbidden_write(x)")
@@ -465,6 +465,25 @@ def test_markdown_output(tmp_path, capsys):
     for text in ("| Bonus | Sessions |", "Mean final merit", "Merit drop", "Validation:",
                  "Notes with >1 move", "Largest absolute gaps", "Skipped:", "Inputs:"):
         assert text in captured.out
+
+
+def test_wal_copy_without_side_files_is_read(tmp_path, capsys):
+    case = _write_case(tmp_path)
+    db = case["db"]
+    conn = sqlite3.connect(str(db))  # noqa: vault-db-connect -- WAL-mode fixture in tmp_path only
+    try:
+        assert conn.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+    finally:
+        conn.close()
+    side_files = [Path(str(db) + suffix) for suffix in ("-wal", "-shm")]
+    for path in side_files:
+        path.unlink(missing_ok=True)
+    assert db.read_bytes()[18:20] == b"\x02\x02"
+    assert all(not path.exists() for path in side_files)
+
+    report = _report(case, capsys)
+    assert report["arms"][0]["total_moves"] == 6
+    assert all(not path.exists() for path in side_files)
 
 
 def test_uri_quoting_and_real_cli_from_another_directory(tmp_path):

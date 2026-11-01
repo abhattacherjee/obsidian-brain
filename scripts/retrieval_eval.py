@@ -16,7 +16,6 @@ import sys
 import time
 from contextlib import closing
 from pathlib import Path
-from urllib.parse import quote
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "hooks"))
@@ -53,9 +52,7 @@ def _evaluate(db: Path, min_results: int | None) -> dict:
     fill = min_results is not None and min_results > 0
 
     rows = []
-    # Escape URI metacharacters so SQLite reads exactly the resolved copy.
-    path = quote(str(db), safe="/")
-    conn = sqlite3.connect('file:' + path + '?mode=ro', uri=True)  # noqa: vault-db-connect -- read only the explicit DB copy; never create a missing DB
+    conn = vault_index.connect_read_only(str(db))
     with closing(conn):
         for query, target_stem in CASES:
             row = {"query": query, "target_stem": target_stem}
