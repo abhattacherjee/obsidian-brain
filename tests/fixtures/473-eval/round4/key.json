@@ -1,0 +1,578 @@
+{
+ "02c8cf7b21e0": {
+  "item": "fc114ec9",
+  "random": false,
+  "sets": [
+   "top1"
+  ],
+  "unit": "L8ba67470"
+ },
+ "0906978b3ca0": {
+  "item": "911e7d7b",
+  "random": true,
+  "sets": [],
+  "unit": "L322aff67"
+ },
+ "0a370834e08a": {
+  "item": "2e8c401d",
+  "random": true,
+  "sets": [],
+  "unit": "L160ccb39"
+ },
+ "0bd3707c1ea5": {
+  "item": "58595408",
+  "random": false,
+  "sets": [
+   "top1"
+  ],
+  "unit": "L6c269d12"
+ },
+ "0d21d8fd5bb6": {
+  "item": "2dae5d33",
+  "random": true,
+  "sets": [],
+  "unit": "Lca3cee55"
+ },
+ "0e6793cc4f97": {
+  "item": "60da082a",
+  "random": false,
+  "sets": [
+   "top1"
+  ],
+  "unit": "Laa8e3443"
+ },
+ "108f9f3b34e2": {
+  "item": "054f4a46",
+  "random": true,
+  "sets": [],
+  "unit": "L2a03a1ab"
+ },
+ "18fa3a24b389": {
+  "item": "c653b53f",
+  "random": false,
+  "sets": [
+   "top1"
+  ],
+  "unit": "L91e4df46"
+ },
+ "19e9cac7997c": {
+  "item": "ba3250d3",
+  "random": false,
+  "sets": [
+   "top1"
+  ],
+  "unit": "L1bbe367a"
+ },
+ "1c2d26526166": {
+  "item": "e27f015e",
+  "random": true,
+  "sets": [],
+  "unit": "Lca3cee55"
+ },
+ "1cca1ab8e431": {
+  "item": "cb0d2e4a",
+  "random": true,
+  "sets": [],
+  "unit": "Laa8e3443"
+ },
+ "1d1ee3203388": {
+  "item": "26b4d727",
+  "random": true,
+  "sets": [],
+  "unit": "L322aff67"
+ },
+ "1ecadd5ae706": {
+  "item": "5d352e3b",
+  "random": false,
+  "sets": [
+   "top1"
+  ],
+  "unit": "Lc264fc90"
+ },
+ "21aee01091c2": {
+  "item": "77db03af",
+  "random": true,
+  "sets": [],
+  "unit": "L8ba67470"
+ },
+ "2508ac53015a": {
+  "item": "78ba5f76",
+  "random": false,
+  "sets": [
+   "top1"
+  ],
+  "unit": "Lca3cee55"
+ },
+ "2582636a302b": {
+  "item": "bf6615ab",
+  "random": true,
+  "sets": [
+   "top1"
+  ],
+  "unit": "L6de01c36"
+ },
+ "25b5fe30c030": {
+  "item": "a530c7cc",
+  "random": false,
+  "sets": [
+   "top1"
+  ],
+  "unit": "Ld522cdbd"
+ },
+ "29d6d3379393": {
+  "item": "7e61a505",
+  "random": true,
+  "sets": [],
+  "unit": "L8bb47f36"
+ },
+ "2b5b749419d8": {
+  "item": "36375732",
+  "random": true,
+  "sets": [],
+  "unit": "L3ee6c96b"
+ },
+ "31852edf3a13": {
+  "item": "a4400125",
+  "random": true,
+  "sets": [],
+  "unit": "L38c23d1a"
+ },
+ "340b58882641": {
+  "item": "fa681087",
+  "random": false,
+  "sets": [
+   "top1"
+  ],
+  "unit": "Lb719c7b0"
+ },
+ "3d4c99c9fbf6": {
+  "item": "5521ef34",
+  "random": true,
+  "sets": [],
+  "unit": "L4676c934"
+ },
+ "3d6c3e72a328": {
+  "item": "366b0054",
+  "random": true,
+  "sets": [],
+  "unit": "L170258c8"
+ },
+ "43b22be1f8b6": {
+  "item": "fd757951",
+  "random": true,
+  "sets": [],
+  "unit": "L170258c8"
+ },
+ "461633c01768": {
+  "item": "199f8715",
+  "random": true,
+  "sets": [],
+  "unit": "L0f796a44"
+ },
+ "49275c93f308": {
+  "item": "1448c16e",
+  "random": true,
+  "sets": [],
+  "unit": "Laa8e3443"
+ },
+ "4df4d0ef1c33": {
+  "item": "53165c95",
+  "random": true,
+  "sets": [],
+  "unit": "L1285b3ed"
+ },
+ "4e6e99397c1a": {
+  "item": "28845189",
+  "random": true,
+  "sets": [],
+  "unit": "L1a2c49bb"
+ },
+ "5116efb8e3fe": {
+  "item": "24d9e9f1",
+  "random": false,
+  "sets": [
+   "top1"
+  ],
+  "unit": "L38c23d1a"
+ },
+ "52fad5031a78": {
+  "item": "8148bba6",
+  "random": false,
+  "sets": [
+   "top1"
+  ],
+  "unit": "L160ccb39"
+ },
+ "557b7cfc6c00": {
+  "item": "b54fe5cc",
+  "random": true,
+  "sets": [],
+  "unit": "L91e4df46"
+ },
+ "58cdc7ae8269": {
+  "item": "c3bc541c",
+  "random": true,
+  "sets": [],
+  "unit": "L3ee6c96b"
+ },
+ "59a6e4b67b52": {
+  "item": "c12daed1",
+  "random": false,
+  "sets": [
+   "top1"
+  ],
+  "unit": "L4676c934"
+ },
+ "5c5026be0114": {
+  "item": "675a148f",
+  "random": true,
+  "sets": [
+   "top1"
+  ],
+  "unit": "L1a2c49bb"
+ },
+ "5e812ae374c9": {
+  "item": "c48faa37",
+  "random": true,
+  "sets": [],
+  "unit": "Lb719c7b0"
+ },
+ "5f6fe2fca5ac": {
+  "item": "4e06550d",
+  "random": true,
+  "sets": [],
+  "unit": "L94f2b919"
+ },
+ "60c79eba0e1d": {
+  "item": "cd82713f",
+  "random": false,
+  "sets": [
+   "top1"
+  ],
+  "unit": "L322aff67"
+ },
+ "623bfb6b249d": {
+  "item": "1cc68038",
+  "random": true,
+  "sets": [],
+  "unit": "Lc264fc90"
+ },
+ "655eb316b55b": {
+  "item": "512a4d5c",
+  "random": false,
+  "sets": [
+   "top1"
+  ],
+  "unit": "L1285b3ed"
+ },
+ "67048a661e67": {
+  "item": "5e597920",
+  "random": true,
+  "sets": [],
+  "unit": "Lc264fc90"
+ },
+ "6b6f9dde564c": {
+  "item": "905633e2",
+  "random": true,
+  "sets": [],
+  "unit": "L457ce076"
+ },
+ "6ba5b1d511ca": {
+  "item": "400a7050",
+  "random": true,
+  "sets": [],
+  "unit": "L6de01c36"
+ },
+ "6f2d2efc020d": {
+  "item": "150bd3c1",
+  "random": true,
+  "sets": [],
+  "unit": "L1bbe367a"
+ },
+ "7120b2df105e": {
+  "item": "323d8802",
+  "random": true,
+  "sets": [],
+  "unit": "L1bbe367a"
+ },
+ "71ac2d9351e8": {
+  "item": "7a6802c6",
+  "random": false,
+  "sets": [
+   "top1"
+  ],
+  "unit": "Ld9e12578"
+ },
+ "746e16e2adf0": {
+  "item": "2e5c171f",
+  "random": true,
+  "sets": [],
+  "unit": "La8c36847"
+ },
+ "793733a828c0": {
+  "item": "3819543e",
+  "random": true,
+  "sets": [],
+  "unit": "L6c269d12"
+ },
+ "7c7d18319441": {
+  "item": "876dfeb0",
+  "random": true,
+  "sets": [
+   "top1"
+  ],
+  "unit": "L457ce076"
+ },
+ "7f45ef173a0d": {
+  "item": "6f84a1b5",
+  "random": false,
+  "sets": [
+   "top1"
+  ],
+  "unit": "L170258c8"
+ },
+ "846a37bfcc3d": {
+  "item": "5dfdb26c",
+  "random": false,
+  "sets": [
+   "top1"
+  ],
+  "unit": "L94f2b919"
+ },
+ "8c6ee75ff387": {
+  "item": "1c396c57",
+  "random": true,
+  "sets": [],
+  "unit": "L38c23d1a"
+ },
+ "8fb057bf42be": {
+  "item": "43b7fcb0",
+  "random": true,
+  "sets": [],
+  "unit": "L4676c934"
+ },
+ "9a830462452e": {
+  "item": "f7785a82",
+  "random": false,
+  "sets": [
+   "top1"
+  ],
+  "unit": "L3ee6c96b"
+ },
+ "9ded72d11c35": {
+  "item": "8b9ca1dc",
+  "random": true,
+  "sets": [],
+  "unit": "L244032a1"
+ },
+ "a35bb1b94bd5": {
+  "item": "cf58572f",
+  "random": true,
+  "sets": [],
+  "unit": "Lf26cedb9"
+ },
+ "a5afa6a0549a": {
+  "item": "ff444bfa",
+  "random": false,
+  "sets": [
+   "top1"
+  ],
+  "unit": "La8c36847"
+ },
+ "a71783c03f28": {
+  "item": "1ebb6880",
+  "random": false,
+  "sets": [
+   "top1"
+  ],
+  "unit": "L2a03a1ab"
+ },
+ "a843cec1a4e3": {
+  "item": "5929935b",
+  "random": true,
+  "sets": [
+   "top1"
+  ],
+  "unit": "L8bb47f36"
+ },
+ "a968cb71cc67": {
+  "item": "02af5ed9",
+  "random": true,
+  "sets": [],
+  "unit": "Lc7c5a4dc"
+ },
+ "aa2764679ea5": {
+  "item": "9ebdcf5f",
+  "random": true,
+  "sets": [],
+  "unit": "La8c36847"
+ },
+ "ab7917e47c90": {
+  "item": "22c0d327",
+  "random": true,
+  "sets": [],
+  "unit": "Ld9e12578"
+ },
+ "ad59bbbf05a7": {
+  "item": "e9567181",
+  "random": true,
+  "sets": [],
+  "unit": "L6c269d12"
+ },
+ "af5ca810fe3d": {
+  "item": "5c088ee4",
+  "random": true,
+  "sets": [],
+  "unit": "L244032a1"
+ },
+ "af9f73c7523c": {
+  "item": "cf0cd0f6",
+  "random": false,
+  "sets": [
+   "top1"
+  ],
+  "unit": "Lc7c5a4dc"
+ },
+ "b05087646b8e": {
+  "item": "3e0f2581",
+  "random": true,
+  "sets": [],
+  "unit": "L160ccb39"
+ },
+ "b1067ebe995f": {
+  "item": "8e6e66f2",
+  "random": true,
+  "sets": [],
+  "unit": "L528a02f5"
+ },
+ "b2ec85e6a643": {
+  "item": "a4f49454",
+  "random": true,
+  "sets": [],
+  "unit": "Ld9e12578"
+ },
+ "b88cdf840a2b": {
+  "item": "aa972179",
+  "random": true,
+  "sets": [],
+  "unit": "L8ba67470"
+ },
+ "bd143d33dff5": {
+  "item": "12b4f541",
+  "random": true,
+  "sets": [],
+  "unit": "L0f796a44"
+ },
+ "c29c6fb01e52": {
+  "item": "0cb347e5",
+  "random": true,
+  "sets": [],
+  "unit": "L3a10bce3"
+ },
+ "c6666dcf78f8": {
+  "item": "21861729",
+  "random": true,
+  "sets": [],
+  "unit": "L2a03a1ab"
+ },
+ "ca62be00dcb0": {
+  "item": "c1ee412b",
+  "random": true,
+  "sets": [],
+  "unit": "Ld522cdbd"
+ },
+ "cac9c745c52d": {
+  "item": "86ff2e3a",
+  "random": true,
+  "sets": [],
+  "unit": "L91e4df46"
+ },
+ "cebb72c4d88f": {
+  "item": "91a98101",
+  "random": true,
+  "sets": [],
+  "unit": "Ld522cdbd"
+ },
+ "cf9b6f5554a8": {
+  "item": "af038ccd",
+  "random": false,
+  "sets": [
+   "top1"
+  ],
+  "unit": "L244032a1"
+ },
+ "d4c619bd4281": {
+  "item": "062744ad",
+  "random": true,
+  "sets": [],
+  "unit": "Lb719c7b0"
+ },
+ "dd8d03dee881": {
+  "item": "8610bf78",
+  "random": false,
+  "sets": [
+   "top1"
+  ],
+  "unit": "L528a02f5"
+ },
+ "dde4831c6738": {
+  "item": "47e05f50",
+  "random": true,
+  "sets": [],
+  "unit": "Lc7c5a4dc"
+ },
+ "dff3d3b1ec55": {
+  "item": "2381c37a",
+  "random": true,
+  "sets": [],
+  "unit": "L94f2b919"
+ },
+ "e90da5098bf4": {
+  "item": "be506c4b",
+  "random": true,
+  "sets": [],
+  "unit": "L3a10bce3"
+ },
+ "e968464aac54": {
+  "item": "bf7eee79",
+  "random": false,
+  "sets": [
+   "top1"
+  ],
+  "unit": "L3a10bce3"
+ },
+ "f252878499f6": {
+  "item": "b51315a9",
+  "random": false,
+  "sets": [
+   "top1"
+  ],
+  "unit": "L0f796a44"
+ },
+ "f33931e23a27": {
+  "item": "3c763fd1",
+  "random": false,
+  "sets": [
+   "top1"
+  ],
+  "unit": "Lf26cedb9"
+ },
+ "f511a35122e8": {
+  "item": "7a8aa486",
+  "random": true,
+  "sets": [],
+  "unit": "Lf26cedb9"
+ },
+ "f5d02f0e63d2": {
+  "item": "e67cfc75",
+  "random": true,
+  "sets": [],
+  "unit": "L1285b3ed"
+ },
+ "f67413ae613f": {
+  "item": "7d46a48a",
+  "random": true,
+  "sets": [],
+  "unit": "L528a02f5"
+ }
+}
