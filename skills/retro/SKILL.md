@@ -618,7 +618,7 @@ c = json.load(open(os.path.expanduser("~/.claude/obsidian-brain-config.json")))
 print("off" if c.get("lessons_enabled") is False else "on")
 ' < /dev/null 2>/dev/null)
 if [ "$LESSONS" != "off" ]; then
-  nohup python3 "$HOOKS/retro_rollup.py" update --note '<NOTE_PATH>' < /dev/null >> "$HOME/.claude/obsidian-brain/lessons-update.log" 2>&1 &
+  nohup python3 "$HOOKS/retro_rollup.py" update --note '<NOTE_PATH>' --concurrency 2 < /dev/null >> "$HOME/.claude/obsidian-brain/lessons-update.log" 2>&1 &
   echo "lesson update queued"
 fi
 ```

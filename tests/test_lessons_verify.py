@@ -69,7 +69,7 @@ def test_run_haiku_uses_worker_env(monkeypatch):
     assert lv.run_haiku("prompt") == "result"
     args, kwargs = calls[0]
     assert args == ["claude", "-p", "--model", "haiku", "--setting-sources", "project",
-                    "--strict-mcp-config", "--tools", ""]
+                    "--strict-mcp-config", "--tools", "", "--no-session-persistence"]
     assert args[args.index("--tools") + 1] == "" and "--strict-mcp-config" in args
     assert kwargs["env"]["OBSIDIAN_BRAIN_WORKER"] == "1"
     assert kwargs["input"] == "prompt"

@@ -37,6 +37,8 @@ def test_retro_step_76_is_detached_and_never_asks():
     for needle in ("nohup", "< /dev/null", "--note", "lesson update queued", "lessons-update.log"):
         assert needle in step, needle
     assert re.search(r"2>&1 &$", step, re.M), "the update must be started in the background"
+    assert re.search(r"retro_rollup\.py\" update --note '<NOTE_PATH>' --concurrency 2 <", step), \
+        "the background update must cap the Haiku checks at 2 at a time"
     assert "AskUserQuestion" not in step
     assert "never asks" in step and "never waits" in step
 
