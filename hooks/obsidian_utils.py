@@ -2396,6 +2396,11 @@ _DEFAULTS: dict = {
     "auto_capture_update_min_cosine": 0.35,
     # #425: projects whose sessions are captured below the 3-user-message gate (headless runs)
     "auto_capture_headless_projects": ["openclaw"],
+    # #471: retro lessons rollup (hooks/retro_rollup.py)
+    "lessons_enabled": True,  # false turns off the /retro update and the weekly lesson prompts
+    "lessons_recent_days": 90,  # recency window for ranking, and the dormant cut-off
+    "lessons_concurrency": 8,  # parallel Haiku calls when judging retro items
+    "project_repos": {},  # project -> "owner/repo" for projects outside ~/dev/claude_workspace/<project>
 }
 
 # #425: set on every `claude -p` this plugin starts, so the child session's

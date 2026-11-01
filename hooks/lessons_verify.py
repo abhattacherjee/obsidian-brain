@@ -86,6 +86,10 @@ class VerdictCache:
                 "anchor TEXT, rubric TEXT, model TEXT, "
                 "PRIMARY KEY(anchor,rubric,model))"
             )
+        # WAL mode keeps recent rows in side files; they hold the same data.
+        for side in (path.with_name(path.name + "-wal"), path.with_name(path.name + "-shm")):
+            if side.exists():
+                side.chmod(0o600)
 
     def judged(self, anchor_key: str) -> bool:
         return self._conn.execute(
