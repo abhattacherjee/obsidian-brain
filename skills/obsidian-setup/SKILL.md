@@ -176,8 +176,10 @@ Stop here if FAIL.
 If **OK**, create the folders:
 
 ```bash
-mkdir -p "$VAULT_PATH/claude-sessions" "$VAULT_PATH/claude-insights" "$VAULT_PATH/claude-dashboards" "$VAULT_PATH/claude-wiki"
+mkdir -p "$VAULT_PATH/claude-sessions" "$VAULT_PATH/claude-insights" "$VAULT_PATH/claude-insights/lessons" "$VAULT_PATH/claude-dashboards" "$VAULT_PATH/claude-wiki"
 ```
+
+`claude-insights/lessons/` holds the generated retro lesson notes (#471). `retro_rollup.py` rewrites them; the vault index skips them (`type: claude-lesson`).
 
 ### Step 6 — Install dashboard templates
 
@@ -489,11 +491,91 @@ if (Object.keys(statsByProject).length > 0) {
 \```
 ```
 
+**File: `$VAULT_PATH/claude-dashboards/retro-lessons.md`**
+
+```markdown
+# Retro Lessons
+
+Lessons that came back across sessions, from the retro notes' `## Process Improvements` items. Each row is one lesson note in `claude-insights/lessons/`, rebuilt by `retro_rollup.py`. Rows are ranked by sessions in the last 90 days (the `lessons_recent_days` setting), then all sessions. Snoozed lessons are hidden until their date.
+
+## 1. Raise priority
+
+An open issue exists, and the lesson kept coming back after it was opened.
+
+\```dataview
+TABLE WITHOUT ID link(file.link, name) AS "Lesson", recent_sessions AS "Recent", sessions AS "Sessions", sessions_after_tracking AS "Since issue", tracking_ref AS "Issue", issue_milestone AS "Milestone", issue_priority AS "Priority"
+FROM "claude-insights/lessons"
+WHERE type = "claude-lesson" AND bucket = "raise" AND !dormant AND (!snoozed_until OR date(snoozed_until) < date(today)) AND (!status OR !startswith(lower(string(status)), "provisional"))
+SORT recent_sessions DESC, sessions DESC
+LIMIT 25
+\```
+
+## 2. File an issue
+
+No issue, memory entry or rule tracks the lesson, or its tracking is gone.
+
+\```dataview
+TABLE WITHOUT ID link(file.link, name) AS "Lesson", recent_sessions AS "Recent", sessions AS "Sessions", length(projects) AS "Projects", first_seen AS "First seen", last_seen AS "Last seen", tracking AS "Tracking"
+FROM "claude-insights/lessons"
+WHERE type = "claude-lesson" AND bucket = "file" AND !dormant AND (!snoozed_until OR date(snoozed_until) < date(today)) AND (!status OR !startswith(lower(string(status)), "provisional"))
+SORT recent_sessions DESC, sessions DESC
+LIMIT 25
+\```
+
+## 3. Fix didn't hold
+
+The issue closed, then the lesson came back.
+
+\```dataview
+TABLE WITHOUT ID link(file.link, name) AS "Lesson", recent_sessions AS "Recent", sessions AS "Sessions", tracking_ref AS "Issue", tracking_since AS "Opened"
+FROM "claude-insights/lessons"
+WHERE type = "claude-lesson" AND bucket = "didnt_hold" AND !dormant AND (!snoozed_until OR date(snoozed_until) < date(today)) AND (!status OR !startswith(lower(string(status)), "provisional"))
+SORT recent_sessions DESC, sessions DESC
+LIMIT 25
+\```
+
+## 4. Rule not followed
+
+A memory entry or a skill or CLAUDE.md rule exists, and the lesson still comes back.
+
+\```dataview
+TABLE WITHOUT ID link(file.link, name) AS "Lesson", recent_sessions AS "Recent", sessions AS "Sessions", sessions_after_tracking AS "Since rule", tracking_ref AS "Tracked by"
+FROM "claude-insights/lessons"
+WHERE type = "claude-lesson" AND bucket = "rule_not_followed" AND !dormant AND (!snoozed_until OR date(snoozed_until) < date(today)) AND (!status OR !startswith(lower(string(status)), "provisional"))
+SORT recent_sessions DESC, sessions DESC
+LIMIT 25
+\```
+
+## 5. Tracked and quiet
+
+Tracking exists and nothing came back since.
+
+\```dataview
+TABLE WITHOUT ID link(file.link, name) AS "Lesson", sessions AS "Sessions", tracking AS "Tracking", tracking_ref AS "Tracked by", last_seen AS "Last seen"
+FROM "claude-insights/lessons"
+WHERE type = "claude-lesson" AND bucket = "quiet" AND !dormant AND (!status OR !startswith(lower(string(status)), "provisional"))
+SORT sessions DESC
+LIMIT 25
+\```
+
+## Dormant
+
+No session in the last 90 days. Probably fixed, or no longer relevant.
+
+\```dataview
+TABLE WITHOUT ID link(file.link, name) AS "Lesson", sessions AS "Sessions", bucket AS "Bucket", last_seen AS "Last seen"
+FROM "claude-insights/lessons"
+WHERE type = "claude-lesson" AND dormant AND (!status OR !startswith(lower(string(status)), "provisional"))
+SORT last_seen DESC
+LIMIT 25
+\```
+```
+
 **Important:** The backslash before the triple backticks above is an escape for this document only. When writing the actual files, use plain triple backticks (no backslash).
 
 ### Step 7 — Write config file
 
-**If `MODE=upgrade`:** Skip this step — preserve existing config.
+**If `MODE=upgrade`:** Skip this step — preserve existing config. Keys added since the config was written (for example the four `lessons_*` / `project_repos` keys from #471) take their defaults from `obsidian_utils._DEFAULTS` at load time, so nothing needs writing.
 
 **If `MODE=fresh` or `MODE=reconfigure`:**
 
@@ -512,7 +594,11 @@ Write `~/.claude/obsidian-brain-config.json` with this exact structure:
   "summary_model": "haiku",
   "auto_log_enabled": true,
   "snapshot_on_compact": true,
-  "snapshot_on_clear": true
+  "snapshot_on_clear": true,
+  "lessons_enabled": true,
+  "lessons_recent_days": 90,
+  "lessons_concurrency": 8,
+  "project_repos": {}
 }
 ```
 
@@ -805,8 +891,8 @@ This is a soft nudge — a non-blocking suggestion, not automatic execution.
 >
 > - Vault path: `<VAULT_PATH>`
 > - Config written to: `~/.claude/obsidian-brain-config.json`
-> - Folders created: `claude-sessions/`, `claude-insights/`, `claude-dashboards/`, `claude-wiki/`
-> - Dashboards installed: `sessions-overview.md`, `project-index.md`, `weekly-review.md`, `learning-velocity.md`, `decision-timeline.md`, `open-items.md`
+> - Folders created: `claude-sessions/`, `claude-insights/`, `claude-insights/lessons/`, `claude-dashboards/`, `claude-wiki/`
+> - Dashboards installed: `sessions-overview.md`, `project-index.md`, `weekly-review.md`, `learning-velocity.md`, `decision-timeline.md`, `open-items.md`, `retro-lessons.md`
 > - skill-kit:extract nudge: configured (run `/compress` reminder after knowledge extraction)
 > - Vault index: N notes indexed (run `/vault-reindex` to rebuild) — _or omit this line if Step 8.5 failed_
 >
