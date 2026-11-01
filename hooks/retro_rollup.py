@@ -154,6 +154,15 @@ def _marker(lid: str) -> str:
     return f"<!-- retro-lesson:{lid} -->"
 
 
+_MARKER_RE = re.compile(r"^<!-- retro-lesson:[A-Za-z0-9_-]{1,64} -->$")
+
+
+def _reconcile_marker(pending: dict, lid: str) -> str:
+    """The marker to look for: the record's own when it has the exact marker shape, else this id's."""
+    marker = pending.get("marker")
+    return marker if isinstance(marker, str) and _MARKER_RE.match(marker) else _marker(lid)
+
+
 def _is_pending(value) -> bool:
     return (isinstance(value, dict) and value.get("pending") is True
             and _valid_repo(value.get("repo")))
@@ -205,17 +214,31 @@ def _load(ctx: Ctx):
     return items, by_key, skipped
 
 
-def _inherited_filing(state: dict, lid: str, lesson: dict, retired: dict):
-    """The issue ref a lesson was filed under: its own id, its split parent, then merged-in ids."""
+def _filing_sources(lid: str, lesson: dict, retired: dict) -> list[str]:
+    """Ids a lesson's filing may sit under: its own id, its split parent, then merged-in ids."""
     olds = [lid]
     if lesson.get("split_from"):
         olds.append(lesson["split_from"])
     olds += sorted(o for o, r in retired.items() if isinstance(r, dict) and r.get("merged_into") == lid)
-    for old_id in olds:
+    return olds
+
+
+def _inherited_filing(state: dict, lid: str, lesson: dict, retired: dict):
+    """The issue ref a lesson was filed under (see _filing_sources)."""
+    for old_id in _filing_sources(lid, lesson, retired):
         ref = state["filed"].get(old_id)
         if isinstance(ref, str) and _REF.match(ref):
             return ref, old_id
     return None, None
+
+
+def _inherited_pending(state: dict, lid: str, lesson: dict, retired: dict):
+    """The first pending filing record under an id this lesson came from, else None."""
+    for old_id in _filing_sources(lid, lesson, retired):
+        rec = state["filed"].get(old_id)
+        if _is_pending(rec):
+            return rec
+    return None
 
 
 def regroup(ctx: Ctx, state: dict, *, judge: bool, note: str | None = None, cache=None) -> dict:
@@ -275,9 +298,15 @@ def regroup(ctx: Ctx, state: dict, *, judge: bool, note: str | None = None, cach
         # `since` is sticky for the id's own record; a split child with a new id inherits its parent's.
         prev_rec = state["lessons"].get(lid) or state["lessons"].get(lesson.get("split_from")) or {}
         tracking = lessons_group.lesson_tracking(lesson["members"], by_key, prev_rec.get("tracking"))
-        if tracking is None:
+        if tracking is None and _is_pending(state["filed"].get(lid)):
+            pass  # an issue may exist under this id: the pending record stays for backfill to reconcile
+        elif tracking is None:
             # Filed, no trace landed yet: keep the issue, also across a merge or a split.
             filed_ref, source = _inherited_filing(state, lid, lesson, retired)
+            if not filed_ref:
+                pending = _inherited_pending(state, lid, lesson, retired)
+                if pending is not None:
+                    state["filed"][lid] = dict(pending)  # keeps its own marker; the old id keeps its record
             if filed_ref:
                 since = (state["tracking"].get(f"issue:{filed_ref}") or {}).get("created")
                 if not since:
@@ -592,15 +621,14 @@ def _create_issue(ctx: Ctx, repo: str, title: str, body: str) -> tuple[str | Non
     return f"{repo}#{match.group(3)}", None
 
 
-def _find_filed_issue(repo: str, lid: str):
-    """Look for an earlier issue carrying this lesson's marker.
+def _find_filed_issue(repo: str, marker: str):
+    """Look for an earlier issue carrying the given marker.
 
     Returns (ref, meta, error): ("owner/repo#N", issue metadata, None) when found, (None, None, None)
     when there is none, or (None, None, error) when the check cannot say. One plain listing of my
     issues (no search index, so a just-created issue is there at once). A full page with no match
     cannot rule out an earlier filing, so it is an error.
     """
-    marker = _marker(lid)
     try:
         result = _run_gh(["issue", "list", "--repo", repo, "--state", "all", "--author", "@me",
                           "--json", "number,body,state,createdAt,closedAt,milestone",
@@ -689,7 +717,7 @@ def backfill(ctx: Ctx, state: dict, accept: list[dict] | None) -> tuple[dict, bo
                 adopted_ref, adopted_meta = None, None
                 if pending is not None:
                     # An earlier run may have created the issue: look for its marker before filing.
-                    adopted_ref, adopted_meta, error = _find_filed_issue(pending["repo"], lid)
+                    adopted_ref, adopted_meta, error = _find_filed_issue(pending["repo"], _reconcile_marker(pending, lid))
                     if error:
                         print(f"retro_rollup: {lid}: cannot check {pending['repo']} for an earlier "
                               f"filing: {error}", file=sys.stderr)

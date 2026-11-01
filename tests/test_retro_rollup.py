@@ -1408,3 +1408,85 @@ def test_filing_survives_a_split_into_two_children(grouped, monkeypatch):
     assert s["lessons"][child]["split_from"] == old_id
     for lid in (old_id, child):
         assert s["lessons"][lid]["tracking"]["ref"] == "o/r#5" and s["filed"][lid] == "o/r#5"
+
+
+# --- pending filings survive a regroup (#471 re-check C-013, X-022) ---
+
+def _merge_setup(vault, state, base, monkeypatch):
+    _bridge_lessons(vault, state, base, monkeypatch)
+    _notes_with_tags(vault, {1: "G1", 2: "G1", 4: "G2", 5: "G2"})
+    assert run(base, "update") == 0
+    survivor, retiring = sorted(state_of(state)["lessons"])
+    return survivor, retiring
+
+
+def _save_filed(state, filed):
+    s = state_of(state)
+    s["filed"] = filed
+    (state / "lessons-state.json").write_text(json.dumps(s))
+
+
+def test_merge_keeps_the_survivors_own_pending_record(grouped, monkeypatch):
+    vault, state, base = grouped
+    survivor, retiring = _merge_setup(vault, state, base, monkeypatch)
+    _save_filed(state, {survivor: _pending(survivor, "o/r"), retiring: "o/r#5"})
+    _notes_with_tags(vault, {3: "G1 G2"})
+    assert run(base, "update") == 0
+    s = state_of(state)
+    assert s["filed"][survivor] == _pending(survivor, "o/r")
+    assert s["lessons"][survivor]["tracking"] is None
+
+
+def test_pending_record_of_a_merged_in_lesson_moves_to_the_survivor(grouped, monkeypatch, capsys):
+    vault, state, base = grouped
+    survivor, retiring = _merge_setup(vault, state, base, monkeypatch)
+    _save_filed(state, {retiring: _pending(retiring, "o/r")})
+    _notes_with_tags(vault, {3: "G1 G2"})
+    assert run(base, "update") == 0
+    s = state_of(state)
+    assert list(s["lessons"]) == [survivor]
+    assert s["filed"][survivor] == _pending(retiring, "o/r") and s["filed"][retiring] == _pending(retiring, "o/r")
+    capsys.readouterr()
+    assert run(base, "backfill") == 0
+    plans = {p["lesson"]: p for p in json.loads(capsys.readouterr().out)["planned_filings"]}
+    assert plans[survivor]["reason"] == "pending reconcile" and plans[survivor]["repo"] == "o/r"
+    gh = FakeGh()
+    gh.issues.append({"number": 9, "body": f"{_pending(retiring, 'o/r')['marker']}\nfiled earlier"})
+    monkeypatch.setattr(retro_rollup, "_run_gh", gh)
+    f = _file_accept(vault.parent, [{"lesson_id": survivor, "file_issue": True, "repo": "o/r"}])
+    assert run(base, "backfill", "--apply", "--accept", str(f)) == 0
+    assert gh.calls == [] and len(gh.list_calls) == 1
+    assert state_of(state)["filed"][survivor] == "o/r#9"
+
+
+def test_pending_record_of_a_split_parent_moves_to_the_child(grouped, monkeypatch, capsys):
+    vault, state, base = grouped
+    _bridge_lessons(vault, state, base, monkeypatch)
+    _notes_with_tags(vault, {1: "G1", 2: "G1", 3: "G1 G2", 4: "G2", 5: "G2"})
+    assert run(base, "update") == 0
+    (old_id,) = state_of(state)["lessons"]
+    _save_filed(state, {old_id: _pending(old_id, "o/r")})
+    (vault / "claude-insights" / "2026-10-03-retro-n3.md").unlink()
+    assert run(base, "update") == 0
+    s = state_of(state)
+    child = next(l for l in s["lessons"] if l != old_id)
+    assert s["lessons"][child]["split_from"] == old_id
+    assert s["filed"][child] == _pending(old_id, "o/r") and s["filed"][old_id] == _pending(old_id, "o/r")
+    gh = FakeGh()
+    gh.issues.append({"number": 9, "body": f"{_pending(old_id, 'o/r')['marker']}\nfiled earlier"})
+    monkeypatch.setattr(retro_rollup, "_run_gh", gh)
+    f = _file_accept(vault.parent, [{"lesson_id": child, "file_issue": True, "repo": "o/r"}])
+    capsys.readouterr()
+    assert run(base, "backfill", "--apply", "--accept", str(f)) == 0
+    assert gh.calls == [] and state_of(state)["filed"][child] == "o/r#9"
+
+
+def test_pending_record_with_a_malformed_marker_falls_back_to_the_lesson_marker(filing, tmp_path):
+    vault, state, base, gh = filing
+    lid = _lesson_named(state, 3)
+    bad = "<!-- retro-lesson:a b --> extra"
+    gh.issues.append({"number": 4, "body": f"{bad}\nnot ours"})
+    gh.issues.append({"number": 6, "body": f"<!-- retro-lesson:{lid} -->\nours"})
+    _set_filed(state, lid, {"pending": True, "repo": "o/r", "marker": bad})
+    assert run(base, "backfill", "--apply", "--accept", str(_accept_file_issue(tmp_path, lid))) == 0
+    assert gh.calls == [] and state_of(state)["filed"] == {lid: "o/r#6"}
