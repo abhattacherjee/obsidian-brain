@@ -112,7 +112,7 @@ def worker_argv(model: str = "sonnet") -> list[str]:
     # denylist left CronCreate, RemoteTrigger, Workflow, SendMessage,
     # PushNotification and Skill callable (#427).
     return ["claude", "-p", "--model", model, "--setting-sources", "project", "--strict-mcp-config",
-            "--tools", "", "--output-format", "json"]
+            "--tools", "", "--output-format", "json", "--no-session-persistence"]
 
 
 def _first_array(text: str):

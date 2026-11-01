@@ -130,7 +130,7 @@ Lesson notes are derived data. They must not count as new knowledge: `vault-ask`
 
 ### Keeping it current (no command to remember)
 
-- `/retro` starts `retro_rollup.py update <retro note>` detached after Step 7.5 has traced the note, and prints one line ("lesson update queued"). It never waits and never asks. The update checks each new item (one Haiku call per item, about 7 s each) and rewrites the lesson notes that changed. It never calls `gh`.
+- `/retro` starts `retro_rollup.py update <retro note>` detached after Step 7.5 has traced the note, and prints one line ("lesson update queued"). It never waits and never asks (shipped as Step 7.6, #475; skipped when `lessons_enabled` is false). The update checks each new item (one Haiku call per item, about 7 s each) and rewrites the lesson notes that changed. It never calls `gh`.
 - **Weekly rebuild.** `plan-week` runs `retro_rollup.py rebuild` before it reads the data. It re-forms every lesson from the cached verdicts (no verdict calls at all: items left unjudged by a failed `update` stay unjudged until the next `update`, so a weekly run can never turn into a full backfill; judging is per anchor, so an anchor is not re-asked when its top 10 later shifts, and the new item's own call covers the new pair; only newly formed lessons get a naming call), so small drift from incremental updates is reset once a week. It drops cache rows whose items no longer exist (edited or deleted retro text).
 - **Fresh tracking before any prompt.** `plan-week`, weekly `/standup` and `/lessons` run `retro_rollup.py refresh-tracking` first. It re-reads issue state, milestone, labels and dates with `gh` (read-only, one `gh issue list` per repo) and checks that each memory and rule `tracking_ref` still exists. A missing ref sets tracking to `gone`, which counts as untracked (bucket 2) and says so in the note.
 - The one-time backfill is the first `update` over the whole vault: about 3,900 Haiku calls, about 65 minutes at concurrency 8 (spike B and the full-graph run). It runs in the background with resumable progress through the verdict cache, and with a stall watcher.
@@ -141,10 +141,12 @@ Lesson notes are derived data. They must not count as new knowledge: `vault-ask`
 - File: picks the repo (single project → that repo; several projects → asks), drafts title and body from the lesson's member items, sets milestone and priority label after the user confirms, creates the issue, then writes issue traces into every member item.
 - Raise: never edits GitHub without the user's explicit choice in that prompt.
 - Called by github-board `plan-week` and by `/standup` in weekly mode. Both run it only when buckets 1–4 are non-empty, and say how many lessons wait.
+- **Shipped (#474), where it differs:** File is offered only for bucket 2 (no tracking); a tracked lesson cannot be filed again through `backfill`, and re-filing a closed issue is a separate decision. Raise writes issue traces to the lesson's untraced members. The batch confirm is a numbered list with accept all, accept all except some, or skip (the question tool takes at most four options). The dry run is `backfill --accept FILE` without `--apply`. A draft may quote member text once you confirm it; automatic filing stays text-free.
 
 ### Other skills using the data
 
 - In this repo: `/standup` gets a "Recurring lessons" section (top 5 across buckets 1–4) and calls `/lessons` in weekly mode. `/emerge` lists lessons whose sessions grew in its window.
+- **Shipped (#475):** `/emerge` lists lessons with `sessions >= 2` and at least one member `date` inside its window (start date included), most members first, top 10. `/standup` asks whether to run `/lessons` only in weekly mode (`this week`, `last week`).
 - Other repos, each a separate issue pointing at `report --json`: `kickoff` (claude-code-config) shows the top lessons for the current project; github-board `triage-issues`, `plan-milestones` and `plan-week` (claude-code-skills) weight priority and milestone by a matched lesson's sessions and `sessions_after_tracking`.
 
 ## Constraints

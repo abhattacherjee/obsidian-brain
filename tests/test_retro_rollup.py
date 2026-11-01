@@ -12,6 +12,7 @@ import pytest
 import lessons_match
 import lessons_verify
 import retro_rollup
+import retro_trace
 
 TAG = re.compile(r"RULE-([A-Z])")
 
@@ -812,7 +813,9 @@ def test_file_issue_files_one_issue_and_traces_every_member(filing, tmp_path, ca
     for name, text in (("2026-10-01-retro-a1.md", "Run preflight alone RULE-A"),
                        ("2026-10-08-retro-b2.md", "Never chain preflight and commit RULE-A"),
                        ("2026-10-15-retro-c3.md", "Preflight as its own call RULE-A")):
-        assert f"- [ ] {text} → {trace}" in (vault / "claude-insights" / name).read_text()
+        note_text = (vault / "claude-insights" / name).read_text()
+        assert f"- [ ] {text} → {trace}" in note_text
+        assert "o/r#7" in retro_trace.read_tracked_issues(note_text)  # #474 C.1: the ref joins tracked_issues
     assert state_of(state)["filed"] == {lid: "o/r#7"}
     assert "RULE-B" in (vault / "claude-insights" / "2026-10-01-retro-a1.md").read_text()
 

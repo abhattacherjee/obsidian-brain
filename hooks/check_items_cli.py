@@ -242,7 +242,7 @@ def run_semantic_merge(stdin_json: str, output_path: str) -> int:
         "<output-json-path>", output_path
     )
 
-    cmd = ["claude", "-p", "--model", model]
+    cmd = ["claude", "-p", "--model", model, "--no-session-persistence"]
     try:
         cp = subprocess.run(
             cmd,
@@ -752,7 +752,7 @@ def _dispatch_classifier_chunk(
             "<output-json-path>", output_path
         )
 
-        cmd = ["claude", "-p", "--model", model]
+        cmd = ["claude", "-p", "--model", model, "--no-session-persistence"]
         try:
             cp = subprocess.run(
                 cmd, input=prompt, capture_output=True, text=True,

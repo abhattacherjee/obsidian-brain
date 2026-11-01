@@ -2,8 +2,8 @@
 recurring lessons, render lesson notes and report, and trace accepted lessons
 back into the source retros.
 
-Commands: update, rebuild, refresh-tracking, report, backfill, match. Exit 0 on
-success, 1 on a runtime or partial failure (unjudged anchors, gh errors, the
+Commands: update, rebuild, refresh-tracking, report, backfill, match, snooze, show.
+Exit 0 on success, 1 on a runtime or partial failure (unjudged anchors, gh errors, the
 lock held, a write error) with the output still printed, 2 on a usage or
 config error.
 
@@ -82,6 +82,7 @@ class Ctx:
     def __init__(self, args):
         import obsidian_utils
         config = obsidian_utils.load_config()
+        self.lessons_enabled = config.get("lessons_enabled")
         self.vault = args.vault or config.get("vault_path") or ""
         self.insights = args.insights_folder or config.get("insights_folder", "claude-insights")
         if not self.vault or not Path(self.vault).is_dir():
@@ -232,11 +233,12 @@ def _filing_sources(lid: str, lesson: dict, retired: dict) -> list[str]:
     return olds
 
 
-def _inherited_filing(state: dict, lid: str, lesson: dict, retired: dict):
-    """The issue ref a lesson was filed under (see _filing_sources)."""
+def _inherited_filing(state: dict, lid: str, lesson: dict, retired: dict, live_only: bool = False):
+    """The issue ref a lesson was filed under (see _filing_sources). live_only skips refs whose
+    issue is gone and keeps looking."""
     for old_id in _filing_sources(lid, lesson, retired):
         ref = state["filed"].get(old_id)
-        if isinstance(ref, str) and _REF.match(ref):
+        if isinstance(ref, str) and _REF.match(ref) and not (live_only and _ref_gone(state, ref)):
             return ref, old_id
     return None, None
 
@@ -799,18 +801,35 @@ def _read_accept(path: str) -> list[dict]:
     except (OSError, UnicodeError, ValueError) as exc:
         raise UsageError(f"cannot read accept file: {exc}")
     usage = ('accept file must be a JSON list of {"lesson_id", "tracking_ref"} or '
-             '{"lesson_id", "file_issue": true, "repo"?: "owner/repo"}')
+             '{"lesson_id", "file_issue": true, "repo"?, "title"?, "body"?, "milestone"?, "labels"?}')
     if not isinstance(data, list):
         raise UsageError(usage)
+    seen = set()
     for e in data:
         if not isinstance(e, dict) or not isinstance(e.get("lesson_id"), str):
             raise UsageError(usage)
+        if e["lesson_id"] in seen:
+            raise UsageError(f"accept file repeats lesson_id {e['lesson_id']!r}")
+        seen.add(e["lesson_id"])
         if "file_issue" in e:
             if e["file_issue"] is not True or "tracking_ref" in e:
                 raise UsageError(usage)
             if "repo" in e and not _valid_repo(e["repo"]):
                 raise UsageError(f"invalid repo in accept file: {e['repo']!r}")
-        elif not isinstance(e.get("tracking_ref"), str) or "repo" in e:
+            for field, low, high in (("title", 1, 256), ("body", 0, 20000), ("milestone", 1, 100)):
+                if field in e:
+                    value = e[field]
+                    if (not isinstance(value, str) or not low <= len(value) <= high
+                            or (field == "title" and (not value.strip() or "\n" in value or "\r" in value))):
+                        raise UsageError(f"invalid {field} in accept file")
+            if "labels" in e:
+                labels = e["labels"]
+                if (not isinstance(labels, list) or len(labels) > 10
+                        or any(not isinstance(label, str) or not 1 <= len(label) <= 50
+                               or any(c in label for c in ",\n\r") for label in labels)):
+                    raise UsageError("invalid labels in accept file")
+        elif (not isinstance(e.get("tracking_ref"), str)
+              or any(field in e for field in ("repo", "title", "body", "milestone", "labels"))):
             raise UsageError(usage)
     return data
 
@@ -898,7 +917,25 @@ def _issue_body(lid: str, rec: dict, by_key: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _create_issue(ctx: Ctx, repo: str, title: str, body: str) -> tuple[str | None, str | None]:
+def _filing_title(lid: str, rec: dict, entry: dict) -> str:
+    import obsidian_utils
+    if "title" in entry:
+        return " ".join(obsidian_utils.scrub_secrets(entry["title"]).split())
+    return " ".join(str(rec["name"]).split())[:200] or lid
+
+
+def _filing_body(lid: str, rec: dict, by_key: dict, entry: dict) -> str:
+    import obsidian_utils
+    facts = _issue_body(lid, rec, by_key)
+    if "body" not in entry:
+        return facts
+    custom = "".join(line for line in obsidian_utils.scrub_secrets(entry["body"]).splitlines(keepends=True)
+                       if not line.strip().startswith("<!-- retro-lesson:"))
+    return _marker(lid) + "\n\n" + custom + "\n\n---\n" + facts.split("\n", 1)[1]
+
+
+def _create_issue(ctx: Ctx, repo: str, title: str, body: str,
+                  milestone=None, labels=()) -> tuple[str | None, str | None]:
     """File one issue; return ("owner/repo#N", None) or (None, error)."""
     _ensure_state_dir(ctx)
     fd, tmp = tempfile.mkstemp(dir=ctx.state_dir, prefix=".gh-body-", suffix=".md")
@@ -907,8 +944,12 @@ def _create_issue(ctx: Ctx, repo: str, title: str, body: str) -> tuple[str | Non
             fh.write(body)
         os.chmod(tmp, 0o600)
         try:
-            result = _run_gh(["issue", "create", "--repo", repo, "--title", title, "--body-file", tmp],
-                             timeout=GH_CREATE_TIMEOUT_SECONDS)
+            args = ["issue", "create", "--repo", repo, "--title", title, "--body-file", tmp]
+            if milestone is not None:
+                args += ["--milestone", milestone]
+            for label in labels:
+                args += ["--label", label]
+            result = _run_gh(args, timeout=GH_CREATE_TIMEOUT_SECONDS)
         except subprocess.TimeoutExpired:
             return None, "gh timed out; the issue may exist, check before rerunning"
         except OSError as exc:
@@ -982,20 +1023,82 @@ def _adopted_info(issue: dict, today: str) -> dict:
             "created": day(issue.get("createdAt")) or today, "closed": day(issue.get("closedAt"))}
 
 
-def _planned_filings(ctx: Ctx, state: dict, by_key: dict) -> list[dict]:
+def _ref_gone(state: dict, ref: str) -> bool:
+    return (state["tracking"].get(f"issue:{ref}") or {}).get("exists") is False
+
+
+def _live_tracking(state: dict, rec: dict) -> bool:
+    """True when the lesson has tracking that still exists. Gone tracking (the bucket is `file`) counts
+    as none, so a lesson the report offers for filing can be filed."""
+    tracking = rec.get("tracking")
+    if not tracking:
+        return False
+    if (state["tracking"].get(_tracking_key(tracking)) or {}).get("exists") is False:
+        return False
+    return not (rec.get("classify") or {}).get("tracking_gone")
+
+
+def _live_filed(state: dict, lid: str):
+    """The lesson's own filed ref when it is a valid ref to an issue that still exists, else None."""
+    ref = state["filed"].get(lid)
+    return ref if isinstance(ref, str) and _REF.match(ref) and not _ref_gone(state, ref) else None
+
+
+def _adopt_decision(state: dict, lid: str, rec: dict, retired: dict):
+    """What backfill --apply does before it files an issue for an untracked lesson.
+
+    ("adopt", ref, source): an issue filed under a merged-in or split-from id counts, so apply adopts
+    it. ("pending", None, None): a pending filing record under an id this lesson came from means an
+    earlier issue may exist. Apply reconciles it first and refuses to file if that fails.
+    (None, None, None): apply goes on to file. An own pending or own filed record is none of these:
+    apply reconciles or uses it first.
+    """
+    filed = state["filed"].get(lid)
+    if _is_pending(filed) or _live_filed(state, lid):
+        return None, None, None
+    ref, source = _inherited_filing(state, lid, rec, retired, live_only=True)
+    if ref is not None:
+        return "adopt", ref, source
+    if _inherited_pending(state, lid, rec, retired) is not None:
+        return "pending", None, None
+    return None, None, None
+
+
+def _planned_filings(ctx: Ctx, state: dict, by_key: dict,
+                     entries: list[dict] | None = None) -> list[dict]:
     plans, cache = [], {}
-    for lid, rec in sorted(state["lessons"].items()):
+    retired = _load_retired(ctx)
+    selected = ({e["lesson_id"]: e for e in entries if e.get("file_issue")}
+                if entries is not None else {lid: {} for lid in state["lessons"]})
+    for lid, entry in sorted(selected.items()):
+        rec = state["lessons"].get(lid)
+        if rec is None:
+            continue
         filed = state["filed"].get(lid)
-        if rec.get("tracking") or isinstance(filed, str):
+        if _live_tracking(state, rec) or _live_filed(state, lid):
             continue
         untraced = sum(1 for k in rec["members"] if k in by_key and by_key[k]["trace"] is None)
+        # The same decisions apply makes before it files (see _adopt_decision): a lesson apply would
+        # adopt, or cannot check, is not a planned issue.
+        decision, found, _source = _adopt_decision(state, lid, rec, retired)
+        if decision == "adopt":
+            plans.append({"lesson": lid, "repo": found.rsplit("#", 1)[0],
+                          "title": rec["name"], "members": untraced, "milestone": None,
+                          "labels": [], "reason": f"adopts existing issue {found}"})
+            continue
         if not untraced:
             continue
-        if _is_pending(filed):
+        if _is_pending(filed) and entries is None:
             repo, reason = filed["repo"], "pending reconcile"
         else:
-            repo, reason = _resolve_repo(ctx, rec, by_key, None, cache)
-        plan = {"lesson": lid, "repo": repo, "title": rec["name"], "members": untraced}
+            repo, reason = _resolve_repo(ctx, rec, by_key, entry.get("repo"), cache)
+            if (_is_pending(filed) or decision == "pending") and reason is None:
+                reason = "pending reconcile"
+        plan = {"lesson": lid, "repo": repo,
+                "title": _filing_title(lid, rec, entry) if entries is not None else rec["name"],
+                "members": untraced, "milestone": entry.get("milestone"), "labels": entry.get("labels", [])}
+        if entries is not None:
+            plan["body_chars"] = len(entry.get("body", ""))
         if reason:
             plan["reason"] = reason
         plans.append(plan)
@@ -1046,14 +1149,17 @@ def _reconcile_pending(ctx: Ctx, state: dict) -> tuple[list[dict], bool, bool]:
     return reconciled, ok, changed
 
 
-def backfill(ctx: Ctx, state: dict, accept: list[dict] | None) -> tuple[dict, bool]:
-    """Dry run when accept is None; else trace accepted lessons. Returns (result, ok)."""
+def backfill(ctx: Ctx, state: dict, accept: list[dict] | None,
+             preview: list[dict] | None = None) -> tuple[dict, bool]:
+    """Dry run when accept is None; preview optionally selects entries without applying them."""
     items, by_key, _ = _load(ctx)
     plan, skipped_entries, filed, reconciled = [], [], [], []
     accepted = {}
     ok = True
     can_file = True
     retired = {}
+    preview_filings = _planned_filings(ctx, state, by_key, preview) if preview is not None else []
+    preview_by_id = {row["lesson"]: row for row in preview_filings}
     if accept is not None:
         retired = _load_retired(ctx)
         reconciled, ok, changed = _reconcile_pending(ctx, state)
@@ -1063,20 +1169,30 @@ def backfill(ctx: Ctx, state: dict, accept: list[dict] | None) -> tuple[dict, bo
             except OSError as exc:
                 print(f"retro_rollup: cannot save the reconcile result: {exc}", file=sys.stderr)
                 ok = can_file = False
-    for entry in accept or []:
+    for entry in (accept if accept is not None else preview) or []:
         lid = entry["lesson_id"]
         rec = state["lessons"].get(lid)
         if rec is None:
             skipped_entries.append({**entry, "reason": "unknown lesson"})
         elif entry.get("file_issue"):
-            ref = state["filed"].get(lid)
-            if not (isinstance(ref, str) and _REF.match(ref)):
-                ref = None
-            if ref is None and not rec.get("tracking") and not _is_pending(state["filed"].get(lid)):
+            if preview is not None:
+                row = preview_by_id.get(lid)
+                reason = None
+                if row is None:
+                    reason = ("already tracked" if _live_tracking(state, rec) or _live_filed(state, lid)
+                              else "nothing to trace")
+                elif row["repo"] is None:
+                    reason = row["reason"]
+                    ok = False
+                if reason:
+                    skipped_entries.append({**entry, "reason": reason})
+                continue
+            ref = _live_filed(state, lid)
+            if ref is None and not _live_tracking(state, rec) and not _is_pending(state["filed"].get(lid)):
                 # An issue filed under a merged-in or split-from id counts: do not file a second one.
                 # An own pending record still here means its reconcile failed: keep it, never overwrite.
-                ref, source = _inherited_filing(state, lid, rec, retired)
-                if ref is not None:
+                decision, ref, source = _adopt_decision(state, lid, rec, retired)
+                if decision == "adopt":
                     state["filed"][lid] = ref
                     since = ((state["tracking"].get(f"issue:{ref}") or {}).get("created")
                              or ((state["lessons"].get(source) or {}).get("tracking") or {}).get("since")
@@ -1091,13 +1207,14 @@ def backfill(ctx: Ctx, state: dict, accept: list[dict] | None) -> tuple[dict, bo
                         ok = False
                         continue
             if ref is None:
-                if rec.get("tracking"):
+                if _live_tracking(state, rec):
                     skipped_entries.append({**entry, "reason": "already tracked"})
                     continue
                 if not any(k in by_key and by_key[k]["trace"] is None for k in rec["members"]):
                     skipped_entries.append({**entry, "reason": "nothing to trace"})
                     continue
-                if not can_file or _inherited_pending(state, lid, rec, retired) is not None:
+                if (not can_file or _is_pending(state["filed"].get(lid))
+                        or _adopt_decision(state, lid, rec, retired)[0] == "pending"):
                     # A reconcile failed (or could not be saved): an earlier issue may exist.
                     skipped_entries.append({**entry, "reason": "cannot check for an earlier filing"})
                     ok = False
@@ -1107,7 +1224,7 @@ def backfill(ctx: Ctx, state: dict, accept: list[dict] | None) -> tuple[dict, bo
                     skipped_entries.append({**entry, "reason": reason})
                     ok = False
                     continue
-                title = " ".join(str(rec["name"]).split())[:200] or lid
+                title = _filing_title(lid, rec, entry)
                 # Phase 1: record the intent, so a crash or a gh timeout can be reconciled later.
                 before = state["filed"].get(lid)
                 state["filed"][lid] = {"pending": True, "repo": repo, "marker": _marker(lid)}
@@ -1121,7 +1238,8 @@ def backfill(ctx: Ctx, state: dict, accept: list[dict] | None) -> tuple[dict, bo
                     skipped_entries.append({**entry, "reason": f"cannot save the filing record: {exc}"})
                     ok = False
                     continue
-                ref, error = _create_issue(ctx, repo, title, _issue_body(lid, rec, by_key))
+                ref, error = _create_issue(ctx, repo, title, _filing_body(lid, rec, by_key, entry),
+                                           milestone=entry.get("milestone"), labels=entry.get("labels", []))
                 if ref is None:
                     # The pending record stays: the issue may exist (timeout, odd output).
                     skipped_entries.append({**entry, "reason": f"filing failed: {error}"})
@@ -1145,7 +1263,7 @@ def backfill(ctx: Ctx, state: dict, accept: list[dict] | None) -> tuple[dict, bo
                     ok = False
                     continue
                 filed.append({"lesson": lid, "repo": repo, "issue": number})
-            elif rec.get("tracking") and rec["tracking"]["ref"] != ref:
+            elif _live_tracking(state, rec) and rec["tracking"]["ref"] != ref:
                 skipped_entries.append({**entry, "reason": "already tracked"})
                 continue
             accepted[lid] = {**rec, "tracking": {"kind": "issue", "ref": ref}}
@@ -1156,7 +1274,7 @@ def backfill(ctx: Ctx, state: dict, accept: list[dict] | None) -> tuple[dict, bo
             skipped_entries.append({**entry, "reason": "tracking gone"})
         else:
             accepted[lid] = rec
-    lessons = accepted if accept is not None else {
+    lessons = accepted if accept is not None or preview is not None else {
         lid: rec for lid, rec in state["lessons"].items() if rec.get("tracking")}
     by_note: dict[str, list[tuple[str, dict]]] = {}
     for lid, rec in lessons.items():
@@ -1207,7 +1325,8 @@ def backfill(ctx: Ctx, state: dict, accept: list[dict] | None) -> tuple[dict, bo
             "plan": plan if accept is None else [], "filed": filed, "reconciled": reconciled,
             "pending_filings": ([{"lesson": l, "repo": r["repo"]} for l, r in _pending_filings(state).items()]
                                 if accept is None else []),
-            "planned_filings": _planned_filings(ctx, state, by_key) if accept is None else [],
+            "planned_filings": (preview_filings if preview is not None else
+                                _planned_filings(ctx, state, by_key) if accept is None else []),
             **report}, ok
 
 
@@ -1234,26 +1353,111 @@ def _print_table(rep: dict) -> None:
     print(f"\n{len(rep['lessons'])} lessons, {dormant} dormant; totals {json.dumps(rep['totals'], sort_keys=True)}")
 
 
+def _require_lesson(ctx: Ctx, state: dict, lid: str) -> dict:
+    if lid not in state["lessons"]:
+        retired = _load_retired(ctx).get(lid, {})
+        if retired.get("merged_into"):
+            raise UsageError(f"retired lesson {lid}; merged_into {retired['merged_into']}")
+        raise UsageError(f"unknown lesson: {lid}")
+    return state["lessons"][lid]
+
+
+def snooze(ctx: Ctx, state: dict, lid: str, when: str) -> dict:
+    """Set a lesson's snooze while the caller holds the lessons lock."""
+    _require_lesson(ctx, state, lid)
+    value = None if when == "none" else when
+    if value is not None:
+        try:
+            if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+                raise ValueError
+            date.fromisoformat(value)
+        except ValueError:
+            raise UsageError(f"bad snooze date: {when!r}; expected YYYY-MM-DD or none")
+    filename = state.get("notes", {}).get(lid)
+    if not filename:
+        raise OSError(f"no note file for lesson {lid}")
+    path = ctx.lessons_dir / filename
+    if not path.resolve().is_relative_to(ctx.lessons_dir.resolve()):
+        raise OSError(f"path traversal blocked: {path}")
+    try:
+        with open(path, encoding="utf-8", newline="") as fh:
+            content = lessons_notes.set_snooze(fh.read(), value)
+    except (UnicodeError, ValueError) as exc:
+        raise OSError(f"cannot snooze lesson {lid}: {exc}") from exc
+    lessons_notes.write_if_changed(ctx.vault, ctx.lessons_folder, filename, content)
+    return {"lesson_id": lid, "snoozed_until": value}
+
+
+def _scrub_values(value):
+    import obsidian_utils
+    if isinstance(value, str):
+        return obsidian_utils.scrub_secrets(value)
+    if isinstance(value, dict):
+        return {key: _scrub_values(v) for key, v in value.items()}
+    if isinstance(value, list):
+        return [_scrub_values(v) for v in value]
+    return value
+
+
+def show(ctx: Ctx, state: dict, lid: str, as_json: bool) -> int:
+    """Display exact member keys from live retro notes, including missing items."""
+    lesson = _require_lesson(ctx, state, lid)
+    _, by_key, _ = _load(ctx)
+    entry = next(e for e in lessons_notes.report(state)["lessons"] if e["id"] == lid)
+    result = {"lesson_id": lid, **{key: entry[key] for key in (
+        "name", "bucket", "tracking", "tracking_ref", "tracking_source",
+        "issue_state", "issue_milestone", "issue_priority", "sessions",
+    )}, "members": []}
+    missing = False
+    for key in lesson["members"]:
+        item = by_key.get(key)
+        if item is None:
+            missing = True
+            member = {"note": key.split(":")[0], **dict.fromkeys(
+                ("item", "date", "project", "text", "trace"))}
+        else:
+            member = {field: item[field] for field in ("note", "item", "date", "project", "text", "trace")}
+        result["members"].append(member)
+    # A trace can also supply tracking_ref, so scrub the full display object.
+    result = _scrub_values(result)
+    if as_json:
+        print(json.dumps(result, indent=1))
+    else:
+        print(f"{result['name']} | {result['bucket']} | {result['tracking']} "
+              f"{result['tracking_ref']} ({result['tracking_source']})")
+        for member in result["members"]:
+            text = member["text"] if member["text"] is not None else "(unreadable)"
+            print(f"- {member['date']} {member['project']} {member['note']}#{member['item']}: "
+                  f"{text} [{json.dumps(member['trace'])}]")
+    return 1 if missing else 0
+
+
 def _parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="retro_rollup.py")
-    common = argparse.ArgumentParser(add_help=False)
+    p = argparse.ArgumentParser(prog="retro_rollup.py", allow_abbrev=False)
+    common = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
     common.add_argument("--vault")
     common.add_argument("--insights-folder")
     common.add_argument("--state-dir")
     sub = p.add_subparsers(dest="cmd", required=True)
-    u = sub.add_parser("update", parents=[common])
+    u = sub.add_parser("update", parents=[common], allow_abbrev=False)
     u.add_argument("--note")
     u.add_argument("--concurrency", type=int)
-    sub.add_parser("rebuild", parents=[common])
-    sub.add_parser("refresh-tracking", parents=[common])
-    m = sub.add_parser("match", parents=[common])
+    sub.add_parser("rebuild", parents=[common], allow_abbrev=False)
+    sub.add_parser("refresh-tracking", parents=[common], allow_abbrev=False)
+    m = sub.add_parser("match", parents=[common], allow_abbrev=False)
     m.add_argument("--concurrency", type=int)
     m.add_argument("--all", action="store_true", help="check every untracked lesson again")
-    r = sub.add_parser("report", parents=[common])
+    r = sub.add_parser("report", parents=[common], allow_abbrev=False)
     r.add_argument("--json", action="store_true")
-    b = sub.add_parser("backfill", parents=[common])
+    b = sub.add_parser("backfill", parents=[common], allow_abbrev=False)
     b.add_argument("--apply", action="store_true")
     b.add_argument("--accept")
+    s = sub.add_parser("snooze", parents=[common], allow_abbrev=False)
+    s.add_argument("lesson_id")
+    s.add_argument("when")
+    s = sub.add_parser("show", parents=[common], allow_abbrev=False)
+    s.add_argument("lesson_id")
+    s.add_argument("--json", action="store_true")
     return p
 
 
@@ -1264,20 +1468,26 @@ def main(argv=None) -> int:
     except SystemExit as exc:
         return 2 if exc.code else 0
     try:
-        if args.cmd == "backfill" and args.apply != bool(args.accept):
+        if args.cmd == "backfill" and args.apply and not args.accept:
             raise UsageError("--apply and --accept FILE go together")
         ctx = Ctx(args)
+        if args.cmd == "update" and args.note and ctx.lessons_enabled is False:
+            print("lessons: disabled (lessons_enabled is false)")
+            return 0
+        if args.cmd == "show":
+            return show(ctx, load_state(ctx), args.lesson_id, args.json)
         if args.cmd == "report":
             state = load_state(ctx)
             snoozes = {lid: lessons_notes.read_snooze(ctx.lessons_dir / fn)
                        for lid, fn in state.get("notes", {}).items()}
-            rep = lessons_notes.report(state, snoozes)
+            dates = {item["key"]: item["date"] for item in _load(ctx)[0]}
+            rep = lessons_notes.report(state, snoozes, dates)
             if args.json:
                 print(json.dumps(rep, indent=1))
             else:
                 _print_table(rep)
             return 0
-        accept = _read_accept(args.accept) if args.cmd == "backfill" and args.apply else None
+        entries = _read_accept(args.accept) if args.cmd == "backfill" and args.accept else None
         lock = _Lock(ctx)
     except UsageError as exc:
         print(f"retro_rollup: {exc}", file=sys.stderr)
@@ -1287,6 +1497,9 @@ def main(argv=None) -> int:
         return 1
     try:
         state = load_state(ctx)
+        if args.cmd == "snooze":
+            print(json.dumps(snooze(ctx, state, args.lesson_id, args.when)))
+            return 0
         if args.cmd in ("update", "rebuild"):
             summary = regroup(ctx, state, judge=args.cmd == "update", note=getattr(args, "note", None))
             print(f"lessons: {summary['lessons']} (+{summary['new']} new), items in lessons: "
@@ -1305,9 +1518,13 @@ def main(argv=None) -> int:
             summary = regroup(ctx, state, judge=False)
             print(json.dumps({"errors": errors, "match": found, "notes_written": summary["notes_written"]}))
             return 1 if _report_unreadable(summary) or errors else 0
-        result, ok = backfill(ctx, state, accept)
+        result, ok = backfill(ctx, state, entries if args.apply else None,
+                              preview=entries if not args.apply else None)
         print(json.dumps(result, indent=1))
         return 0 if ok else 1
+    except UsageError as exc:
+        print(f"retro_rollup: {exc}", file=sys.stderr)
+        return 2
     except (OSError, Refused) as exc:
         print(f"retro_rollup: {exc}", file=sys.stderr)
         return 1

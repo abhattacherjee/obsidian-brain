@@ -2245,7 +2245,7 @@ def test_run_semantic_merge_pipes_prompt_via_stdin(tmp_path, monkeypatch):
     )
     assert rc == 0
     # argv must only contain the known-safe tokens; no prompt text
-    allowed = {"claude", "-p", "--model", "haiku", "sonnet"}
+    allowed = {"claude", "-p", "--model", "haiku", "sonnet", "--no-session-persistence"}
     unexpected = [arg for arg in captured["cmd"] if arg not in allowed]
     assert not unexpected, (
         f"argv contains unexpected items (likely prompt leaked into argv): {unexpected}"
@@ -2292,7 +2292,7 @@ def test_run_classifier_pipes_prompt_via_stdin(tmp_path, monkeypatch):
         output_path=str(out_path),
     )
     assert rc == 0
-    allowed = {"claude", "-p", "--model", "haiku", "sonnet"}
+    allowed = {"claude", "-p", "--model", "haiku", "sonnet", "--no-session-persistence"}
     unexpected = [arg for arg in captured["cmd"] if arg not in allowed]
     assert not unexpected, (
         f"argv contains unexpected items (likely prompt leaked into argv): {unexpected}"

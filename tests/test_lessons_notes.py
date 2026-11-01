@@ -124,8 +124,9 @@ def test_report_has_no_item_text(sample):
         "issue_state": "open",
         "issue_milestone": sample[3]["milestone"], "issue_priority": "P1",
         "snoozed_until": None,
-        "members": [{"note": "b", "item_key": "b:2"}, {"note": "a", "item_key": "a:1"},
-                    {"note": "a", "item_key": "a:0"}],
+        "members": [{"note": "b", "item_key": "b:2", "date": None},
+                    {"note": "a", "item_key": "a:1", "date": None},
+                    {"note": "a", "item_key": "a:0", "date": None}],
     }
     assert all(item["text"] not in json.dumps(entry) for item in sample[4].values())
 

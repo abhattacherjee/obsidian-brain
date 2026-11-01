@@ -60,7 +60,8 @@ def run_haiku(prompt: str, timeouts: tuple[int, int] = (120, 240)) -> str | None
             result = subprocess.run(
                 # No tools and no MCP: retro text must not reach a tool-capable session.
                 ["claude", "-p", "--model", MODEL, "--setting-sources", "project",
-                 "--strict-mcp-config", "--tools", ""], input=prompt,
+                 "--strict-mcp-config", "--tools", "", "--no-session-persistence"],
+                input=prompt,
                 capture_output=True, text=True, timeout=t,
                 env=obsidian_utils.worker_env(),
             )

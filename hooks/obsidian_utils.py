@@ -4587,7 +4587,7 @@ def generate_snapshot_summary(
     for i, attempt_timeout in enumerate(attempts):
         try:
             result = subprocess.run(
-                ["claude", "-p", "--model", model],
+                ["claude", "-p", "--model", model, "--no-session-persistence"],
                 input=prompt, capture_output=True, text=True, timeout=attempt_timeout,
                 env=worker_env(),
             )
@@ -4653,7 +4653,7 @@ def generate_theme_names(
     for idx, attempt_timeout in enumerate(attempts):
         try:
             result = subprocess.run(
-                ["claude", "-p", "--model", model],
+                ["claude", "-p", "--model", model, "--no-session-persistence"],
                 input=prompt, capture_output=True, text=True, timeout=attempt_timeout,
                 env=worker_env(),
             )
@@ -4804,7 +4804,7 @@ Rate this session 1-10. 1-3: trivial (config, interrupted). 4-6: standard work. 
     for i, attempt_timeout in enumerate(attempts):
         try:
             result = subprocess.run(
-                ["claude", "-p", "--model", model],
+                ["claude", "-p", "--model", model, "--no-session-persistence"],
                 input=prompt,
                 capture_output=True,
                 text=True,
@@ -7271,7 +7271,7 @@ def generate_summaries_batch(
     for i, attempt_timeout in enumerate(attempts):
         try:
             result = subprocess.run(
-                ["claude", "-p", "--model", model],
+                ["claude", "-p", "--model", model, "--no-session-persistence"],
                 input=prompt,
                 capture_output=True,
                 text=True,
