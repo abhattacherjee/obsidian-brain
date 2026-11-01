@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
-- CI runs `python-tests` (3.12, 90% coverage gate) and `python-tests-py39` with `pytest-xdist` (`-n auto`), the way `scripts/commit-preflight.sh` already does (#485). The wall-clock budget tests (`tests/test_security.py::TestDecisionTimeIsBounded`, 5–6.5 min serially on CI, and `tests/test_lessons_corpus.py::test_top_candidates_speed_4000_items`, which took 20.8 s of its 30 s CI budget under xdist) move to a new `timed-tests` job that runs them alone on its own runner for 3.12 and 3.9, so they run alongside the parallel jobs instead of after them. Every test job prints its slowest tests (`--durations`). Before this change the jobs ran serially and took 8–14 min (3.12) and 17–26 min (3.9).
+- CI runs `python-tests` (3.12, 90% coverage gate) and `python-tests-py39` with `pytest-xdist` (`-n auto`), the way `scripts/commit-preflight.sh` already does (#485). The wall-clock budget tests (`tests/test_security.py::TestDecisionTimeIsBounded`, 5–7 min serially on CI, and `tests/test_lessons_corpus.py::test_top_candidates_speed_4000_items`, which took 20.8 s of its 30 s CI budget under xdist) move to a new `timed-tests` job that runs them alone on its own runner for 3.12 and 3.9, so they run alongside the parallel jobs instead of after them. Every test job prints its slowest tests (`--durations`). Before this change the jobs ran serially and took 8–14 min (3.12) and 17–26 min (3.9).
 
 ## [3.10.0] - 2026-11-01
 
