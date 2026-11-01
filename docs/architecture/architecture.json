@@ -1134,7 +1134,7 @@
       "id": "retro-lessons",
       "name": "Retro Lessons (rollup)",
       "color": "#84CC16",
-      "description": "Groups open retro Process Improvements items across sessions into recurring lessons (#471): TF-IDF top-10 candidates, a Haiku same-lesson verdict per pair (cached), star grouping, stable ids, tracking inherited from member traces, five buckets, and one generated note per lesson for the Retro Lessons dashboard.",
+      "description": "Groups open retro Process Improvements items across sessions into recurring lessons (#471): TF-IDF top-10 candidates, a Haiku same-lesson verdict per pair (cached), star grouping, stable ids, tracking inherited from member traces (or, for a lesson with none, from an issue, memory entry or rule matched by TF-IDF and one Haiku call, #473), five buckets, and one generated note per lesson for the Retro Lessons dashboard.",
       "components": [
         {
           "id": "retro-rollup-cli",
@@ -1143,7 +1143,7 @@
           "files": [
             "hooks/retro_rollup.py"
           ],
-          "purpose": "CLI: update (judge unjudged anchors with Haiku, regroup, name new lessons, write changed notes), rebuild (regroup from the cache; no verdict calls), refresh-tracking (gh issue view per tracked issue, memory/path existence), report [--json] (from the private state file), backfill [--apply --accept FILE] (dry run lists planned traces and planned filings; apply traces only accepted lessons via retro_trace partial apply, and runs gh issue create for an accepted lesson with no tracking, saving a pending record with a marker before gh issue create, and reconciling it by marker search on a rerun; the issue and the lesson's tracking are saved before any trace is written). Holds a non-blocking fcntl lock, moves a corrupt state file aside, exit 0 ok / 1 failure / 2 usage."
+          "purpose": "CLI: update (judge unjudged anchors with Haiku, regroup, name new lessons, write changed notes), rebuild (regroup from the cache; no verdict calls), refresh-tracking (gh issue view per tracked issue, memory/path existence), report [--json] (from the private state file), match [--all] [--concurrency N] (#473: for each lesson with no member trace, filed issue or pending filing, rank issues, memory and rules by TF-IDF and ask Haiku once about the top candidate; saves rec[match]; reads GitHub only through gh issue list and never writes a trace; refresh-tracking runs the same check first), backfill [--apply --accept FILE] (dry run lists planned traces and planned filings; apply traces only accepted lessons via retro_trace partial apply, and runs gh issue create for an accepted lesson with no tracking, saving a pending record with a marker before gh issue create, and reconciling it by marker search on a rerun; the issue and the lesson's tracking are saved before any trace is written). Holds a non-blocking fcntl lock, moves a corrupt state file aside, exit 0 ok / 1 failure (including a failed issue listing, a memory scan error or a Haiku non-answer, which leave the lesson unchecked) / 2 usage."
         },
         {
           "id": "lessons-corpus",
@@ -1173,13 +1173,22 @@
           "purpose": "star_lessons (greedy disjoint stars over confirmed edges, spanning >= 2 notes), assign_ids (reuse an id at half overlap; record merged_into / split_from), lesson_tracking (most frequent member trace), classify (sessions, recent sessions, dormant, bucket raise/file/didnt_hold/rule_not_followed/quiet), rank_key."
         },
         {
+          "id": "lessons-match",
+          "name": "lessons_match.py",
+          "kind": "module",
+          "files": [
+            "hooks/lessons_match.py"
+          ],
+          "purpose": "Pure matching module (#473). Candidate documents: issue_docs (gh issue list rows), memory_docs (memory_sources files) and rule_docs (~/.claude/CLAUDE.md and project CLAUDE.md bullets, SKILL.md paragraphs outside code fences, highest numeric plugin version). Index / best_candidate: per-source cosine with sublinear tf and idf over the source, the top across sources, ties by ref. gate / parse_gate: one Haiku call (GATE_PROMPT, RUBRIC_VERSION m4-2026-11-01) answers {\"covers\": bool}; any other answer is None, never a rejection. short_hash keys a stored match to its candidate."
+        },
+        {
           "id": "lessons-notes",
           "name": "lessons_notes.py",
           "kind": "module",
           "files": [
             "hooks/lessons_notes.py"
           ],
-          "purpose": "note_filename, render_note (type claude-lesson, tags claude/lesson + claude/project/*), read_snooze (snoozed_until carries over), write_if_changed (atomic, only when bytes differ), and the text/JSON report."
+          "purpose": "note_filename, render_note (type claude-lesson, tags claude/lesson + claude/project/*), read_snooze (snoozed_until carries over), write_if_changed (atomic, only when bytes differ), and the text/JSON report. Frontmatter and report carry tracking_source (trace, filed, match or none)."
         }
       ]
     },
@@ -1305,7 +1314,7 @@
           "files": [
             "hooks/retro_rollup.py"
           ],
-          "purpose": "<secure dir>/lessons-state.json (0600): lessons (members, tracking, info), tracking refresh results, the lesson id → note filename map and totals. report --json reads it. retired.json (merged and split ids) lives beside the lesson notes in <insights>/lessons/."
+          "purpose": "<secure dir>/lessons-state.json (0600): lessons (members, tracking with its source trace/filed/match, info, match: the accepted or rejected candidate keyed by lesson id), tracking refresh results, the lesson id → note filename map and totals. report --json reads it. retired.json (merged and split ids) lives beside the lesson notes in <insights>/lessons/."
         }
       ]
     },
@@ -2549,6 +2558,43 @@
           "from": "retro-rollup-cli",
           "to": "lessons-notes",
           "label": "render notes"
+        },
+        {
+          "from": "lessons-notes",
+          "to": "db-vault",
+          "label": "write changed notes to claude-insights/lessons/"
+        }
+      ]
+    },
+    {
+      "id": "lessons-match",
+      "name": "Retro lessons match",
+      "description": "retro_rollup.py match (and the start of refresh-tracking) gives an untracked lesson the issue, memory entry or rule that already covers it. It reads GitHub only through gh issue list and writes no trace.",
+      "steps": [
+        {
+          "from": "retro-rollup-cli",
+          "to": "memory-sources",
+          "label": "list memory files (a scan error leaves every lesson unchecked)"
+        },
+        {
+          "from": "retro-rollup-cli",
+          "to": "lessons-match",
+          "label": "gh issue list per repo (read-only), memory and rule documents; TF-IDF top candidate per lesson"
+        },
+        {
+          "from": "retro-rollup-cli",
+          "to": "lessons-verify",
+          "label": "run_haiku: one gate call per lesson whose top candidate changed"
+        },
+        {
+          "from": "retro-rollup-cli",
+          "to": "db-lessons-state",
+          "label": "save match on the lesson record"
+        },
+        {
+          "from": "retro-rollup-cli",
+          "to": "lessons-notes",
+          "label": "regroup: a match is tracking after member traces and a filed issue"
         },
         {
           "from": "lessons-notes",
