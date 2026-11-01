@@ -441,6 +441,54 @@ If zero items were closed across all projects, **omit this entire section** — 
 
 Order projects alphabetically. Within each project, preserve the order items were extracted (file mtime descending — newest checkoffs first).
 
+### Recurring lessons
+
+Retro lessons that keep coming back (from `/retro` notes, grouped by the lessons rollup). Collect the data once, after Step 8. Set `WEEKLY` to `true` when the argument was `this week` or `last week`, else `false`. Weekly mode first runs `refresh-tracking` (it reads issue state with `gh`, read-only); daily mode makes no `gh` call.
+
+```bash
+cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+HOOKS=$(python3 -c "
+import glob, json, os, re
+def _ob_hooks():
+    try:
+        for _m in json.load(open(os.path.expanduser('~/.claude/plugins/known_marketplaces.json'))).values():
+            _s = _m.get('source') if isinstance(_m, dict) else None
+            if not (isinstance(_s, dict) and _s.get('source') == 'directory'):
+                continue
+            _i = _m.get('installLocation') if isinstance(_m, dict) else None
+            if not (isinstance(_i, str) and os.path.isabs(_i)):
+                continue
+            _h = os.path.join(_i, 'hooks')
+            if os.path.isfile(os.path.join(_h, 'obsidian_utils.py')):
+                return _h
+    except Exception:
+        pass
+    _c = [_d for _d in glob.glob(os.path.expanduser('~/.claude/plugins/cache/*/obsidian-brain/*/hooks')) if re.fullmatch('[0-9]+([.][0-9]+)*', _d.split('/')[-2])]
+    return max(_c, key=lambda _p: ([int(_n) for _n in _p.split('/')[-2].split('.')], _p), default='hooks')
+print(_ob_hooks())
+")
+test -f "$HOOKS/retro_rollup.py" || { echo "ERROR: retro_rollup.py not found under $HOOKS - verify the obsidian-brain install resolved there is complete (git pull for a directory-source checkout, or /plugin marketplace update for a cache install), then retry." >&2; exit 1; }
+python3 -c '
+import json, os
+c = json.load(open(os.path.expanduser("~/.claude/obsidian-brain-config.json")))
+print("LESSONS_ENABLED=" + ("false" if c.get("lessons_enabled") is False else "true"))
+' < /dev/null 2>/dev/null || echo LESSONS_ENABLED=true
+WEEKLY='<true|false>'
+if [ "$WEEKLY" = true ]; then python3 "$HOOKS/retro_rollup.py" refresh-tracking < /dev/null; fi
+python3 "$HOOKS/retro_rollup.py" report --json < /dev/null
+```
+
+`refresh-tracking` exit 1 only means some lookups failed; carry on. If `report --json` fails, write "Lessons unavailable." in the section and continue with the rest of the standup. Read the lessons only from `report --json`, never from the state file.
+
+From `lessons[]` drop every lesson with `dormant` true and every lesson with `snoozed_until` on or after today. Keep the buckets `raise`, `file`, `didnt_hold` and `rule_not_followed`, in the report's order. Call the number of lessons kept `LESSONS_WAITING`. Render the first 5, one line each:
+
+```markdown
+### Recurring lessons
+- **<name>** — <bucket> · <sessions> sessions · <tracking_ref, or "no tracking">
+```
+
+If `lessons[]` is empty (no state yet) write `No lessons yet.` under the heading and offer nothing.
+
 Rules for the header sections:
 - **Highlights:** Include only projects with substantive work (skip vault-import-only or config-tweak sessions). Write 1-2 sentences per project summarizing the outcome, not the process. Order by impact/significance, not alphabetically.
 - **Key Open Items:** Consolidate the most important open items across all projects (max ~5-7 items). Prefix each with the project name. These are the items that should drive next week's work. Skip low-priority or already-in-progress items.
@@ -556,6 +604,10 @@ If `UPGRADED_COUNT > 0`, append:
 Then confirm the saved file:
 
 > **Saved:** `$VAULT_PATH/$INSIGHTS_FOLDER/<filename>`
+
+### Step 13b — Offer /lessons (weekly mode only)
+
+Only when `WEEKLY` is `true`, `LESSONS_ENABLED` is `true` and `LESSONS_WAITING` is above 0. Say "<LESSONS_WAITING> lessons wait." and ask one AskUserQuestion: run `/lessons` now, or not. Yes: invoke the `lessons` skill. Daily mode, a disabled setting, an empty bucket list or a missing state never produce this question.
 
 ### Step 14 — Cascade completed open items across vault
 

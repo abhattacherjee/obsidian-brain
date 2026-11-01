@@ -82,7 +82,7 @@ def _frontmatter(scope_name, date_str, window_days, raw_count, group_count,
 
 def _body(scope_name, date_str, window_days, raw_count, group_count,
           classifications, applied, cascaded, merges, skipped=0,
-          evidence_gaps=None):
+          evidence_gaps=None, closed_on_github=None):
     by_kind = {"DONE": [], "NEEDS-ACTION": [], "STALE": [], "ACTIVE": [], "REVIEW": []}
     for c in classifications:
         by_kind.setdefault(c.get("classification", "ACTIVE"), []).append(c)
@@ -234,6 +234,19 @@ def _body(scope_name, date_str, window_days, raw_count, group_count,
                          f"evidence available for this project).")
         parts.append("")
 
+    # #470 X-003: ticks Step 8 made from `=== Closed on GitHub ===` candidates.
+    # They come from retro notes, not classifications, so they get their own
+    # section; the caller already counted them in `applied`.
+    if closed_on_github:
+        parts.append(f"## Closed on GitHub ({len(closed_on_github)} applied)")
+        for c in closed_on_github:
+            if not isinstance(c, dict):
+                continue
+            text = " ".join(str(c.get("text", "")).split())
+            parts.append(f"- [x] {text} ({c.get('ref', '?')}) — "
+                         f"{c.get('file', '?')}:{c.get('line', '?')}")
+        parts.append("")
+
     return "\n".join(parts)
 
 
@@ -254,6 +267,7 @@ def write_check_items_dashboard(
     dry_run,
     skipped=0,
     evidence_gaps=None,
+    closed_on_github=None,
 ):
     """
     Write the check-items dashboard report and return the path.
@@ -269,6 +283,10 @@ def write_check_items_dashboard(
     ``all_projects_gapped`` (bool). None (the default) is a true no-op —
     every existing caller omits it, so it must render nothing and add no
     frontmatter key.
+
+    ``closed_on_github`` (#470) is an optional list of the closed-issue
+    candidates Step 8 flipped (file, line, text, ref); rendered as its own
+    section. The caller adds their count to ``applied``.
     """
     # Folder name comes from user config. Reject empty / absolute / parent-
     # escape values explicitly, and anchor the containment check on
@@ -309,7 +327,8 @@ def write_check_items_dashboard(
                             evidence_gaps=evidence_gaps)
                + _body(safe_scope, date_str, window_days, raw_count, group_count,
                        classifications, applied, cascaded, merges, skipped=skipped,
-                       evidence_gaps=evidence_gaps))
+                       evidence_gaps=evidence_gaps,
+                       closed_on_github=closed_on_github))
 
     tmp = tempfile.NamedTemporaryFile(
         mode="w", delete=False, dir=str(target_dir),

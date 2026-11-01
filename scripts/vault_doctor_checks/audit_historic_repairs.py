@@ -33,7 +33,6 @@ The backup root can be overridden via ``OBSIDIAN_BRAIN_DOCTOR_BACKUP_ROOT``
 from __future__ import annotations
 
 import os
-import shutil
 import sys
 import tempfile
 from datetime import datetime, timezone
@@ -46,6 +45,8 @@ from . import Issue, Result
 from .source_sessions import (
     _EXTRA_INSIGHT_FOLDERS,
     _FILENAME_DATE_RE,
+    _backup_note,
+    _iter_note_paths,
     _parse_frontmatter,
     _rewrite_frontmatter,
 )
@@ -114,13 +115,52 @@ def _candidate_folders(sessions_folder: str, insights_folder: str) -> list[str]:
     return [insights_folder, *_EXTRA_INSIGHT_FOLDERS, sessions_folder]
 
 
-def _find_current_note(
-    vault: Path, basename: str, sessions_folder: str, insights_folder: str
-) -> Path | None:
+def _index_current_notes(
+    vault: Path, sessions_folder: str, insights_folder: str
+) -> tuple[dict[Path, Path], dict[str, Path]]:
+    """Index exact relative paths and legacy basenames once per audit.
+
+    Legacy backups have no folder hint. Preserve their folder priority and
+    prefer top-level notes before nested ones when basenames collide.
+    """
+    by_path: dict[Path, Path] = {}
+    by_name: dict[str, Path] = {}
     for folder in _candidate_folders(sessions_folder, insights_folder):
-        candidate = vault / folder / basename
-        if candidate.is_file():
-            return candidate
+        directory = vault / folder
+        if not directory.is_dir():
+            continue
+        entries = sorted(
+            _iter_note_paths(directory, recursive=folder == insights_folder, root=vault),
+            key=lambda p: (len(p.relative_to(vault).parts), str(p)),
+        )
+        for entry in entries:
+            by_path[entry.relative_to(vault)] = entry
+            by_name.setdefault(entry.name, entry)
+    return by_path, by_name
+
+
+def _backup_folder_hint(
+    relative: Path, folders: set[Path], insights_folder: str
+) -> Path | None:
+    """Keep the entire source folder suffix, including _provisional/deeper.
+
+    A run prefixes it with project/check directories; configured folder
+    names may themselves have multiple components.
+    """
+    # Modern runs prefix the source path with one project/check component.
+    # Prefer that layout so a project named "claude-decisions" is not
+    # mistaken for the source folder. Also accept unprefixed older layouts.
+    starts = [1, 0, *range(2, len(relative.parts) - 1)]
+    for start in starts:
+        suffix = Path(*relative.parts[start:])
+        if any(suffix.is_relative_to(folder) for folder in folders):
+            return suffix.parent
+    # A parent-name-only backup can carry _provisional without its insights
+    # ancestor. It still has a folder hint: never pair it with a top-level
+    # note of the same name through the legacy basename fallback.
+    if "_provisional" in relative.parts[:-1]:
+        start = relative.parts.index("_provisional")
+        return Path(insights_folder, *relative.parts[start:-1])
     return None
 
 
@@ -169,9 +209,12 @@ def scan(
     # dropping one note from the audit and potentially pairing a backup with
     # the WRONG note (which apply() would then "restore" into an uncorrupted
     # note). Modern backup runs nest each note under its source folder
-    # (<run>/<project>/<folder>/<basename>), so the backup's parent dir name
-    # is used as a folder hint when it matches a known note folder.
-    known_folders = set(_candidate_folders(sessions_folder, insights_folder))
+    # (<run>/<project>/<vault-relative-path>), so preserve the full source
+    # folder suffix as the hint, including _provisional and nested folders.
+    known_folders = {Path(f) for f in _candidate_folders(sessions_folder, insights_folder)}
+    current_by_path, current_by_name = _index_current_notes(
+        vault, sessions_folder, insights_folder
+    )
 
     # resolved target path (str) -> (run_ts, backup_path); the OLDEST run per
     # target wins — it is the true pre-doctor original. Intermediate backups
@@ -191,24 +234,23 @@ def scan(
         if run_ts < cutoff:
             skipped_old_runs += 1
             continue
-        for md in run_dir.rglob("*.md"):
+        for md in _iter_note_paths(run_dir, recursive=True):
             # Skip this check's own restore backups — re-running the audit
             # must not treat its own output as a historic repair.
             if NAME in md.relative_to(run_dir).parts:
                 continue
-            folder_hint = md.parent.name if md.parent.name in known_folders else None
+            folder_hint = _backup_folder_hint(
+                md.relative_to(run_dir), known_folders, insights_folder
+            )
             if folder_hint:
-                candidate = vault / folder_hint / md.name
-                target = candidate if candidate.is_file() else None
+                target = current_by_path.get(folder_hint / md.name)
             else:
                 # Legacy-layout backups (<run>/<project>/<basename>) carry no
                 # folder information; fall back to the ordered folder search.
                 # A cross-folder basename collision can still mis-resolve
                 # here — no folder info exists to disambiguate — but
                 # reachability is near-zero in practice.
-                target = _find_current_note(
-                    vault, md.name, sessions_folder, insights_folder
-                )
+                target = current_by_name.get(md.name)
             if target is None:
                 missing.add(f"{folder_hint or '?'}/{md.name}")
                 continue
@@ -333,6 +375,7 @@ def scan(
             reason=reason,
             confidence=confidence,
             extra={
+                "vault_path": str(vault.resolve()),
                 "category": category,
                 "signal_class": _CATEGORY_SIGNALS[category],
                 "unresolved": unresolved,
@@ -407,20 +450,8 @@ def apply(issues: list[Issue], backup_root: str) -> list[Result]:
 
         # Backup the current state under a check-named subdir so re-running
         # this tool is itself reversible.
-        source_folder = note_path.parent.name
-        backup_dir = Path(backup_root) / NAME / source_folder
         try:
-            backup_dir.mkdir(parents=True, exist_ok=True)
-            backup_path = backup_dir / note_path.name
-            # Defense-in-depth (mirrors source_sessions.apply): the backup
-            # write must never escape backup_root via a hostile folder name.
-            resolved_root = Path(backup_root).resolve()
-            resolved_backup = backup_path.resolve()
-            if resolved_root not in resolved_backup.parents:
-                raise ValueError(
-                    f"backup path {backup_path} would escape backup_root {backup_root}"
-                )
-            shutil.copy2(note_path, backup_path)
+            backup_path = _backup_note(issue, backup_root, NAME)
         except (OSError, ValueError) as exc:
             results.append(Result(
                 check=NAME, note_path=issue.note_path, status="error",

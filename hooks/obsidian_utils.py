@@ -346,13 +346,38 @@ def mark_retro_classification_pending(session_id: str, retro_path: str) -> str:
                 pass
 
 
-def clear_retro_classification_pending(session_id: str) -> bool:
+def retro_gate_untraced(session_id: str) -> int | None:
+    """How many Process Improvements items in the gated retro have no trace (#470).
+
+    None when no gate is armed for *session_id*, or its note cannot be read
+    (missing, unreadable, no frontmatter). Never raises.
+    """
+    pending = get_retro_classification_pending(session_id)
+    if pending is None:
+        return None
+    try:
+        # Imported here: retro_trace imports note_writer, which imports this module.
+        import retro_trace
+        return retro_trace.untraced_count(pending["retro_path"])
+    except Exception:
+        return None
+
+
+def clear_retro_classification_pending(session_id: str, force: bool = False) -> bool:
     """Delete the retro-classification-pending sentinel if present.
+
+    Without *force*, refuses (returns False, sentinel kept) while the gated
+    retro still has a Process Improvements item with no trace (#470). A note
+    that cannot be read does not hold the gate. The Stop hook's fail-open
+    paths pass ``force=True``.
 
     Returns True if the sentinel existed (and was removed), False otherwise.
     Never raises — swallows all errors.
     """
     if not session_id:
+        return False
+
+    if not force and (retro_gate_untraced(session_id) or 0) > 0:
         return False
 
     sanitized = _RETRO_SID_SAFE.sub("_", session_id)
@@ -707,6 +732,19 @@ def _peek_frontmatter_fields(
             result[field] = value
             break
     return result
+
+
+def normalize_status(value) -> str | None:
+    """A frontmatter ``status`` value as a comparable token, or None.
+
+    The first token, lowercased, with an inline ``# comment`` and quotes
+    removed: ``"Provisional"`` and ``provisional # kept for now`` both give
+    ``provisional`` (#455). Anything that is not a string gives None.
+    """
+    if not isinstance(value, str):
+        return None
+    text = re.split(r"(?:^|\s)#", value, maxsplit=1)[0].strip().strip("\"'").strip()
+    return text.split()[0].lower() if text.split() else None
 
 
 def _peek_frontmatter_field(path: Path, field: str) -> str | None:
@@ -2358,6 +2396,11 @@ _DEFAULTS: dict = {
     "auto_capture_update_min_cosine": 0.35,
     # #425: projects whose sessions are captured below the 3-user-message gate (headless runs)
     "auto_capture_headless_projects": ["openclaw"],
+    # #471: retro lessons rollup (hooks/retro_rollup.py)
+    "lessons_enabled": True,  # false turns off the /retro update and the weekly lesson prompts
+    "lessons_recent_days": 90,  # recency window for ranking, and the dormant cut-off
+    "lessons_concurrency": 8,  # parallel Haiku calls when judging retro items
+    "project_repos": {},  # project -> "owner/repo" for projects outside ~/dev/claude_workspace/<project>
 }
 
 # #425: set on every `claude -p` this plugin starts, so the child session's
@@ -3647,7 +3690,8 @@ def gather_session_evidence(
     """Discover and load all artifacts written during this session.
 
     Returns a structured bundle of snapshots (from sessions_folder) and
-    insights/decisions/error-fixes/retros (from insights_folder) whose
+    insights/decisions/error-fixes/retros (recursively from insights_folder,
+    excluding _rejected directories) whose
     frontmatter `source_session` matches `session_id` OR any id in
     `also_session_ids`.
 
@@ -3765,7 +3809,8 @@ def gather_session_evidence(
             key=lambda s: (0 if s["hhmmss"] == "??????" else 1, s["stem"]),
         )
     insights_path = Path(vault_path) / insights_folder
-    if insights_path.is_dir():
+    vault_root = Path(vault_path).resolve()
+    if insights_path.is_dir() and insights_path.resolve().is_relative_to(vault_root):
         type_buckets = {
             "claude-insight": bundle["insights"],
             "claude-decision": bundle["decisions"],
@@ -3776,7 +3821,22 @@ def gather_session_evidence(
         # index only lets a note it proves irrelevant skip the metadata read
         # (#447). None = no index: read every note, as before.
         indexed = _indexed_rows_under(insights_path)
-        for note_path in sorted(insights_path.glob("*.md")):
+        for note_path in sorted(insights_path.rglob("*.md"), key=lambda p: (p.name, str(p))):
+            if "_rejected" in note_path.relative_to(insights_path).parts:
+                continue
+            try:
+                real = note_path.resolve()
+            except (OSError, RuntimeError) as exc:
+                bundle["discovery_errors"].append(
+                    f"{note_path.name}: {_UNREADABLE_REASON_PREFIX} "
+                    f"{getattr(exc, 'strerror', None) or type(exc).__name__}"
+                )
+                continue
+            # A file symlink must not escape the vault or alias a rejected note.
+            if not real.is_relative_to(vault_root):
+                continue
+            if "_rejected" in real.relative_to(vault_root).parts:
+                continue
             row = _fresh_index_row(indexed, note_path)
             if row is not None and row["source_session"] not in id_set:
                 continue
@@ -4527,7 +4587,7 @@ def generate_snapshot_summary(
     for i, attempt_timeout in enumerate(attempts):
         try:
             result = subprocess.run(
-                ["claude", "-p", "--model", model],
+                ["claude", "-p", "--model", model, "--no-session-persistence"],
                 input=prompt, capture_output=True, text=True, timeout=attempt_timeout,
                 env=worker_env(),
             )
@@ -4593,7 +4653,7 @@ def generate_theme_names(
     for idx, attempt_timeout in enumerate(attempts):
         try:
             result = subprocess.run(
-                ["claude", "-p", "--model", model],
+                ["claude", "-p", "--model", model, "--no-session-persistence"],
                 input=prompt, capture_output=True, text=True, timeout=attempt_timeout,
                 env=worker_env(),
             )
@@ -4744,7 +4804,7 @@ Rate this session 1-10. 1-3: trivial (config, interrupted). 4-6: standard work. 
     for i, attempt_timeout in enumerate(attempts):
         try:
             result = subprocess.run(
-                ["claude", "-p", "--model", model],
+                ["claude", "-p", "--model", model, "--no-session-persistence"],
                 input=prompt,
                 capture_output=True,
                 text=True,
@@ -5542,7 +5602,7 @@ def build_context_brief(
                 [f for f in insights_dir.iterdir() if f.suffix == '.md'],
                 reverse=True
             )
-            project_insights: list[Path] = []
+            candidates: list[dict] = []
             for f in insight_files:
                 meta = read_note_metadata(str(f))
                 if not meta:
@@ -5550,8 +5610,13 @@ def build_context_brief(
                 fm_project = meta.get('project', '')
                 if fm_project.lower() != project.lower() and slugify(fm_project) != slugify(project):
                     continue
-                project_insights.append(f)
+                if normalize_status(meta.get('status')) == 'provisional':  # #455: as query_related_notes leaves them out
+                    continue
+                candidates.append({"path": f, "type": meta.get('type')})
 
+            # #458: the same retro rule as query_related_notes, on the date-ordered list.
+            from related_select import select_related
+            project_insights: list[Path] = [r["path"] for r in select_related(candidates, len(candidates))]
             insight_count = len(project_insights)
             for f in project_insights[:20]:
                 title = f.stem
@@ -7206,7 +7271,7 @@ def generate_summaries_batch(
     for i, attempt_timeout in enumerate(attempts):
         try:
             result = subprocess.run(
-                ["claude", "-p", "--model", model],
+                ["claude", "-p", "--model", model, "--no-session-persistence"],
                 input=prompt,
                 capture_output=True,
                 text=True,

@@ -21,6 +21,7 @@ from typing import TypedDict
 
 import capture_state
 import compress_guard
+import note_placement
 import note_writer
 import obsidian_utils
 import vault_index
@@ -47,6 +48,19 @@ def _writer_failed(what: str, output: str) -> Exception:
     if any(m in output for m in _TRANSIENT_MARKERS):
         return TransientSaveError(f"{what} failed: {output}")
     return RuntimeError(f"{what} failed: {output}")
+
+
+def _other_home(config: dict, abs_path: Path) -> Path | None:
+    """The same basename in the note's other R1 home, or None outside both homes."""
+    try:
+        _, root = note_placement._insights_root(config)
+        path = Path(abs_path).resolve()
+        if not note_placement._is_r1_home(path, root):
+            return None
+    except ValueError:
+        return None
+    other_dir = root if path.parent != root else root / note_placement.PROVISIONAL_DIR
+    return other_dir / path.name
 
 
 class Candidate(TypedDict):
@@ -121,7 +135,7 @@ def section_end(lines: list[str], start: int, marker: str) -> int:
     return len(lines)
 
 
-AUTO_HEADING_RE = re.compile(r"^## Update \([^)]*\) — auto-capture (?P<id>[0-9a-f]{12})$")
+AUTO_HEADING_RE = re.compile(r"^## Update \([^)]*\) — auto-capture (?P<id>[0-9a-f]{12})\Z")
 
 
 def strip_auto_updates(text: str) -> str:
@@ -277,8 +291,14 @@ def session_note_for(session_id: str, project: str, config: dict) -> str:
     return obsidian_utils.resolve_source_session_note(name, session_id, vault, folder)
 
 
+PROVISIONAL = "provisional"  # #455: every new auto note starts out of the default retrieval pool
+MAX_UPDATES_PER_NOTE_PER_DAY = 3
+
+
 def _frontmatter(c: Candidate, *, session_id: str, project: str, session_note: str, today: str,
-                 created_at: str | None = None) -> str:
+                 created_at: str | None = None, status: str | None = PROVISIONAL) -> str:
+    """The new note's frontmatter. ``status`` replaces the template's (decisions say
+    ``active``) or is added after ``source:``; None keeps the template as it is."""
     template_name, _ = TYPES[c["type"]]
     template = (_TEMPLATES / template_name).read_text(encoding="utf-8")
     front = template.split("---", 2)[1]
@@ -296,17 +316,74 @@ def _frontmatter(c: Candidate, *, session_id: str, project: str, session_note: s
     if not session_note:
         front = re.sub(r'^source_session_note: ""\n', "", front, flags=re.M)
     front = front.replace(f"project: {project_tag}\n", f"project: {project_tag}\nsource: auto-capture\n", 1)
+    if status is not None:
+        front, n = re.subn(r"^status: .*\n", f"status: {status}\n", front, count=1, flags=re.M)
+        if not n:
+            front = front.replace("source: auto-capture\n", f"source: auto-capture\nstatus: {status}\n", 1)
     front = front.rstrip("\n") + "\n  - claude/auto\n"
     return f"---{front}---\n"
 
 
+def _new_note_home(config: dict, filename: str, status: str | None) -> Path:
+    """The validated R1 destination, before creating any directories."""
+    folder = Path(config.get("insights_folder", "claude-insights"))
+    if status == PROVISIONAL:
+        folder /= note_placement.PROVISIONAL_DIR
+    path = Path(config["vault_path"]) / folder / filename
+    home = note_placement.home_for(config, path, status)
+    # home_for resolves its input, but its computed destination may itself
+    # traverse a symlink (notably _provisional). Validate that destination too.
+    if home is None or home.resolve() != home:
+        raise ValueError("new note must resolve to an R1 home inside insights_folder")
+    return home
+
+
+def _ensure_note_dir(vault: str, folder: str) -> None:
+    """Create missing note directories privately, after containment checks."""
+    error = note_writer._validate_folder(folder)
+    if error:
+        raise ValueError(error)
+    root = Path(vault).resolve()
+    parent = (root / folder).resolve()
+    if not parent.is_relative_to(root) or parent == root:
+        raise ValueError("note directory must resolve inside the vault")
+    parts = parent.relative_to(root).parts
+    if any(part.startswith(".") for part in parts):
+        raise ValueError("note directory must not resolve to a hidden folder")
+    for part in parts:
+        root /= part
+        root.mkdir(mode=0o700, exist_ok=True)
+
+
 def new_filename(vault: str, folder: str, day: str, title: str) -> str:
-    """``<day>-<slug>-<hash4>.md`` that does not exist yet in ``folder``."""
+    """``<day>-<slug>-<hash4>.md`` free in both R1 homes."""
+    config = {"vault_path": vault, "insights_folder": folder}
+    error = note_writer._validate_folder(folder)
+    if error:
+        raise ValueError(error)
+    root = Path(vault).resolve()
     for _ in range(2):
         filename = f"{day}-{_slug(title)}-{_hash4()}.md"
-        if not (Path(vault) / folder / filename).exists():
-            return filename
+        homes = (root / folder / filename, root / folder / note_placement.PROVISIONAL_DIR / filename)
+        if any(not home.resolve().is_relative_to(root) for home in homes):
+            raise ValueError("note filename must resolve inside the vault")
+        # Check the original entries, before home_for resolves them: directories
+        # and dangling symlinks also occupy a name, but are not note homes.
+        if any(home.exists() or home.is_symlink() for home in homes):
+            continue
+        for status in (None, PROVISIONAL):
+            _new_note_home(config, filename, status)
+        return filename
     raise RuntimeError("could not find a free filename")
+
+
+def _updates_today(match: str, today: str) -> int:
+    # ledger_list's since is inclusive epoch seconds. A naive midnight's
+    # timestamp uses the local offset AT midnight, including on DST days.
+    midnight = datetime.datetime.combine(datetime.date.fromisoformat(today), datetime.time.min).timestamp()
+    return sum(1 for row in capture_state.ledger_list(since=midnight, limit=10**9)
+               if row.get("kind") == "updated" and row.get("status") != "rejected"
+               and isinstance(row.get("note_path"), str) and Path(row["note_path"]).name == Path(match).name)
 
 
 def save_candidate(
@@ -317,8 +394,14 @@ def save_candidate(
     session_note: str | None = None,
     today: str | None = None,
     config: dict | None = None,
+    repo: str | None = None,
 ) -> dict:
-    """Write ``c`` as a new note or an update; append and return its ledger row."""
+    """Write ``c`` as a new note or an update; append and return its ledger row.
+
+    #455: the row also keeps the worker's ``score`` and ``about_issue`` and
+    the session's ``repo`` (its cwd), which selection and the closed-issue
+    check read later. A new note is written ``status: provisional``.
+    """
     if c.get("type") not in TYPES:
         raise ValueError(f"unknown candidate type: {c.get('type')!r}")
     config = config or obsidian_utils.load_config()
@@ -331,33 +414,72 @@ def save_candidate(
         raise ValueError("candidate has an empty body")
     cid = secrets.token_hex(6)
     row = {"id": cid, "session_id": session_id, "project": project, "type": c["type"],
-           "title": title, "status": "active", "summary": summary_of(body)}
+           "title": title, "status": "active", "summary": summary_of(body),
+           "score": c.get("score"), "about_issue": c.get("about_issue"), "repo": repo}
 
     try:
         match = find_match(query_text(title, body), config, session_id=session_id)
     except Exception as exc:  # noqa: BLE001 -- a dedup that cannot run fails toward a new note, never a lost one
         capture_state.append_capture_log(project, session_id, "match-failed", f"{type(exc).__name__}: {exc}"[:160])
         match = None
-    sink = io.StringIO()
-    if match:
-        heading = f"## Update ({today}) — auto-capture {cid}"
-        abs_path = str(Path(vault) / match)
-        with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
-            rc = note_writer.run_append_update(vault, abs_path, f"{heading}\n\n**{title}**\n\n{_demote_headings(body)}\n\n{end_marker(cid)}\n",
-                                               last_updated=today, add_tags_csv="claude/auto")
-        if rc != 0:
-            raise _writer_failed("append-update", sink.getvalue().strip())
-        row.update(kind="updated", note_path=match, update_heading=heading)
-    else:
-        if session_note is None:
-            session_note = session_note_for(session_id, project, config)
-        content = _frontmatter(c, session_id=session_id, project=project,
-                               session_note=session_note, today=today) + f"\n# {title}\n\n{body}\n"
-        filename = new_filename(vault, folder, today, title)
-        with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
-            rc = note_writer.run_write(vault, folder, filename, content)
-        if rc != 0:
-            raise _writer_failed("write", sink.getvalue().strip())
-        row.update(kind="new", note_path=f"{folder}/{filename}")
-    capture_state.ledger_append(row)
+    # R3 accepts two sessions racing at N-1 both passing: the ledger count
+    # and append are not one transaction with the note writer's lock.
+    if match and _updates_today(match, today) >= MAX_UPDATES_PER_NOTE_PER_DAY:
+        row["capped_update_of"] = match
+        match = None
+    # Hold the note's other R1 home for the whole append and ledger write, so
+    # a relocation (which needs both homes) cannot move the note in between and
+    # leave the row naming the old path.
+    other_lock = None
+    other = _other_home(config, Path(vault) / match) if match else None
+    if other is not None:
+        other.parent.mkdir(mode=0o700, exist_ok=True)
+        other_lock, lock_error = note_writer._acquire_lock(other)
+        if lock_error:
+            raise _writer_failed("append-update", lock_error)
+    try:
+        sink = io.StringIO()
+        if match:
+            heading = f"## Update ({today}) — auto-capture {cid}"
+            abs_path = str(Path(vault) / match)
+            with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
+                rc = note_writer.run_append_update(vault, abs_path, f"{heading}\n\n**{title}**\n\n{_demote_headings(body)}\n\n{end_marker(cid)}\n",
+                                                   last_updated=today, add_tags_csv="claude/auto")
+            if rc != 0:
+                raise _writer_failed("append-update", sink.getvalue().strip())
+            row.update(kind="updated", note_path=match, update_heading=heading)
+        else:
+            if session_note is None:
+                session_note = session_note_for(session_id, project, config)
+            content = _frontmatter(c, session_id=session_id, project=project,
+                                   session_note=session_note, today=today) + f"\n# {title}\n\n{body}\n"
+            filename = new_filename(vault, folder, today, title)
+            home = _new_note_home(config, filename, PROVISIONAL)
+            folder = home.parent.relative_to(Path(vault).resolve()).as_posix()
+            _ensure_note_dir(vault, folder)
+            with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
+                rc = note_writer.run_write(vault, folder, filename, content)
+            if rc != 0:
+                raise _writer_failed("write", sink.getvalue().strip())
+            row.update(kind="new", note_path=f"{folder}/{filename}")
+        capture_state.ledger_append(row)
+    finally:
+        note_writer._release_lock(other_lock)
+    if row.get("kind") == "updated":
+        _replace_after_update(config, Path(vault) / match, project, session_id)
     return row
+
+
+def _replace_after_update(config: dict, path: Path, project: str, session_id: str) -> None:
+    """Re-place an updated note by its current status.
+
+    A hand append that promoted the note while our companion lock was held had
+    its own placement refused, and nothing retries it. A failure here never
+    undoes the saved update.
+    """
+    try:
+        status = obsidian_utils.normalize_status(
+            obsidian_utils._peek_frontmatter_fields(path, ("status",))["status"])
+        note_placement.place(config, path, status, vault_index._default_db_path())
+    except Exception as exc:  # noqa: BLE001 -- the update is already saved
+        capture_state.append_capture_log(project, session_id, "place-failed", f"{type(exc).__name__}: {exc}"[:160])

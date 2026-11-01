@@ -34,8 +34,11 @@ def test_codex_policy_hooks_use_one_source():
                        for hook in group["hooks"]]
     source_paths = []
     for command in source_commands:
-        executable, path = shlex.split(command)
+        executable, anchored = shlex.split(command)
         assert executable == "python3"
+        # Anchored on the project root, as harden-repo's settings are (#418).
+        assert anchored.startswith("$CLAUDE_PROJECT_DIR/"), anchored
+        path = anchored[len("$CLAUDE_PROJECT_DIR/"):]
         assert path.startswith(".claude/hooks/") and path.endswith(".py")
         assert (ROOT / path).is_file()
         source_paths.append(path)

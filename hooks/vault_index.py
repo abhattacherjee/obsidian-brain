@@ -40,8 +40,15 @@ from themes import (  # noqa: F401  (re-export shim)
     _THEME_SIMILARITY_THRESHOLD,
 )
 from frontmatter import split_frontmatter, split_lines_lf_crlf
+from related_select import RELATED_MAX_RETROS, select_related  # noqa: F401  (re-export; #458)
 
 DEFAULT_IMPORTANCE = 5
+# #455: auto notes capture selection did not promote. NULL (every note from
+# before #455, and hand notes) stays in. ``p`` is the table alias prefix.
+# Tolerant of case, quotes and an inline comment ("Provisional", provisional # x).
+_SQL_TRIM_CHARS = "' \"'''"  # a space, a double quote and a single quote, as an SQL literal
+NOT_PROVISIONAL_SQL = ("({p}status IS NULL OR lower(trim({p}status, " + _SQL_TRIM_CHARS + ")) NOT LIKE 'provisional%')")
+
 IMPORTANCE_AUTO_CAPTURE = 3
 IMPORTANCE_HAND_SAVED = 6
 CURATED_IMPORTANCE_TYPES = ("claude-insight", "claude-decision", "claude-error-fix")
@@ -744,9 +751,10 @@ def _delete_note(conn: sqlite3.Connection, rel_path: str) -> None:
 _MALFORMED_FILES_CAP = 20
 
 # Note types written into indexed folders that are not knowledge: the LLM
-# wiki's own index and log files (#383). _sync skips them, and removes a row
-# whose note changed to one of these types.
-_UNINDEXED_TYPES = frozenset({"claude-wiki-index"})
+# wiki's own index and log files (#383), and the generated retro lesson notes
+# (#471), which only regroup retro items already indexed. _sync and index_note
+# skip them, and remove a row whose note changed to one of these types.
+_UNINDEXED_TYPES = frozenset({"claude-wiki-index", "claude-lesson"})
 
 # Cap on the length of a filename recorded in `stats["malformed_files"]`.
 # 120 chars is generous headroom over any realistic vault filename.
@@ -903,6 +911,16 @@ def _sync(conn: sqlite3.Connection, vault_path: str, folders: list[str]) -> dict
                 if any(
                     _is_under(indexed_path, root) for root in scanned_roots
                 ):
+                    # A relocation may finish after rglob's listing but before
+                    # the indexed-path snapshot. Keep a row whose file is now
+                    # present even though the stale listing missed it. Files
+                    # under _rejected/ are left out of disk_files on purpose,
+                    # so they never qualify.
+                    if os.path.exists(abs_path_str) and not any(
+                        "_rejected" in indexed_path.relative_to(root).parts
+                        for root in scanned_roots if _is_under(indexed_path, root)
+                    ):
+                        continue
                     _delete_note(conn, abs_path_str)
                     stats["deleted"] += 1
 
@@ -1764,6 +1782,12 @@ def index_note(db_path: str, note_path: str) -> bool:
 
     try:
         try:
+            if parsed.get("type") in _UNINDEXED_TYPES:
+                # Same rule as _sync (#471): never a row; drop a stale one.
+                conn.execute("BEGIN IMMEDIATE")
+                _delete_note(conn, note_path)
+                conn.commit()
+                return True
             # BEGIN IMMEDIATE so _upsert_note's read-modify-write
             # (_prior_tokens_for → _update_term_df → SELECT COUNT → INSERT)
             # is serialized against other writers (concurrent hooks,
@@ -1782,6 +1806,54 @@ def index_note(db_path: str, note_path: str) -> bool:
             return False
     finally:
         conn.close()
+
+
+def update_note_status(db_path: str, note_path: str, pre_stat: tuple[float, int] | None = None,
+                       post_stat: tuple[int, int] | None = None) -> bool:
+    """Refresh one indexed note's ``status`` from its file, keeping its vector (#455).
+
+    Capture selection rewrites only frontmatter fields the index does not
+    score (``status``, ``capture_*``). A full ``index_note`` would re-derive
+    the TF-IDF vector against the current IDF, and that drift alone can flip
+    a near-tie in the next selection. A note not indexed yet is indexed in full.
+
+    ``pre_stat`` and ``post_stat`` are what ``set_frontmatter_fields(...,
+    stat_out=)`` reports: the file's ``(st_mtime, st_size)`` read under the
+    note's lock just before our own write, and the ``(st_mtime_ns, st_size)``
+    that write produced. The row's mtime and size
+    are stamped with the file's new ones only when (a) the row still held
+    ``pre_stat``, i.e. the index had seen exactly the content we edited, and
+    (b) the file still has ``post_stat``, i.e. nobody edited it after us.
+    Otherwise (an external edit the index never saw, one after our write, or
+    no stat given) only ``status`` changes and the row stays stale, so the
+    next ``_sync`` re-indexes the content.
+    """
+    if not os.path.isfile(db_path) or not os.path.isfile(note_path):
+        return False
+    parsed = _parse_note(note_path)
+    if parsed is None:
+        return False
+    st = os.stat(note_path)
+    conn = _connect(db_path)
+    try:
+        row = conn.execute("SELECT mtime, size FROM notes WHERE path = ?", (note_path,)).fetchone()
+        if row is None:
+            updated = False
+        else:
+            fresh = (pre_stat is not None and post_stat is not None
+                     and row["mtime"] is not None and row["size"] is not None
+                     and mtime_unchanged(pre_stat[0], row["mtime"]) and pre_stat[1] == row["size"]
+                     and (st.st_mtime_ns, st.st_size) == tuple(post_stat))
+            if fresh:
+                conn.execute("UPDATE notes SET status = ?, mtime = ?, size = ? WHERE path = ?",
+                             (parsed.get("status"), st.st_mtime, st.st_size, note_path))
+            else:
+                conn.execute("UPDATE notes SET status = ? WHERE path = ?", (parsed.get("status"), note_path))
+            conn.commit()
+            updated = True
+    finally:
+        conn.close()
+    return True if updated else index_note(db_path, note_path)
 
 
 # ---------------------------------------------------------------------------
@@ -2122,6 +2194,8 @@ def search_vault(
     caller: str | None = None,
     include_vectors: bool = False,
     log_access: bool = True,
+    include_provisional: bool = True,
+    min_results: int = 0,
 ) -> list[dict]:
     """Full-text search over the vault index.
 
@@ -2132,7 +2206,11 @@ def search_vault(
 
     Candidates are retrieved with BM25 column weighting (title=10x,
     tags=5x), then reranked with a 7-signal scorer for context relevance.
-    Falls back to OR-mode if the AND query returns no results.
+    Falls back to OR-mode if the AND query returns no candidates. With
+    ``min_results > 0``, also fills from OR-mode when AND returns fewer than
+    ``min_results`` candidates, reranking each leg separately and keeping AND
+    results first, up to ``limit``. Nonpositive values (default 0) disable
+    this extra fill.
 
     The optional ``caller`` parameter (e.g. 'vault-search', 'standup')
     drives task-context detection for context-adaptive type scoring.
@@ -2143,13 +2221,17 @@ def search_vault(
     vector pay no overhead and the key is absent (backward-compatible).
 
     Every result dict carries an ``or_fallback`` boolean: ``True`` when the
-    row was retrieved via the OR-fallback branch (AND returned 0 results),
-    ``False`` on the normal AND path.
+    row was retrieved via OR-mode (fallback or opt-in fill), ``False`` on
+    the normal AND path.
 
     Each returned hit is logged as a ``search`` access, which feeds ACT-R
     activation in the rerank. Pass ``log_access=False`` from any search that
     is not a person or agent retrieving notes (dedup checks, wiki lookup,
     tuning scripts): logging those turned activation into noise (#448).
+
+    ``include_provisional=False`` leaves out auto-captured notes that capture
+    selection did not promote (``status: provisional``, #455). The default
+    keeps them, so dedup (``find_match``, ``/compress``) still sees them.
     """
     if not os.path.isfile(db_path):
         return []
@@ -2178,6 +2260,8 @@ def search_vault(
         if note_type:
             filter_sql += "AND n.type = ? "
             filter_params.append(note_type)
+        if not include_provisional:
+            filter_sql += f"AND {NOT_PROVISIONAL_SQL.format(p='n.')} "
 
         # Optionally include the stored TF-IDF vector column.
         vector_col = ", n.tfidf_vector" if include_vectors else ""
@@ -2204,6 +2288,7 @@ def search_vault(
         for c in candidates:
             c["or_fallback"] = False
 
+        or_candidates: list[dict] = []
         # OR fallback when AND returns nothing
         if not candidates:
             or_query = _sanitize_fts_query_or(query)
@@ -2218,12 +2303,36 @@ def search_vault(
                 # are rejected (fail-closed) to prevent false-positive dedup matches.
                 for c in candidates:
                     c["or_fallback"] = True
+        elif len(candidates) < min_results:
+            or_query = _sanitize_fts_query_or(query)
+            if or_query:
+                or_params = [or_query] + filter_params + [candidate_limit]
+                try:
+                    rows = conn.execute(sql, or_params).fetchall()
+                except sqlite3.Error as exc:
+                    # Fill is optional: preserve the successful AND leg.
+                    print(f"[vault-index] search_vault OR fill failed: {exc}",
+                          file=sys.stderr)
+                else:
+                    and_paths = {c["path"] for c in candidates}
+                    for row in rows:
+                        if row["path"] not in and_paths:
+                            c = dict(row)
+                            c["or_fallback"] = True
+                            or_candidates.append(c)
 
         task_context = detect_task_context(caller_skill=caller) if caller else None
         results = rerank_results(
             candidates, query_terms, limit,
             db_path=db_path, task_context=task_context,
         )
+        if or_candidates:
+            # BM25 ranks from distinct MATCH queries are not comparable.
+            or_results = rerank_results(
+                or_candidates, query_terms, limit,
+                db_path=db_path, task_context=task_context,
+            )
+            results = (results + or_results)[:limit]
         # Log access for returned results (single connection, one commit).
         # Per-row project preserves each note's project attribution for
         # per-project analytics, even when the search itself was unscoped.
@@ -2342,6 +2451,8 @@ def query_related_notes(
     session_summary: str,
     note_types: list[str] | None = None,
     limit: int = 20,
+    include_provisional: bool = False,
+    max_retros: int = RELATED_MAX_RETROS,
 ) -> list[dict]:
     """Find notes related to current context using layered ranking.
 
@@ -2349,7 +2460,14 @@ def query_related_notes(
     Layer 2: Tag overlap (claude/topic/* tags)
     Layer 3: FTS keyword search on session summary
 
-    Returns up to `limit` results, filling slots layer by layer.
+    Returns up to `limit` results, filling slots layer by layer. Provisional
+    auto-captured notes (#455) are left out of every layer unless
+    ``include_provisional`` is set. At most ``max_retros`` ``claude-retro``
+    notes are kept, the first ones in layer order (#458, ``select_related``).
+    A later layer runs while fewer than ``limit`` rows are selectable, and
+    Layer 3 pages through its ranked matches until ``limit`` rows are
+    selectable or the matches run out. The list is short only when fewer
+    than ``limit`` rows match at all.
     """
     if not os.path.isfile(db_path):
         return []
@@ -2371,6 +2489,8 @@ def query_related_notes(
             placeholders = ",".join("?" for _ in note_types)
             type_filter = f"AND type IN ({placeholders})"
             type_params = list(note_types)
+        if not include_provisional:
+            type_filter += f" AND {NOT_PROVISIONAL_SQL.format(p='')}"
 
         # Layer 1: Backlinks — notes whose source_session matches loaded sessions
         if session_ids:
@@ -2396,10 +2516,14 @@ def query_related_notes(
                       file=sys.stderr)
 
         # Layer 2: Tag overlap (claude/topic/* tags)
+        def _short() -> bool:
+            # Count with the selection rule, so skipped retros never stop a layer early.
+            return len(select_related(results, limit, max_retros)) < limit
+
         topic_tags = [t for t in session_tags if t.startswith("claude/topic/")]
-        if topic_tags and len(results) < limit:
+        if topic_tags and _short():
             for tag in topic_tags:
-                if len(results) >= limit:
+                if not _short():
                     break
                 escaped_tag = tag.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
                 sql = (
@@ -2424,14 +2548,18 @@ def query_related_notes(
                           file=sys.stderr)
 
         # Layer 3: FTS keyword search
-        if len(results) < limit and session_summary:
+        if _short() and session_summary:
             keywords = extract_keywords(session_summary)
             if keywords:
                 # Layer 3 uses OR-mode: keyword discovery benefits from
                 # recall over precision (5-8 keywords rarely all co-occur).
                 fts_query = _sanitize_fts_query_or(" ".join(keywords))
                 if fts_query:
-                    remaining = limit - len(results)
+                    # #458: page through the ranked matches until the selection has
+                    # `limit` rows or the matches run out, so retros that outrank
+                    # every other match cannot leave the list short. Rows already
+                    # taken come back from FTS and dedup drops them.
+                    page = max(limit * 2, 20)
                     sql = (
                         f"SELECT n.path, n.type, n.date, n.project, n.title, n.tags, "
                         f"n.status, n.source_session, n.source_note, n.size "
@@ -2439,30 +2567,36 @@ def query_related_notes(
                         f"JOIN notes n ON n.rowid = f.rowid "
                         f"WHERE notes_fts MATCH ? AND n.project = ? "
                         f"{type_filter} "
-                        f"ORDER BY f.rank LIMIT ?"
+                        f"ORDER BY f.rank, n.rowid LIMIT ? OFFSET ?"
                     )
                     try:
-                        rows = conn.execute(
-                            sql, [fts_query, project] + type_params + [remaining]
-                        ).fetchall()
-                        for row in rows:
-                            d = dict(row)
-                            d["layer"] = "fts"
-                            if d["path"] not in seen_paths:
-                                results.append(d)
-                                seen_paths.add(d["path"])
+                        offset = 0
+                        while _short():
+                            rows = conn.execute(
+                                sql, [fts_query, project] + type_params + [page, offset]
+                            ).fetchall()
+                            for row in rows:
+                                d = dict(row)
+                                d["layer"] = "fts"
+                                if d["path"] not in seen_paths:
+                                    results.append(d)
+                                    seen_paths.add(d["path"])
+                            if len(rows) < page:
+                                break
+                            offset += page
                     except sqlite3.Error as exc:
                         print(f"[vault-index] Layer 3 (FTS) query failed: {exc}",
                               file=sys.stderr)
 
+        selected = select_related(results, limit, max_retros)
         # Log access for returned results (single connection, one commit)
         _batch_log_access(
             conn,
-            [r["path"] for r in results[:limit]],
+            [r["path"] for r in selected],
             "related",
             project=project,
         )
-        return results[:limit]
+        return selected
     finally:
         conn.close()
 

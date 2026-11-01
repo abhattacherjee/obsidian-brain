@@ -13,7 +13,7 @@ LIMIT 20
 ```dataview
 TABLE date, project, tags
 FROM "claude-insights"
-WHERE type = "claude-insight"
+WHERE type = "claude-insight" AND (!status OR !startswith(lower(string(status)), "provisional"))
 SORT date DESC
 LIMIT 10
 ```
@@ -24,4 +24,5 @@ TABLE date, project
 FROM "claude-insights"
 WHERE type = "claude-decision" AND status = "active"
 SORT date DESC
+LIMIT 20
 ```

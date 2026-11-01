@@ -40,7 +40,7 @@ from frontmatter import (
     split_frontmatter,
     split_lines_lf_crlf,
 )
-from obsidian_utils import write_vault_note
+from obsidian_utils import normalize_status, write_vault_note
 
 # Private aliases kept so every existing call site in this module (and its
 # test suite, tests/test_note_writer.py, which must keep passing UNCHANGED)
@@ -866,7 +866,7 @@ def _release_lock(lock):
         pass
 
 
-def _atomic_rewrite(dest: Path, content: str, expect_stat=None):
+def _atomic_rewrite(dest: Path, content: str, expect_stat=None, stat_out=None):
     """Rewrite an EXISTING file at ``dest`` with ``content``, atomically.
 
     Mirrors obsidian_utils.write_vault_note()'s temp-file + chmod 0o600 +
@@ -893,6 +893,10 @@ def _atomic_rewrite(dest: Path, content: str, expect_stat=None):
     but it converts the common case (two sessions running /compress on the
     same note) from silent loss into a loud, retryable error.
 
+    ``stat_out``, when a list, receives ``(st_mtime_ns, st_size)`` of the file
+    we wrote, taken from the temp file just before the rename (which keeps
+    both), so a later edit by someone else can never be mistaken for ours.
+
     Returns None on success, a non-empty error string on failure.
 
     Opens with ``newline=""`` -- ``content`` already carries whatever line
@@ -906,6 +910,9 @@ def _atomic_rewrite(dest: Path, content: str, expect_stat=None):
             with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
                 fh.write(content)
             os.chmod(tmp_path, 0o600)
+            if stat_out is not None:
+                written = os.stat(tmp_path)
+                stat_out.append((written.st_mtime_ns, written.st_size))
             if expect_stat is not None:
                 current = os.stat(str(dest))
                 if (current.st_mtime_ns, current.st_size) != expect_stat:
@@ -967,9 +974,16 @@ def run_append_update(
     update_text: str,
     last_updated: str | None = None,
     add_tags_csv: str | None = None,
+    promote_provisional: bool = False,
 ) -> int:
     """Append ``update_text`` to the existing note at ``note_path`` and, in
     the SAME atomic write, apply frontmatter mutations.
+
+    ``promote_provisional`` (the CLI passes True; auto-capture's own update
+    keeps False): when the note's ``status`` is ``provisional``, the same
+    write also sets it to ``promoted`` (``active`` for a ``claude-decision``)
+    and ``promoted_by: hand-update`` (#455), because a hand update means the
+    note is in use. A note with any other status keeps it.
 
     Insertion point: scans the note body (after the frontmatter's closing
     fence) top-down for the first line matching a trailing metadata marker
@@ -997,6 +1011,10 @@ def run_append_update(
     ``ERROR: <reason>`` to stderr, returns 1, and leaves the file on disk
     byte-identical (no write attempt is made until every check upstream of
     it has already succeeded).
+
+    After a hand promotion, placement runs after releasing the append lock.
+    If placement fails, the update is already saved: return 1 and report that
+    explicitly, without printing a misleading success path.
 
     Prints ``OK: <resolved path>`` to stdout and returns 0 on success.
 
@@ -1032,12 +1050,40 @@ def run_append_update(
     if lock_err:
         print(f"ERROR: {lock_err}", file=sys.stderr)
         return 1
+    promoted = []
     try:
-        return _append_update_locked(
-            resolved, note_path, update_text, last_updated, add_tags
+        result = _append_update_locked(
+            resolved, note_path, update_text, last_updated, add_tags, promote_provisional,
+            promoted_out=promoted,
         )
     finally:
         _release_lock(lock)
+    if result:
+        return result
+    if promoted:
+        # note_placement imports note_writer for its locks. Import it here,
+        # after our write and unlock, to avoid both a cycle and self-contention.
+        import note_placement
+        import obsidian_utils
+        import vault_index
+        from obsidian_utils import indexed_folders
+
+        try:
+            config = {**(obsidian_utils.load_config() or {}), "vault_path": vault_path}
+            db = vault_index._default_db_path()
+            if not os.path.isfile(db):
+                db = vault_index.ensure_index(vault_path, indexed_folders(config), db_path=db)
+            else:
+                # Keep the configured vault spelling used by the index, even
+                # when _resolve_note_path followed a symlink to the vault.
+                indexed_path = Path(vault_path) / resolved.relative_to(Path(vault_path).resolve())
+                vault_index.update_note_status(db, str(indexed_path))
+            resolved = note_placement.place(config, resolved, promoted[0], db)
+        except Exception as exc:
+            print(f"ERROR: update saved but placement failed for {resolved}: {exc}", file=sys.stderr)
+            return 1
+    print(f"OK: {resolved}")
+    return 0
 
 
 def _append_update_locked(
@@ -1046,6 +1092,8 @@ def _append_update_locked(
     update_text: str,
     last_updated,
     add_tags: list[str],
+    promote_provisional: bool = False,
+    promoted_out: list[str] | None = None,
 ) -> int:
     """The read-modify-write half of run_append_update, run while holding the
     note's lock. Split out purely so the lock has one obvious scope and one
@@ -1085,6 +1133,11 @@ def _append_update_locked(
         print(f"ERROR: {tags_merge_err}", file=sys.stderr)
         return 1
 
+    top = None
+    if promote_provisional and normalize_status(_fm_scalar(fm_lines, "status")) == "provisional":
+        top = "active" if _fm_scalar(fm_lines, "type") == "claude-decision" else "promoted"
+        fm_lines = _set_fields(fm_lines, {"status": top, "promoted_by": "hand-update", "demoted_by": None}, eol)
+
     insertion_idx = _find_insertion_index(body_lines)
 
     prefix = body_lines[:insertion_idx]
@@ -1122,8 +1175,123 @@ def _append_update_locked(
         print(f"ERROR: {write_err}", file=sys.stderr)
         return 1
 
-    print(f"OK: {resolved}")
+    if top is not None and promoted_out is not None:
+        promoted_out.append(top)
     return 0
+
+
+# #455: what set_frontmatter_fields may write. Allow-lists, like the tag rule
+# above: a key or value outside them could inject YAML into the frontmatter.
+_FIELD_KEY_RE = re.compile(r"\A[A-Za-z_][A-Za-z0-9_]*\Z", re.ASCII)
+_FIELD_VALUE_RE = re.compile(r"\A[A-Za-z0-9._:-]+\Z", re.ASCII)
+
+
+def _field_value(key: str, value) -> str | None:
+    """``value`` as frontmatter text, or None to remove the key; ValueError when not allowed."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        raise ValueError(f"field {key!r}: unsupported value type {type(value).__name__}")
+    if isinstance(value, float) and (value != value or abs(value) == float("inf")):
+        raise ValueError(f"field {key!r}: value must be finite")
+    text = str(value)
+    if not _FIELD_VALUE_RE.match(text):
+        raise ValueError(f"field {key!r}: value {text[:40]!r} is outside the allowed characters")
+    return text
+
+
+def _fm_scalar(fm_lines: list[str], key: str) -> str | None:
+    """The first top-level ``key:`` value in ``fm_lines``, unquoted, or None."""
+    for line in fm_lines:
+        m = re.match(rf"^{re.escape(key)}\s*:\s*(.*?)\s*$", line)
+        if m:
+            return m.group(1).strip("\"'") or None
+    return None
+
+
+def _set_fields(fm_lines: list[str], fields: dict, eol: str) -> list[str]:
+    """``fm_lines`` with each top-level key replaced, inserted at the end, or removed (None).
+
+    A replaced or removed key takes its indented continuation lines with it,
+    and a repeated key keeps only its first line.
+    """
+    out = list(fm_lines)
+    for key, text in fields.items():
+        key_re = re.compile(rf"^{re.escape(key)}\s*:")
+        new_line = None if text is None else f"{key}: {text}{eol}"
+        kept, placed, i = [], False, 0
+        while i < len(out):
+            if not key_re.match(out[i]):
+                kept.append(out[i])
+                i += 1
+                continue
+            j = i + 1
+            while j < len(out) and out[j][:1] in (" ", "\t"):
+                j += 1
+            if new_line is not None and not placed:
+                kept.append(new_line)
+                placed = True
+            i = j
+        if new_line is not None and not placed:
+            if kept and not kept[-1].endswith(("\n", "\r")):
+                kept[-1] += eol
+            kept.append(new_line)
+        out = kept
+    return out
+
+
+def set_frontmatter_fields(vault_path: str, note_path: str, fields: dict, stat_out: list | None = None) -> bool:
+    """Set, insert or remove (value None) top-level frontmatter fields of an existing note (#455).
+
+    ``note_path`` is absolute or vault-relative and must resolve inside the
+    vault. Keys and values are allow-listed (``_FIELD_KEY_RE``,
+    ``_FIELD_VALUE_RE``). Runs under the note's lock, keeps the note's line
+    endings, and rewrites atomically only if the bytes change; a note that
+    changed between the read and the rename is left alone.
+
+    ``stat_out``, when a list, is set to ``[pre, post]`` when this call wrote
+    the file (and left empty when it wrote nothing): ``pre`` is
+    ``(st_mtime, st_size)`` from the open file, under the lock, before the
+    read; ``post`` is ``(st_mtime_ns, st_size)`` of what we wrote. Pass them
+    on as ``vault_index.update_note_status(db, path, *stat_out)``.
+
+    Returns True when the file changed. Raises ValueError for a bad key,
+    value, path or a note without frontmatter, and OSError when the note is
+    locked, changed under us, or the write fails.
+    """
+    texts = {}
+    for key, value in fields.items():
+        if not isinstance(key, str) or not _FIELD_KEY_RE.match(key):
+            raise ValueError(f"invalid frontmatter key: {key!r}")
+        texts[key] = _field_value(key, value)
+    p = Path(note_path)
+    resolved, err = _resolve_note_path(vault_path, str(p if p.is_absolute() else Path(vault_path) / p))
+    if err:
+        raise ValueError(err)
+    lock, lock_err = _acquire_lock(resolved)
+    if lock_err:
+        raise OSError(lock_err)
+    try:
+        with open(resolved, "r", encoding="utf-8", newline="") as fh:
+            st = os.fstat(fh.fileno())  # taken before the read, so a change after it fails the re-check
+            original = fh.read()
+        open_fence, fm_lines, close_fence, body_lines, split_err = _split_frontmatter(_split_lines_lf_crlf(original))
+        if split_err:
+            raise ValueError(f"{split_err}: {note_path}")
+        new_fm = _set_fields(fm_lines, texts, _detect_line_ending(original))
+        content = open_fence + "".join(new_fm) + close_fence + "".join(body_lines)
+        if content == original:
+            return False
+        post: list = []
+        extra = {} if stat_out is None else {"stat_out": post}
+        write_err = _atomic_rewrite(resolved, content, (st.st_mtime_ns, st.st_size), **extra)
+        if write_err:
+            raise OSError(write_err)
+        if stat_out is not None:
+            stat_out[:] = [(st.st_mtime, st.st_size), post[0]]
+        return True
+    finally:
+        _release_lock(lock)
 
 
 def _oversize_error() -> str:
@@ -1194,7 +1362,8 @@ def main():
             print(_oversize_error(), file=sys.stderr)
             sys.exit(1)
         sys.exit(
-            run_append_update(vault_path, note_path, update_text, last_updated, add_tags_csv)
+            run_append_update(vault_path, note_path, update_text, last_updated, add_tags_csv,
+                              promote_provisional=True)
         )
 
     print(f"unknown command: {cmd}", file=sys.stderr)

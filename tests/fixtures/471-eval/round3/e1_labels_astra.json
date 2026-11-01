@@ -1,0 +1,426 @@
+[
+ {
+  "id": "lesson-00-0",
+  "label": "keep"
+ },
+ {
+  "id": "lesson-00-1",
+  "label": "drop"
+ },
+ {
+  "id": "lesson-01-0",
+  "label": "keep"
+ },
+ {
+  "id": "lesson-01-1",
+  "label": "keep"
+ },
+ {
+  "id": "lesson-02-0",
+  "label": "keep"
+ },
+ {
+  "id": "lesson-02-1",
+  "label": "keep"
+ },
+ {
+  "id": "lesson-02-2",
+  "label": "keep"
+ },
+ {
+  "id": "lesson-02-3",
+  "label": "drop"
+ },
+ {
+  "id": "lesson-02-4",
+  "label": "drop"
+ },
+ {
+  "id": "lesson-03-0",
+  "label": "drop"
+ },
+ {
+  "id": "lesson-03-1",
+  "label": "keep"
+ },
+ {
+  "id": "lesson-03-2",
+  "label": "keep"
+ },
+ {
+  "id": "lesson-03-3",
+  "label": "drop"
+ },
+ {
+  "id": "lesson-04-0",
+  "label": "keep"
+ },
+ {
+  "id": "lesson-04-1",
+  "label": "drop"
+ },
+ {
+  "id": "lesson-05-0",
+  "label": "keep"
+ },
+ {
+  "id": "lesson-05-1",
+  "label": "keep"
+ },
+ {
+  "id": "lesson-05-2",
+  "label": "keep"
+ },
+ {
+  "id": "lesson-06-0",
+  "label": "drop"
+ },
+ {
+  "id": "lesson-06-1",
+  "label": "drop"
+ },
+ {
+  "id": "lesson-07-0",
+  "label": "keep"
+ },
+ {
+  "id": "lesson-07-1",
+  "label": "drop"
+ },
+ {
+  "id": "lesson-08-0",
+  "label": "keep"
+ },
+ {
+  "id": "lesson-08-1",
+  "label": "drop"
+ },
+ {
+  "id": "lesson-09-0",
+  "label": "keep"
+ },
+ {
+  "id": "lesson-09-1",
+  "label": "drop"
+ },
+ {
+  "id": "lesson-10-0",
+  "label": "keep"
+ },
+ {
+  "id": "lesson-10-1",
+  "label": "drop"
+ },
+ {
+  "id": "lesson-10-2",
+  "label": "keep"
+ },
+ {
+  "id": "lesson-10-3",
+  "label": "keep"
+ },
+ {
+  "id": "lesson-10-4",
+  "label": "keep"
+ },
+ {
+  "id": "lesson-10-5",
+  "label": "keep"
+ },
+ {
+  "id": "lesson-10-6",
+  "label": "keep"
+ },
+ {
+  "id": "lesson-10-7",
+  "label": "keep"
+ },
+ {
+  "id": "lesson-11-0",
+  "label": "keep"
+ },
+ {
+  "id": "lesson-11-1",
+  "label": "keep"
+ },
+ {
+  "id": "lesson-12-0",
+  "label": "drop"
+ },
+ {
+  "id": "lesson-12-1",
+  "label": "drop"
+ },
+ {
+  "id": "lesson-13-0",
+  "label": "keep"
+ },
+ {
+  "id": "lesson-13-1",
+  "label": "keep"
+ },
+ {
+  "id": "lesson-13-2",
+  "label": "keep"
+ },
+ {
+  "id": "lesson-14-0",
+  "label": "keep"
+ },
+ {
+  "id": "lesson-14-1",
+  "label": "keep"
+ },
+ {
+  "id": "lesson-14-2",
+  "label": "keep"
+ },
+ {
+  "id": "lesson-14-3",
+  "label": "keep"
+ },
+ {
+  "id": "lesson-14-4",
+  "label": "keep"
+ },
+ {
+  "id": "lesson-14-5",
+  "label": "keep"
+ },
+ {
+  "id": "lesson-15-0",
+  "label": "keep"
+ },
+ {
+  "id": "lesson-15-1",
+  "label": "keep"
+ },
+ {
+  "id": "lesson-15-2",
+  "label": "keep"
+ },
+ {
+  "id": "lesson-16-0",
+  "label": "drop"
+ },
+ {
+  "id": "lesson-16-1",
+  "label": "keep"
+ },
+ {
+  "id": "lesson-16-2",
+  "label": "keep"
+ },
+ {
+  "id": "lesson-16-3",
+  "label": "keep"
+ },
+ {
+  "id": "lesson-16-4",
+  "label": "keep"
+ },
+ {
+  "id": "lesson-16-5",
+  "label": "keep"
+ },
+ {
+  "id": "lesson-16-6",
+  "label": "drop"
+ },
+ {
+  "id": "lesson-16-7",
+  "label": "keep"
+ },
+ {
+  "id": "lesson-17-0",
+  "label": "keep"
+ },
+ {
+  "id": "lesson-17-1",
+  "label": "keep"
+ },
+ {
+  "id": "lesson-17-2",
+  "label": "keep"
+ },
+ {
+  "id": "lesson-18-0",
+  "label": "keep"
+ },
+ {
+  "id": "lesson-18-1",
+  "label": "keep"
+ },
+ {
+  "id": "lesson-18-2",
+  "label": "drop"
+ },
+ {
+  "id": "lesson-18-3",
+  "label": "drop"
+ },
+ {
+  "id": "lesson-19-0",
+  "label": "keep"
+ },
+ {
+  "id": "lesson-19-1",
+  "label": "keep"
+ },
+ {
+  "id": "lesson-19-2",
+  "label": "keep"
+ },
+ {
+  "id": "lesson-19-3",
+  "label": "drop"
+ },
+ {
+  "id": "lesson-20-0",
+  "label": "keep"
+ },
+ {
+  "id": "lesson-20-1",
+  "label": "drop"
+ },
+ {
+  "id": "lesson-20-2",
+  "label": "keep"
+ },
+ {
+  "id": "lesson-20-3",
+  "label": "keep"
+ },
+ {
+  "id": "lesson-20-4",
+  "label": "keep"
+ },
+ {
+  "id": "lesson-21-0",
+  "label": "keep"
+ },
+ {
+  "id": "lesson-21-1",
+  "label": "keep"
+ },
+ {
+  "id": "lesson-22-0",
+  "label": "drop"
+ },
+ {
+  "id": "lesson-22-1",
+  "label": "keep"
+ },
+ {
+  "id": "lesson-23-0",
+  "label": "keep"
+ },
+ {
+  "id": "lesson-23-1",
+  "label": "keep"
+ },
+ {
+  "id": "lesson-24-0",
+  "label": "drop"
+ },
+ {
+  "id": "lesson-24-1",
+  "label": "drop"
+ },
+ {
+  "id": "lesson-25-0",
+  "label": "drop"
+ },
+ {
+  "id": "lesson-25-1",
+  "label": "keep"
+ },
+ {
+  "id": "lesson-25-2",
+  "label": "keep"
+ },
+ {
+  "id": "lesson-25-3",
+  "label": "keep"
+ },
+ {
+  "id": "lesson-25-4",
+  "label": "drop"
+ },
+ {
+  "id": "lesson-26-0",
+  "label": "drop"
+ },
+ {
+  "id": "lesson-26-1",
+  "label": "keep"
+ },
+ {
+  "id": "lesson-27-0",
+  "label": "keep"
+ },
+ {
+  "id": "lesson-27-1",
+  "label": "keep"
+ },
+ {
+  "id": "lesson-27-2",
+  "label": "keep"
+ },
+ {
+  "id": "lesson-28-0",
+  "label": "drop"
+ },
+ {
+  "id": "lesson-28-1",
+  "label": "keep"
+ },
+ {
+  "id": "lesson-28-2",
+  "label": "keep"
+ },
+ {
+  "id": "lesson-28-3",
+  "label": "drop"
+ },
+ {
+  "id": "lesson-28-4",
+  "label": "drop"
+ },
+ {
+  "id": "lesson-28-5",
+  "label": "keep"
+ },
+ {
+  "id": "lesson-29-0",
+  "label": "keep"
+ },
+ {
+  "id": "lesson-29-1",
+  "label": "keep"
+ },
+ {
+  "id": "lesson-29-2",
+  "label": "keep"
+ },
+ {
+  "id": "lesson-29-3",
+  "label": "keep"
+ },
+ {
+  "id": "lesson-29-4",
+  "label": "keep"
+ },
+ {
+  "id": "lesson-29-5",
+  "label": "keep"
+ },
+ {
+  "id": "lesson-29-6",
+  "label": "keep"
+ },
+ {
+  "id": "lesson-29-7",
+  "label": "keep"
+ }
+]

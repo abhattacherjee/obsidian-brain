@@ -395,6 +395,7 @@ Mark task #3 (the renamed final task) as `completed` and end.
 
 - **No sessions found:** Tell the user no session history was found for this project. Suggest they start a session and it will be logged automatically.
 - **No insights found:** Omit the "Curated Insights" section. Mention: "No curated insights yet for this project."
+- **Provisional auto notes:** "Curated Insights" leaves out auto-captured notes with `status: provisional` (the ones capture selection did not promote, #455). They stay on disk; `/vault-search` still finds them.
 - **Very large vault (50+ sessions):** Only grep, never glob the entire folder. Limit reads to the most recent 5 sessions + all insights.
 - **Config exists but vault path is invalid:** Warn the user and suggest running `/obsidian-setup` again.
 - **Open items exist:** Do not attempt to check them off. Append the footer nudge pointing to `/check-items` instead.

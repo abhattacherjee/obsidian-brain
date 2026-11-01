@@ -121,13 +121,14 @@ from __future__ import annotations
 
 import os
 import re
-import shutil
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 
 from . import Issue, Result
+from .encoding_corruption import _iter_md_files
+from .source_sessions import _backup_note
 from .source_sessions import _EXTRA_INSIGHT_FOLDERS, _parse_frontmatter
 
 NAME = "project-name-canonicalization"
@@ -401,7 +402,7 @@ def scan(
             file=sys.stderr,
         )
     else:
-        for md_file in sorted(sessions_dir.glob("*.md")):
+        for md_file in _iter_md_files(vault, sessions_folder):
             try:
                 content = md_file.read_text(encoding="utf-8", errors="replace")
             except OSError as exc:
@@ -601,11 +602,7 @@ def scan(
             file=sys.stderr,
         )
     for folder_name in insight_folders:
-        folder_path = vault / folder_name
-        if not folder_path.is_dir():
-            continue
-
-        for md_file in sorted(folder_path.glob("*.md")):
+        for md_file in _iter_md_files(vault, folder_name, recursive=folder_name == insights_folder):
             try:
                 content = md_file.read_text(encoding="utf-8", errors="replace")
             except OSError as exc:
@@ -748,6 +745,8 @@ def scan(
         file=sys.stderr,
     )
 
+    for issue in issues:
+        issue.extra["vault_path"] = str(vault.resolve())
     return issues
 
 
@@ -786,8 +785,8 @@ def apply(issues: list[Issue], backup_root: str) -> list[Result]:
     errors="replace" would permanently bake U+FFFD into the note. Undecodable
     notes return an error pointing at the encoding-corruption check.
 
-    Backup path: ``<backup_root>/<check-name>/<source-folder>/<basename>``
-    (containment-checked against ``backup_root`` before the copy).
+    Backup path: ``<backup_root>/<check-name>/<vault-relative-note-path>``
+    (containment-checked against ``backup_root`` before the atomic copy).
     """
     results: list[Result] = []
 
@@ -944,18 +943,8 @@ def apply(issues: list[Issue], backup_root: str) -> list[Result]:
             )
 
         # Backup original (with containment check)
-        source_folder = note_path.parent.name
-        backup_dir = Path(backup_root) / NAME / source_folder
         try:
-            backup_dir.mkdir(parents=True, exist_ok=True)
-            backup_path = backup_dir / note_path.name
-            resolved_root = Path(backup_root).resolve()
-            resolved_backup = backup_path.resolve()
-            if resolved_root not in resolved_backup.parents:
-                raise ValueError(
-                    f"backup path {backup_path} would escape backup_root {backup_root}"
-                )
-            shutil.copy2(note_path, backup_path)
+            backup_path = _backup_note(issue, backup_root, check_name=NAME)
         except (OSError, ValueError) as exc:
             results.append(Result(
                 check=NAME,

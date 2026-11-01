@@ -97,6 +97,7 @@ Run `/obsidian-setup` after installation. It will:
 | `/emerge` | Cross-project pattern discovery — scans vault notes within a time window and surfaces technical patterns, process patterns, knowledge gaps, and unnamed habits |
 | `/link` | Cross-reference related notes with bidirectional wikilinks |
 | `/retro` | Session retrospective — what worked, what didn't, process improvements |
+| `/lessons` | Act on retro lessons that keep coming back: file an issue, raise an issue's milestone or priority, skip or snooze, and confirm rule and memory matches in one batch |
 | `/vault-ask` | Ask questions and get synthesized answers grounded in vault history |
 | `/check-items` | Cross-project sweep for completed open items — auto-checks off matches after user confirmation |
 | `/vault-doctor` | Audit and repair the vault — detects stale `source_session` backlinks and other health issues (dry-run by default) |
@@ -187,12 +188,27 @@ While you work, obsidian-brain saves insights, decisions and error-fixes on its 
 - **Turn it off:** set `"auto_capture_enabled": false` in the config. Change the batch interval with `auto_capture_interval_minutes`.
 - **Cost:** each batch is one Sonnet call on your Claude login. With a subscription that has extra usage turned on, batches can use it.
 
+## Retro Lessons
+
+Every `/retro` ends with `## Process Improvements` items. The same lesson often comes back in many retros. `hooks/retro_rollup.py` groups those items into lessons, so the lesson that causes friction most often rises to the top.
+
+- **Grouping:** for each open item, TF-IDF picks its 10 closest items from other retros, and Claude Haiku says which of them state the same lesson. Verdicts are cached in SQLite (`~/.claude/obsidian-brain/lessons-verdicts.db`), so an item is judged once. A lesson is a star: one centre item plus the items Haiku matched to it, spanning at least two retros.
+- **Tracking:** a lesson inherits the issue, memory entry or rule its members were traced to by `/retro`. `refresh-tracking` re-reads each issue's state, milestone and priority label with `gh`.
+- **Matching:** `python3 hooks/retro_rollup.py match [--all] [--concurrency N]` looks for an issue, memory entry or rule that already covers a lesson with no trace and no filed issue. It reads open and closed issues with one `gh issue list` per project repo, the memory files, `~/.claude/CLAUDE.md`, the `CLAUDE.md` of the lesson's projects and `SKILL.md` files. TF-IDF picks the one closest document across the three; one Haiku call accepts or rejects it. An accepted match counts as tracking (`tracking_source: match`; the report table adds `(match)`), so the lesson leaves the file-an-issue bucket. A match stays with the lesson and is checked again only when its closest document changes. If an issue listing fails, memory cannot be scanned, a rule file or directory cannot be read, a `project_repos` value is not an `owner/name` repo or Haiku gives no answer, the lesson stays unchecked (never recorded as "no match") and the command exits 1. `refresh-tracking` runs the same check first. `match` never writes to GitHub and never writes a trace: a match reaches the retro notes only when you accept it in `backfill --apply --accept FILE`, and until then the untraced items show the reason `lesson-matched`. On a copy of the vault (551 lessons, 542 with no tracking) it matched 347 and rejected 195, and the file-an-issue bucket went from 542 to 195. The first run made 542 Haiku calls and took 152 s; a rerun took 4 s and made none.
+- **Buckets:** raise priority (an open issue, and the lesson still comes back), file an issue (nothing tracks it), fix didn't hold (closed issue, then it came back), rule not followed, tracked and quiet. A lesson with no session in the last 90 days is dormant.
+- **Notes:** one note per lesson in `claude-insights/lessons/`, rewritten only when it changes. The Retro Lessons dashboard reads them. The vault index skips them, so `/vault-ask` and `/recall` never cite them. Run `retro_rollup.py snooze <lesson id> <YYYY-MM-DD|none>` (or add `snoozed_until: YYYY-MM-DD` to a note) to hide a lesson until then; a snooze that ends today still hides it.
+- **Commands:** `python3 hooks/retro_rollup.py update` (judge new items, regroup, write notes), `rebuild` (regroup from the cache; no verdict calls, only a Haiku name for each new lesson), `refresh-tracking`, `match`, `report [--json]` (each member carries its retro note `date`), `show <lesson id> [--json]` (read-only: the lesson's tracking and each member's wording, scrubbed, with its trace), `snooze <lesson id> <date|none>`, and `backfill [--apply --accept FILE]`. `backfill --accept FILE` without `--apply` is a dry run of that file: it lists the filings and traces the file would cause, calls no `gh` and writes nothing. The dry run lists the traces it would write and, for each lesson with no tracking or gone tracking, the issue it would file (`planned_filings`: lesson, repo, title); it makes no `gh` call. `--apply` acts only on the lessons in the accept file, a JSON list whose entries take one of two forms: `{"lesson_id", "tracking_ref"}` traces the lesson's untraced items to the tracking it already has, and `{"lesson_id", "file_issue": true, "repo"?, "title"?, "body"?, "milestone"?, "labels"?}` runs `gh issue create` for a lesson with no tracking or gone tracking (live tracking is refused), then traces every untraced member to the new issue. The repo is the entry's `repo`, else `project_repos[project]`, else the `origin` remote (github.com only) of `<workspace root>/<project>`, for the project with the most member sessions. Without `body`, the issue body holds the lesson id, counts, project names, dates and `note#item` refs, never item text, and the title is the lesson name. With `body` (which `/lessons` drafts and you confirm), the body is the marker line, your text with secrets scrubbed, then that same facts block. Limits: `title` 1 to 256 characters on one line, `body` up to 20,000, `milestone` 1 to 100, up to 10 `labels` of 1 to 50 characters with no comma; a bad entry, or a `lesson_id` that appears twice, refuses the whole file (exit 2) before any `gh` call. The dry run lists each filing with its repo, title, milestone and labels (`planned_filings`) before you accept. Filing is two-phase: before `gh issue create`, a pending record (repo and a `<!-- retro-lesson:ID -->` marker, which is also the first line of the issue body) is saved to the state file, and if that save fails `gh` is not called. Every `--apply` first reconciles all pending filings, whatever lesson id they sit under: one plain listing of your issues per repo (up to 1,000, so a just-created issue shows up at once), then each record either adopts the issue carrying its marker (with its real state and dates), is cleared because no issue has the marker, or, if the listing fails or comes back full with no match, stays and the run exits 1 with no new issue filed for that lesson. The result lists each one under `reconciled`, and the dry run lists them under `pending_filings` without calling `gh`. A lesson whose merged-in or split-from id already has an issue uses that issue instead of filing another. The issue and its tracking are then saved before any trace is written, so a dry run, the report and a later `update` show the issue even if every trace write fails. Nothing is ticked without an accept.
+- **Cost:** the first `update` on a vault with about 3,900 open items makes one Haiku call per item: 3,881 items took 3,611 s (about 60 minutes) at the default concurrency of 8. After that, only new items are judged.
+- **`/lessons`:** walks the lessons that need action (raise, then file, then fix didn't hold, then rule not followed; top first; `/lessons 5` limits the count) and asks per lesson: file, raise, skip or snooze. File drafts a title and body from the lesson's items and asks the milestone and priority label; you confirm the draft before anything is sent. Raise shows the tracked issue and only edits its milestone or priority label if you pick that change. Rule and memory matches are confirmed in one batch. At the end it shows a dry run and asks once before `backfill --apply`; `/lessons` never runs `gh issue create` itself.
+- **Kept current:** `/retro` starts `retro_rollup.py update --note <the new note>` in the background after its Step 7.5 and prints `lesson update queued`; it never waits or asks. `/standup` has a Recurring lessons section (the top 5, from `report --json`), and in weekly mode (`this week`, `last week`) it refreshes tracking and, when lessons are waiting, asks whether to run `/lessons`. `/emerge` lists lessons that have at least one new item in its window. `lessons_enabled: false` turns off the `/retro` update, the `/standup` offer and `/lessons`.
+
 ## Vault Structure
 
 ```
 YourVault/
   claude-sessions/       # Auto-logged sessions + context snapshots
   claude-insights/       # Curated insights, decisions, error fixes
+    lessons/             # Generated retro lesson notes (retro_rollup.py)
   claude-dashboards/     # Dataview query dashboards
   claude-check-items/    # /check-items per-run reports
 ```
@@ -253,12 +269,13 @@ Holds per-run reports produced by `/check-items`: a markdown note per scope (pro
 | Imported Session | `claude/imported` | `/vault-import` |
 | Standup | `claude/standup` | `/standup` |
 | Retrospective | `claude/retro` | `/retro` |
+| Retro Lesson | `claude/lesson` | `retro_rollup.py` (generated, not indexed) |
 
 ### Tag Convention
 
 All tags use the `claude/` prefix to separate from your existing vault tags:
 
-- `claude/session`, `claude/insight`, `claude/decision`, `claude/error-fix`, `claude/snapshot`, `claude/standup`, `claude/retro`
+- `claude/session`, `claude/insight`, `claude/decision`, `claude/error-fix`, `claude/snapshot`, `claude/standup`, `claude/retro`, `claude/lesson`
 - `claude/project/<name>` — project scoping
 - `claude/topic/<topic>` — domain/technology tags
 - `claude/auto` — auto-generated content
@@ -266,7 +283,7 @@ All tags use the `claude/` prefix to separate from your existing vault tags:
 
 ## Dataview Dashboards
 
-Six dashboard templates are installed to `claude-dashboards/`:
+Seven dashboard templates are installed to `claude-dashboards/`:
 
 - **Sessions Overview** — recent sessions, insights, and active decisions across all projects
 - **Project Index** — sessions grouped by project with counts and date ranges
@@ -274,6 +291,7 @@ Six dashboard templates are installed to `claude-dashboards/`:
 - **Learning Velocity** — topic frequency from curated insights, recent retrospectives, and error patterns
 - **Decision Timeline** — chronological view of all decisions with active/superseded status tracking
 - **Open Items** — cross-project view of all unchecked `- [ ]` items from session notes' Open Questions sections, scoped to the last 90 days
+- **Retro Lessons** — lessons that came back across retros, in five tables: raise priority, file an issue, fix didn't hold, rule not followed, tracked and quiet; plus a dormant table. Ranked by sessions in the last 90 days
 
 These use [Dataview](https://github.com/blacksmithgu/obsidian-dataview) queries that auto-update as new notes are added.
 
@@ -298,9 +316,15 @@ Machine-local config at `~/.claude/obsidian-brain-config.json`:
   "auto_capture_enabled": true,
   "auto_capture_interval_minutes": 10,
   "auto_capture_headless_projects": ["openclaw"],
-  "auto_capture_update_min_cosine": 0.35
+  "auto_capture_update_min_cosine": 0.35,
+  "lessons_enabled": true,
+  "lessons_recent_days": 90,
+  "lessons_concurrency": 8,
+  "project_repos": {}
 }
 ```
+
+The four `lessons_*`/`project_repos` keys belong to the retro lessons rollup. `lessons_recent_days` sets the ranking window and the dormant cut-off; `lessons_concurrency` caps parallel Haiku calls (1 to 16). `project_repos` (project → `owner/repo`, used by `match` and issue filing) is optional: without it the repo comes from the `origin` remote of `<workspace root>/<project>`. `lessons_enabled` set to `false` turns off the `/retro` background update, the `/standup` offer to run `/lessons`, and `/lessons` itself.
 
 ### Environment Variables
 
@@ -313,6 +337,7 @@ Machine-local config at `~/.claude/obsidian-brain-config.json`:
 ## Multi-Device Support
 
 - **Obsidian Sync:** Works seamlessly — all vault writes are new markdown files (no conflict risk). Config lives at `~/.claude/` (machine-local, outside the vault).
+- **Exclude `claude-insights/_provisional/` from Obsidian Sync** (Settings → Sync → Excluded folders). Auto-capture keeps the notes it did not promote there; `/vault-ask` and `/recall` skip them anyway, and leaving them out keeps thousands of files off your other devices. Run `python3 scripts/capture_provisional_relocate.py` (a dry run) and then `--apply` once to move notes captured before #465.
 - **New machine setup:** Install the plugin, run `/obsidian-setup` with your vault path on that machine.
 
 ## Troubleshooting

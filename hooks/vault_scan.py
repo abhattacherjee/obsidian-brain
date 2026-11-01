@@ -14,7 +14,7 @@ Two commands:
 Usage::
 
     python3 vault_scan.py grep <vault> <folder> [<folder> ...] --pattern=<regex>
-                          [--ignore-case] [--frontmatter-only]
+                          [--ignore-case] [--frontmatter-only] [--exclude-dir NAME] ...
     python3 vault_scan.py meta <vault> <file> [<file> ...]
 
 ``grep`` matches one line at a time, like ripgrep behind the Grep tool, so
@@ -29,6 +29,10 @@ counts directories that could not be listed (permissions), including a folder
 named on the command line; their notes are not scanned. Under ``--frontmatter-only`` a
 note with no frontmatter at all is scanned (it cannot match), not skipped;
 only a fence that does not close counts as ``bad_frontmatter``.
+
+Repeat ``--exclude-dir NAME`` to prune subdirectories with that exact basename
+at any depth; their files are not scanned or counted. NAME must be nonempty,
+contain no ``/``, and differ from ``.`` and ``..``.
 
 Exit codes: 0 on success (with or without matches); 2 for bad arguments and
 1 for an unexpected error or a missing dependency module. On exit 2 or 1,
@@ -57,7 +61,7 @@ else:
 
 MAX_FILE_BYTES = 5 * 1024 * 1024
 SNIPPET_CHARS = 200
-META_FIELDS = ("date", "type", "project", "session_id", "source_session_note")
+META_FIELDS = ("date", "type", "project", "session_id", "source_session_note", "status")
 SKIP_KINDS = ("too_large", "unreadable", "outside_vault", "bad_frontmatter",
               "symlinked_dirs", "unreadable_dirs")
 _UTILS_WARNED = False
@@ -82,6 +86,8 @@ def _build_parser() -> argparse.ArgumentParser:
     g.add_argument("--pattern", required=True)
     g.add_argument("--ignore-case", action="store_true")
     g.add_argument("--frontmatter-only", action="store_true")
+    g.add_argument("--exclude-dir", action="append", default=[], metavar="NAME",
+                   help="exclude subdirectories by exact basename (repeatable)")
 
     m = sub.add_parser("meta", help="print frontmatter fields of notes as JSON Lines")
     m.add_argument("vault")
@@ -123,7 +129,8 @@ def _folder_dirs(vault: str, root: Path, folders: list[str]) -> list[Path]:
     return dirs
 
 
-def _iter_md(folder: Path, symlinked_dirs: set[str], unreadable_dirs: set[str]):
+def _iter_md(folder: Path, symlinked_dirs: set[str], unreadable_dirs: set[str],
+             exclude_dirs: set[str]):
     # followlinks=False: a symlinked subdirectory is never descended. Each one
     # is recorded in ``symlinked_dirs`` so the summary can count it. A directory
     # that cannot be listed is recorded in ``unreadable_dirs``: os.walk drops it
@@ -133,7 +140,7 @@ def _iter_md(folder: Path, symlinked_dirs: set[str], unreadable_dirs: set[str]):
 
     for dirpath, dirnames, filenames in os.walk(folder, followlinks=False,
                                                 onerror=_on_error):
-        dirnames.sort()
+        dirnames[:] = sorted(name for name in dirnames if name not in exclude_dirs)
         for name in dirnames:
             sub = os.path.join(dirpath, name)
             if os.path.islink(sub):
@@ -156,13 +163,17 @@ def _line_matches(regex: re.Pattern, lines) -> bool:
 
 
 def grep_files(vault: str, folders: list[str], regex: re.Pattern,
-               frontmatter_only: bool = False):
+               frontmatter_only: bool = False, exclude_dirs: list[str] | None = None):
     """Return ``(matches, scanned, skipped)``.
 
     ``matches`` is sorted. ``skipped`` maps each name in ``SKIP_KINDS`` to a
     count; ``symlinked_dirs`` counts subdirectories that were not descended and
     ``unreadable_dirs`` counts directories that could not be listed.
     """
+    excluded = set(exclude_dirs or [])
+    for name in excluded:
+        if not name or "/" in name or name in (".", ".."):
+            raise _UsageError(f"invalid excluded directory basename: {name!r}")
     root = _check_vault(vault)
     dirs = _folder_dirs(vault, root, folders)
     seen: set[str] = set()
@@ -172,7 +183,7 @@ def grep_files(vault: str, folders: list[str], regex: re.Pattern,
     scanned = 0
     skipped = dict.fromkeys(SKIP_KINDS, 0)
     for d in dirs:
-        for path in _iter_md(d, symlinked_dirs, unreadable_dirs):
+        for path in _iter_md(d, symlinked_dirs, unreadable_dirs, excluded):
             key = os.path.normpath(str(path))
             if key in seen:
                 continue
@@ -331,6 +342,53 @@ def _describe_parse_failure(reason: str) -> str:
     return _describe_note_parse_failure(reason)
 
 
+_LENIENT_STATUS_BYTES = 65536
+_LENIENT_STATUS_RE = re.compile(r"^status:\s*[\"']?([A-Za-z_-]+)")
+
+
+def _normalized_status(value) -> str | None:
+    """``status`` as one lowercase token (quotes and an inline comment dropped); see obsidian_utils.normalize_status."""
+    global _UTILS_WARNED
+    try:
+        from obsidian_utils import normalize_status
+    except ImportError as exc:
+        if not _UTILS_WARNED:
+            _UTILS_WARNED = True
+            print(f"vault_scan: obsidian_utils unavailable: {exc}", file=sys.stderr)
+        text = re.split(r"(?:^|\s)#", value, maxsplit=1)[0].strip().strip("\"'") if isinstance(value, str) else ""
+        return text.split()[0].lower() if text.split() else None
+    return normalize_status(value)
+
+
+def _lenient_status(path: Path) -> str | None:
+    """The note's ``status`` when its frontmatter cannot be parsed (oversized, malformed, unreadable).
+
+    Scans the frontmatter block, up to its closing ``---`` and at most the first
+    64 KB (a note is never read past that, so never its body when it is big),
+    and takes the first ``status:`` line. /vault-ask drops ``provisional`` notes by
+    this value, so an error row must still say it.
+    """
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(_LENIENT_STATUS_BYTES).decode("utf-8", errors="replace")
+    except OSError:
+        return None
+    for i, line in enumerate(head.splitlines()):
+        line = line.rstrip("\r")
+        if i > 0 and line.strip() == "---":
+            break
+        m = _LENIENT_STATUS_RE.match(line)
+        if m:
+            return _normalized_status(m.group(1))
+    return None
+
+
+def _error_row(file_arg: str, error: str, path: Path) -> dict:
+    row = _empty_row(file_arg, error)
+    row["status"] = _lenient_status(path)
+    return row
+
+
 def note_meta(vault_root: Path, vault: str, file_arg: str) -> dict:
     path = Path(file_arg)
     if not path.is_absolute():
@@ -343,13 +401,13 @@ def note_meta(vault_root: Path, vault: str, file_arg: str) -> dict:
         if not path.is_file():
             return _empty_row(file_arg, "not found")
         if path.stat().st_size > MAX_FILE_BYTES:
-            return _empty_row(file_arg, "file too large")
+            return _error_row(file_arg, "file too large", path)
         text = _read_text(path)
     except OSError as exc:
-        return _empty_row(file_arg, f"unreadable: {exc.strerror or type(exc).__name__}")
+        return _error_row(file_arg, f"unreadable: {exc.strerror or type(exc).__name__}", path)
     _open, fm, _close, body, err = split_frontmatter(split_lines_lf_crlf(text))
     if err:
-        return _empty_row(file_arg, f"unparsable frontmatter: {_describe_parse_failure(err)}")
+        return _error_row(file_arg, f"unparsable frontmatter: {_describe_parse_failure(err)}", path)
     fields = _parse_fields(fm)
     body_text = "".join(body)
     title = next(
@@ -358,6 +416,7 @@ def note_meta(vault_root: Path, vault: str, file_arg: str) -> dict:
     )
     row = {"path": file_arg}
     row.update({f: (fields.get(f) or None) for f in META_FIELDS})
+    row["status"] = _normalized_status(row["status"])
     row.update({
         "tags": fields["tags"],
         "title": title,
@@ -374,7 +433,7 @@ def _run_grep(args) -> int:
     except re.error as exc:
         raise _UsageError(f"invalid regex {args.pattern!r}: {exc}")
     matches, scanned, skipped = grep_files(
-        args.vault, args.folders, regex, args.frontmatter_only,
+        args.vault, args.folders, regex, args.frontmatter_only, args.exclude_dir,
     )
     for m in matches:
         print(m)

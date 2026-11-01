@@ -10,6 +10,7 @@ Everything lives under ``<_SECURE_DIR>/capture/`` (0o700):
 - ``captures.jsonl`` the capture ledger the Captures pane reads. Append-only;
                    an update appends a superseding row with the same ``id``.
 - ``installed_at`` first-use timestamp; the sweep never reaches back past it.
+- ``PAUSED``      reason and timestamp for a pause of new capture batches.
 
 Python stdlib only. Every file is written 0o600.
 """
@@ -30,8 +31,10 @@ from pathlib import Path
 import obsidian_utils
 
 CLAIM_TTL_SECONDS = 900
+PAUSE_TTL_SECONDS = 7200
 LEDGER_NAME = "captures.jsonl"
 
+_stale_pause_logged: tuple | None = None
 _SID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 _STATE_DEFAULTS = {
     "offset": 0,
@@ -74,6 +77,44 @@ def _atomic_write(path: Path, text: str) -> None:
         except OSError:
             pass
         raise
+
+
+def pause(reason: str) -> None:
+    """Pause new capture batches for up to two hours; replace any previous pause."""
+    global _stale_pause_logged
+    _atomic_write(capture_dir() / "PAUSED", json.dumps({"reason": reason, "ts": time.time()}))
+    _stale_pause_logged = None
+
+
+def resume() -> None:
+    """Remove only the pause flag, leaving session state, claims and the ledger intact."""
+    global _stale_pause_logged
+    try:
+        (capture_dir() / "PAUSED").unlink()
+    except FileNotFoundError:
+        pass
+    _stale_pause_logged = None
+
+
+def is_paused() -> bool:
+    """True while PAUSED's mtime is under the TTL; log each expired flag once per process."""
+    global _stale_pause_logged
+    path = capture_dir() / "PAUSED"
+    try:
+        st = path.stat()
+    except FileNotFoundError:
+        _stale_pause_logged = None
+        return False
+    age = time.time() - st.st_mtime
+    if age < PAUSE_TTL_SECONDS:
+        return True
+    # Keep the stale flag for diagnostics. A replacement gets its own warning,
+    # and repeated checks in launch/sweep/run_batch do not flood the hook log.
+    identity = (path, st.st_dev, st.st_ino, st.st_mtime_ns)
+    if _stale_pause_logged != identity:
+        _stale_pause_logged = identity
+        append_capture_log("unknown", None, "pause-expired", f"age={age:.0f}s")
+    return False
 
 
 def get_state(sid: str) -> dict:
@@ -157,6 +198,13 @@ def claim_is_live(sid: str, ttl: int = CLAIM_TTL_SECONDS) -> bool:
         return time.time() - _sid_path(sid, ".claim").stat().st_mtime <= ttl
     except FileNotFoundError:
         return False
+
+
+def active_claims() -> list[str]:
+    """Sorted session ids with regular claim files still inside the existing claim TTL."""
+    return sorted(path.stem for path in capture_dir().glob("*.claim")
+                  if _SID_RE.fullmatch(path.stem) and not path.is_symlink()
+                  and path.is_file() and claim_is_live(path.stem))
 
 
 def release(sid: str, token: str) -> None:

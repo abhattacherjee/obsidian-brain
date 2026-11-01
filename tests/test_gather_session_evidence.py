@@ -1254,3 +1254,131 @@ def test_retro_order_requires_calendar_date(date: str) -> None:
     assert tier == "filename"
     assert [r["stem"] for r in ordered] == ["aaaa", "zzzz"]
     assert [r["stem"] for r in retros] == ["zzzz", "aaaa"]
+
+
+@pytest.mark.parametrize("insights_folder", ["claude-insights", "knowledge/insights"])
+@pytest.mark.parametrize("subfolder, found", [
+    ("", True),
+    ("_provisional", True),
+    ("_provisional/nested", True),
+    ("archive", True),
+    ("_rejected", False),
+    ("_rejected/nested", False),
+    ("archive/_rejected", False),
+    ("_rejected-backup", True),
+])
+@pytest.mark.parametrize("note_type, bucket", [
+    ("claude-insight", "insights"),
+    ("claude-decision", "decisions"),
+    ("claude-error-fix", "error_fixes"),
+    ("claude-retro", "retros"),
+])
+def test_recursive_evidence_locations(
+    tmp_path, monkeypatch, insights_folder, subfolder, found, note_type, bucket,
+):
+    import vault_index
+
+    vault = tmp_path / "vault"
+    insights_dir = vault / insights_folder / subfolder
+    insights_dir.mkdir(parents=True)
+    note = _make_insight(
+        insights_dir, filename="2026-05-03-finding-aaaa.md",
+        note_type=note_type, sid="SID-A",
+    )
+    db = tmp_path / "evidence.db"
+    monkeypatch.setenv("OBSIDIAN_BRAIN_DB", str(db))
+    vault_index.ensure_index(str(vault), [insights_folder], db_path=str(db))
+
+    bundle = obsidian_utils.gather_session_evidence(
+        str(vault), "claude-sessions", insights_folder, "SID-A", "obsidian-brain",
+    )
+
+    assert [item["path"] for item in bundle[bucket]] == ([str(note)] if found else [])
+    assert bundle["discovery_errors"] == []
+
+
+def test_recursive_evidence_without_index_skips_rejected_before_reading(tmp_path, monkeypatch):
+    vault = tmp_path / "vault"
+    insights = vault / "insights"
+    provisional = insights / "_provisional"
+    rejected = insights / "archive" / "_rejected"
+    provisional.mkdir(parents=True)
+    rejected.mkdir(parents=True)
+    first = _make_insight(
+        provisional, filename="2026-05-03-aaaa.md",
+        note_type="claude-insight", sid="SID-A",
+    )
+    last = _make_insight(
+        insights, filename="2026-05-03-zzzz.md",
+        note_type="claude-insight", sid="SID-A",
+    )
+    # Malformed rejected notes must not even produce discovery errors.
+    (rejected / "broken.md").write_text("---\ntype: claude-insight\n", encoding="utf-8")
+    monkeypatch.setattr(obsidian_utils, "_vault_index", None)
+    original_read = obsidian_utils.read_note_metadata_detailed
+
+    def read_visible_only(path):
+        assert "_rejected" not in Path(path).parts
+        return original_read(path)
+
+    monkeypatch.setattr(obsidian_utils, "read_note_metadata_detailed", read_visible_only)
+    bundle = obsidian_utils.gather_session_evidence(
+        str(vault), "sessions", "insights", "SID-A", "obsidian-brain",
+    )
+    assert [item["path"] for item in bundle["insights"]] == [str(first), str(last)]
+    assert bundle["discovery_errors"] == []
+
+
+@pytest.mark.parametrize("target_folder", ["outside", "vault/insights/_rejected"])
+def test_recursive_evidence_refuses_symlink_targets(tmp_path, monkeypatch, target_folder):
+    vault = tmp_path / "vault"
+    provisional = vault / "insights" / "_provisional"
+    provisional.mkdir(parents=True)
+    target_dir = tmp_path / target_folder
+    target_dir.mkdir(parents=True)
+    target = _make_insight(
+        target_dir, filename="2026-05-03-hidden.md",
+        note_type="claude-insight", sid="SID-A",
+    )
+    (provisional / "alias.md").symlink_to(target)
+    monkeypatch.setenv("OBSIDIAN_BRAIN_DB", str(tmp_path / "unused.db"))
+    original_read = obsidian_utils.read_note_metadata_detailed
+
+    def read_visible_only(path):
+        assert Path(path).resolve() != target
+        return original_read(path)
+
+    monkeypatch.setattr(obsidian_utils, "read_note_metadata_detailed", read_visible_only)
+    bundle = obsidian_utils.gather_session_evidence(
+        str(vault), "sessions", "insights", "SID-A", "obsidian-brain",
+    )
+    assert bundle["insights"] == []
+    assert bundle["discovery_errors"] == []
+
+
+def test_recursive_evidence_reports_path_resolution_error(tmp_path, monkeypatch):
+    vault = tmp_path / "vault"
+    provisional = vault / "insights" / "_provisional"
+    provisional.mkdir(parents=True)
+    note = _make_insight(
+        provisional, filename="2026-05-03-unreadable.md",
+        note_type="claude-insight", sid="SID-A",
+    )
+    monkeypatch.setenv("OBSIDIAN_BRAIN_DB", str(tmp_path / "unused.db"))
+    original_resolve = Path.resolve
+
+    def resolve(path, *args, **kwargs):
+        if path == note:
+            raise OSError(errno.EACCES, "Permission denied", str(note))
+        return original_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", resolve)
+    bundle = obsidian_utils.gather_session_evidence(
+        str(vault), "sessions", "insights", "SID-A", "obsidian-brain",
+    )
+    assert bundle["insights"] == []
+    assert len(bundle["discovery_errors"]) == 1
+    error = bundle["discovery_errors"][0]
+    assert note.name in error
+    assert "unreadable" in error
+    assert str(vault) not in error

@@ -83,7 +83,7 @@ def pending_sessions(limit: int, exclude: str | None = None,
 
 def sweep(limit: int = 3, exclude: str | None = None) -> list[str]:
     """Launch a batch for up to ``limit`` pending sessions."""
-    if os.environ.get(capture_worker.DISABLE_ENV_VAR) == "1":
+    if os.environ.get(capture_worker.DISABLE_ENV_VAR) == "1" or capture_state.is_paused():
         return []  # skip the transcript scan too, not just the spawn
     launched = []
     for sid, path in pending_sessions(limit, exclude=exclude):

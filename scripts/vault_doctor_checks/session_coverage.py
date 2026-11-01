@@ -98,7 +98,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import Issue, Result
-from .source_sessions import _EXTRA_INSIGHT_FOLDERS, _parse_frontmatter
+from .source_sessions import _EXTRA_INSIGHT_FOLDERS, _iter_note_paths, _parse_frontmatter
 
 NAME = "session-coverage"
 DESCRIPTION = (
@@ -538,9 +538,9 @@ def _index_referenced_by(
         folder_path = vault / folder
         if not folder_path.is_dir():
             continue
-        for entry in folder_path.iterdir():
-            if not entry.name.endswith(".md"):
-                continue
+        for entry in _iter_note_paths(
+            folder_path, recursive=folder == insights_folder, root=vault
+        ):
             try:
                 text = entry.read_text(encoding="utf-8", errors="replace")
             except OSError as exc:

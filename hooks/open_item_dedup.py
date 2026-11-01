@@ -1236,6 +1236,30 @@ _MAX_EVIDENCE_TAGS = 20
 _MAX_EVIDENCE_CHANGED_PATHS = 200
 
 
+def _resolve_window_note(
+    vault_path: str, sessions_folder: str, insights_folder: str, basename: str,
+) -> str | None:
+    """Resolve a window basename in sessions or either R1 insight home."""
+    if not basename or os.path.basename(basename) != basename:
+        return None
+    root = Path(vault_path).resolve()
+    for folder in (sessions_folder, insights_folder,
+                   os.path.join(insights_folder, "_provisional")):
+        candidate = root / folder / basename
+        try:
+            resolved = candidate.resolve()
+        except (OSError, RuntimeError):
+            continue
+        if not candidate.is_relative_to(root) or not resolved.is_relative_to(root):
+            continue
+        if ("_rejected" in candidate.relative_to(root).parts
+                or "_rejected" in resolved.relative_to(root).parts):
+            continue
+        if resolved.is_file():
+            return str(resolved)
+    return None
+
+
 def deep_analysis_pipeline(
     basenames: list[str],
     projects_json: str,
@@ -1301,11 +1325,9 @@ def deep_analysis_pipeline(
     stem_to_path: dict[str, str] = {}
     for b in basenames:
         stem = os.path.splitext(b)[0]
-        for folder in [sessions_folder, insights_folder]:
-            candidate = os.path.join(vault_path, folder, b)
-            if os.path.isfile(candidate):
-                stem_to_path[stem] = candidate
-                break
+        candidate = _resolve_window_note(vault_path, sessions_folder, insights_folder, b)
+        if candidate is not None:
+            stem_to_path[stem] = candidate
 
     # Parse wikilinks from each note
     outgoing_links: dict[str, set[str]] = {}  # stem -> set of linked stems
@@ -1737,35 +1759,34 @@ def build_deep_presentation(
     # Build set of all stems referenced via wikilinks across window notes
     linked_stems: set[str] = set()
     note_types: dict[str, str] = {}  # stem -> type
+    loaded_stems: set[str] = set()
 
     for b in basenames:
         stem = os.path.splitext(b)[0]
-        for folder in [sessions_folder, insights_folder]:
-            fpath = os.path.join(vault_path, folder, b)
-            if not os.path.isfile(fpath):
-                continue
-            try:
-                with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
-                    content = f.read()
-            except OSError:
-                continue
+        fpath = _resolve_window_note(vault_path, sessions_folder, insights_folder, b)
+        if fpath is None:
+            continue
+        try:
+            with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
+                content = f.read()
+        except OSError:
+            continue
+        loaded_stems.add(stem)
 
-            # Extract type from frontmatter (first 20 lines)
-            for line in content.split('\n')[:20]:
-                stripped = line.strip()
-                if stripped.startswith('type:'):
-                    note_types[stem] = stripped.split(':', 1)[1].strip().strip('"').strip("'")
-                    break
+        # Extract type from frontmatter (first 20 lines)
+        for line in content.split('\n')[:20]:
+            stripped = line.strip()
+            if stripped.startswith('type:'):
+                note_types[stem] = stripped.split(':', 1)[1].strip().strip('"').strip("'")
+                break
 
-            # Collect all wikilink targets
-            for target in _RE_WIKILINK.findall(content):
-                linked_stems.add(target)
-            break  # found in this folder
+        # Collect all wikilink targets
+        for target in _RE_WIKILINK.findall(content):
+            linked_stems.add(target)
 
     # Find orphans: notes in window not linked by any other note, excluding aggregation types
-    all_stems = {os.path.splitext(b)[0] for b in basenames}
     orphans: list[str] = []
-    for stem in sorted(all_stems):
+    for stem in sorted(loaded_stems):
         note_type = note_types.get(stem, "")
         if note_type in _ORPHAN_EXCLUDE_TYPES:
             continue

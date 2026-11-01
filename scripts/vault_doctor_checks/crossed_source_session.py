@@ -39,7 +39,7 @@ scanned for the STAMPED fields (``source_session`` / ``source_session_note``)
 — in practice only insight/decision/error-fix notes carry them today (see
 ``templates/insight.md``, ``templates/decision.md``,
 ``templates/error-fix.md``), but scanning both folders costs one extra
-glob and does not depend on that staying true. Wikilink TARGETS are
+directory walk and does not depend on that staying true. Wikilink TARGETS are
 resolved by indexing ``sessions_folder`` ONLY: ``source_session_note``
 always names a session note (the note the retro/insight/error-fix was
 captured FROM), never another insight, so there is nothing to gain — and a
@@ -56,6 +56,7 @@ import sys
 from pathlib import Path
 
 from . import Issue, Result
+from .source_sessions import _iter_note_paths
 
 # Path bootstrap: add hooks/ so we can import the plugin's shared frontmatter
 # parser. Same pattern as project_name_normalization.py.
@@ -148,9 +149,12 @@ def _is_readable_dir(path: Path) -> bool:
         return False
 
 
-def _list_md_files(folder_path: Path) -> tuple[list[Path], str | None]:
-    """List the ``*.md`` files directly in ``folder_path``, or ``([], error)``
-    if the directory itself could not be listed.
+def _list_md_files(
+    folder_path: Path, *, recursive: bool = False, root: Path | None = None
+) -> tuple[list[Path], str | None]:
+    """List markdown notes, or ``([], error)`` if a directory cannot be listed.
+
+    Insights recurse (excluding _rejected); sessions stay flat.
 
     ``Path.glob()`` silently SWALLOWS ``OSError`` raised while walking a
     directory (an unreadable subdirectory just vanishes from the results —
@@ -166,10 +170,7 @@ def _list_md_files(folder_path: Path) -> tuple[list[Path], str | None]:
     which uses ``iterdir()`` for exactly this reason.
     """
     try:
-        entries = sorted(
-            p for p in folder_path.iterdir()
-            if p.name.endswith(".md") and p.is_file()
-        )
+        entries = sorted(_iter_note_paths(folder_path, recursive=recursive, root=root))
     except OSError as exc:
         return [], str(exc)
     return entries, None
@@ -192,7 +193,7 @@ def _index_sessions_by_stem(
     folder_path = vault_root / sessions_folder
     if not _is_readable_dir(folder_path):
         return index, 0, None
-    entries, err = _list_md_files(folder_path)
+    entries, err = _list_md_files(folder_path, root=vault_root)
     if err is not None:
         return index, 0, err
     for md_file in entries:
@@ -239,7 +240,9 @@ def scan(
         if not _is_readable_dir(folder_path):
             continue
 
-        entries, folder_err = _list_md_files(folder_path)
+        entries, folder_err = _list_md_files(
+            folder_path, recursive=folder == insights_folder, root=vault_root
+        )
         if folder_err is not None:
             print(
                 f"[{NAME}] WARNING: could not list {folder_path}: "

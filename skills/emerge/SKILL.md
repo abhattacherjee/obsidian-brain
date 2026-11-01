@@ -102,6 +102,36 @@ Parse `SAVED:<path>` and everything after `---REPORT---`. Mark tasks #3-#4 `comp
 ### Step 4 — Present to user
 Display report prefixed with **Pattern Discovery Results:**. Confirm saved path. Mark task #5 `completed`.
 
+Then add a section "Lessons growing in this window" (shown in the conversation, not saved in the note). Read the lessons:
+
+```bash
+cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+HOOKS=$(python3 -c "
+import glob, json, os, re
+def _ob_hooks():
+    try:
+        for _m in json.load(open(os.path.expanduser('~/.claude/plugins/known_marketplaces.json'))).values():
+            _s = _m.get('source') if isinstance(_m, dict) else None
+            if not (isinstance(_s, dict) and _s.get('source') == 'directory'):
+                continue
+            _i = _m.get('installLocation') if isinstance(_m, dict) else None
+            if not (isinstance(_i, str) and os.path.isabs(_i)):
+                continue
+            _h = os.path.join(_i, 'hooks')
+            if os.path.isfile(os.path.join(_h, 'obsidian_utils.py')):
+                return _h
+    except Exception:
+        pass
+    _c = [_d for _d in glob.glob(os.path.expanduser('~/.claude/plugins/cache/*/obsidian-brain/*/hooks')) if re.fullmatch('[0-9]+([.][0-9]+)*', _d.split('/')[-2])]
+    return max(_c, key=lambda _p: ([int(_n) for _n in _p.split('/')[-2].split('.')], _p), default='hooks')
+print(_ob_hooks())
+")
+test -f "$HOOKS/retro_rollup.py" || { echo "ERROR: retro_rollup.py not found under $HOOKS - verify the obsidian-brain install resolved there is complete (git pull for a directory-source checkout, or /plugin marketplace update for a cache install), then retry." >&2; exit 1; }
+python3 "$HOOKS/retro_rollup.py" report --json < /dev/null
+```
+
+Read the lessons only from `report --json`, never from the state file. The window starts `$DAYS` days before today and includes its start date. Keep lessons with `sessions` of at least 2 and at least one `members[].date` inside the window. Sort by the number of members dated inside the window (most first), keep 10, and print one line each: `<name> · <members in window> new items · <sessions> sessions · <tracking_ref or "no tracking">`. If none qualify, or the command fails, print "No lessons grew in this window." and move on.
+
 ## Edge Cases
 - **Sparse window (< 2 themes updated):** nudge the user to run `/consolidate` first or widen the window (`/emerge 90d`) — see Step 1.
 - **Only 1 project:** Sub-agent skips Cross-Project Connections.
