@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import os
 import re
 from pathlib import Path
@@ -712,22 +713,51 @@ def test_report_table_shows_items_dates_and_tracking(env, capsys):
 # --- file an issue per accepted untracked lesson (#471 Task 9) --------------------
 
 class FakeGh:
-    """Fakes `gh issue create`: records calls, reads the body file while it exists."""
+    """Fakes `gh issue create` and `gh issue list`: records calls, reads the body file while it exists.
 
-    def __init__(self, number=7, stdout=None, returncode=0):
-        self.calls, self.bodies, self.modes = [], [], []
+    A created issue is remembered (number, body) so a later `issue list` can find it. `record_then`
+    makes create raise after the issue exists, like a gh timeout that came too late. `list_fail` is
+    None, "rc", "timeout", "json" or "shape" and breaks `issue list`.
+    """
+
+    def __init__(self, number=7, stdout=None, returncode=0, record_then=None, list_fail=None,
+                 list_pad=0):
+        self.calls, self.bodies, self.modes, self.list_calls = [], [], [], []
         self.number, self.stdout, self.returncode = number, stdout, returncode
+        self.record_then, self.list_fail, self.list_pad = record_then, list_fail, list_pad
+        self.issues, self.on_create = [], None
 
     def __call__(self, args, timeout=10):
+        if args[:2] == ["issue", "list"]:
+            return self._list(args)
         assert args[:2] == ["issue", "create"], args
         self.calls.append(args)
         body = Path(args[args.index("--body-file") + 1])
         self.bodies.append(body.read_text())
         self.modes.append(body.stat().st_mode & 0o777)
+        if self.on_create:
+            self.on_create()
         repo = args[args.index("--repo") + 1]
+        if self.returncode == 0 and (self.stdout is None or self.record_then):
+            self.issues.append({"number": self.number, "body": self.bodies[-1]})
+        if self.record_then:
+            raise self.record_then
         out = self.stdout if self.stdout is not None else (
             f"Creating issue in {repo}\n\nhttps://github.com/{repo}/issues/{self.number}\n")
         return type("R", (), {"returncode": self.returncode, "stdout": out, "stderr": "boom"})()
+
+    def _list(self, args):
+        self.list_calls.append(args)
+        if self.list_fail == "timeout":
+            raise subprocess.TimeoutExpired("gh", 1)
+        out = json.dumps(self.issues + [{"number": 900 + i, "body": "unrelated"}
+                                        for i in range(self.list_pad)])
+        if self.list_fail == "json":
+            out = "not json"
+        elif self.list_fail == "shape":
+            out = json.dumps({"issues": []})
+        rc = 1 if self.list_fail == "rc" else 0
+        return type("R", (), {"returncode": rc, "stdout": out, "stderr": "boom"})()
 
 
 @pytest.fixture
@@ -751,6 +781,10 @@ def _file_accept(tmp_path, entries):
     f = tmp_path / "accept-file.json"
     f.write_text(json.dumps(entries))
     return f
+
+
+def _pending(lid, repo):
+    return {"pending": True, "repo": repo, "marker": f"<!-- retro-lesson:{lid} -->"}
 
 
 def _issue_trace(repo, n):
@@ -837,11 +871,15 @@ def test_partly_traced_filed_lesson_is_finished_by_a_rerun(filing, tmp_path, mon
     assert _issue_trace("o/r", 7) in (vault / "claude-insights" / "2026-10-08-retro-b2.md").read_text()
 
 
-def _filed_repo(filing, tmp_path, monkeypatch, entry, config=None, origin=None, size=3):
+def _filed_repo(filing, tmp_path, monkeypatch, entry, config=None, origin=None, size=3, origin_repo=None):
+    """origin_repo patches _origin_repo itself (what _resolve_repo asks last), so a precedence test can
+    show a higher source beating a real origin value; `origin` patches only the git call under it."""
     import obsidian_utils
     vault, state, base, gh = filing
     monkeypatch.setattr(obsidian_utils, "load_config", lambda: config or {})
     monkeypatch.setattr(retro_rollup, "_git_origin", lambda path: origin(path) if origin else None)
+    if origin_repo is not None:
+        monkeypatch.setattr(retro_rollup, "_origin_repo", lambda project: origin_repo)
     lid = _lesson_named(state, size)
     f = _file_accept(tmp_path, [{"lesson_id": lid, **entry}])
     code = run(base, "backfill", "--apply", "--accept", str(f))
@@ -850,21 +888,22 @@ def _filed_repo(filing, tmp_path, monkeypatch, entry, config=None, origin=None, 
 
 def test_repo_accept_override_beats_config_beats_origin(filing, tmp_path, monkeypatch):
     cfg = {"project_repos": {"p1": "cfg/repo"}}
-    origin = lambda path: "https://github.com/git/origin"
-    code, gh = _filed_repo(filing, tmp_path, monkeypatch, {"file_issue": True, "repo": "acc/repo"}, cfg, origin)
+    code, gh = _filed_repo(filing, tmp_path, monkeypatch, {"file_issue": True, "repo": "acc/repo"}, cfg,
+                           origin_repo="orig/repo")
     assert code == 0 and gh.calls[0][3] == "acc/repo"
 
 
 def test_repo_config_beats_origin_and_uses_the_busiest_project(filing, tmp_path, monkeypatch):
     # RULE-A members: p1 in two retros, p2 in one -> p1.
     cfg = {"project_repos": {"p1": "cfg/one", "p2": "cfg/two"}}
-    code, gh = _filed_repo(filing, tmp_path, monkeypatch, {"file_issue": True}, cfg, lambda path: "https://github.com/git/origin")
+    code, gh = _filed_repo(filing, tmp_path, monkeypatch, {"file_issue": True}, cfg, origin_repo="orig/repo")
     assert code == 0 and gh.calls[0][3] == "cfg/one"
 
 
 def test_repo_tie_between_projects_goes_to_the_smaller_name(filing, tmp_path, monkeypatch):
     cfg = {"project_repos": {"p1": "cfg/one", "p2": "cfg/two"}}
-    code, gh = _filed_repo(filing, tmp_path, monkeypatch, {"file_issue": True}, cfg, size=2)  # RULE-B: p1 and p2 once each
+    code, gh = _filed_repo(filing, tmp_path, monkeypatch, {"file_issue": True}, cfg, size=2,  # RULE-B: p1 and p2 once each
+                           origin_repo="orig/repo")
     assert code == 0 and gh.calls[0][3] == "cfg/one"
 
 
@@ -928,7 +967,9 @@ def test_bad_gh_output_is_a_failure_with_nothing_traced_or_saved(filing, tmp_pat
     f = _file_accept(tmp_path, [{"lesson_id": lid, "file_issue": True, "repo": "o/r"}])
     before = retro_bytes(vault)
     assert run(base, "backfill", "--apply", "--accept", str(f)) == 1
-    assert retro_bytes(vault) == before and not state_of(state).get("filed")
+    assert retro_bytes(vault) == before
+    # The issue may exist, so the pending record stays for the next run to reconcile.
+    assert state_of(state)["filed"] == {lid: _pending(lid, "o/r")}
 
 
 def test_gh_create_matching_repo_case_insensitively_is_accepted(filing, tmp_path, monkeypatch):
@@ -951,7 +992,7 @@ def test_gh_timeout_or_missing_gh_is_a_failure(filing, tmp_path, monkeypatch):
             raise exc
         monkeypatch.setattr(retro_rollup, "_run_gh", fail)
         assert run(base, "backfill", "--apply", "--accept", str(f)) == 1
-    assert not state_of(state).get("filed")
+    assert state_of(state)["filed"] == {lid: _pending(lid, "o/r")}
 
 
 def test_dry_run_lists_planned_filings_and_calls_no_gh(env, monkeypatch, capsys):
@@ -1055,6 +1096,176 @@ def test_git_origin_reads_the_real_remote(tmp_path):
     assert retro_rollup._git_origin(str(tmp_path / "missing")) is None
 
 
+
+# --- two-phase filing: pending record, marker, reconcile (#471 review C-013, X-017) ---
+
+def _accept_file_issue(tmp_path, lid, repo="o/r"):
+    return _file_accept(tmp_path, [{"lesson_id": lid, "file_issue": True, "repo": repo}])
+
+
+def _set_filed(state, lid, value):
+    s = state_of(state)
+    s["filed"] = {lid: value}
+    (state / "lessons-state.json").write_text(json.dumps(s))
+
+
+def test_pending_record_is_saved_before_gh_and_the_marker_is_the_first_body_line(filing, tmp_path):
+    vault, state, base, gh = filing
+    lid = _lesson_named(state, 3)
+    seen = []
+    gh.on_create = lambda: seen.append(state_of(state)["filed"])
+    assert run(base, "backfill", "--apply", "--accept", str(_accept_file_issue(tmp_path, lid))) == 0
+    assert seen == [{lid: _pending(lid, "o/r")}]
+    assert gh.bodies[0].splitlines()[0] == f"<!-- retro-lesson:{lid} -->"
+    assert state_of(state)["filed"] == {lid: "o/r#7"}
+
+
+def test_failed_pending_save_means_no_gh_call_and_exit_1(filing, tmp_path, monkeypatch, capsys):
+    vault, state, base, gh = filing
+    lid = _lesson_named(state, 3)
+    before = retro_bytes(vault)
+
+    def no_save(ctx, st):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(retro_rollup, "save_state", no_save)
+    capsys.readouterr()
+    assert run(base, "backfill", "--apply", "--accept", str(_accept_file_issue(tmp_path, lid))) == 1
+    assert gh.calls == [] and retro_bytes(vault) == before
+    assert "disk full" in json.loads(capsys.readouterr().out)["skipped_entries"][0]["reason"]
+
+
+def test_save_fails_after_gh_created_the_issue_then_rerun_adopts_it(filing, tmp_path, monkeypatch, capsys):
+    vault, state, base, gh = filing
+    lid = _lesson_named(state, 3)
+    f = _accept_file_issue(tmp_path, lid)
+    real_save = retro_rollup.save_state
+
+    def save_unless_filed(ctx, st):
+        if gh.calls:
+            raise OSError("disk full")
+        real_save(ctx, st)
+
+    monkeypatch.setattr(retro_rollup, "save_state", save_unless_filed)
+    before = retro_bytes(vault)
+    assert run(base, "backfill", "--apply", "--accept", str(f)) == 1
+    assert retro_bytes(vault) == before and len(gh.calls) == 1
+    assert state_of(state)["filed"] == {lid: _pending(lid, "o/r")}
+    monkeypatch.setattr(retro_rollup, "save_state", real_save)
+    capsys.readouterr()
+    assert run(base, "backfill", "--apply", "--accept", str(f)) == 0
+    assert len(gh.calls) == 1 and len(gh.list_calls) == 1  # adopted, not filed again
+    out = json.loads(capsys.readouterr().out)
+    assert out["filed"] == [] and out["adopted"] == [{"lesson": lid, "repo": "o/r", "issue": 7}]
+    assert state_of(state)["filed"] == {lid: "o/r#7"}
+    assert _issue_trace("o/r", 7) in (vault / "claude-insights" / "2026-10-08-retro-b2.md").read_text()
+    listing = gh.list_calls[0]
+    assert listing == ["issue", "list", "--repo", "o/r", "--state", "all", "--author", "@me",
+                       "--json", "number,body", "--limit", "50"]
+
+
+def test_gh_create_timeout_after_the_issue_exists_is_adopted_not_refiled(filing, tmp_path, monkeypatch):
+    vault, state, base, gh = filing
+    lid = _lesson_named(state, 3)
+    f = _accept_file_issue(tmp_path, lid)
+    slow = FakeGh(number=11, record_then=subprocess.TimeoutExpired("gh", 60))
+    monkeypatch.setattr(retro_rollup, "_run_gh", slow)
+    assert run(base, "backfill", "--apply", "--accept", str(f)) == 1
+    assert len(slow.calls) == 1 and state_of(state)["filed"] == {lid: _pending(lid, "o/r")}
+    assert run(base, "backfill", "--apply", "--accept", str(f)) == 0
+    assert len(slow.calls) == 1  # still one create
+    assert state_of(state)["filed"] == {lid: "o/r#11"}
+    assert _issue_trace("o/r", 11) in (vault / "claude-insights" / "2026-10-01-retro-a1.md").read_text()
+
+
+def test_pending_record_with_no_matching_issue_files_exactly_once(filing, tmp_path):
+    vault, state, base, gh = filing
+    lid = _lesson_named(state, 3)
+    gh.issues.append({"number": 3, "body": "<!-- retro-lesson:other -->\nsomething else"})
+    _set_filed(state, lid, _pending(lid, "o/r"))
+    assert run(base, "backfill", "--apply", "--accept", str(_accept_file_issue(tmp_path, lid))) == 0
+    assert len(gh.list_calls) == 1 and len(gh.calls) == 1
+    assert state_of(state)["filed"] == {lid: "o/r#7"}
+
+
+@pytest.mark.parametrize("fail, pad", [("rc", 0), ("timeout", 0), ("json", 0), ("shape", 0), (None, 50)])
+def test_pending_record_with_a_failed_search_never_files_blind(filing, tmp_path, monkeypatch, capsys, fail, pad):
+    # pad=50: a full newest page, then a full search page, with no match may hide the issue.
+    vault, state, base, gh = filing
+    lid = _lesson_named(state, 3)
+    broken = FakeGh(list_fail=fail, list_pad=pad)
+    monkeypatch.setattr(retro_rollup, "_run_gh", broken)
+    _set_filed(state, lid, _pending(lid, "o/r"))
+    before = retro_bytes(vault)
+    capsys.readouterr()
+    assert run(base, "backfill", "--apply", "--accept", str(_accept_file_issue(tmp_path, lid))) == 1
+    assert broken.calls == [] and retro_bytes(vault) == before
+    reason = json.loads(capsys.readouterr().out)["skipped_entries"][0]["reason"]
+    assert reason == "cannot check for an earlier filing"
+    assert state_of(state)["filed"] == {lid: _pending(lid, "o/r")}
+
+
+def test_search_needs_the_exact_marker_not_just_the_lesson_id(filing, tmp_path):
+    vault, state, base, gh = filing
+    lid = _lesson_named(state, 3)
+    gh.issues.append({"number": 5, "body": f"mentions {lid} but has no marker"})
+    gh.issues.append({"number": 6, "body": f"<!-- retro-lesson:{lid}x -->\nlonger id"})
+    _set_filed(state, lid, _pending(lid, "o/r"))
+    assert run(base, "backfill", "--apply", "--accept", str(_accept_file_issue(tmp_path, lid))) == 0
+    assert len(gh.calls) == 1 and state_of(state)["filed"] == {lid: "o/r#7"}
+
+
+def test_dry_run_lists_a_pending_lesson_as_pending_reconcile(filing, tmp_path, capsys):
+    vault, state, base, gh = filing
+    lid = _lesson_named(state, 3)
+    _set_filed(state, lid, _pending(lid, "o/r"))
+    capsys.readouterr()
+    assert run(base, "backfill") == 0
+    plans = {p["lesson"]: p for p in json.loads(capsys.readouterr().out)["planned_filings"]}
+    assert plans[lid]["reason"] == "pending reconcile" and plans[lid]["repo"] == "o/r"
+    assert gh.calls == [] and gh.list_calls == []
+
+
+def test_load_state_keeps_both_forms_and_drops_junk(filing):
+    vault, state, base, gh = filing
+    s = state_of(state)
+    s["filed"] = {"a": "o/r#3", "b": _pending("b", "o/r"), "c": "garbage", "d": {"pending": True},
+                  "e": {"pending": True, "repo": "bad repo"}, "f": 5}
+    (state / "lessons-state.json").write_text(json.dumps(s))
+    ctx = retro_rollup.Ctx(retro_rollup._parser().parse_args(
+        ["backfill", "--vault", str(vault), "--state-dir", str(state)]))
+    assert retro_rollup.load_state(ctx)["filed"] == {"a": "o/r#3", "b": _pending("b", "o/r")}
+
+
+def test_issue_tracking_is_saved_with_the_filing_even_if_every_trace_write_fails(filing, tmp_path, monkeypatch, capsys):
+    vault, state, base, gh = filing
+    lid = _lesson_named(state, 3)
+
+    def boom(*a, **k):
+        raise OSError("locked")
+
+    monkeypatch.setattr(retro_rollup.retro_trace, "apply_traces", boom)
+    before = retro_bytes(vault)
+    assert run(base, "backfill", "--apply", "--accept", str(_accept_file_issue(tmp_path, lid))) == 1
+    assert retro_bytes(vault) == before
+    assert state_of(state)["lessons"][lid]["tracking"] == {
+        "kind": "issue", "ref": "o/r#7", "since": state_of(state)["lessons"][lid]["tracking"]["since"]}
+    capsys.readouterr()
+    assert run(base, "backfill") == 0  # dry run
+    dry = json.loads(capsys.readouterr().out)
+    members = {(p["note"], p["item"]) for p in dry["plan"] if p["lesson"] == lid}
+    assert len(members) == 3 and all(p["trace"]["ref"] == "o/r#7" for p in dry["plan"] if p["lesson"] == lid)
+    assert all(p["lesson"] != lid for p in dry["planned_filings"])
+    assert run(base, "report", "--json") == 0
+    rep = json.loads(capsys.readouterr().out)
+    assert next(l for l in rep["lessons"] if l["id"] == lid)["tracking_ref"] == "o/r#7"
+    assert run(base, "update") == 0  # a regroup must not drop the issue while no trace has landed
+    capsys.readouterr()
+    assert run(base, "report", "--json") == 0
+    rep = json.loads(capsys.readouterr().out)
+    assert next(l for l in rep["lessons"] if l["id"] == lid)["tracking_ref"] == "o/r#7"
+
+
 def test_freshly_filed_lesson_is_quiet_not_raise(filing, tmp_path):
     # Sessions before the issue existed are not recurrences: the new issue counts as opened today.
     vault, state, base, gh = filing
@@ -1067,3 +1278,35 @@ def test_freshly_filed_lesson_is_quiet_not_raise(filing, tmp_path):
     assert c["bucket"] == "quiet" and c["sessions_after_tracking"] == 0, c
     info = s["tracking"]["issue:o/r#7"]
     assert info["state"] == "OPEN" and info["created"] == s["generated"] and info["exists"] is True
+
+
+
+def test_newest_page_not_full_and_no_match_files_without_a_search(filing, tmp_path):
+    # The plain listing is complete when its page is not full, so no index-lagged search is needed.
+    vault, state, base, gh = filing
+    lid = _lesson_named(state, 3)
+    gh.list_pad = 3
+    _set_filed(state, lid, _pending(lid, "o/r"))
+    assert run(base, "backfill", "--apply", "--accept", str(_accept_file_issue(tmp_path, lid))) == 0
+    assert len(gh.list_calls) == 1 and "--search" not in gh.list_calls[0] and len(gh.calls) == 1
+
+
+def test_full_newest_page_falls_back_to_the_body_search(filing, tmp_path):
+    vault, state, base, gh = filing
+    lid = _lesson_named(state, 3)
+    gh.list_pad = 50
+    gh.issues.append({"number": 41, "body": f"<!-- retro-lesson:{lid} -->\nbody"})
+    real = gh._list
+    calls = []
+
+    def listing(args):
+        calls.append(args)
+        if "--author" in args:  # the newest page is full of other issues
+            return type("R", (), {"returncode": 0, "stdout": json.dumps(
+                [{"number": 900 + i, "body": "unrelated"} for i in range(50)]), "stderr": ""})()
+        return real(args)
+    gh._list = listing
+    _set_filed(state, lid, _pending(lid, "o/r"))
+    assert run(base, "backfill", "--apply", "--accept", str(_accept_file_issue(tmp_path, lid))) == 0
+    assert [("--search" in c) for c in calls] == [False, True] and gh.calls == []
+    assert state_of(state)["filed"] == {lid: "o/r#41"}

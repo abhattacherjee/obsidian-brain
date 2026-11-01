@@ -44,6 +44,8 @@ _REMOTE = re.compile(
     r"([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?/?$")
 _CREATED = re.compile(r"^https://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)/issues/([1-9][0-9]*)$")
 GH_CREATE_TIMEOUT_SECONDS = 60
+SEARCH_LIMIT = 20
+RECENT_LIMIT = 50  # newest own issues listed before falling back to a body search
 GIT_TIMEOUT_SECONDS = 10
 
 
@@ -145,9 +147,25 @@ def load_state(ctx: Ctx) -> dict:
         return _empty_state()
     base = _empty_state()
     base.update(state)
-    if not isinstance(base.get("filed"), dict):
-        base["filed"] = {}
+    base["filed"] = _clean_filed(base.get("filed"))
     return base
+
+
+def _marker(lid: str) -> str:
+    return f"<!-- retro-lesson:{lid} -->"
+
+
+def _is_pending(value) -> bool:
+    return (isinstance(value, dict) and value.get("pending") is True
+            and _valid_repo(value.get("repo")))
+
+
+def _clean_filed(filed) -> dict:
+    """Keep the two valid forms: "owner/repo#N", or a pending record; drop anything else."""
+    if not isinstance(filed, dict):
+        return {}
+    return {lid: v for lid, v in filed.items()
+            if (isinstance(v, str) and _REF.match(v)) or _is_pending(v)}
 
 
 def save_state(ctx: Ctx, state: dict) -> None:
@@ -245,6 +263,10 @@ def regroup(ctx: Ctx, state: dict, *, judge: bool, note: str | None = None, cach
         # `since` is sticky for the id's own record; a split child with a new id inherits its parent's.
         prev_rec = state["lessons"].get(lid) or state["lessons"].get(lesson.get("split_from")) or {}
         tracking = lessons_group.lesson_tracking(lesson["members"], by_key, prev_rec.get("tracking"))
+        filed_ref = state["filed"].get(lid)
+        if (tracking is None and isinstance(filed_ref, str) and state["lessons"].get(lid, {}).get("tracking")
+                and state["lessons"][lid]["tracking"].get("ref") == filed_ref):
+            tracking = state["lessons"][lid]["tracking"]  # filed, no trace landed yet: keep the issue
         info = state["tracking"].get(_tracking_key(tracking)) if tracking else None
         c = lessons_group.classify(lesson, by_key, tracking, info, ctx.today, ctx.recent_days)
         snooze = snoozes.get(lid)
@@ -513,7 +535,7 @@ def _issue_body(lid: str, rec: dict, by_key: dict) -> str:
     """Counts, dates, project names and note#item refs only; never retro item text."""
     members = [by_key[k] for k in rec["members"] if k in by_key]
     dates = sorted(m["date"] for m in members)
-    lines = [f"Recurring lesson `{lid}` from the retro lessons rollup (#471).", "",
+    lines = [_marker(lid), f"Recurring lesson `{lid}` from the retro lessons rollup (#471).", "",
              f"- Sessions: {len({m['note'] for m in members})}",
              f"- Projects: {', '.join(sorted({m['project'] for m in members}))}",
              f"- First seen: {dates[0] if dates else 'unknown'}",
@@ -552,15 +574,62 @@ def _create_issue(ctx: Ctx, repo: str, title: str, body: str) -> tuple[str | Non
     return f"{repo}#{match.group(3)}", None
 
 
+def _scan_issues(repo: str, filters: list[str], limit: int, marker: str):
+    """One `gh issue list`: (found ref or None, page full, error or None)."""
+    try:
+        result = _run_gh(["issue", "list", "--repo", repo, "--state", "all", *filters,
+                          "--json", "number,body", "--limit", str(limit)])
+    except subprocess.TimeoutExpired:
+        return None, False, "gh timed out"
+    except OSError as exc:
+        return None, False, str(exc)[:200]
+    if result.returncode:
+        return None, False, f"gh exited with code {result.returncode}"
+    try:
+        data = json.loads(result.stdout)
+    except ValueError:
+        return None, False, "gh returned invalid JSON"
+    if not isinstance(data, list) or not all(isinstance(i, dict) for i in data):
+        return None, False, "gh JSON is not a list of issues"
+    found = sorted(i["number"] for i in data
+                   if isinstance(i.get("number"), int) and not isinstance(i["number"], bool)
+                   and i["number"] > 0 and isinstance(i.get("body"), str)
+                   and marker in (line.strip() for line in i["body"].splitlines()))
+    return (f"{repo}#{found[0]}" if found else None), len(data) >= limit, None
+
+
+def _find_filed_issue(repo: str, lid: str) -> tuple[str | None, str | None]:
+    """Look for an earlier issue carrying this lesson's marker: ("owner/repo#N", None), (None, None)
+    when there is none, or (None, error) when the check cannot say.
+
+    First my newest issues in the repo (a plain listing, so a just-created issue is there at once;
+    GitHub's search index can lag). Only a full page with no match falls back to a body search.
+    """
+    marker = _marker(lid)
+    ref, full, error = _scan_issues(repo, ["--author", "@me"], RECENT_LIMIT, marker)
+    if error or ref or not full:
+        return ref, error
+    ref, full, error = _scan_issues(repo, ["--search", f"{lid} in:body"], SEARCH_LIMIT, marker)
+    if error or ref:
+        return ref, error
+    if full:
+        return None, "search result page is full and has no match; the issue may be further down"
+    return None, None
+
+
 def _planned_filings(ctx: Ctx, state: dict, by_key: dict) -> list[dict]:
     plans, cache = [], {}
     for lid, rec in sorted(state["lessons"].items()):
-        if rec.get("tracking") or lid in state["filed"]:
+        filed = state["filed"].get(lid)
+        if rec.get("tracking") or isinstance(filed, str):
             continue
         untraced = sum(1 for k in rec["members"] if k in by_key and by_key[k]["trace"] is None)
         if not untraced:
             continue
-        repo, reason = _resolve_repo(ctx, rec, by_key, None, cache)
+        if _is_pending(filed):
+            repo, reason = filed["repo"], "pending reconcile"
+        else:
+            repo, reason = _resolve_repo(ctx, rec, by_key, None, cache)
         plan = {"lesson": lid, "repo": repo, "title": rec["name"], "members": untraced}
         if reason:
             plan["reason"] = reason
@@ -571,7 +640,7 @@ def _planned_filings(ctx: Ctx, state: dict, by_key: dict) -> list[dict]:
 def backfill(ctx: Ctx, state: dict, accept: list[dict] | None) -> tuple[dict, bool]:
     """Dry run when accept is None; else trace accepted lessons. Returns (result, ok)."""
     items, by_key, _ = _load(ctx)
-    plan, skipped_entries, filed = [], [], []
+    plan, skipped_entries, filed, adopted = [], [], [], []
     accepted = {}
     ok = True
     for entry in accept or []:
@@ -581,7 +650,8 @@ def backfill(ctx: Ctx, state: dict, accept: list[dict] | None) -> tuple[dict, bo
             skipped_entries.append({**entry, "reason": "unknown lesson"})
         elif entry.get("file_issue"):
             ref = state["filed"].get(lid)
-            if ref is not None and not _REF.match(str(ref)):
+            pending = ref if _is_pending(ref) else None
+            if pending is not None or not (isinstance(ref, str) and _REF.match(ref)):
                 ref = None
             if ref is None:
                 if rec.get("tracking"):
@@ -590,24 +660,62 @@ def backfill(ctx: Ctx, state: dict, accept: list[dict] | None) -> tuple[dict, bo
                 if not any(k in by_key and by_key[k]["trace"] is None for k in rec["members"]):
                     skipped_entries.append({**entry, "reason": "nothing to trace"})
                     continue
-                repo, reason = _resolve_repo(ctx, rec, by_key, entry.get("repo"))
-                if repo is None:
-                    skipped_entries.append({**entry, "reason": reason})
-                    ok = False
-                    continue
-                title = " ".join(str(rec["name"]).split())[:200] or lid
-                ref, error = _create_issue(ctx, repo, title, _issue_body(lid, rec, by_key))
-                if ref is None:
-                    skipped_entries.append({**entry, "reason": f"filing failed: {error}"})
-                    ok = False
-                    continue
-                state["filed"][lid] = ref  # saved before any trace, so a crash never files twice
+                adopted_ref = None
+                if pending is not None:
+                    # An earlier run may have created the issue: look for its marker before filing.
+                    adopted_ref, error = _find_filed_issue(pending["repo"], lid)
+                    if error:
+                        print(f"retro_rollup: {lid}: cannot check {pending['repo']} for an earlier "
+                              f"filing: {error}", file=sys.stderr)
+                        skipped_entries.append({**entry, "reason": "cannot check for an earlier filing"})
+                        ok = False
+                        continue
+                if adopted_ref is not None:
+                    repo, ref = adopted_ref.rsplit("#", 1)[0], adopted_ref
+                else:
+                    repo, reason = _resolve_repo(ctx, rec, by_key, entry.get("repo"))
+                    if repo is None:
+                        skipped_entries.append({**entry, "reason": reason})
+                        ok = False
+                        continue
+                    title = " ".join(str(rec["name"]).split())[:200] or lid
+                    # Phase 1: record the intent, so a crash or a gh timeout can be reconciled later.
+                    before = state["filed"].get(lid)
+                    state["filed"][lid] = {"pending": True, "repo": repo, "marker": _marker(lid)}
+                    try:
+                        save_state(ctx, state)
+                    except OSError as exc:
+                        if before is None:
+                            del state["filed"][lid]
+                        else:
+                            state["filed"][lid] = before
+                        skipped_entries.append({**entry, "reason": f"cannot save the filing record: {exc}"})
+                        ok = False
+                        continue
+                    ref, error = _create_issue(ctx, repo, title, _issue_body(lid, rec, by_key))
+                    if ref is None:
+                        # The pending record stays: the issue may exist (timeout, odd output).
+                        skipped_entries.append({**entry, "reason": f"filing failed: {error}"})
+                        ok = False
+                        continue
+                # Phase 2, in one save: the issue ref, and the tracking the new issue gives the lesson,
+                # so a dry run, the report and the untraced list see it even if every trace write fails.
+                state["filed"][lid] = ref
+                rec["tracking"] = {"kind": "issue", "ref": ref, "since": ctx.today}
                 # Known facts about the new issue, as refresh-tracking would record them, so the
                 # sessions from before it existed do not count as recurrences.
                 state["tracking"][f"issue:{ref}"] = {"exists": True, "state": "OPEN", "milestone": None,
                                                      "priority": None, "created": ctx.today, "closed": None}
-                save_state(ctx, state)
-                filed.append({"lesson": lid, "repo": repo, "issue": int(ref.rsplit("#", 1)[1])})
+                number = int(ref.rsplit("#", 1)[1])
+                try:
+                    save_state(ctx, state)
+                except OSError as exc:
+                    skipped_entries.append({**entry, "reason": f"issue {ref} exists but the state "
+                                            f"could not be saved: {exc}; rerun to adopt it"})
+                    ok = False
+                    continue
+                (adopted if adopted_ref is not None else filed).append(
+                    {"lesson": lid, "repo": repo, "issue": number})
             elif rec.get("tracking") and rec["tracking"]["ref"] != ref:
                 skipped_entries.append({**entry, "reason": "already tracked"})
                 continue
@@ -667,7 +775,7 @@ def backfill(ctx: Ctx, state: dict, accept: list[dict] | None) -> tuple[dict, bo
     report = _untraced_report(ctx, state, set(accepted))
     return {"mode": "apply" if accept is not None else "dry-run", "planned": len(plan),
             "notes_written": written, "skipped_entries": skipped_entries,
-            "plan": plan if accept is None else [], "filed": filed,
+            "plan": plan if accept is None else [], "filed": filed, "adopted": adopted,
             "planned_filings": _planned_filings(ctx, state, by_key) if accept is None else [],
             **report}, ok
 
