@@ -615,7 +615,10 @@ def match_lessons(ctx: Ctx, state: dict, *, recheck: bool = False) -> dict:
     import obsidian_utils
     home = Path.home()
     roots = [Path(r) for r in obsidian_utils.get_workspace_roots()] or [home / "dev" / "claude_workspace"]
-    projects = sorted({m["project"] for _, _, members in todo for m in members})
+    # Rankings use idf over the whole source: every project's repo and rules, not just the lessons being
+    # checked now. A lesson is then limited to its own repos and its own projects' rules, so a rerun with
+    # fewer lessons to check ranks the rest the same way.
+    projects = sorted({item["project"] for item in by_key.values()})
     rule_errors: list = []
     rules, seen = [], set()
     for root in roots:
@@ -627,37 +630,53 @@ def match_lessons(ctx: Ctx, state: dict, *, recheck: bool = False) -> dict:
                   for e in {e["path"]: e for e in rule_errors}.values())
     project_rules = {p: {_home_ref(home, root / p / "CLAUDE.md") for root in roots} for p in projects}
     every_project_rule = set().union(*project_rules.values()) if project_rules else set()
+    rule_at: dict[str, list[int]] = {}
+    for i, doc in enumerate(rules):
+        rule_at.setdefault(doc["ref"], []).append(i)
+    global_rules = {i for ref, at in rule_at.items() if ref not in every_project_rule for i in at}
 
     repo_cache: dict = {}
     lesson_projects = {lid: sorted({m["project"] for m in members}) for lid, _, members in todo}
     lesson_repos = {lid: sorted({r for p in ps if (r := _project_repo(ctx, p, repo_cache))})
                     for lid, ps in lesson_projects.items()}
-    repos = sorted({r for rs in lesson_repos.values() for r in rs})
-    issue_docs, issue_meta, failed = {}, {}, set()
+    repos = sorted({r for p in projects if (r := _project_repo(ctx, p, repo_cache))})
+    issue_docs, issue_meta, failed = [], {}, set()
+    issue_at: dict[str, list[int]] = {}
     if repos:
         with ThreadPoolExecutor(max_workers=min(GH_MAX_WORKERS, len(repos))) as pool:
             listings = list(pool.map(_list_repo_issues, repos))
         for repo, (data, error) in zip(repos, listings):
             if error:
                 failed.add(repo)
-                errors.append({"ref": repo, "error": error})
+                if any(repo in rs for rs in lesson_repos.values()):  # only a repo a pending lesson needs
+                    errors.append({"ref": repo, "error": error})
                 continue
             if len(data) >= RECENT_LIMIT:
                 print(f"retro_rollup: {repo}: the listing is full ({len(data)} issues); "
                       f"older issues are not candidates", file=sys.stderr)
-            issue_docs[repo] = lessons_match.issue_docs(repo, data)
+            docs = lessons_match.issue_docs(repo, data)
+            issue_at[repo] = list(range(len(issue_docs), len(issue_docs) + len(docs)))
+            issue_docs.extend(docs)
             issue_meta.update({f"{repo}#{i['number']}": i for i in data
                                if type(i.get("number")) is int})
+    issue_index = lessons_match.Index(issue_docs)
+    memory_index = lessons_match.Index(memory)
+    rule_index = lessons_match.Index(rules)
+    issue_views, rule_views = {}, {}
 
     jobs, changed = [], False
     for lid, rec, members in todo:
         if failed & set(lesson_repos[lid]):
             summary["unchecked"] += 1
             continue
-        own_rules = [d for d in rules if d["ref"] not in every_project_rule
-                     or any(d["ref"] in project_rules[p] for p in lesson_projects[lid])]
-        sources = {"issue": [d for r in lesson_repos[lid] for d in issue_docs[r]],
-                   "memory": memory, "rule": own_rules}
+        repo_key = tuple(lesson_repos[lid])
+        if repo_key not in issue_views:
+            issue_views[repo_key] = issue_index.view({i for r in repo_key for i in issue_at[r]})
+        applicable = frozenset(ref for p in lesson_projects[lid] for ref in project_rules[p])
+        if applicable not in rule_views:
+            rule_views[applicable] = rule_index.view(
+                global_rules | {i for ref in applicable for i in rule_at.get(ref, ())})
+        sources = {"issue": issue_views[repo_key], "memory": memory_index, "rule": rule_views[applicable]}
         texts = [m["text"] for m in members]
         best = lessons_match.best_candidate(lessons_match.lesson_text(rec["name"], texts), sources)
         doc = best[0] if best else None

@@ -183,19 +183,61 @@ def _vector(tokens: list[str], df: Counter, count: int) -> dict[str, float]:
     return {term: weight / norm for term, weight in weights.items()} if norm else {}
 
 
-def best_candidate(query: str, sources: dict[str, list[dict]]) -> tuple[dict, float] | None:
+class Index:
+    """One source's documents: idf over all of them, L2-normalised vectors and an inverted index.
+
+    Build it once and rank many lessons against it. Ranking walks only the postings of the lesson's own
+    terms, so a run over hundreds of lessons does not re-tokenise every document each time. ``view`` limits
+    a lesson to some of the documents (its own repos, its own projects' rules) while idf stays that of the
+    whole source.
+    """
+
+    def __init__(self, docs: list[dict]):
+        self.docs = docs
+        tokens = [tfidf._tokenize_for_tfidf(doc["text"]) for doc in docs]
+        self.df = Counter(term for document in tokens for term in set(document))
+        self.postings: dict[str, list[tuple[int, float]]] = {}
+        for i, document in enumerate(tokens):
+            for term, weight in _vector(document, self.df, len(docs)).items():
+                self.postings.setdefault(term, []).append((i, weight))
+
+    def view(self, allowed: "set[int]") -> "_View":
+        return _View(self, allowed)
+
+    def top(self, query_tokens: list[str], allowed: "set[int] | None" = None) -> tuple[dict, float] | None:
+        """The highest-scoring document (lowest ref on a tie), or None when every score is 0."""
+        scores: dict[int, float] = {}
+        for term, weight in _vector(query_tokens, self.df, len(self.docs)).items():
+            for i, doc_weight in self.postings.get(term, ()):
+                if allowed is None or i in allowed:
+                    scores[i] = scores.get(i, 0.0) + weight * doc_weight
+        ranked = [(score, i) for i, score in scores.items() if score > 0]
+        if not ranked:
+            return None
+        score, i = min(ranked, key=lambda r: (-r[0], self.docs[r[1]]["ref"], r[1]))
+        return self.docs[i], score
+
+
+class _View:
+    def __init__(self, index: Index, allowed: "set[int]"):
+        self.index, self.allowed = index, allowed
+
+    def top(self, query_tokens: list[str]) -> tuple[dict, float] | None:
+        return self.index.top(query_tokens, self.allowed)
+
+
+def best_candidate(query: str, sources: "dict[str, list[dict] | Index | _View]") -> tuple[dict, float] | None:
+    """The highest-cosine document across sources; a source may be a list of documents, an Index or a view."""
     query_tokens = tfidf._tokenize_for_tfidf(query)
     best, best_score, best_key = None, 0.0, None
     for source, docs in sources.items():
-        tokens = [tfidf._tokenize_for_tfidf(doc["text"]) for doc in docs]
-        df = Counter(term for document in tokens for term in set(document))
-        query_vector = _vector(query_tokens, df, len(docs))
-        for doc, document in zip(docs, tokens):
-            vector = _vector(document, df, len(docs))
-            score = sum(weight * query_vector.get(term, 0) for term, weight in vector.items())
-            key = (source, doc["ref"])
-            if score > 0 and (score > best_score or (score == best_score and key < best_key)):
-                best, best_score, best_key = doc, score, key
+        found = (docs if hasattr(docs, "top") else Index(docs)).top(query_tokens)
+        if found is None:
+            continue
+        doc, score = found
+        key = (source, doc["ref"])
+        if score > best_score or (score == best_score and key < best_key):
+            best, best_score, best_key = doc, score, key
     return (best, best_score) if best is not None else None
 
 

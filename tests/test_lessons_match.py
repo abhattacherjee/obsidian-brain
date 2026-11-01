@@ -190,3 +190,62 @@ def test_gate_prompt_holds_the_examples_and_reply_shape():
     ]
     assert all(example in match.GATE_PROMPT for example in examples)
     assert match.GATE_PROMPT.endswith('{"covers": true|false}')
+
+
+def _naive_best(query, sources):
+    """The straightforward ranking: re-tokenise and re-weigh every document for each query."""
+    import tfidf
+    from collections import Counter
+    qt = tfidf._tokenize_for_tfidf(query)
+    best = None
+    for source, docs in sources.items():
+        toks = [tfidf._tokenize_for_tfidf(d["text"]) for d in docs]
+        df = Counter(t for doc in toks for t in set(doc))
+
+        def vec(tokens):
+            w = {t: (1 + math.log(c)) * (1 + math.log((len(docs) + 1) / (df[t] + 1)))
+                 for t, c in Counter(tokens).items()}
+            n = math.sqrt(sum(x * x for x in w.values()))
+            return {t: x / n for t, x in w.items()} if n else {}
+
+        q = vec(qt)
+        for d, t in zip(docs, toks):
+            score = sum(x * q.get(term, 0) for term, x in vec(t).items())
+            key = (source, d["ref"])
+            if score > 0 and (best is None or score > best[1] or (score == best[1] and key < best[2])):
+                best = (d, score, key)
+    return (best[0], best[1]) if best else None
+
+
+def test_index_ranks_like_the_naive_scan_and_can_be_reused():
+    words = "router refusal script session grep caller preflight commit chain issue memory rule".split()
+    import random
+    rng = random.Random(7)
+
+    def docs(prefix, n):
+        return [{"ref": f"{prefix}{i}", "text": " ".join(rng.choices(words, k=rng.randint(2, 9)))}
+                for i in range(n)]
+
+    sources = {"issue": docs("i", 9), "memory": docs("m", 12), "rule": docs("r", 7)}
+    indexes = {name: match.Index(items) for name, items in sources.items()}
+    for _ in range(40):
+        query = " ".join(rng.choices(words, k=rng.randint(1, 6)))
+        expected = _naive_best(query, sources)
+        for given in (sources, indexes):  # lists, and prebuilt indexes reused across queries
+            got = match.best_candidate(query, given)
+            assert (got is None) == (expected is None)
+            if expected:
+                assert got[0] is expected[0] and got[1] == pytest.approx(expected[1])
+
+
+def test_view_limits_documents_but_keeps_the_whole_sources_idf():
+    docs = [{"ref": "a", "text": "alpha beta"}, {"ref": "b", "text": "alpha gamma"},
+            {"ref": "c", "text": "delta"}]
+    index = match.Index(docs)
+    whole = index.top(["alpha"])
+    assert whole[0]["ref"] == "a"  # tie on score: lowest ref
+    only_b = match.best_candidate("alpha", {"memory": index.view({1, 2})})
+    assert only_b[0]["ref"] == "b"
+    # idf is the whole source's (3 documents), not the view's (2): the score matches the full index's
+    assert only_b[1] == pytest.approx(index.top(["alpha"], {1})[1])
+    assert match.best_candidate("alpha", {"memory": index.view({2})}) is None

@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+import lessons_match
 import lessons_verify
 import retro_rollup
 
@@ -2060,3 +2061,41 @@ def test_match_makes_no_gh_write(menv):
     for args, timeout in menv.gh:
         assert args[:2] == ["issue", "list"] and timeout == 60
         assert "--limit" in args and not {"create", "edit", "comment", "close"} & set(args)
+
+
+def test_match_builds_one_index_per_source_set_not_one_per_lesson(menv, monkeypatch):
+    menv.memory("feedback_preflight", PREFLIGHT_DOC)
+    menv.issues["o/r"] = [ISSUE_7]
+    built = []
+    real = lessons_match.Index.__init__
+
+    def counting(self, docs):
+        built.append(len(docs))
+        real(self, docs)
+
+    monkeypatch.setattr(lessons_match.Index, "__init__", counting)
+    assert run(menv.base, "update") == 0 and run(menv.base, "match") == 0
+    # two lessons, one repo, no project rules: memory + one issue set + one rule set
+    assert len(built) == 3
+
+
+def test_a_lesson_sees_its_own_projects_rules_not_other_projects(menv, monkeypatch, tmp_path):
+    import obsidian_utils
+    root = tmp_path / "ws"
+    rule = "- Run preflight alone, never chain preflight and commit; preflight as its own call.\n"
+    (root / "p3").mkdir(parents=True)
+    (root / "p3" / "CLAUDE.md").write_text(rule)
+    note(menv.vault, "2026-10-20-retro-e5.md", "2026-10-20", "p3", ["Unrelated walrus item two"])
+    monkeypatch.setattr(obsidian_utils, "get_workspace_roots", lambda: [str(root)])
+    (Path.home() / ".claude").mkdir(exist_ok=True)
+    (Path.home() / ".claude/CLAUDE.md").write_text("- Grep every caller before edits; grep callers first, always.\n")
+    assert run(menv.base, "update") == 0 and run(menv.base, "match") == 0
+    # a global rule stays visible next to the per-project ones
+    assert lesson_of(menv.state, "Follow rule B")[1]["match"]["ref"] == "~/.claude/CLAUDE.md"
+    _, a = lesson_of(menv.state, "Follow rule A")  # lesson A spans p1 and p2, never p3
+    assert a["match"] == {"none": True, "candidate": None}
+    (root / "p1").mkdir()
+    (root / "p1" / "CLAUDE.md").write_text(rule)
+    assert run(menv.base, "match") == 0
+    _, a = lesson_of(menv.state, "Follow rule A")
+    assert a["match"]["kind"] == "path" and a["match"]["ref"] == str(root / "p1" / "CLAUDE.md")
