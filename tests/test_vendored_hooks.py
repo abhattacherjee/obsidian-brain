@@ -1,4 +1,4 @@
-"""Subprocess acceptance tests for harden-repo v1.3.0 (892d0f5).
+"""Subprocess acceptance tests for harden-repo v1.3.1 (release/v1.3.1, f2574b5).
 
 All Git state belongs to per-test repositories. Commands in hook payloads are
 judged, never executed; the Bash truth checks only run git --version or type.
@@ -21,18 +21,18 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 HOOKS = ROOT / ".claude" / "hooks"
-# The vendored bytes at harden-repo tag v1.3.0, commit 892d0f5 (#418).
-V130_SHA256 = {
+# The vendored bytes at harden-repo v1.3.1, release commit f2574b5 (#418, #485).
+V131_SHA256 = {
     "enforce-pr-base-branch.py":
-        "6cd5585b9894776a6cb422b8a3714e9663372c2a1f30c68b4bdf9d3d1b97bf0c",
+        "d19e6cdb6dad27298056c1162949810587e953820ae10b7ac85a58dc51e40d11",
     "prevent-direct-push.py":
-        "87734a8844dcd86943afa59ef6c999e5e4becbcaded4434cfef0240af537467d",
+        "55bedda32d22efc3479b8a33c23574a13a490ecf6570104fc15513d118371352",
     "require-preflight.py":
-        "3de792e15dcf89b210a677e260cf0734518ec41575f1f3af5cd9f541238dbb9e",
+        "c522396fc9b2c0b0a9a46c654bb29e855a828fd4d34f6003ecdeacd85cd8144b",
     "update-changelog-before-pr.py":
-        "883b41cbcc94a06a47fb2ce654643cb3bf87c331b611efbc8962ad263dd47292",
+        "6a9ec20375ed9cfe6a21b4a2e7a62db1697c29dc6577162f4330834f6ef7156a",
     "validate-branch-name.py":
-        "2d44d5bcc0387ae25ccde0b3cd7b3e3fac71aaed16dd2e8cd69f06e1d642cdb3",
+        "c1db1f0b551b315d82f90c83fa0f9fd806ff4f85a8a4e3d5ad69faae775eab77",
 }
 
 GATES = (
@@ -189,11 +189,11 @@ def _write_bound_token(repo, cwd, **overrides):
     return token
 
 
-@pytest.mark.parametrize("hook", V130_SHA256, ids=list(V130_SHA256))
-def test_hook_bytes_match_harden_repo_v130(hook):
-    """#418: local edits cannot silently diverge from the v1.3.0 templates."""
-    assert hashlib.sha256((HOOKS / hook).read_bytes()).hexdigest() == V130_SHA256[hook], (
-        f"{hook} differs from harden-repo v1.3.0 (892d0f5); "
+@pytest.mark.parametrize("hook", V131_SHA256, ids=list(V131_SHA256))
+def test_hook_bytes_match_harden_repo_v131(hook):
+    """#418: local edits cannot silently diverge from the v1.3.1 templates."""
+    assert hashlib.sha256((HOOKS / hook).read_bytes()).hexdigest() == V131_SHA256[hook], (
+        f"{hook} differs from harden-repo v1.3.1 (f2574b5); "
         "re-vendor from harden-repo rather than edit by hand."
     )
 
