@@ -73,8 +73,8 @@ jobs:
   #   start a process or a git repo, so this splits well.
   # - timed-tests runs TIMED_TESTS alone, on its own runner, on both Pythons.
   #   They assert wall-clock budgets, and next to busy workers a 2,000 ms
-  #   backstop measured 2,042 ms. They take 3-5 min serially, so running them
-  #   after the parallel step would make each job the sum of the two.
+  #   backstop measured 2,042 ms. They take 5-6.5 min serially on CI, so
+  #   running them after the parallel step would make each job the sum.
   # The 90% coverage gate is applied without TIMED_TESTS (94.7% without
   # them, measured 2026-11-01).
   # TIMED_TESTS is set once at the top, so the deselect and the run use the
