@@ -2,6 +2,8 @@
 
 import hashlib
 import json
+import os
+import shutil
 import stat
 import subprocess
 from types import SimpleNamespace
@@ -33,11 +35,27 @@ def test_build_prompt_shape():
 
 def test_parse_verdicts_maps_same_and_rejects_garbage():
     assert lv.parse_verdicts(
-        '```json\n{"1": "same", "2": "different", "3": "Same", "4": true}\n```', 5
-    ) == [True, False, False, False, False]
-    assert lv.parse_verdicts("{}", 1) == [False]
+        '```json\n{"1": "same", "2": " DIFFERENT ", "3": "Same"}\n```', 3
+    ) == [True, False, True]
     for bad in ("garbage", "{invalid}", "[]", "null", '{"1": "same"'):
         assert lv.parse_verdicts(bad, 1) is None
+
+
+@pytest.mark.parametrize("reply", [
+    "{}", '{"1": "same"}', '{"1": "same", "3": "different"}', '{"1": "same", "2": "maybe"}',
+    '{"1": "same", "2": true}', '{"1": "same", "2": null}',
+])
+def test_parse_verdicts_needs_every_candidate_answered(reply):
+    assert lv.parse_verdicts(reply, 2) is None
+
+
+def test_verify_anchors_incomplete_reply_is_failed_and_not_cached(cache):
+    result = lv.verify_anchors({"a": "a", "b": "b", "c": "c"}, {"a": ["b", "c"]}, cache,
+                               runner=lambda _: '{"1": "maybe"}')
+    assert result == {"judged": 0, "failed": 1, "skipped": 0}
+    assert not cache.judged("a")
+    assert cache.edges() == set()
+    assert cache._conn.execute("SELECT COUNT(*) FROM pairs").fetchone()[0] == 0
 
 
 def test_run_haiku_uses_worker_env(monkeypatch):
@@ -50,7 +68,9 @@ def test_run_haiku_uses_worker_env(monkeypatch):
     monkeypatch.setattr(lv.subprocess, "run", fake_run)
     assert lv.run_haiku("prompt") == "result"
     args, kwargs = calls[0]
-    assert args == ["claude", "-p", "--model", "haiku"]
+    assert args == ["claude", "-p", "--model", "haiku", "--setting-sources", "project",
+                    "--strict-mcp-config", "--tools", ""]
+    assert args[args.index("--tools") + 1] == "" and "--strict-mcp-config" in args
     assert kwargs["env"]["OBSIDIAN_BRAIN_WORKER"] == "1"
     assert kwargs["input"] == "prompt"
     assert kwargs["capture_output"] is True
@@ -158,6 +178,35 @@ def test_cache_file_mode_0600(tmp_path):
         cache.close()
 
 
+def test_cache_sidecars_chmod_0600(tmp_path):
+    # A crashed run leaves -wal/-shm behind with whatever mode they had; reopening must tighten them.
+    src = tmp_path / "src"
+    src.mkdir()
+    old = os.umask(0o022)
+    try:
+        first = lv.VerdictCache(src / "verdicts.db")
+        first.record("a", ["b"], [True])
+        dest = tmp_path / "private"
+        dest.mkdir(mode=0o700)
+        for name in ("verdicts.db", "verdicts.db-wal", "verdicts.db-shm"):
+            shutil.copy(src / name, dest / name)
+            (dest / name).chmod(0o644)
+        first.close()
+    finally:
+        os.umask(old)
+    path = dest / "verdicts.db"
+    wal, shm = (path.with_name(path.name + sfx) for sfx in ("-wal", "-shm"))
+    assert wal.stat().st_size > 0
+    cache = lv.VerdictCache(path)
+    try:
+        assert wal.exists() and shm.exists()
+        assert stat.S_IMODE(wal.stat().st_mode) == 0o600
+        assert stat.S_IMODE(shm.stat().st_mode) == 0o600
+        assert cache.edges() == {("a", "b")}
+    finally:
+        cache.close()
+
+
 def test_verify_anchors_skips_judged_and_counts_failures(cache, monkeypatch):
     texts = {key: key for key in ("old", "empty", "good", "bad", "invalid", "c")}
     cands = {key: ["c"] for key in ("old", "good", "bad", "invalid")}
@@ -221,7 +270,7 @@ def test_verify_anchors_progress_every_100_and_at_end(cache):
     texts = {str(i): str(i) for i in range(201)}
     cands = {str(i): ["200"] for i in range(200)}
     progress = []
-    result = lv.verify_anchors(texts, cands, cache, runner=lambda _: "{}",
+    result = lv.verify_anchors(texts, cands, cache, runner=lambda _: '{"1": "same"}',
                                progress=lambda *p: progress.append(p))
     assert result == {"judged": 200, "failed": 0, "skipped": 0}
     assert progress == [(100, 200, 0), (200, 200, 0)]

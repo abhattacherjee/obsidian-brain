@@ -45,3 +45,11 @@ def test_vault_config_never_passes_the_map_as_an_argument():
 
 def test_vault_ask_drops_claude_lesson_rows():
     assert "Drop every file whose `type` is `claude-lesson`" in ASK
+
+
+def test_every_retro_lessons_table_hides_snoozed_lessons():
+    text = (REPO / "dashboards" / "retro-lessons.md").read_text()
+    wheres = [l for l in text.splitlines() if l.startswith("WHERE type = \"claude-lesson\"")]
+    assert len(wheres) == 6
+    clause = "(!snoozed_until OR date(snoozed_until) < date(today))"
+    assert [l for l in wheres if clause not in l] == []

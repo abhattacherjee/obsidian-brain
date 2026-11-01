@@ -71,6 +71,28 @@ def test_assign_ids_records_merge_and_split():
     assert assign_ids([], old, {})[1] == {i: {"gone": True} for i in old}
 
 
+def test_assign_ids_never_duplicates_a_split_child_id():
+    # The old id was derived from centre "d"; the larger child keeps it and the child centred on "d" must not.
+    old = {_id("d"): list("abcde")}
+    lessons = [_lesson("a", "b", "c"), _lesson("d", "e")]
+    assigned, retired = assign_ids(lessons, old, {})
+    ids = [l["id"] for l in assigned]
+    assert ids[0] == _id("d") and len(set(ids)) == 2
+    assert assigned[1]["split_from"] == _id("d")
+    assert retired == {}
+    assert [l["id"] for l in assign_ids(lessons, old, {})[0]] == ids
+    # Same, with the child centred on the old centre listed first (it takes the old id).
+    lessons = [_lesson("d", "e"), _lesson("a", "b", "c")]
+    ids = [l["id"] for l in assign_ids(lessons, old, {})[0]]
+    assert ids[0] == _id("d") and len(set(ids)) == 2
+    assert ids == [l["id"] for l in assign_ids(lessons, old, {})[0]]
+    # A fresh lesson whose centre hash equals a retired-by-merge old id gets another id too.
+    old = {_id("x"): ["p", "q"], "Lbig": list("abcd")}
+    lessons = [_lesson("a", "b", "c", "d", "p", "q"), _lesson("x", "y")]
+    ids = [l["id"] for l in assign_ids(lessons, old, {})[0]]
+    assert len(set(ids)) == 2 and _id("x") not in ids
+
+
 def test_tracking_most_frequent_then_issue_path_memory_tiebreak():
     items = {
         "i": _item("i", date="2026-10-03", trace={"kind": "issue", "ref": "o/r#2"}),
@@ -85,6 +107,18 @@ def test_tracking_most_frequent_then_issue_path_memory_tiebreak():
     assert lesson_tracking(["i", "j"], items)["ref"] == "o/r#3"
     items["i"]["date"] = "2026-10-02"
     assert lesson_tracking(["j", "i"], items)["ref"] == "o/r#2"
+
+
+def test_tracking_since_is_sticky_for_the_same_kind_and_ref():
+    items = {
+        "new": _item("new", date="2026-10-15", trace={"kind": "path", "path": "r.md"}),
+        "old": _item("old", date="2026-10-01", trace={"kind": "path", "path": "r.md"}),
+    }
+    prev = {"kind": "path", "ref": "r.md", "since": "2026-10-15"}
+    assert lesson_tracking(["new", "old"], items)["since"] == "2026-10-01"
+    assert lesson_tracking(["new", "old"], items, prev)["since"] == "2026-10-15"
+    for other in ({**prev, "ref": "q.md"}, {**prev, "kind": "memory"}, {**prev, "since": None}, None):
+        assert lesson_tracking(["new", "old"], items, other)["since"] == "2026-10-01"
 
 
 def test_tracking_ignores_skipped_traces():

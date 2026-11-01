@@ -553,7 +553,7 @@ Tracking exists and nothing came back since.
 \```dataview
 TABLE WITHOUT ID link(file.link, name) AS "Lesson", sessions AS "Sessions", tracking AS "Tracking", tracking_ref AS "Tracked by", last_seen AS "Last seen"
 FROM "claude-insights/lessons"
-WHERE type = "claude-lesson" AND bucket = "quiet" AND !dormant AND (!status OR !startswith(lower(string(status)), "provisional"))
+WHERE type = "claude-lesson" AND bucket = "quiet" AND !dormant AND (!snoozed_until OR date(snoozed_until) < date(today)) AND (!status OR !startswith(lower(string(status)), "provisional"))
 SORT sessions DESC
 LIMIT 25
 \```
@@ -565,7 +565,7 @@ No session in the last 90 days. Probably fixed, or no longer relevant.
 \```dataview
 TABLE WITHOUT ID link(file.link, name) AS "Lesson", sessions AS "Sessions", bucket AS "Bucket", last_seen AS "Last seen"
 FROM "claude-insights/lessons"
-WHERE type = "claude-lesson" AND dormant AND (!status OR !startswith(lower(string(status)), "provisional"))
+WHERE type = "claude-lesson" AND dormant AND (!snoozed_until OR date(snoozed_until) < date(today)) AND (!status OR !startswith(lower(string(status)), "provisional"))
 SORT last_seen DESC
 LIMIT 25
 \```

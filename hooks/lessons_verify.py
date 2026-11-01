@@ -44,14 +44,23 @@ def parse_verdicts(stdout: str, n: int) -> list[bool] | None:
     obj = _parse_object(stdout)
     if obj is None:
         return None
-    return [obj.get(str(i+1)) == "same" for i in range(n)]
+    verdicts = []
+    for i in range(n):
+        value = obj.get(str(i + 1))
+        word = value.strip().lower() if isinstance(value, str) else None
+        if word not in ("same", "different"):
+            return None  # a missing or odd answer must not cache as "different"
+        verdicts.append(word == "same")
+    return verdicts
 
 
 def run_haiku(prompt: str, timeouts: tuple[int, int] = (120, 240)) -> str | None:
     for t in timeouts:
         try:
             result = subprocess.run(
-                ["claude", "-p", "--model", MODEL], input=prompt,
+                # No tools and no MCP: retro text must not reach a tool-capable session.
+                ["claude", "-p", "--model", MODEL, "--setting-sources", "project",
+                 "--strict-mcp-config", "--tools", ""], input=prompt,
                 capture_output=True, text=True, timeout=t,
                 env=obsidian_utils.worker_env(),
             )

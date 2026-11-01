@@ -266,7 +266,7 @@ def test_backfill_reports_every_untraced_item_with_reason(env, tmp_path, capsys)
     vault, state, base = env
     _trace_items(vault, "2026-10-01-retro-a1.md", {"Grep callers first RULE-B": "memory `feedback_grep`"})
     (vault / "claude-insights" / "2026-10-20-retro-bad.md").write_text("---\ntype: claude-retro\n")
-    assert run(base, "update") == 0
+    assert run(base, "update") == 1  # an unreadable retro note is a partial failure
     f = _accept(tmp_path, state, "feedback_grep")
     capsys.readouterr()
     assert run(base, "backfill", "--apply", "--accept", str(f)) == 0
@@ -290,7 +290,7 @@ def test_report_json_contract_fields(env, capsys):
     assert "RULE" not in json.dumps(rep["lessons"][0]["members"])
 
 
-def test_snooze_carries_through_merge_and_split(env, tmp_path):
+def test_snooze_survives_membership_growth(env, tmp_path):
     vault, state, base = env
     assert run(base, "update") == 0
     s = state_of(state)
@@ -402,3 +402,232 @@ def test_report_json_reads_snooze_live_from_the_note(env, capsys):
     rep = {l["id"]: l for l in json.loads(capsys.readouterr().out)["lessons"]}
     assert rep[lid]["snoozed_until"] == "2026-12-01"
     assert all(l["snoozed_until"] is None for k, l in rep.items() if k != lid)
+
+
+# --- review fixes -------------------------------------------------------------
+
+def _cache_rows(state):
+    cache = lessons_verify.VerdictCache(state / "lessons-verdicts.db")
+    try:
+        return (cache._conn.execute("SELECT COUNT(*) FROM pairs").fetchone()[0],
+                cache._conn.execute("SELECT COUNT(*) FROM anchors").fetchone()[0])
+    finally:
+        cache.close()
+
+
+def _lesson_with(state, size):
+    s = state_of(state)
+    return next(k for k, l in s["lessons"].items() if len(l["members"]) == size), s
+
+
+def test_backfill_traces_the_first_of_two_identical_items(env, tmp_path):
+    vault, state, base = env
+    a1 = vault / "claude-insights" / "2026-10-01-retro-a1.md"
+    a1.write_text(a1.read_text().replace(
+        "- [ ] Run preflight alone RULE-A\n",
+        "- [ ] Run preflight alone RULE-A\n- [ ] Run preflight alone RULE-A\n"))
+    _trace_items(vault, "2026-10-15-retro-c3.md", {"Preflight as its own call RULE-A": "memory `feedback_x`"})
+    assert run(base, "update") == 0
+    f = _accept(tmp_path, state, "feedback_x")
+    assert run(base, "backfill", "--apply", "--accept", str(f)) == 0
+    lines = [l for l in a1.read_text().splitlines() if "Run preflight alone" in l]
+    assert lines == ["- [x] Run preflight alone RULE-A → memory `feedback_x`",
+                     "- [ ] Run preflight alone RULE-A"]
+
+
+@pytest.mark.parametrize("cmd", ["update", "rebuild", "refresh-tracking"])
+def test_unreadable_note_keeps_vanishing_lessons_and_exits_1(env, cmd, capsys):
+    vault, state, base = env
+    assert run(base, "update") == 0
+    lid_b, s = _lesson_with(state, 2)  # RULE-B spans a1 and b2 only
+    p = vault / "claude-insights" / "lessons" / s["notes"][lid_b]
+    p.write_text(p.read_text().replace("snoozed_until: null", 'snoozed_until: "2026-12-01"'))
+    kept_text, rows = p.read_text(), _cache_rows(state)
+    b2 = vault / "claude-insights" / "2026-10-08-retro-b2.md"
+    good = b2.read_text()
+    b2.write_text("---\ntype: claude-retro\n")
+    capsys.readouterr()
+    assert run(base, cmd) == 1
+    err = capsys.readouterr().err
+    assert "1 unreadable" in err and lid_b in err
+    assert p.read_text() == kept_text
+    assert _cache_rows(state) == rows
+    s2 = state_of(state)
+    assert s2["lessons"][lid_b] == s["lessons"][lid_b] and s2["notes"][lid_b] == s["notes"][lid_b]
+    b2.write_text(good)
+    assert run(base, "rebuild") == 0
+    assert lid_b in state_of(state)["lessons"] and 'snoozed_until: "2026-12-01"' in p.read_text()
+
+
+def test_unreadable_note_runs_clean_after_it_is_fixed_and_prunes(env):
+    vault, state, base = env
+    assert run(base, "update") == 0
+    note(vault, "2026-10-22-retro-d4.md", "2026-10-22", "p3", ["Brand new thing RULE-Z"])
+    assert run(base, "update") == 0
+    (vault / "claude-insights" / "2026-10-22-retro-d4.md").unlink()
+    assert run(base, "rebuild") == 0  # nothing unreadable: pruning still happens
+    assert _cache_rows(state)[1] == 7
+
+
+def test_refresh_tracking_memory_scan_error_is_unknown_not_gone(env, monkeypatch, capsys):
+    vault, state, base = env
+    _trace_items(vault, "2026-10-01-retro-a1.md", {"Grep callers first RULE-B": "memory `feedback_there`"})
+    assert run(base, "update") == 0
+    import memory_sources
+
+    def failing(host, config=None, errors=None):
+        errors.append({"path": "/denied", "error": "permission denied"})
+        return []
+
+    monkeypatch.setattr(memory_sources, "memory_sources", failing)
+    capsys.readouterr()
+    assert run(base, "refresh-tracking") == 1
+    assert "permission denied" in capsys.readouterr().out
+    s = state_of(state)
+    assert s["tracking"]["memory:feedback_there"] == {"exists": None}
+    lesson = next(l for l in s["lessons"].values() if l["tracking"])
+    assert lesson["classify"]["tracking_gone"] is False and lesson["classify"]["bucket"] != "file"
+
+
+@pytest.mark.parametrize("config, flag, key", [
+    ({"lessons_concurrency": 0}, [], "lessons_concurrency"),
+    ({"lessons_concurrency": 17}, [], "lessons_concurrency"),
+    ({"lessons_concurrency": "x"}, [], "lessons_concurrency"),
+    ({"lessons_concurrency": True}, [], "lessons_concurrency"),
+    ({}, ["--concurrency", "0"], "concurrency"),
+    ({}, ["--concurrency", "17"], "concurrency"),
+    ({"lessons_recent_days": 0}, [], "lessons_recent_days"),
+    ({"lessons_recent_days": "x"}, [], "lessons_recent_days"),
+    ({"lessons_recent_days": 1.5}, [], "lessons_recent_days"),
+])
+def test_bad_numeric_settings_exit_2_naming_the_key(env, monkeypatch, capsys, config, flag, key):
+    import obsidian_utils
+    vault, state, base = env
+    monkeypatch.setattr(obsidian_utils, "load_config", lambda: config)
+    assert run(base, "update", *flag) == 2
+    assert key in capsys.readouterr().err
+    assert not (state / "lessons-state.json").exists()
+
+
+@pytest.mark.parametrize("config, flag", [
+    ({"lessons_concurrency": 16, "lessons_recent_days": 1}, []),
+    ({"lessons_concurrency": 1}, []),
+    ({}, ["--concurrency", "16"]),
+])
+def test_numeric_settings_at_the_edges_are_accepted(env, monkeypatch, config, flag):
+    import obsidian_utils
+    vault, state, base = env
+    monkeypatch.setattr(obsidian_utils, "load_config", lambda: config)
+    assert run(base, "update", *flag) == 0
+
+
+def test_lock_oserror_exits_1_without_traceback(env, tmp_path, capsys):
+    vault, state, base = env
+    blocker = tmp_path / "state-is-a-file"
+    blocker.write_text("x")
+    base = base[:-1] + [str(blocker)]
+    assert run(base, "update") == 1
+    assert "retro_rollup:" in capsys.readouterr().err
+
+
+def test_tracking_since_stays_put_when_backfill_traces_older_notes(env, tmp_path):
+    vault, state, base = env
+    _trace_items(vault, "2026-10-15-retro-c3.md", {"Preflight as its own call RULE-A": "memory `feedback_x`"})
+    assert run(base, "update") == 0
+    lid, s = _lesson_with(state, 3)
+    assert s["lessons"][lid]["tracking"]["since"] == "2026-10-15"
+    f = _accept(tmp_path, state, "feedback_x")
+    assert run(base, "backfill", "--apply", "--accept", str(f)) == 0
+    assert "memory `feedback_x`" in (vault / "claude-insights" / "2026-10-01-retro-a1.md").read_text()
+    assert run(base, "update") == 0
+    rec = state_of(state)["lessons"][lid]
+    assert rec["tracking"]["since"] == "2026-10-15"
+    assert rec["classify"]["bucket"] == "quiet" and rec["classify"]["sessions_after_tracking"] == 0
+
+
+def test_backfill_skips_accept_for_a_lesson_whose_tracking_is_gone(env, tmp_path, monkeypatch, capsys):
+    vault, state, base = env
+    _trace_items(vault, "2026-10-01-retro-a1.md", {"Grep callers first RULE-B": "memory `feedback_gone`"})
+    assert run(base, "update") == 0
+    import memory_sources
+    monkeypatch.setattr(memory_sources, "memory_sources", lambda host, *a, **k: [])
+    assert run(base, "refresh-tracking") == 0
+    f = _accept(tmp_path, state, "feedback_gone")
+    before = retro_bytes(vault)
+    capsys.readouterr()
+    assert run(base, "backfill", "--apply", "--accept", str(f)) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert [e["reason"] for e in result["skipped_entries"]] == ["tracking gone"]
+    assert retro_bytes(vault) == before
+
+
+def _snooze(vault, state, lid, day):
+    p = vault / "claude-insights" / "lessons" / state_of(state)["notes"][lid]
+    p.write_text(p.read_text().replace("snoozed_until: null", f'snoozed_until: "{day}"'))
+
+
+def _retag(vault, name, old, new):
+    p = vault / "claude-insights" / name
+    p.write_text(p.read_text().replace(old, new))
+
+
+GROUP = re.compile(r"\bG\d\b")
+
+
+def group_haiku(prompt: str):
+    """Same lesson iff anchor and candidate share a G<n> tag; an item can carry two."""
+    if prompt.startswith("Give each lesson"):
+        return json.dumps({n: f"Rule {n}" for n in re.findall(r"^LESSON (\d+):", prompt, re.M)})
+    anchor = set(GROUP.findall(re.search(r"^ANCHOR: (.*)$", prompt, re.M).group(1)))
+    return json.dumps({n: "same" if anchor & set(GROUP.findall(t)) else "different"
+                       for n, t in re.findall(r"^CANDIDATE (\d+): (.*)$", prompt, re.M)})
+
+
+@pytest.fixture
+def grouped(tmp_path, monkeypatch):
+    vault, state = tmp_path / "vault", tmp_path / "state"
+    monkeypatch.setattr(lessons_verify, "run_haiku", lambda p, timeouts=(120, 240): group_haiku(p))
+    base = ["--vault", str(vault), "--insights-folder", "claude-insights", "--state-dir", str(state)]
+    return vault, state, base
+
+
+def _notes_with_tags(vault, tags):
+    for i, tag in tags.items():
+        note(vault, f"2026-10-0{i}-retro-n{i}.md", f"2026-10-0{i}", f"p{i}", [f"Do the thing number {i} {tag}"])
+
+
+def _snoozed_dates(vault, state):
+    import lessons_notes
+    return {lid: lessons_notes.read_snooze(vault / "claude-insights" / "lessons" / fn)
+            for lid, fn in state_of(state)["notes"].items()}
+
+
+def test_snooze_is_inherited_by_the_child_of_a_split(grouped):
+    vault, state, base = grouped
+    # c (note 3) bridges two pairs, so all five items form one lesson.
+    _notes_with_tags(vault, {1: "G1", 2: "G1", 3: "G1 G2", 4: "G2", 5: "G2"})
+    assert run(base, "update") == 0
+    (old_id,) = state_of(state)["lessons"]
+    _snooze(vault, state, old_id, "2026-12-01")
+    (vault / "claude-insights" / "2026-10-03-retro-n3.md").unlink()  # the bridge goes
+    assert run(base, "update") == 0
+    s = state_of(state)
+    assert len(s["lessons"]) == 2 and old_id in s["lessons"]
+    child = next(l for l in s["lessons"] if l != old_id)
+    assert s["lessons"][child]["split_from"] == old_id
+    assert _snoozed_dates(vault, state) == {old_id: "2026-12-01", child: "2026-12-01"}
+
+
+def test_merged_lesson_keeps_the_snooze_of_a_retired_id(grouped):
+    vault, state, base = grouped
+    _notes_with_tags(vault, {1: "G1", 2: "G1", 4: "G2", 5: "G2"})
+    assert run(base, "update") == 0
+    survivor, retiring = sorted(state_of(state)["lessons"])  # equal overlap: the smaller id survives
+    _snooze(vault, state, retiring, "2026-12-01")
+    _notes_with_tags(vault, {3: "G1 G2"})  # the bridge arrives
+    assert run(base, "update") == 0
+    s = state_of(state)
+    assert list(s["lessons"]) == [survivor] and len(s["lessons"][survivor]["members"]) == 5
+    assert _snoozed_dates(vault, state) == {survivor: "2026-12-01"}
+    assert json.loads((vault / "claude-insights" / "lessons" / "retired.json").read_text()) == {
+        retiring: {"merged_into": survivor}}

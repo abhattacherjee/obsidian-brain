@@ -1305,7 +1305,7 @@
           "files": [
             "hooks/retro_rollup.py"
           ],
-          "purpose": "<secure dir>/lessons-state.json (0600): lessons (members, tracking, info), tracking refresh results, note hashes and totals. report --json reads it. retired.json (merged and split ids) lives beside the lesson notes in <insights>/lessons/."
+          "purpose": "<secure dir>/lessons-state.json (0600): lessons (members, tracking, info), tracking refresh results, the lesson id → note filename map and totals. report --json reads it. retired.json (merged and split ids) lives beside the lesson notes in <insights>/lessons/."
         }
       ]
     },

@@ -37,6 +37,7 @@ def assign_ids(
     taken = set()
     assigned = []
     new_members = []
+    pending = []  # lessons that need a fresh id, with the old id they split from (or None)
     for lesson in lessons:
         result = dict(lesson)
         members = set(lesson["members"])
@@ -47,12 +48,26 @@ def assign_ids(
                 result["id"] = best
                 taken.add(best)
             else:
-                result["id"] = "L" + sha1(lesson["centre"].encode()).hexdigest()[:8]
+                pending.append(result)
                 result["split_from"] = best
         else:
-            result["id"] = "L" + sha1(lesson["centre"].encode()).hexdigest()[:8]
+            pending.append(result)
         assigned.append(result)
         new_members.append(members)
+
+    # Fresh ids come after every reuse is known, so they cannot collide with an id
+    # a later lesson keeps. Deterministic: centre hash, then centre plus members, then a counter.
+    used = set(taken) | set(old_members)
+    for result in pending:
+        seeds = [result["centre"], result["centre"] + "\0" + ",".join(sorted(result["members"]))]
+        candidate = "L" + sha1(seeds[0].encode()).hexdigest()[:8]
+        n = 0
+        while candidate in used:
+            seed = seeds[min(n, 1)] + (str(n) if n > 1 else "")
+            candidate = "L" + sha1(seed.encode()).hexdigest()[:8]
+            n += 1
+        result["id"] = candidate
+        used.add(candidate)
 
     new_retired = dict(retired)
     for lesson_id, members in old_members.items():
@@ -68,8 +83,14 @@ def assign_ids(
     return assigned, new_retired
 
 
-def lesson_tracking(members: list[str], items: dict[str, dict]) -> dict | None:
-    """Choose the most frequent member trace, then kind, earliest date and ref."""
+def lesson_tracking(members: list[str], items: dict[str, dict],
+                    previous: dict | None = None) -> dict | None:
+    """Choose the most frequent member trace, then kind, earliest date and ref.
+
+    ``since`` is sticky: when ``previous`` tracks the same kind and ref and has a
+    ``since``, keep it. Backfill copies a trace into older retros, which would
+    otherwise move ``since`` earlier and invent recurrences.
+    """
     fields = {"issue": "ref", "memory": "stem", "path": "path"}
     kind_order = {"issue": 0, "path": 1, "memory": 2}
     traces = {}
@@ -87,7 +108,11 @@ def lesson_tracking(members: list[str], items: dict[str, dict]) -> dict | None:
         traces,
         key=lambda t: (-len(traces[t]), kind_order[t[0]], min(traces[t]), t[1]),
     )
-    return {"kind": kind, "ref": ref, "since": min(traces[(kind, ref)])}
+    since = min(traces[(kind, ref)])
+    if (previous and previous.get("since") and previous.get("kind") == kind
+            and previous.get("ref") == ref):
+        since = previous["since"]
+    return {"kind": kind, "ref": ref, "since": since}
 
 
 def classify(

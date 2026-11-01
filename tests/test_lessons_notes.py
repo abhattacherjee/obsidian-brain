@@ -165,6 +165,8 @@ def test_tracking_fields_match_report(sample, tracking, info, gone, kind, since)
     "", "snoozed_until: \"outside\"\n", "---\nsnoozed_until: null\n---\n",
     "---\nsnoozed_until: invalid\n---\n", "---\nsnoozed_until: 123\n---\n",
     '---\nsnoozed_until: "unterminated"\n', '---\n---\nsnoozed_until: "body"\n',
+    "---\nsnoozed_until: 2026-13-45\n---\n", '---\nsnoozed_until: "2026-02-30"\n---\n',
+    "---\nsnoozed_until: \"2026-12-01'\n---\n", '---\nsnoozed_until: "2026-12-01\n---\n',
 ])
 def test_read_snooze_absent_or_invalid(tmp_path, content):
     path = tmp_path / "note.md"

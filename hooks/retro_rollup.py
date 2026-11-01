@@ -35,6 +35,7 @@ LESSONS_SUBFOLDER = "lessons"
 RETIRED_NAME = "retired.json"
 GH_TIMEOUT_SECONDS = 10
 GH_MAX_WORKERS = 8
+MAX_CONCURRENCY = 16
 _PRIORITY = re.compile(r"^P[0-9]")
 _REF = re.compile(r"^([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#([1-9][0-9]*)$")
 
@@ -53,6 +54,13 @@ class Refused(Exception):
 
 # --- context ---------------------------------------------------------------
 
+def _bounded_int(name: str, value, low: int, high: int | None = None) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < low or (high is not None and value > high):
+        want = f"an integer from {low} to {high}" if high is not None else f"an integer of at least {low}"
+        raise UsageError(f"{name} must be {want}, got {value!r}")
+    return value
+
+
 class Ctx:
     def __init__(self, args):
         import obsidian_utils
@@ -68,8 +76,11 @@ class Ctx:
             raise UsageError(f"insights folder not found: {self.insights!r}")
         self.lessons_folder = f"{self.insights}/{LESSONS_SUBFOLDER}"
         self.state_dir = Path(args.state_dir or Path.home() / ".claude" / "obsidian-brain")
-        self.recent_days = int(config.get("lessons_recent_days", 90))
-        self.concurrency = int(getattr(args, "concurrency", None) or config.get("lessons_concurrency", 8))
+        self.recent_days = _bounded_int("lessons_recent_days", config.get("lessons_recent_days", 90), 1)
+        flag = getattr(args, "concurrency", None)
+        self.concurrency = (_bounded_int("concurrency", flag, 1, MAX_CONCURRENCY) if flag is not None else
+                            _bounded_int("lessons_concurrency", config.get("lessons_concurrency", 8),
+                                         1, MAX_CONCURRENCY))
         self.today = date.today().isoformat()
 
     @property
@@ -172,6 +183,7 @@ def regroup(ctx: Ctx, state: dict, *, judge: bool, note: str | None = None, cach
         # Retro notes missing mid-sync or all unreadable: keep notes and state as they are.
         raise Refused(f"no retro items found in {ctx.insights!r} ({len(skipped)} unreadable); "
                       f"refusing to drop {len(state['lessons'])} lessons")
+    unreadable = bool(skipped)  # an unreadable note hides items: never prune or delete on partial data
     texts = {k: v["text"] for k, v in by_key.items()}
     note_of = {k: v["note"] for k, v in by_key.items()}
     _ensure_state_dir(ctx)
@@ -191,7 +203,7 @@ def regroup(ctx: Ctx, state: dict, *, judge: bool, note: str | None = None, cach
 
             verify = lessons_verify.verify_anchors(texts, cands, cache, concurrency=ctx.concurrency,
                                                    progress=progress)
-        else:
+        elif not unreadable:
             cache.prune(set(by_key))
         live = set(by_key)
         edges = {e for e in cache.edges() if e[0] in live and e[1] in live}
@@ -213,7 +225,8 @@ def regroup(ctx: Ctx, state: dict, *, judge: bool, note: str | None = None, cach
     for lesson in lessons:
         lid = lesson["id"]
         lesson["name"] = state["lessons"].get(lid, {}).get("name") or names.get(lid) or lid
-        tracking = lessons_group.lesson_tracking(lesson["members"], by_key)
+        tracking = lessons_group.lesson_tracking(
+            lesson["members"], by_key, state["lessons"].get(lid, {}).get("tracking"))
         info = state["tracking"].get(_tracking_key(tracking)) if tracking else None
         c = lessons_group.classify(lesson, by_key, tracking, info, ctx.today, ctx.recent_days)
         snooze = snoozes.get(lid)
@@ -235,6 +248,18 @@ def regroup(ctx: Ctx, state: dict, *, judge: bool, note: str | None = None, cach
         out_lessons[lid] = rec
         out_notes[lid] = filename
 
+    kept = []
+    if unreadable:
+        # Keep every old lesson that would vanish: its state record and its note stay as they were.
+        for lid, rec in state["lessons"].items():
+            if lid not in out_lessons:
+                out_lessons[lid] = rec
+                if lid in old_notes:
+                    out_notes[lid] = old_notes[lid]
+                if lid not in retired_before:
+                    retired.pop(lid, None)
+                kept.append(lid)
+
     removed = 0
     for lid, filename in old_notes.items():
         if lid not in out_notes:
@@ -249,7 +274,7 @@ def regroup(ctx: Ctx, state: dict, *, judge: bool, note: str | None = None, cach
         lessons_notes.write_if_changed(ctx.vault, ctx.lessons_folder, RETIRED_NAME,
                                        json.dumps(retired, indent=1, sort_keys=True) + "\n")
 
-    in_lessons = sum(len(l["members"]) for l in out_lessons.values())
+    in_lessons = len({k for l in out_lessons.values() for k in l["members"]} & set(by_key))
     state.update({
         "generated": ctx.today, "lessons": out_lessons, "notes": out_notes,
         "totals": {"items": len(by_key), "items_in_lessons": in_lessons,
@@ -260,7 +285,18 @@ def regroup(ctx: Ctx, state: dict, *, judge: bool, note: str | None = None, cach
     save_state(ctx, state)
     return {"lessons": len(out_lessons), "new": len(new), "items_in_lessons": in_lessons,
             "unjudged": unjudged, "failed": verify["failed"], "notes_written": written,
-            "notes_removed": removed, "unreadable": len(skipped)}
+            "notes_removed": removed, "unreadable": len(skipped),
+            "kept": [f"{lid} ({out_lessons[lid]['name']})" for lid in kept]}
+
+
+def _report_unreadable(summary: dict) -> bool:
+    """Say which lessons were kept because retro notes were unreadable; True when any were."""
+    if not summary["unreadable"]:
+        return False
+    kept = ", ".join(summary["kept"]) or "none"
+    print(f"retro_rollup: {summary['unreadable']} unreadable retro notes; nothing was pruned or deleted; "
+          f"kept lessons: {kept}", file=sys.stderr)
+    return True
 
 
 # --- tracking refresh -------------------------------------------------------------
@@ -318,12 +354,19 @@ def refresh_tracking(ctx: Ctx, state: dict) -> list[dict]:
             else:
                 state["tracking"][key] = info
     memory_stems = None
+    memory_failed = False
     for key, t in refs.items():
         if t["kind"] == "memory":
             if memory_stems is None:
                 import memory_sources
-                memory_stems = {Path(p).stem for p in memory_sources.memory_sources("claude-code")}
-            state["tracking"][key] = {"exists": t["ref"] in memory_stems}
+                scan_errors: list = []
+                memory_stems = {Path(p).stem for p in
+                                memory_sources.memory_sources("claude-code", errors=scan_errors)}
+                memory_failed = bool(scan_errors)
+                errors.extend({"ref": e.get("path", "memory"), "error": e.get("error", "memory scan failed")}
+                              for e in scan_errors)
+            # A scan that hit errors cannot say a stem is gone.
+            state["tracking"][key] = {"exists": None if memory_failed else t["ref"] in memory_stems}
         elif t["kind"] == "path":
             raw = t["ref"]
             if raw.startswith(("~", "/")):
@@ -391,6 +434,9 @@ def backfill(ctx: Ctx, state: dict, accept: list[dict] | None) -> tuple[dict, bo
             skipped_entries.append({**entry, "reason": "unknown lesson"})
         elif not rec.get("tracking") or rec["tracking"]["ref"] != entry["tracking_ref"]:
             skipped_entries.append({**entry, "reason": "tracking changed"})
+        elif ((state["tracking"].get(_tracking_key(rec["tracking"])) or {}).get("exists") is False
+              or (rec.get("classify") or {}).get("tracking_gone")):
+            skipped_entries.append({**entry, "reason": "tracking gone"})
         else:
             accepted[entry["lesson_id"]] = rec
     lessons = accepted if accept is not None else {
@@ -416,7 +462,9 @@ def backfill(ctx: Ctx, state: dict, accept: list[dict] | None) -> tuple[dict, bo
                 ok = False
                 continue
             stem = Path(path).stem
-            current = {lessons_corpus.item_key(stem, it["text"]): it for it in retro_trace.parse_items(text)}
+            current = {}
+            for it in retro_trace.parse_items(text):
+                current.setdefault(lessons_corpus.item_key(stem, it["text"]), it)  # first copy, like _load
             traces = []
             for key, tracking in wanted:
                 it = current.get(key)
@@ -501,7 +549,7 @@ def main(argv=None) -> int:
     except UsageError as exc:
         print(f"retro_rollup: {exc}", file=sys.stderr)
         return 2
-    except LockHeld as exc:
+    except (LockHeld, OSError) as exc:
         print(f"retro_rollup: {exc}", file=sys.stderr)
         return 1
     try:
@@ -512,12 +560,12 @@ def main(argv=None) -> int:
                   f"{summary['items_in_lessons']}, unjudged: {summary['unjudged']}, "
                   f"failed: {summary['failed']}, notes written: {summary['notes_written']}, "
                   f"removed: {summary['notes_removed']}, unreadable notes: {summary['unreadable']}")
-            return 1 if summary["failed"] else 0
+            return 1 if _report_unreadable(summary) or summary["failed"] else 0
         if args.cmd == "refresh-tracking":
             errors = refresh_tracking(ctx, state)
             summary = regroup(ctx, state, judge=False)
             print(json.dumps({"errors": errors, "notes_written": summary["notes_written"]}))
-            return 1 if errors else 0
+            return 1 if _report_unreadable(summary) or errors else 0
         result, ok = backfill(ctx, state, accept)
         print(json.dumps(result, indent=1))
         return 0 if ok else 1
