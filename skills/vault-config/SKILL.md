@@ -68,11 +68,15 @@ Obsidian Brain Configuration
 7. min_duration_minutes   <value>      <- minimum duration to log
 8. snapshot_on_compact    <value>      <- checkpoint note on /compact
 9. snapshot_on_clear      <value>      <- checkpoint note on /clear
+10. lessons_enabled       <value>      <- retro lesson rollup (#471)
+11. lessons_recent_days   <value>      <- window for ranking lessons by recent sessions
+12. lessons_concurrency   <value>      <- parallel Haiku calls during a lesson update
+13. project_repos         <value>      <- project name -> GitHub owner/repo, for issue tracking
 
 Enter a number to change, or 'done' to exit.
 ```
 
-For any key not present in the config, show its default value: `wiki_folder` defaults to `claude-wiki`, `log_raw_messages` defaults to `true`, `min_turns` defaults to `3`, `min_duration_minutes` defaults to `2`, `snapshot_on_compact` defaults to `true`, `snapshot_on_clear` defaults to `true`.
+For any key not present in the config, show its default value: `wiki_folder` defaults to `claude-wiki`, `log_raw_messages` defaults to `true`, `min_turns` defaults to `3`, `min_duration_minutes` defaults to `2`, `snapshot_on_compact` defaults to `true`, `snapshot_on_clear` defaults to `true`, `lessons_enabled` defaults to `true`, `lessons_recent_days` defaults to `90`, `lessons_concurrency` defaults to `8`, `project_repos` defaults to `{}` (show each entry as `project -> owner/repo`, or `(none)`). `lessons_enabled` is read by the `/retro` lesson update (#475) and `project_repos` by lesson-to-issue matching (#473); until those ship, changing them has no effect. Issue traces already name their repo (`owner/repo#N`).
 
 When rendering rows 8 or 9, if the value is `False`, append this warning inline on the same row:
 
@@ -89,13 +93,14 @@ Wait for user input.
 
 ### Step 4 — Change setting
 
-- **Boolean settings** (`log_raw_messages`, `snapshot_on_compact`, `snapshot_on_clear`): Toggle the value (true→false, false→true). If the user is about to set `snapshot_on_compact` or `snapshot_on_clear` to `False`, warn first:
+- **Boolean settings** (`log_raw_messages`, `snapshot_on_compact`, `snapshot_on_clear`, `lessons_enabled`): Toggle the value (true→false, false→true). If the user is about to set `snapshot_on_compact` or `snapshot_on_clear` to `False`, warn first:
 
   > ⚠ Disabling this removes the pre-compact/clear checkpoint safety net. You will lose in-flight context on accidental `/clear`. Proceed? (y/N)
 
   Only toggle after explicit confirmation.
 - **String settings** (`vault_path`, `sessions_folder`, `insights_folder`, `wiki_folder`): Show current value, ask for new value.
-- **Number settings** (`min_turns`, `min_duration_minutes`): Show current value, ask for new value. Validate it's a positive integer.
+- **Number settings** (`min_turns`, `min_duration_minutes`, `lessons_recent_days`, `lessons_concurrency`): Show current value, ask for new value. Validate it's a positive integer. `lessons_concurrency` must be 1 to 16.
+- **Map setting** (`project_repos`): show each `project -> owner/repo` entry and ask whether to add, edit or remove one. The project name is the lowercased folder name the session notes use (`project:` in their frontmatter); the repo must match `^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$`. Build the whole new map, write it as JSON with the Write tool to `~/.claude/obsidian-brain/config-value-<8 random hex>.json` (run `mkdir -m 700 -p ~/.claude/obsidian-brain` first), and pass `-` as `$JSON_VALUE` with that file on stdin in Step 5. Delete the file afterwards. Never put the map in a shell argument.
 
 ### Step 5 — Write updated config
 
@@ -107,7 +112,7 @@ import sys, os, json
 config_path = os.path.expanduser("~/.claude/obsidian-brain-config.json")
 with open(config_path, "r") as f:
     config = json.load(f)
-config[sys.argv[1]] = json.loads(sys.argv[2])
+config[sys.argv[1]] = json.load(sys.stdin) if sys.argv[2] == "-" else json.loads(sys.argv[2])
 import tempfile
 fd, tmp = tempfile.mkstemp(dir=os.path.dirname(config_path), suffix=".tmp")
 with os.fdopen(fd, "w") as f:

@@ -314,8 +314,13 @@ def _merge_field(fm: list[str], refs: list[str], eol: str) -> list[str]:
     return out
 
 
-def apply_traces(vault_path: str, note_path: str, traces: list[dict]) -> dict:
-    """Validate every outcome before rewriting a note under its writer lock."""
+def apply_traces(vault_path: str, note_path: str, traces: list[dict],
+                 partial: bool = False, verify=None) -> dict:
+    """Validate outcomes under the writer lock; partial allows untraced items.
+
+    verify(item) -> bool runs under the lock for each item to trace (the parsed
+    item dict from parse_items); False raises TraceError with nothing written.
+    """
     if not isinstance(traces, list):
         raise TraceError("traces must be a list")
     path = Path(note_path)
@@ -348,8 +353,11 @@ def apply_traces(vault_path: str, note_path: str, traces: list[dict]) -> dict:
                 raise TraceError(f"item {number} is already traced")
             if number in validated:
                 raise TraceError(f"duplicate item: {number}")
+            if verify is not None and not verify(by_number[number]):
+                raise TraceError(f"item {number} changed since it was read; nothing written")
             validated[number] = (entry, _render(entry))
-        if set(validated) != {item["item"] for item in items if item["trace"] is None}:
+        untraced = {item["item"] for item in items if item["trace"] is None}
+        if not partial and set(validated) != untraced:
             raise TraceError("missing trace for an untraced item")
         refs = list(dict.fromkeys(read_tracked_issues(original)))
         for number, (entry, rendered) in validated.items():
@@ -370,7 +378,8 @@ def apply_traces(vault_path: str, note_path: str, traces: list[dict]) -> dict:
             content = opening + "".join(new_fm) + closing + "".join(lines[len(fm) + 2:])
         else:
             content = original
-        result = {"written": content != original, "untraced": 0, "tracked_issues": refs}
+        result = {"written": content != original,
+                  "untraced": len(untraced - validated.keys()), "tracked_issues": refs}
         if content == original:
             return result
         error = _atomic_rewrite(resolved, content, (st.st_mtime_ns, st.st_size))
@@ -385,12 +394,13 @@ def main(argv=None) -> int:
     """CLI for retro traces; JSON input is read only for apply."""
     args = list(sys.argv[1:] if argv is None else argv)
     if not args or not (
-        (args[0] == "apply" and len(args) == 3)
+        (args[0] == "apply" and (
+            len(args) == 3 or (len(args) == 4 and args[3] == "--partial")))
         or (args[0] in ("untraced", "items") and len(args) == 2)
         or (args[0] == "closed-candidates" and (
             len(args) == 3 or (len(args) == 5 and args[3] == "--project")))
     ):
-        print("usage: retro_trace.py apply <vault> <note> | untraced <note> | items <note>"
+        print("usage: retro_trace.py apply <vault> <note> [--partial] | untraced <note> | items <note>"
               " | closed-candidates <vault> <insights_folder> [--project P]", file=sys.stderr)
         return 2
     try:
@@ -402,7 +412,8 @@ def main(argv=None) -> int:
             payload = json.loads(raw)
             if not isinstance(payload, dict) or "traces" not in payload:
                 raise TraceError('expected JSON object with "traces" list')
-            print(json.dumps(apply_traces(args[1], args[2], payload["traces"])))
+            print(json.dumps(apply_traces(
+                args[1], args[2], payload["traces"], partial=len(args) == 4)))
         elif args[0] == "closed-candidates":
             try:
                 result = closed_candidates(

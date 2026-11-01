@@ -39,6 +39,82 @@ def snapshot(path):
     return path.read_bytes(), path.stat().st_mtime_ns
 
 
+PARTIAL_BODY = (
+    "## Process Improvements\n- [ ] First.\n- [ ] Second.\n- [ ] Third.\n"
+)
+
+
+def test_partial_apply_traces_only_given_items(tmp_path):
+    path = make_note(tmp_path, HEADER + PARTIAL_BODY)
+    before = path.read_bytes().splitlines(keepends=True)
+    result = rt.apply_traces(str(tmp_path), path.name, [
+        {"item": 2, "kind": "memory", "stem": "x"}], partial=True)
+    after = path.read_bytes().splitlines(keepends=True)
+    assert b"- [x] Second. " + "→ memory `x`\n".encode() in after
+    for line in (b"- [ ] First.\n", b"- [ ] Third.\n"):
+        assert line in before and line in after
+    assert result["untraced"] == 2
+    assert rt.untraced_count(path) == 2
+
+
+def test_partial_false_still_requires_every_untraced_item(tmp_path):
+    path = make_note(tmp_path, HEADER + PARTIAL_BODY)
+    before = snapshot(path)
+    with pytest.raises(rt.TraceError, match="missing trace for an untraced item"):
+        rt.apply_traces(str(tmp_path), path.name, [
+            {"item": 2, "kind": "memory", "stem": "x"}], partial=False)
+    assert snapshot(path) == before
+
+
+def test_partial_apply_keeps_crlf(tmp_path):
+    path = make_note(tmp_path, (HEADER + PARTIAL_BODY).replace("\n", "\r\n"))
+    result = rt.apply_traces(str(tmp_path), path.name, [
+        {"item": 2, "kind": "memory", "stem": "x"}], partial=True)
+    written = path.read_bytes()
+    assert "- [x] Second. → memory `x`\r\n".encode() in written
+    assert b"\n" not in written.replace(b"\r\n", b"")
+    assert result["untraced"] == 2
+
+
+def test_partial_apply_rejects_already_traced_item(tmp_path):
+    text = (HEADER + PARTIAL_BODY).replace("Second.", "Second. → memory `existing`")
+    path = make_note(tmp_path, text)
+    before = snapshot(path)
+    with pytest.raises(rt.TraceError, match="already traced"):
+        rt.apply_traces(str(tmp_path), path.name, [
+            {"item": 2, "kind": "memory", "stem": "x"}], partial=True)
+    assert snapshot(path) == before
+
+
+def test_partial_empty_apply_reports_current_untraced_count(tmp_path):
+    path = make_note(tmp_path, HEADER + PARTIAL_BODY)
+    before = snapshot(path)
+    assert rt.apply_traces(str(tmp_path), path.name, [], partial=True) == {
+        "written": False, "untraced": 3, "tracked_issues": []}
+    assert snapshot(path) == before
+
+
+def test_cli_apply_partial_flag(tmp_path, monkeypatch, capsys):
+    path = make_note(tmp_path, HEADER + PARTIAL_BODY)
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({"traces": [
+        {"item": 2, "kind": "memory", "stem": "x"}]})))
+    assert rt.main(["apply", str(tmp_path), path.name, "--partial"]) == 0
+    assert "- [x] Second. → memory `x`\n".encode() in path.read_bytes()
+    assert json.loads(capsys.readouterr().out)["untraced"] == 2
+
+
+@pytest.mark.parametrize("extra", [["--bogus"], ["extra"], ["--partial", "--bogus"],
+                                   ["--partial", "--partial"]])
+def test_cli_apply_unknown_flag_is_usage_error(tmp_path, capsys, extra):
+    path = make_note(tmp_path, HEADER + PARTIAL_BODY)
+    before = snapshot(path)
+    assert rt.main(["apply", str(tmp_path), path.name, *extra]) == 2
+    output = capsys.readouterr()
+    assert "usage:" in output.err and "[--partial]" in output.err
+    assert not output.out
+    assert snapshot(path) == before
+
+
 def test_fixture(tmp_path):
     text = FIXTURE.read_text()
     items = rt.parse_items(text)
@@ -410,3 +486,29 @@ def test_apply_on_crlf_note_rereads_every_trace(tmp_path):
     rt.apply_traces(str(tmp_path), path.name, TRACES)
     items = rt.parse_items(path.read_bytes().decode())
     assert [i["trace"]["kind"] for i in items] == ["issue", "memory", "path", "skipped"]
+
+
+def test_verify_false_raises_and_leaves_the_note_byte_identical(tmp_path):
+    path = make_note(tmp_path, HEADER + PARTIAL_BODY)
+    before = snapshot(path)
+    seen = []
+
+    def verify(item):
+        seen.append(item["item"])
+        return item["item"] != 3
+
+    with pytest.raises(rt.TraceError):
+        rt.apply_traces(str(tmp_path), path.name, [
+            {"item": 2, "kind": "memory", "stem": "x"},
+            {"item": 3, "kind": "memory", "stem": "y"}], partial=True, verify=verify)
+    assert sorted(seen) == [2, 3]
+    assert snapshot(path) == before
+
+
+def test_verify_true_writes_and_none_skips_the_check(tmp_path):
+    path = make_note(tmp_path, HEADER + PARTIAL_BODY)
+    rt.apply_traces(str(tmp_path), path.name, [{"item": 1, "kind": "memory", "stem": "x"}],
+                    partial=True, verify=lambda item: item["text"].startswith("- [ ] First"))
+    assert b"- [x] First. \xe2\x86\x92 memory `x`" in path.read_bytes()
+    rt.apply_traces(str(tmp_path), path.name, [{"item": 2, "kind": "memory", "stem": "x"}], partial=True)
+    assert b"- [x] Second. \xe2\x86\x92 memory `x`" in path.read_bytes()

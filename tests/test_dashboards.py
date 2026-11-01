@@ -13,7 +13,7 @@ REPO = Path(__file__).resolve().parent.parent
 DASH = REPO / "dashboards"
 SETUP = REPO / "skills" / "obsidian-setup" / "SKILL.md"
 FILES = sorted(p.name for p in DASH.glob("*.md"))
-EXPECTED_INSIGHT_BLOCKS = 11  # claude-insights query blocks across dashboards/*.md; update when one is added or removed
+EXPECTED_INSIGHT_BLOCKS = 17  # claude-insights query blocks across dashboards/*.md; update when one is added or removed
 
 DQL_FILTER = '(!status OR !startswith(lower(string(status)), "provisional"))'
 JS_FILTER = '.where(p => !p.status || !String(p.status).toLowerCase().startsWith("provisional"))'

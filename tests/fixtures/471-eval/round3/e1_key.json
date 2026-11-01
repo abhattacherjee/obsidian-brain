@@ -1,0 +1,288 @@
+{
+ "lesson-00": {
+  "anchor": "2026-08-16-retro-571d#2",
+  "design": "star",
+  "members": [
+   "2026-07-04-retro-b123#4",
+   "2026-07-10-retro-9e26#1"
+  ]
+ },
+ "lesson-01": {
+  "anchor": "2026-05-05-retro-5596#3",
+  "design": "linked",
+  "members": [
+   "2026-04-11-retro-1749#4",
+   "2026-04-21-retro-5cfe#2"
+  ]
+ },
+ "lesson-02": {
+  "anchor": "2026-10-21-retro-ace3#5",
+  "design": "linked",
+  "members": [
+   "2026-10-21-retro-0692#3",
+   "2026-10-16-retro-e2fa#1",
+   "2026-10-27-retro-f00b#3",
+   "2026-10-25-retro-70d1#1",
+   "2026-10-16-retro-e792#2"
+  ]
+ },
+ "lesson-03": {
+  "anchor": "2026-05-23-retro-a0fe#2",
+  "design": "star",
+  "members": [
+   "2026-05-10-retro-be9b#6",
+   "2026-04-27-retro-4011#2",
+   "2026-05-20-retro-be73#1",
+   "2026-10-20-retro-0829#3"
+  ]
+ },
+ "lesson-04": {
+  "anchor": "2026-04-25-retro-1448#5",
+  "design": "star",
+  "members": [
+   "2026-10-22-retro-989e#2",
+   "2026-06-15-retro-3cae#1"
+  ]
+ },
+ "lesson-05": {
+  "anchor": "2026-10-14-retro-bdb6#4",
+  "design": "linked",
+  "members": [
+   "2026-06-19-retro-2c92#3",
+   "2026-06-02-retro-aa7a#2",
+   "2026-06-26-retro-969c#2"
+  ]
+ },
+ "lesson-06": {
+  "anchor": "2026-10-19-retro-9d66#5",
+  "design": "star",
+  "members": [
+   "2026-06-16-retro-d2c9#3",
+   "2026-10-09-retro-39f7#2"
+  ]
+ },
+ "lesson-07": {
+  "anchor": "2026-10-23-retro-bb82#2",
+  "design": "star",
+  "members": [
+   "2026-04-18-retro-164d#4",
+   "2026-09-25-retro-ae32#3"
+  ]
+ },
+ "lesson-08": {
+  "anchor": "2026-09-03-retro-4864#3",
+  "design": "linked",
+  "members": [
+   "2026-06-07-retro-7d05#1",
+   "2026-09-07-retro-0123#1"
+  ]
+ },
+ "lesson-09": {
+  "anchor": "2026-10-20-retro-1d2c#5",
+  "design": "star",
+  "members": [
+   "2026-10-17-retro-da05#3",
+   "2026-10-04-retro-a816#4"
+  ]
+ },
+ "lesson-10": {
+  "anchor": "2026-10-03-retro-d4d8#3",
+  "design": "star",
+  "members": [
+   "2026-05-11-retro-ee00#2",
+   "2026-10-18-retro-1c65#5",
+   "2026-10-12-retro-75fa#3",
+   "2026-06-12-retro-edbd#1",
+   "2026-10-05-retro-1726#2",
+   "2026-10-10-retro-364e#4",
+   "2026-09-26-retro-0f9a#2",
+   "2026-06-02-retro-961f#2"
+  ]
+ },
+ "lesson-11": {
+  "anchor": "2026-07-09-retro-f0bf#3",
+  "design": "star",
+  "members": [
+   "2026-07-03-retro-d529#3",
+   "2026-05-08-retro-8888#3"
+  ]
+ },
+ "lesson-12": {
+  "anchor": "2026-04-19-retro-b1e7#4",
+  "design": "linked",
+  "members": [
+   "2026-10-16-retro-317f#4",
+   "2026-08-19-retro-5c4a#3"
+  ]
+ },
+ "lesson-13": {
+  "anchor": "2026-10-01-retro-c395#3",
+  "design": "linked",
+  "members": [
+   "2026-05-11-retro-618a#1",
+   "2026-10-27-retro-2f3e#4",
+   "2026-05-01-retro-8e01#1"
+  ]
+ },
+ "lesson-14": {
+  "anchor": "2026-06-15-retro-37f0#2",
+  "design": "star",
+  "members": [
+   "2026-05-19-retro-9328#3",
+   "2026-05-30-retro-88fe#2",
+   "2026-06-26-retro-aba4#3",
+   "2026-06-13-retro-9b9e#4",
+   "2026-06-12-retro-0849#3",
+   "2026-06-12-retro-3a1c#2"
+  ]
+ },
+ "lesson-15": {
+  "anchor": "2026-10-04-retro-0a2a#4",
+  "design": "star",
+  "members": [
+   "2026-09-03-retro-4864#7",
+   "2026-09-27-retro-8d13#1",
+   "2026-10-11-retro-c0a7#3"
+  ]
+ },
+ "lesson-16": {
+  "anchor": "2026-07-03-retro-4b82#2",
+  "design": "star",
+  "members": [
+   "2026-06-12-retro-1d02#2",
+   "2026-06-20-retro-2a53#2",
+   "2026-06-06-retro-f1ec#2",
+   "2026-06-12-retro-3a1c#1",
+   "2026-05-08-retro-3aee#7",
+   "2026-06-15-retro-b0d0#1",
+   "2026-07-10-retro-8a27#1",
+   "2026-06-13-retro-2408#2"
+  ]
+ },
+ "lesson-17": {
+  "anchor": "2026-10-09-retro-7928#4",
+  "design": "linked",
+  "members": [
+   "2026-08-10-retro-326d#1",
+   "2026-08-10-retro-610b#4",
+   "2026-09-04-retro-0f7e#3"
+  ]
+ },
+ "lesson-18": {
+  "anchor": "2026-08-27-retro-47d6#6",
+  "design": "linked",
+  "members": [
+   "2026-06-02-retro-4e15#5",
+   "2026-06-15-retro-3cae#2",
+   "2026-05-19-retro-9328#6",
+   "2026-05-03-retro-3452#5"
+  ]
+ },
+ "lesson-19": {
+  "anchor": "2026-05-04-retro-2f5a#4",
+  "design": "star",
+  "members": [
+   "2026-06-01-retro-0981#5",
+   "2026-09-22-retro-81be#3",
+   "2026-05-18-retro-597b#1",
+   "2026-05-01-retro-d970#9"
+  ]
+ },
+ "lesson-20": {
+  "anchor": "2026-06-20-retro-d4e3#1",
+  "design": "linked",
+  "members": [
+   "2026-10-29-retro-c051#4",
+   "2026-05-16-retro-77b4#3",
+   "2026-06-19-retro-354d#1",
+   "2026-06-19-retro-1aa5#1",
+   "2026-08-16-retro-787b#3"
+  ]
+ },
+ "lesson-21": {
+  "anchor": "2026-08-29-retro-8bfd#4",
+  "design": "star",
+  "members": [
+   "2026-04-30-retro-e25a#6",
+   "2026-04-30-retro-55f9#4"
+  ]
+ },
+ "lesson-22": {
+  "anchor": "2026-10-10-retro-7740#4",
+  "design": "linked",
+  "members": [
+   "2026-10-21-retro-c776#3",
+   "2026-10-13-retro-347f#5"
+  ]
+ },
+ "lesson-23": {
+  "anchor": "2026-09-28-retro-2326#1",
+  "design": "linked",
+  "members": [
+   "2026-08-15-retro-9a50#1",
+   "2026-08-30-retro-1ae5#1"
+  ]
+ },
+ "lesson-24": {
+  "anchor": "2026-10-25-retro-4068#2",
+  "design": "star",
+  "members": [
+   "2026-08-12-retro-ce21#6",
+   "2026-10-23-retro-2989#2"
+  ]
+ },
+ "lesson-25": {
+  "anchor": "2026-06-20-retro-351a#3",
+  "design": "star",
+  "members": [
+   "2026-05-10-retro-28e5#8",
+   "2026-06-05-retro-c149#1",
+   "2026-08-14-retro-dfd3#2",
+   "2026-05-05-retro-5596#2",
+   "2026-06-22-retro-a584#5"
+  ]
+ },
+ "lesson-26": {
+  "anchor": "2026-06-26-retro-aba4#1",
+  "design": "linked",
+  "members": [
+   "2026-06-21-retro-9040#1",
+   "2026-06-19-retro-f8bf#3"
+  ]
+ },
+ "lesson-27": {
+  "anchor": "2026-05-16-retro-6b03#1",
+  "design": "linked",
+  "members": [
+   "2026-05-03-retro-7af5#6",
+   "2026-05-02-retro-11da#4",
+   "2026-05-07-retro-b49d#7"
+  ]
+ },
+ "lesson-28": {
+  "anchor": "2026-10-16-retro-56cf#1",
+  "design": "linked",
+  "members": [
+   "2026-10-23-retro-208e#4",
+   "2026-07-30-retro-5a2d#1",
+   "2026-10-13-retro-298b#1",
+   "2026-10-16-retro-593d#1",
+   "2026-10-10-retro-fdf9#2",
+   "2026-10-16-retro-88df#1"
+  ]
+ },
+ "lesson-29": {
+  "anchor": "2026-06-04-retro-cdc4#1",
+  "design": "linked",
+  "members": [
+   "2026-05-12-retro-bea6#4",
+   "2026-05-24-retro-e7c4#4",
+   "2026-06-21-retro-3986#2",
+   "2026-04-21-retro-9dc1#5",
+   "2026-06-13-retro-dc13#4",
+   "2026-06-05-retro-6a85#1",
+   "2026-05-30-retro-8798#2",
+   "2026-04-24-retro-3c0b#4"
+  ]
+ }
+}
