@@ -1167,7 +1167,8 @@ def test_save_fails_after_gh_created_the_issue_then_rerun_adopts_it(filing, tmp_
     assert run(base, "backfill", "--apply", "--accept", str(f)) == 0
     assert len(gh.calls) == 1 and len(gh.list_calls) == 1  # adopted, not filed again
     out = json.loads(capsys.readouterr().out)
-    assert out["filed"] == [] and out["adopted"] == [{"lesson": lid, "repo": "o/r", "issue": 7}]
+    assert out["filed"] == [] and out["reconciled"] == [{"lesson": lid, "repo": "o/r", "issue": 7,
+                                                         "outcome": "adopted"}]
     assert state_of(state)["filed"] == {lid: "o/r#7"}
     assert _issue_trace("o/r", 7) in (vault / "claude-insights" / "2026-10-08-retro-b2.md").read_text()
     listing = gh.list_calls[0]
@@ -1490,3 +1491,161 @@ def test_pending_record_with_a_malformed_marker_falls_back_to_the_lesson_marker(
     _set_filed(state, lid, {"pending": True, "repo": "o/r", "marker": bad})
     assert run(base, "backfill", "--apply", "--accept", str(_accept_file_issue(tmp_path, lid))) == 0
     assert gh.calls == [] and state_of(state)["filed"] == {lid: "o/r#6"}
+
+
+# --- one reconcile pass for every pending record (#471 re-check round 3: X-023, X-024, C-013) ---
+
+def _gh_with(monkeypatch, *issues, **kw):
+    gh = FakeGh(**kw)
+    gh.issues.extend(issues)
+    monkeypatch.setattr(retro_rollup, "_run_gh", gh)
+    return gh
+
+
+def test_marker_must_match_exactly_a_trailing_newline_falls_back():
+    rec = {"marker": "<!-- retro-lesson:L1 -->\n"}
+    assert retro_rollup._reconcile_marker(rec, "L1") == "<!-- retro-lesson:L1 -->"
+    assert retro_rollup._reconcile_marker({"marker": "<!-- retro-lesson:L2 -->\n"}, "L1") == "<!-- retro-lesson:L1 -->"
+    assert retro_rollup._reconcile_marker({"marker": "<!-- retro-lesson:L2 -->"}, "L1") == "<!-- retro-lesson:L2 -->"
+
+
+def test_x023_survivor_pending_and_a_merged_in_filing_files_nothing(grouped, monkeypatch, capsys):
+    vault, state, base = grouped
+    survivor, retiring = _merge_setup(vault, state, base, monkeypatch)
+    _save_filed(state, {survivor: _pending(survivor, "o/r"), retiring: "o/r#5"})
+    _notes_with_tags(vault, {3: "G1 G2"})
+    assert run(base, "update") == 0
+    gh = _gh_with(monkeypatch)  # the survivor's marker is in no issue
+    f = _file_accept(vault.parent, [{"lesson_id": survivor, "file_issue": True, "repo": "o/r"}])
+    capsys.readouterr()
+    assert run(base, "backfill", "--apply", "--accept", str(f)) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert gh.calls == [] and len(gh.list_calls) == 1  # one listing, no issue create
+    s = state_of(state)
+    assert s["filed"][survivor] == "o/r#5" and s["lessons"][survivor]["tracking"]["ref"] == "o/r#5"
+    assert [r["outcome"] for r in out["reconciled"]] == ["none"] and out["filed"] == []
+    traced = "".join(p.read_text() for p in (vault / "claude-insights").glob("*retro*.md"))
+    assert _issue_trace("o/r", 5) in traced
+
+
+def test_c013_pending_record_of_a_retired_id_is_adopted_even_when_the_survivor_is_tracked(grouped, monkeypatch, capsys):
+    vault, state, base = grouped
+    survivor, retiring = _merge_setup(vault, state, base, monkeypatch)
+    _notes_with_tags(vault, {3: "G1 G2"})
+    assert run(base, "update") == 0
+    s = state_of(state)
+    s["lessons"][survivor]["tracking"] = {"kind": "issue", "ref": "o/r#2", "since": "2026-10-01"}
+    s["filed"] = {retiring: _pending(retiring, "o/r")}
+    (state / "lessons-state.json").write_text(json.dumps(s))
+    gh = _gh_with(monkeypatch, {"number": 9, "body": f"{_pending(retiring, 'o/r')['marker']}\nearlier"})
+    f = _file_accept(vault.parent, [{"lesson_id": survivor, "file_issue": True, "repo": "o/r"}])
+    capsys.readouterr()
+    run(base, "backfill", "--apply", "--accept", str(f))
+    out = json.loads(capsys.readouterr().out)
+    assert gh.calls == [] and len(gh.list_calls) == 1
+    assert state_of(state)["filed"][retiring] == "o/r#9"
+    assert out["reconciled"] == [{"lesson": retiring, "repo": "o/r", "issue": 9, "outcome": "adopted"}]
+
+
+def test_pending_record_without_a_matching_issue_is_deleted_outcome_none(filing, tmp_path, capsys):
+    vault, state, base, gh = filing
+    lid = _lesson_named(state, 3)
+    other = _lesson_named(state, 2)
+    _set_filed(state, "gone-id", _pending("gone-id", "o/r"))
+    f = _file_accept(tmp_path, [{"lesson_id": other, "tracking_ref": "x"}])
+    capsys.readouterr()
+    run(base, "backfill", "--apply", "--accept", str(f))
+    out = json.loads(capsys.readouterr().out)
+    assert state_of(state)["filed"] == {} and gh.calls == []
+    assert out["reconciled"] == [{"lesson": "gone-id", "repo": "o/r", "issue": None, "outcome": "none"}]
+
+
+def test_failed_listing_keeps_records_exits_1_and_files_nothing_in_that_repo(filing, tmp_path, monkeypatch, capsys):
+    vault, state, base, gh = filing
+    lid = _lesson_named(state, 3)
+    broken = _gh_with(monkeypatch, list_fail="rc")
+    s = state_of(state)
+    s["filed"] = {lid: _pending(lid, "o/r"), "other": _pending("other", "o/r")}
+    (state / "lessons-state.json").write_text(json.dumps(s))
+    capsys.readouterr()
+    assert run(base, "backfill", "--apply", "--accept", str(_accept_file_issue(tmp_path, lid))) == 1
+    captured = capsys.readouterr()
+    out = json.loads(captured.out)
+    assert broken.calls == [] and len(broken.list_calls) == 1
+    assert sorted(r["outcome"] for r in out["reconciled"]) == ["error", "error"]
+    assert out["skipped_entries"][0]["reason"] == "cannot check for an earlier filing"
+    assert "gh exited with code 1" in captured.err
+    assert set(state_of(state)["filed"]) == {lid, "other"}
+
+
+def test_two_pending_records_in_one_repo_cost_one_listing(filing, tmp_path, capsys):
+    vault, state, base, gh = filing
+    lid = _lesson_named(state, 3)
+    s = state_of(state)
+    s["filed"] = {"a": _pending("a", "o/r"), "b": _pending("b", "o/r")}
+    (state / "lessons-state.json").write_text(json.dumps(s))
+    run(base, "backfill", "--apply", "--accept", str(_accept_file_issue(tmp_path, lid)))
+    assert len(gh.list_calls) == 1 and len(gh.calls) == 1
+
+
+def test_one_marker_under_two_ids_adopts_the_same_issue_for_both(filing, tmp_path, capsys):
+    vault, state, base, gh = filing
+    lid = _lesson_named(state, 3)
+    marker = f"<!-- retro-lesson:{lid} -->"
+    gh.issues.append({"number": 9, "body": f"{marker}\nearlier"})
+    s = state_of(state)
+    s["filed"] = {lid: _pending(lid, "o/r"), "copy": {**_pending(lid, "o/r")}}
+    (state / "lessons-state.json").write_text(json.dumps(s))
+    assert run(base, "backfill", "--apply", "--accept", str(_accept_file_issue(tmp_path, lid))) == 0
+    assert state_of(state)["filed"] == {lid: "o/r#9", "copy": "o/r#9"} and gh.calls == []
+
+
+def test_dry_run_lists_pending_filings_and_makes_no_gh_call(filing, capsys):
+    vault, state, base, gh = filing
+    lid = _lesson_named(state, 3)
+    s = state_of(state)
+    s["filed"] = {lid: _pending(lid, "o/r"), "gone-id": _pending("gone-id", "p/q")}
+    (state / "lessons-state.json").write_text(json.dumps(s))
+    capsys.readouterr()
+    assert run(base, "backfill") == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["pending_filings"] == sorted(
+        [{"lesson": lid, "repo": "o/r"}, {"lesson": "gone-id", "repo": "p/q"}], key=lambda r: r["lesson"])
+    assert gh.calls == [] and gh.list_calls == []
+
+
+def test_failed_listing_blocks_filing_when_only_a_merged_in_id_has_the_pending_record(grouped, monkeypatch, capsys):
+    vault, state, base = grouped
+    survivor, retiring = _merge_setup(vault, state, base, monkeypatch)
+    _notes_with_tags(vault, {3: "G1 G2"})
+    assert run(base, "update") == 0
+    _save_filed(state, {retiring: _pending(retiring, "o/r")})
+    s = state_of(state)
+    s["filed"].pop(survivor, None)
+    (state / "lessons-state.json").write_text(json.dumps(s))
+    gh = _gh_with(monkeypatch, list_fail="rc")
+    f = _file_accept(vault.parent, [{"lesson_id": survivor, "file_issue": True, "repo": "o/r"}])
+    capsys.readouterr()
+    assert run(base, "backfill", "--apply", "--accept", str(f)) == 1
+    assert gh.calls == []
+    assert json.loads(capsys.readouterr().out)["skipped_entries"][0]["reason"] == "cannot check for an earlier filing"
+
+
+def test_unsaved_reconcile_result_files_nothing_this_run(filing, tmp_path, monkeypatch, capsys):
+    vault, state, base, gh = filing
+    lid = _lesson_named(state, 3)
+    _set_filed(state, lid, _pending(lid, "o/r"))
+
+    real_save, calls = retro_rollup.save_state, []
+
+    def first_save_fails(ctx, st):
+        calls.append(1)
+        if len(calls) == 1:
+            raise OSError("disk full")
+        real_save(ctx, st)
+
+    monkeypatch.setattr(retro_rollup, "save_state", first_save_fails)
+    capsys.readouterr()
+    assert run(base, "backfill", "--apply", "--accept", str(_accept_file_issue(tmp_path, lid))) == 1
+    captured = capsys.readouterr()
+    assert gh.calls == [] and "disk full" in captured.err

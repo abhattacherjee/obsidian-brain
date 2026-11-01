@@ -154,13 +154,13 @@ def _marker(lid: str) -> str:
     return f"<!-- retro-lesson:{lid} -->"
 
 
-_MARKER_RE = re.compile(r"^<!-- retro-lesson:[A-Za-z0-9_-]{1,64} -->$")
+_MARKER_RE = re.compile(r"<!-- retro-lesson:[A-Za-z0-9_-]{1,64} -->")
 
 
 def _reconcile_marker(pending: dict, lid: str) -> str:
     """The marker to look for: the record's own when it has the exact marker shape, else this id's."""
     marker = pending.get("marker")
-    return marker if isinstance(marker, str) and _MARKER_RE.match(marker) else _marker(lid)
+    return marker if isinstance(marker, str) and _MARKER_RE.fullmatch(marker) else _marker(lid)
 
 
 def _is_pending(value) -> bool:
@@ -621,30 +621,35 @@ def _create_issue(ctx: Ctx, repo: str, title: str, body: str) -> tuple[str | Non
     return f"{repo}#{match.group(3)}", None
 
 
-def _find_filed_issue(repo: str, marker: str):
-    """Look for an earlier issue carrying the given marker.
-
-    Returns (ref, meta, error): ("owner/repo#N", issue metadata, None) when found, (None, None, None)
-    when there is none, or (None, None, error) when the check cannot say. One plain listing of my
-    issues (no search index, so a just-created issue is there at once). A full page with no match
-    cannot rule out an earlier filing, so it is an error.
-    """
+def _list_my_issues(repo: str):
+    """One plain listing of my issues in a repo (no search index, so a just-created issue is there at
+    once). Returns (issues, None) or (None, error)."""
     try:
         result = _run_gh(["issue", "list", "--repo", repo, "--state", "all", "--author", "@me",
                           "--json", "number,body,state,createdAt,closedAt,milestone",
                           "--limit", str(RECENT_LIMIT)])
     except subprocess.TimeoutExpired:
-        return None, None, "gh timed out"
+        return None, "gh timed out"
     except OSError as exc:
-        return None, None, str(exc)[:200]
+        return None, str(exc)[:200]
     if result.returncode:
-        return None, None, f"gh exited with code {result.returncode}"
+        return None, f"gh exited with code {result.returncode}"
     try:
         data = json.loads(result.stdout)
     except ValueError:
-        return None, None, "gh returned invalid JSON"
+        return None, "gh returned invalid JSON"
     if not isinstance(data, list) or not all(isinstance(i, dict) for i in data):
-        return None, None, "gh JSON is not a list of issues"
+        return None, "gh JSON is not a list of issues"
+    return data, None
+
+
+def _match_marker(repo: str, data: list, marker: str):
+    """Look for an earlier issue carrying the marker in a listing from _list_my_issues.
+
+    Returns (ref, meta, error): ("owner/repo#N", issue metadata, None) when found, (None, None, None)
+    when there is none, or (None, None, error) when the listing cannot say: a full page with no match
+    cannot rule out an earlier filing.
+    """
     found = sorted((i for i in data
                     if isinstance(i.get("number"), int) and not isinstance(i["number"], bool)
                     and i["number"] > 0 and isinstance(i.get("body"), str)
@@ -691,12 +696,67 @@ def _planned_filings(ctx: Ctx, state: dict, by_key: dict) -> list[dict]:
     return plans
 
 
+def _pending_filings(state: dict) -> dict:
+    return {lid: v for lid, v in sorted(state["filed"].items()) if _is_pending(v)}
+
+
+def _reconcile_pending(ctx: Ctx, state: dict) -> tuple[list[dict], bool, bool]:
+    """Settle every pending filing record with one issue listing per repo.
+
+    Found marker: adopt the issue. Listing fine and no match: nothing was created, drop the record.
+    Listing failed: keep the record. Returns (reconciled, ok, changed).
+    """
+    pending = _pending_filings(state)
+    by_repo: dict[str, list[str]] = {}
+    for lid, rec in pending.items():
+        by_repo.setdefault(rec["repo"], []).append(lid)
+    reconciled, ok, changed = [], True, False
+    for repo, lids in by_repo.items():
+        data, list_error = _list_my_issues(repo)
+        for lid in lids:
+            rec = pending[lid]
+            ref, meta, error = (None, None, list_error)
+            if list_error is None:
+                ref, meta, error = _match_marker(repo, data, _reconcile_marker(rec, lid))
+            if error:
+                print(f"retro_rollup: {lid}: cannot check {repo} for an earlier filing: {error}",
+                      file=sys.stderr)
+                reconciled.append({"lesson": lid, "repo": repo, "issue": None, "outcome": "error"})
+                ok = False
+                continue
+            changed = True
+            if ref is None:
+                del state["filed"][lid]
+                reconciled.append({"lesson": lid, "repo": repo, "issue": None, "outcome": "none"})
+                continue
+            info = _adopted_info(meta, ctx.today)
+            state["filed"][lid] = ref
+            state["tracking"][f"issue:{ref}"] = info
+            lesson = state["lessons"].get(lid)
+            if lesson is not None and not lesson.get("tracking"):
+                lesson["tracking"] = {"kind": "issue", "ref": ref, "since": info["created"]}
+            reconciled.append({"lesson": lid, "repo": repo, "issue": int(ref.rsplit("#", 1)[1]),
+                               "outcome": "adopted"})
+    return reconciled, ok, changed
+
+
 def backfill(ctx: Ctx, state: dict, accept: list[dict] | None) -> tuple[dict, bool]:
     """Dry run when accept is None; else trace accepted lessons. Returns (result, ok)."""
     items, by_key, _ = _load(ctx)
-    plan, skipped_entries, filed, adopted = [], [], [], []
+    plan, skipped_entries, filed, reconciled = [], [], [], []
     accepted = {}
     ok = True
+    can_file = True
+    retired = {}
+    if accept is not None:
+        retired = _load_retired(ctx)
+        reconciled, ok, changed = _reconcile_pending(ctx, state)
+        if changed:
+            try:
+                save_state(ctx, state)
+            except OSError as exc:
+                print(f"retro_rollup: cannot save the reconcile result: {exc}", file=sys.stderr)
+                ok = can_file = False
     for entry in accept or []:
         lid = entry["lesson_id"]
         rec = state["lessons"].get(lid)
@@ -704,9 +764,25 @@ def backfill(ctx: Ctx, state: dict, accept: list[dict] | None) -> tuple[dict, bo
             skipped_entries.append({**entry, "reason": "unknown lesson"})
         elif entry.get("file_issue"):
             ref = state["filed"].get(lid)
-            pending = ref if _is_pending(ref) else None
-            if pending is not None or not (isinstance(ref, str) and _REF.match(ref)):
+            if not (isinstance(ref, str) and _REF.match(ref)):
                 ref = None
+            if ref is None and not rec.get("tracking"):
+                # An issue filed under a merged-in or split-from id counts: do not file a second one.
+                ref, source = _inherited_filing(state, lid, rec, retired)
+                if ref is not None:
+                    state["filed"][lid] = ref
+                    since = ((state["tracking"].get(f"issue:{ref}") or {}).get("created")
+                             or ((state["lessons"].get(source) or {}).get("tracking") or {}).get("since")
+                             or ctx.today)
+                    rec["tracking"] = {"kind": "issue", "ref": ref, "since": since}
+                    try:
+                        save_state(ctx, state)
+                    except OSError as exc:
+                        print(f"retro_rollup: cannot save: {exc}", file=sys.stderr)
+                        skipped_entries.append({**entry, "reason": f"issue {ref} exists but the state "
+                                                f"could not be saved: {exc}; rerun to adopt it"})
+                        ok = False
+                        continue
             if ref is None:
                 if rec.get("tracking"):
                     skipped_entries.append({**entry, "reason": "already tracked"})
@@ -714,53 +790,43 @@ def backfill(ctx: Ctx, state: dict, accept: list[dict] | None) -> tuple[dict, bo
                 if not any(k in by_key and by_key[k]["trace"] is None for k in rec["members"]):
                     skipped_entries.append({**entry, "reason": "nothing to trace"})
                     continue
-                adopted_ref, adopted_meta = None, None
-                if pending is not None:
-                    # An earlier run may have created the issue: look for its marker before filing.
-                    adopted_ref, adopted_meta, error = _find_filed_issue(pending["repo"], _reconcile_marker(pending, lid))
-                    if error:
-                        print(f"retro_rollup: {lid}: cannot check {pending['repo']} for an earlier "
-                              f"filing: {error}", file=sys.stderr)
-                        skipped_entries.append({**entry, "reason": "cannot check for an earlier filing"})
-                        ok = False
-                        continue
-                if adopted_ref is not None:
-                    repo, ref = adopted_ref.rsplit("#", 1)[0], adopted_ref
-                else:
-                    repo, reason = _resolve_repo(ctx, rec, by_key, entry.get("repo"))
-                    if repo is None:
-                        skipped_entries.append({**entry, "reason": reason})
-                        ok = False
-                        continue
-                    title = " ".join(str(rec["name"]).split())[:200] or lid
-                    # Phase 1: record the intent, so a crash or a gh timeout can be reconciled later.
-                    before = state["filed"].get(lid)
-                    state["filed"][lid] = {"pending": True, "repo": repo, "marker": _marker(lid)}
-                    try:
-                        save_state(ctx, state)
-                    except OSError as exc:
-                        if before is None:
-                            del state["filed"][lid]
-                        else:
-                            state["filed"][lid] = before
-                        skipped_entries.append({**entry, "reason": f"cannot save the filing record: {exc}"})
-                        ok = False
-                        continue
-                    ref, error = _create_issue(ctx, repo, title, _issue_body(lid, rec, by_key))
-                    if ref is None:
-                        # The pending record stays: the issue may exist (timeout, odd output).
-                        skipped_entries.append({**entry, "reason": f"filing failed: {error}"})
-                        ok = False
-                        continue
+                if not can_file or _inherited_pending(state, lid, rec, retired) is not None:
+                    # A reconcile failed (or could not be saved): an earlier issue may exist.
+                    skipped_entries.append({**entry, "reason": "cannot check for an earlier filing"})
+                    ok = False
+                    continue
+                repo, reason = _resolve_repo(ctx, rec, by_key, entry.get("repo"))
+                if repo is None:
+                    skipped_entries.append({**entry, "reason": reason})
+                    ok = False
+                    continue
+                title = " ".join(str(rec["name"]).split())[:200] or lid
+                # Phase 1: record the intent, so a crash or a gh timeout can be reconciled later.
+                before = state["filed"].get(lid)
+                state["filed"][lid] = {"pending": True, "repo": repo, "marker": _marker(lid)}
+                try:
+                    save_state(ctx, state)
+                except OSError as exc:
+                    if before is None:
+                        del state["filed"][lid]
+                    else:
+                        state["filed"][lid] = before
+                    skipped_entries.append({**entry, "reason": f"cannot save the filing record: {exc}"})
+                    ok = False
+                    continue
+                ref, error = _create_issue(ctx, repo, title, _issue_body(lid, rec, by_key))
+                if ref is None:
+                    # The pending record stays: the issue may exist (timeout, odd output).
+                    skipped_entries.append({**entry, "reason": f"filing failed: {error}"})
+                    ok = False
+                    continue
                 # Phase 2, in one save: the issue ref, and the tracking the new issue gives the lesson,
                 # so a dry run, the report and the untraced list see it even if every trace write fails.
                 state["filed"][lid] = ref
                 # Known facts about the issue, as refresh-tracking would record them, so the sessions
-                # from before it existed do not count as recurrences. An adopted issue keeps its own
-                # state and dates; a new one is open and created today.
-                info = (_adopted_info(adopted_meta, ctx.today) if adopted_meta is not None else
-                        {"exists": True, "state": "OPEN", "milestone": None, "priority": None,
-                         "created": ctx.today, "closed": None})
+                # from before it existed do not count as recurrences. A new issue is open and created today.
+                info = {"exists": True, "state": "OPEN", "milestone": None, "priority": None,
+                        "created": ctx.today, "closed": None}
                 rec["tracking"] = {"kind": "issue", "ref": ref, "since": info["created"]}
                 state["tracking"][f"issue:{ref}"] = info
                 number = int(ref.rsplit("#", 1)[1])
@@ -771,8 +837,7 @@ def backfill(ctx: Ctx, state: dict, accept: list[dict] | None) -> tuple[dict, bo
                                             f"could not be saved: {exc}; rerun to adopt it"})
                     ok = False
                     continue
-                (adopted if adopted_ref is not None else filed).append(
-                    {"lesson": lid, "repo": repo, "issue": number})
+                filed.append({"lesson": lid, "repo": repo, "issue": number})
             elif rec.get("tracking") and rec["tracking"]["ref"] != ref:
                 skipped_entries.append({**entry, "reason": "already tracked"})
                 continue
@@ -832,7 +897,9 @@ def backfill(ctx: Ctx, state: dict, accept: list[dict] | None) -> tuple[dict, bo
     report = _untraced_report(ctx, state, set(accepted))
     return {"mode": "apply" if accept is not None else "dry-run", "planned": len(plan),
             "notes_written": written, "skipped_entries": skipped_entries,
-            "plan": plan if accept is None else [], "filed": filed, "adopted": adopted,
+            "plan": plan if accept is None else [], "filed": filed, "reconciled": reconciled,
+            "pending_filings": ([{"lesson": l, "repo": r["repo"]} for l, r in _pending_filings(state).items()]
+                                if accept is None else []),
             "planned_filings": _planned_filings(ctx, state, by_key) if accept is None else [],
             **report}, ok
 
