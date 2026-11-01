@@ -2,8 +2,8 @@
 recurring lessons, render lesson notes and report, and trace accepted lessons
 back into the source retros.
 
-Commands: update, rebuild, refresh-tracking, report, backfill, match. Exit 0 on
-success, 1 on a runtime or partial failure (unjudged anchors, gh errors, the
+Commands: update, rebuild, refresh-tracking, report, backfill, match, snooze, show.
+Exit 0 on success, 1 on a runtime or partial failure (unjudged anchors, gh errors, the
 lock held, a write error) with the output still printed, 2 on a usage or
 config error.
 
@@ -82,6 +82,7 @@ class Ctx:
     def __init__(self, args):
         import obsidian_utils
         config = obsidian_utils.load_config()
+        self.lessons_enabled = config.get("lessons_enabled")
         self.vault = args.vault or config.get("vault_path") or ""
         self.insights = args.insights_folder or config.get("insights_folder", "claude-insights")
         if not self.vault or not Path(self.vault).is_dir():
@@ -1298,6 +1299,85 @@ def _print_table(rep: dict) -> None:
     print(f"\n{len(rep['lessons'])} lessons, {dormant} dormant; totals {json.dumps(rep['totals'], sort_keys=True)}")
 
 
+def _require_lesson(ctx: Ctx, state: dict, lid: str) -> dict:
+    if lid not in state["lessons"]:
+        retired = _load_retired(ctx).get(lid, {})
+        if retired.get("merged_into"):
+            raise UsageError(f"retired lesson {lid}; merged_into {retired['merged_into']}")
+        raise UsageError(f"unknown lesson: {lid}")
+    return state["lessons"][lid]
+
+
+def snooze(ctx: Ctx, state: dict, lid: str, when: str) -> dict:
+    """Set a lesson's snooze while the caller holds the lessons lock."""
+    _require_lesson(ctx, state, lid)
+    value = None if when == "none" else when
+    if value is not None:
+        try:
+            if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+                raise ValueError
+            date.fromisoformat(value)
+        except ValueError:
+            raise UsageError(f"bad snooze date: {when!r}; expected YYYY-MM-DD or none")
+    filename = state.get("notes", {}).get(lid)
+    if not filename:
+        raise OSError(f"no note file for lesson {lid}")
+    path = ctx.lessons_dir / filename
+    if not path.resolve().is_relative_to(ctx.lessons_dir.resolve()):
+        raise OSError(f"path traversal blocked: {path}")
+    try:
+        with open(path, encoding="utf-8", newline="") as fh:
+            content = lessons_notes.set_snooze(fh.read(), value)
+    except (UnicodeError, ValueError) as exc:
+        raise OSError(f"cannot snooze lesson {lid}: {exc}") from exc
+    lessons_notes.write_if_changed(ctx.vault, ctx.lessons_folder, filename, content)
+    return {"lesson_id": lid, "snoozed_until": value}
+
+
+def _scrub_values(value):
+    import obsidian_utils
+    if isinstance(value, str):
+        return obsidian_utils.scrub_secrets(value)
+    if isinstance(value, dict):
+        return {key: _scrub_values(v) for key, v in value.items()}
+    if isinstance(value, list):
+        return [_scrub_values(v) for v in value]
+    return value
+
+
+def show(ctx: Ctx, state: dict, lid: str, as_json: bool) -> int:
+    """Display exact member keys from live retro notes, including missing items."""
+    lesson = _require_lesson(ctx, state, lid)
+    _, by_key, _ = _load(ctx)
+    entry = next(e for e in lessons_notes.report(state)["lessons"] if e["id"] == lid)
+    result = {"lesson_id": lid, **{key: entry[key] for key in (
+        "name", "bucket", "tracking", "tracking_ref", "tracking_source",
+        "issue_state", "issue_milestone", "issue_priority", "sessions",
+    )}, "members": []}
+    missing = False
+    for key in lesson["members"]:
+        item = by_key.get(key)
+        if item is None:
+            missing = True
+            member = {"note": key.split(":")[0], **dict.fromkeys(
+                ("item", "date", "project", "text", "trace"))}
+        else:
+            member = {field: item[field] for field in ("note", "item", "date", "project", "text", "trace")}
+        result["members"].append(member)
+    # A trace can also supply tracking_ref, so scrub the full display object.
+    result = _scrub_values(result)
+    if as_json:
+        print(json.dumps(result, indent=1))
+    else:
+        print(f"{result['name']} | {result['bucket']} | {result['tracking']} "
+              f"{result['tracking_ref']} ({result['tracking_source']})")
+        for member in result["members"]:
+            text = member["text"] if member["text"] is not None else "(unreadable)"
+            print(f"- {member['date']} {member['project']} {member['note']}#{member['item']}: "
+                  f"{text} [{json.dumps(member['trace'])}]")
+    return 1 if missing else 0
+
+
 def _parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="retro_rollup.py")
     common = argparse.ArgumentParser(add_help=False)
@@ -1318,6 +1398,12 @@ def _parser() -> argparse.ArgumentParser:
     b = sub.add_parser("backfill", parents=[common])
     b.add_argument("--apply", action="store_true")
     b.add_argument("--accept")
+    s = sub.add_parser("snooze", parents=[common])
+    s.add_argument("lesson_id")
+    s.add_argument("when")
+    s = sub.add_parser("show", parents=[common])
+    s.add_argument("lesson_id")
+    s.add_argument("--json", action="store_true")
     return p
 
 
@@ -1331,11 +1417,17 @@ def main(argv=None) -> int:
         if args.cmd == "backfill" and args.apply and not args.accept:
             raise UsageError("--apply and --accept FILE go together")
         ctx = Ctx(args)
+        if args.cmd == "update" and args.note and ctx.lessons_enabled is False:
+            print("lessons: disabled (lessons_enabled is false)")
+            return 0
+        if args.cmd == "show":
+            return show(ctx, load_state(ctx), args.lesson_id, args.json)
         if args.cmd == "report":
             state = load_state(ctx)
             snoozes = {lid: lessons_notes.read_snooze(ctx.lessons_dir / fn)
                        for lid, fn in state.get("notes", {}).items()}
-            rep = lessons_notes.report(state, snoozes)
+            dates = {item["key"]: item["date"] for item in _load(ctx)[0]}
+            rep = lessons_notes.report(state, snoozes, dates)
             if args.json:
                 print(json.dumps(rep, indent=1))
             else:
@@ -1351,6 +1443,9 @@ def main(argv=None) -> int:
         return 1
     try:
         state = load_state(ctx)
+        if args.cmd == "snooze":
+            print(json.dumps(snooze(ctx, state, args.lesson_id, args.when)))
+            return 0
         if args.cmd in ("update", "rebuild"):
             summary = regroup(ctx, state, judge=args.cmd == "update", note=getattr(args, "note", None))
             print(f"lessons: {summary['lessons']} (+{summary['new']} new), items in lessons: "
@@ -1373,6 +1468,9 @@ def main(argv=None) -> int:
                               preview=entries if not args.apply else None)
         print(json.dumps(result, indent=1))
         return 0 if ok else 1
+    except UsageError as exc:
+        print(f"retro_rollup: {exc}", file=sys.stderr)
+        return 2
     except (OSError, Refused) as exc:
         print(f"retro_rollup: {exc}", file=sys.stderr)
         return 1

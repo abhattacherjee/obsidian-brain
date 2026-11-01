@@ -220,3 +220,292 @@ def test_preview_filing_eligibility(filing, tmp_path, capsys, status):
         assert result["skipped_entries"][0]["reason"] == ("nothing to trace" if status == "untraced" else "already tracked")
     assert gh.calls == gh.list_calls == []
     assert (retro_bytes(vault), (state / "lessons-state.json").read_bytes()) == before
+
+
+import lessons_notes
+import lessons_verify
+from datetime import date
+from test_retro_rollup import grouped, _notes_with_tags, _snoozed_dates, fake_haiku, _trace_items
+
+
+@pytest.fixture
+def ready(env):
+    vault, state, base = env
+    assert run(base, "update") == 0
+    lid = _lesson_named(state, 3)
+    path = vault / "claude-insights" / "lessons" / state_of(state)["notes"][lid]
+    return vault, state, base, lid, path
+
+
+def cli_json(base, capsys, *args):
+    capsys.readouterr()
+    code = run(base, *args)
+    return code, json.loads(capsys.readouterr().out)
+
+
+def test_snooze_sets_and_clears(ready, capsys):
+    _, _, base, lid, path = ready
+    before = path.read_bytes()
+    assert cli_json(base, capsys, "snooze", lid, "2026-12-01") == (
+        0, {"lesson_id": lid, "snoozed_until": "2026-12-01"})
+    assert cli_json(base, capsys, "snooze", lid, "none") == (
+        0, {"lesson_id": lid, "snoozed_until": None})
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("value", ["2026-12-01", "2000-01-01", date.today().isoformat()])
+def test_snooze_written_value_reads_back(ready, capsys, value):
+    _, _, base, lid, path = ready
+    assert run(base, "snooze", lid, value) == 0
+    assert lessons_notes.read_snooze(path) == value
+    code, rep = cli_json(base, capsys, "report", "--json")
+    assert code == 0
+    assert next(r for r in rep["lessons"] if r["id"] == lid)["snoozed_until"] == value
+    for raw in (value, '"' + value + '"', "'" + value + "'"):
+        path.write_bytes(path.read_bytes().replace(('"' + value + '"').encode(), raw.encode()))
+        assert lessons_notes.read_snooze(path) == value
+        assert run(base, "snooze", lid, value) == 0
+
+
+@pytest.mark.parametrize("eol", [b"\n", b"\r\n"])
+@pytest.mark.parametrize("absent", [False, True])
+def test_snooze_keeps_the_rest_of_the_note(ready, eol, absent):
+    _, _, base, lid, path = ready
+    before = path.read_bytes().replace(b"\n", eol)
+    old = b"snoozed_until: null" + eol
+    if absent:
+        before = before.replace(old, b"")
+    path.write_bytes(before)
+    assert run(base, "snooze", lid, "2026-12-01") == 0
+    new = b'snoozed_until: "2026-12-01"' + eol
+    expected = before.replace(b"tags:", new + b"tags:", 1) if absent else before.replace(old, new, 1)
+    assert path.read_bytes() == expected
+
+
+def test_snooze_exit_codes(ready, capsys):
+    _, _, base, lid, path = ready
+    assert run(base, "snooze", lid, "2026-12-01") == 0
+    for value in ("2026-13-45", "tomorrow", "2026-1-5"):
+        assert run(base, "snooze", lid, value) == 2
+    assert run(base, "snooze", "unknown", "none") == 2
+    (path.parent / "retired.json").write_text(json.dumps({"old": {"merged_into": lid}}))
+    capsys.readouterr()
+    assert run(base, "snooze", "old", "none") == 2
+    assert lid in capsys.readouterr().err
+    path.unlink()
+    assert run(base, "snooze", lid, "none") == 1
+
+
+def test_snooze_survives_rebuild(ready):
+    _, _, base, lid, path = ready
+    assert run(base, "snooze", lid, "2026-12-01") == 0
+    assert run(base, "rebuild") == 0
+    assert lessons_notes.read_snooze(path) == "2026-12-01"
+
+
+def test_snooze_carries_over_merged_into(grouped):
+    vault, state, base = grouped
+    _notes_with_tags(vault, {1: "G1", 2: "G1", 4: "G2", 5: "G2"})
+    assert run(base, "update") == 0
+    survivor, retiring = sorted(state_of(state)["lessons"])
+    assert run(base, "snooze", retiring, "2026-12-01") == 0
+    _notes_with_tags(vault, {3: "G1 G2"})
+    assert run(base, "update") == 0
+    assert _snoozed_dates(vault, state) == {survivor: "2026-12-01"}
+
+
+def test_snooze_carries_over_split_from(grouped):
+    vault, state, base = grouped
+    _notes_with_tags(vault, {1: "G1", 2: "G1", 3: "G1 G2", 4: "G2", 5: "G2"})
+    assert run(base, "update") == 0
+    (lid,) = state_of(state)["lessons"]
+    assert run(base, "snooze", lid, "2026-12-01") == 0
+    (vault / "claude-insights" / "2026-10-03-retro-n3.md").unlink()
+    assert run(base, "update") == 0
+    s = state_of(state)
+    assert len(s["lessons"]) == 2
+    child = next(k for k in s["lessons"] if k != lid)
+    assert s["lessons"][child]["split_from"] == lid
+    assert set(_snoozed_dates(vault, state).values()) == {"2026-12-01"}
+
+
+def test_snooze_none_then_rebuild_writes_nothing(ready, capsys):
+    _, _, base, lid, path = ready
+    before = path.read_bytes()
+    assert run(base, "snooze", lid, "2026-12-01") == 0
+    assert run(base, "snooze", lid, "none") == 0
+    assert path.read_bytes() == before
+    capsys.readouterr()
+    assert run(base, "rebuild") == 0
+    assert "notes written: 0" in capsys.readouterr().out
+
+
+def test_show_prints_member_text_and_traces(ready, capsys):
+    vault, state, base, lid, _ = ready
+    # Traces are read live even though the state predates the trace.
+    _trace_items(vault, "2026-10-01-retro-a1.md", {"Run preflight alone RULE-A": "memory `feedback_preflight`"})
+    ctx = retro_rollup.Ctx(retro_rollup._parser().parse_args(["show", *base, lid]))
+    _, by_key, _ = retro_rollup._load(ctx)
+    code, result = cli_json(base, capsys, "show", lid, "--json")
+    assert code == 0
+    assert any(m["trace"] is not None for m in result["members"])
+    rep = next(r for r in lessons_notes.report(state_of(state))["lessons"] if r["id"] == lid)
+    fields = ("name", "bucket", "tracking", "tracking_ref", "tracking_source", "issue_state",
+              "issue_milestone", "issue_priority", "sessions")
+    assert result == {"lesson_id": lid, **{k: rep[k] for k in fields}, "members": [
+        {k: by_key[key][k] for k in ("note", "item", "date", "project", "text", "trace")}
+        for key in state_of(state)["lessons"][lid]["members"]]}
+    assert run(base, "show", lid) == 0
+    out = capsys.readouterr().out
+    assert rep["name"] in out and rep["bucket"] in out
+    assert all(m["text"] in out for m in result["members"])
+
+
+@pytest.mark.parametrize("failure", ["deleted", "invalid-utf8", "edited-away"])
+def test_show_unreadable_note_lists_null_text_and_exits_1(ready, capsys, failure):
+    vault, state, base, lid, _ = ready
+    key = state_of(state)["lessons"][lid]["members"][0]
+    source = vault / "claude-insights" / (key.split(":")[0] + ".md")
+    ctx = retro_rollup.Ctx(retro_rollup._parser().parse_args(["show", *base, lid]))
+    _, by_key, _ = retro_rollup._load(ctx)
+    expected = {i["note"]: i["text"] for k, i in by_key.items()
+                if k in state_of(state)["lessons"][lid]["members"] and k != key}
+    if failure == "deleted":
+        source.unlink()
+    elif failure == "invalid-utf8":
+        source.write_bytes(b"\xff")
+    else:
+        source.write_text(source.read_text().replace(by_key[key]["text"], "Changed item text"))
+    code, result = cli_json(base, capsys, "show", lid, "--json")
+    assert code == 1
+    missing = next(m for m in result["members"] if m["note"] == key.split(":")[0])
+    assert missing == {"note": key.split(":")[0], **dict.fromkeys(("item", "date", "project", "text", "trace"))}
+    assert len([m for m in result["members"] if m["text"] is not None]) == 2
+    assert {m["note"]: m["text"] for m in result["members"] if m["text"] is not None} == expected
+    assert run(base, "show", lid) == 1
+    assert "(unreadable)" in capsys.readouterr().out
+
+
+def test_show_exit_codes(ready, capsys):
+    _, _, base, lid, path = ready
+    assert run(base, "show", lid) == 0
+    assert run(base, "show", "unknown") == 2
+    (path.parent / "retired.json").write_text(json.dumps({"old": {"merged_into": lid}}))
+    capsys.readouterr()
+    assert run(base, "show", "old") == 2
+    assert lid in capsys.readouterr().err
+
+
+def test_show_scrubs_secrets(env, capsys):
+    vault, state, base = env
+    token = "sk-ant-" + "a" * 30
+    for p in (vault / "claude-insights").glob("*.md"):
+        p.write_text(p.read_text().replace("RULE-A", "RULE-A " + token + " → memory `" + token + "`"))
+    assert run(base, "update") == 0
+    lid = _lesson_named(state, 3)
+    for flags in ((), ("--json",)):
+        capsys.readouterr()
+        assert run(base, "show", lid, *flags) == 0
+        out = capsys.readouterr().out
+        assert token not in out
+        assert obsidian_utils.scrub_secrets(token) in out
+        if flags:
+            members = json.loads(out)["members"]
+            assert any(m["trace"] and obsidian_utils.scrub_secrets(token) in json.dumps(m["trace"])
+                       for m in members)
+
+
+def test_report_members_carry_dates(ready, capsys):
+    vault, _, base, lid, _ = ready
+    code, rep = cli_json(base, capsys, "report", "--json")
+    assert code == 0
+    members = next(r for r in rep["lessons"] if r["id"] == lid)["members"]
+    assert {m["date"] for m in members} == {"2026-10-01", "2026-10-08", "2026-10-15"}
+    (vault / "claude-insights" / (members[0]["note"] + ".md")).unlink()
+    _, rep = cli_json(base, capsys, "report", "--json")
+    assert next(r for r in rep["lessons"] if r["id"] == lid)["members"][0]["date"] is None
+
+
+@pytest.mark.parametrize("existing", [False, True])
+@pytest.mark.parametrize("flag", [False, True, None, 0, "false", "absent"])
+def test_update_note_honours_lessons_enabled(env, monkeypatch, capsys, flag, existing):
+    vault, state, base = env
+    if existing:
+        assert run(base, "update") == 0
+        # Uncached text makes a subsequent enabled update call the verifier.
+        target = vault / "claude-insights" / "2026-10-01-retro-a1.md"
+        target.write_text(target.read_text().replace("Run preflight alone", "Run preflight separately"))
+    monkeypatch.setattr(obsidian_utils, "load_config", lambda: {} if flag == "absent" else {"lessons_enabled": flag})
+    calls = []
+    monkeypatch.setattr(lessons_verify, "run_haiku", lambda p, timeouts=(120, 240): calls.append(p) or fake_haiku(p))
+    before = {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in vault.rglob("*") if p.is_file()}
+    state_before = {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in state.rglob("*") if p.is_file()}
+    target = vault / "claude-insights" / "2026-10-01-retro-a1.md"
+    capsys.readouterr()
+    assert run(base, "update", "--note", str(target)) == 0
+    if flag is False:
+        assert capsys.readouterr().out == "lessons: disabled (lessons_enabled is false)\n"
+        assert not calls
+        assert state_before == {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in state.rglob("*") if p.is_file()}
+        if not existing:
+            assert not state.exists()
+        assert before == {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in vault.rglob("*") if p.is_file()}
+    else:
+        assert calls
+
+
+def test_update_without_note_ignores_lessons_enabled(env, monkeypatch):
+    _, state, base = env
+    monkeypatch.setattr(obsidian_utils, "load_config", lambda: {"lessons_enabled": False})
+    assert run(base, "update") == 0
+    assert len(state_of(state)["lessons"]) == 2
+
+
+def test_other_commands_ignore_lessons_enabled(ready, monkeypatch):
+    _, _, base, lid, _ = ready
+    monkeypatch.setattr(obsidian_utils, "load_config", lambda: {"lessons_enabled": False})
+    for args in (("rebuild",), ("report", "--json"), ("snooze", lid, "2026-12-01"),
+                 ("show", lid), ("backfill",)):
+        assert run(base, *args) == 0
+
+
+def test_set_snooze_pure_helper():
+    for eol in ("\n", "\r\n"):
+        text = eol.join(["---", "name: unchanged", "tags: []", "---", "snoozed_until: body", ""])
+        inserted = text.replace("tags: []", 'snoozed_until: "2026-12-01"' + eol + "tags: []")
+        assert lessons_notes.set_snooze(text, "2026-12-01") == inserted
+        cleared = inserted.replace('snoozed_until: "2026-12-01"', "snoozed_until: null")
+        assert lessons_notes.set_snooze(inserted, None) == cleared
+        assert lessons_notes.set_snooze(text, None) == text
+        no_tags = text.replace("tags: []" + eol, "")
+        assert lessons_notes.set_snooze(no_tags, "2026-12-01") == no_tags.replace(
+            eol + "---", eol + 'snoozed_until: "2026-12-01"' + eol + "---", 1)
+    for text in ("body", "---\nno closing delimiter\n"):
+        with pytest.raises(ValueError):
+            lessons_notes.set_snooze(text, None)
+
+
+def test_snooze_lock_and_read_only_commands(ready, capsys):
+    import fcntl
+    vault, state, base, lid, path = ready
+    before = {p: (p.read_bytes(), p.stat().st_mtime_ns)
+              for root in (vault, state) for p in root.rglob("*") if p.is_file()}
+    with open(state / "lessons.lock", "r") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        assert run(base, "snooze", lid, "2026-12-01") == 1
+        assert run(base, "show", lid, "--json") == 0
+        assert run(base, "report", "--json") == 0
+    assert before == {p: (p.read_bytes(), p.stat().st_mtime_ns)
+                      for root in (vault, state) for p in root.rglob("*") if p.is_file()}
+
+
+def test_snooze_refuses_note_outside_lessons(ready, tmp_path):
+    _, state, base, lid, _ = ready
+    outside = tmp_path / "outside.md"
+    outside.write_text('---\nsnoozed_until: null\n---\n')
+    s = state_of(state)
+    s["notes"][lid] = str(outside)
+    (state / "lessons-state.json").write_text(json.dumps(s))
+    before = outside.read_bytes()
+    assert run(base, "snooze", lid, "2026-12-01") == 1
+    assert outside.read_bytes() == before

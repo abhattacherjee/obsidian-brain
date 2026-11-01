@@ -72,6 +72,31 @@ def render_note(
     return "\n".join(lines).rstrip("\n") + "\n"
 
 
+def set_snooze(note_text: str, value: str | None) -> str:
+    """Edit only the snooze frontmatter line, preserving all other bytes.
+
+    Clearing an existing field uses JSON null, as render_note does; clearing
+    an absent field leaves the note alone.
+    """
+    lines = note_text.splitlines(keepends=True)
+    if not lines or lines[0].rstrip("\r\n") != "---":
+        raise ValueError("note has no frontmatter")
+    end = next((i for i in range(1, len(lines))
+                if lines[i].rstrip("\r\n") == "---"), None)
+    if end is None:
+        raise ValueError("note has no closing frontmatter delimiter")
+    ending = lines[0][3:]
+    for i in range(1, end):
+        if lines[i].startswith("snoozed_until:"):
+            line_ending = lines[i][len(lines[i].rstrip("\r\n")):]
+            lines[i] = f"snoozed_until: {json.dumps(value)}{line_ending}"
+            return "".join(lines)
+    if value is not None:
+        insert = next((i for i in range(1, end) if lines[i].startswith("tags:")), end)
+        lines.insert(insert, f"snoozed_until: {json.dumps(value)}{ending}")
+    return "".join(lines)
+
+
 def read_snooze(path) -> str | None:
     """Read a JSON string snooze from frontmatter; unavailable values are absent."""
     try:
@@ -116,12 +141,15 @@ def write_if_changed(vault_path: str, folder: str, filename: str, content: str) 
     return True
 
 
-def report(state: dict, snoozes: dict[str, str | None] | None = None) -> dict:
+def report(state: dict, snoozes: dict[str, str | None] | None = None,
+           dates: dict[str, str] | None = None) -> dict:
     """Project state into a ranked report without exposing item text.
 
     ``snoozes`` maps lesson id to the ``snoozed_until`` read live from its note.
+    ``dates`` maps member item keys to dates read live from retro notes.
     """
     snoozes = snoozes or {}
+    dates = dates or {}
     entries = []
     for lesson_id, lesson in state["lessons"].items():
         c = lesson["classify"]
@@ -137,7 +165,7 @@ def report(state: dict, snoozes: dict[str, str | None] | None = None) -> dict:
             **tracking_fields,
             "sessions_after_tracking": c["sessions_after_tracking"],
             "snoozed_until": snoozes.get(lesson_id),
-            "members": [{"note": key.split(":")[0], "item_key": key}
+            "members": [{"note": key.split(":")[0], "item_key": key, "date": dates.get(key)}
                         for key in lesson["members"]],
         })
     bucket_order = {bucket: i for i, bucket in enumerate(
