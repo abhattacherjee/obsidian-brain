@@ -72,7 +72,8 @@ def logical_lines(text: str):
 
 
 READ_ONLY_GH = {("issue", "list"), ("issue", "view"), ("label", "list"), ("repo", "view")}
-GH_WRITE_TOKEN = re.compile(r"(?:-X|--method|-f|-F|--field|--raw-field|--input)")
+# every flag the skill passes to `gh api`; any other flag token (combined short options included) fails
+GH_API_FLAGS = {"--jq"}
 # a `gh` word that starts a command: line start, or after whitespace, `;`, `&`, `|`, `(` or `$(`
 GH_CALL = re.compile(r"(?:^|[\s;&|(])gh\s+(\S+)(?:\s+(\S+))?(.*)$")
 
@@ -109,8 +110,9 @@ def gh_violations(text: str) -> list[str]:
             bad.append(f"cannot parse gh call ({exc}): {rest.strip()}")
             continue
         if pair[0] == "api":
-            if any(GH_WRITE_TOKEN.match(t) for t in tokens[1:]):
-                bad.append(f"gh api with a write flag: {rest.strip()}")
+            flags = [t for t in tokens[1:] if t.startswith("-")]
+            if any(t not in GH_API_FLAGS for t in flags):
+                bad.append(f"gh api with a flag outside the allowlist: {rest.strip()}")
         elif pair == ("issue", "edit"):
             if not low <= offset < high:
                 bad.append("gh issue edit outside the Raise step")
@@ -128,7 +130,11 @@ def branch(text: str, label: str) -> tuple[int, int]:
 
 def is_apply(line: str) -> bool:
     """A backfill call is an apply when any token is --apply or an abbreviation of it (--ap...)."""
-    return any(t.startswith("--ap") for t in re.split(r"[\s=]+", line))
+    try:
+        tokens = shlex.split(line)
+    except ValueError:
+        return True  # cannot parse: assume the worst
+    return any(t.startswith("--ap") for token in tokens for t in token.split("="))
 
 
 def apply_violations(text: str) -> list[str]:
@@ -188,6 +194,12 @@ def test_skill_makes_no_github_write_without_an_explicit_choice():
 
 
 WRITE_FORMS = [
+    "gh api -iXDELETE repos/o/r/issues/1 < /dev/null",
+    "gh api -XPATCH repos/o/r/issues/1 < /dev/null",
+    "gh api repos/o/r/issues/1 --method PUT < /dev/null",
+    "gh api repos/o/r/issues/1 '--method' 'PUT' < /dev/null",
+    'gh api repos/o/r/issues/1 "-iXDELETE" < /dev/null',
+    "gh api --paginate -X POST repos/o/r/issues < /dev/null",
     "gh api -X PATCH repos/o/r/issues/1 < /dev/null",
     "gh api -XPOST repos/o/r/issues < /dev/null",
     "gh api -X PUT repos/o/r/issues/1/lock < /dev/null",
@@ -255,7 +267,12 @@ def test_apply_guard_catches_a_second_apply_in_any_form():
     reordered = TEXT.replace(dry, dry.replace(" < /dev/null", " --apply < /dev/null"), 1)
     assert apply_violations(reordered)  # dry run turned into an apply, flags in another order
     abbreviated = TEXT.replace(dry, dry.replace(" < /dev/null", " --appl < /dev/null"), 1)
-    assert apply_violations(abbreviated)  # argparse used to accept --appl as --apply
+    assert apply_violations(abbreviated)
+    for quoted in ('"--apply"', "'--apply'"):
+        q = TEXT.replace(dry, dry.replace(" < /dev/null", f" {quoted} < /dev/null"), 1)
+        assert apply_violations(q), quoted
+        extra_q = TEXT.replace("### Step 5", f"```bash\npython3 \"$HOOKS/retro_rollup.py\" backfill --accept X {quoted} < /dev/null\n```\n\n### Step 5", 1)
+        assert apply_violations(extra_q), quoted  # argparse used to accept --appl as --apply
     extra = TEXT.replace("### Step 5", "```bash\n    python3 \"$HOOKS/retro_rollup.py\" backfill --accept X --apply < /dev/null\n```\n\n### Step 5", 1)
     assert apply_violations(extra)
 
