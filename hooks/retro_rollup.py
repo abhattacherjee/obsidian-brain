@@ -632,8 +632,13 @@ def match_lessons(ctx: Ctx, state: dict, *, recheck: bool = False) -> dict:
         errors.append({"ref": "rules", "error": str(exc)[:200]})
         summary["unchecked"] = len(todo)
         return summary
-    errors.extend({"ref": e["path"], "error": e["error"]}
-                  for e in {e["path"]: e for e in rule_errors}.values())
+    if rule_errors:
+        # A rule file or directory that cannot be read could hide the covering rule: like a memory scan
+        # error, check nothing rather than record "no match" or erase an earlier accept.
+        errors.extend({"ref": e["path"], "error": e["error"]}
+                      for e in {e["path"]: e for e in rule_errors}.values())
+        summary["unchecked"] = len(todo)
+        return summary
     project_rules = {p: {_home_ref(home, root / p / "CLAUDE.md") for root in roots} for p in projects}
     every_project_rule = set().union(*project_rules.values()) if project_rules else set()
     rule_at: dict[str, list[int]] = {}
@@ -643,6 +648,13 @@ def match_lessons(ctx: Ctx, state: dict, *, recheck: bool = False) -> dict:
 
     repo_cache: dict = {}
     lesson_projects = {lid: sorted({m["project"] for m in members}) for lid, _, members in todo}
+    # A configured project_repos value that is not a repo is a setup error, not "no repo": the project's
+    # issues cannot be read, so its lessons stay unchecked. No value and no origin is simply no issue source.
+    bad_repo = {p: v for p in projects
+                if (v := ctx.project_repos.get(p)) is not None and not _valid_repo(v)}
+    for p in sorted({p for lid, ps in lesson_projects.items() for p in ps} & set(bad_repo)):
+        errors.append({"ref": p, "error": f"project_repos[{p!r}] is not an owner/name repo: "
+                                          f"{str(bad_repo[p])[:80]!r}"})
     lesson_repos = {lid: sorted({r for p in ps if (r := _project_repo(ctx, p, repo_cache))})
                     for lid, ps in lesson_projects.items()}
     repos = sorted({r for p in projects if (r := _project_repo(ctx, p, repo_cache))})
@@ -672,7 +684,7 @@ def match_lessons(ctx: Ctx, state: dict, *, recheck: bool = False) -> dict:
 
     jobs, changed = [], False
     for lid, rec, members in todo:
-        if failed & set(lesson_repos[lid]):
+        if failed & set(lesson_repos[lid]) or bad_repo.keys() & set(lesson_projects[lid]):
             summary["unchecked"] += 1
             continue
         repo_key = tuple(lesson_repos[lid])
@@ -720,6 +732,9 @@ def match_lessons(ctx: Ctx, state: dict, *, recheck: bool = False) -> dict:
                                 "since": since, "candidate": chash}
                 if doc["source"] == "issue":
                     state["tracking"][f"issue:{doc['ref']}"] = _listed_issue_info(issue_meta[doc["ref"]])
+                else:
+                    # The file was read just now: drop a stale "gone" left by an earlier refresh-tracking.
+                    state["tracking"][f"{rec['match']['kind']}:{doc['ref']}"] = {"exists": True}
                 summary["matched"] += 1
                 changed = True
             else:

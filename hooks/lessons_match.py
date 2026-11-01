@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import re
 from collections import Counter
 from pathlib import Path
@@ -70,15 +71,29 @@ def memory_docs(paths: list[str], errors: list) -> list[dict]:
     return docs
 
 
+_FENCE = re.compile(r"(`{3,}|~{3,})(.*)$")
+
+
 def _outside_fences(path: Path):
-    """Yield line numbers and text, with boundaries at blank lines and fences."""
-    fenced = False
+    """Yield line numbers and text, with boundaries at blank lines and fences.
+
+    CommonMark: a fence closes only on a line of the same character, at least as long as the opening
+    one, with nothing after it but spaces.
+    """
+    opening = None
     for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-        if line.lstrip().startswith(("```", "~~~")):
-            fenced = not fenced
+        found = _FENCE.match(line.lstrip())
+        if opening is None:
+            if found and not (found[1][0] == "`" and "`" in found[2]):
+                opening = found[1]
+                yield number, ""
+            else:
+                yield number, line
+        else:
             yield number, ""
-        elif not fenced:
-            yield number, line
+            if found and found[1][0] == opening[0] and len(found[1]) >= len(opening) \
+                    and not found[2].strip():
+                opening = None
 
 
 def rule_bullets(path: Path) -> list[tuple[int, str]]:
@@ -119,6 +134,20 @@ def rule_paragraphs(path: Path) -> list[tuple[int, str]]:
     return paragraphs
 
 
+def _subdirs(path: Path, errors: list) -> list[Path]:
+    """The visible subdirectories of ``path``, sorted. A missing path is empty; any other failure is
+    reported (``Path.glob`` would swallow it and hide the rules below)."""
+    try:
+        with os.scandir(path) as entries:
+            found = [Path(e.path) for e in entries if not e.name.startswith(".") and e.is_dir()]
+    except (FileNotFoundError, NotADirectoryError):
+        return []
+    except OSError as exc:
+        errors.append({"path": str(path), "error": str(exc)})
+        return []
+    return sorted(found)
+
+
 def rule_docs(home: Path, projects: list[str], workspace: Path,
               errors: list) -> list[dict]:
     files = [(home / ".claude/CLAUDE.md", rule_bullets)]
@@ -128,22 +157,14 @@ def rule_docs(home: Path, projects: list[str], workspace: Path,
         path = workspace / project / "CLAUDE.md"
         if path.resolve().is_relative_to(workspace.resolve()):
             files.append((path, rule_bullets))
-    files.extend((p, rule_paragraphs) for p in sorted(
-        (home / ".claude/skills").glob("*/SKILL.md")))
-    cache = home / ".claude/plugins/cache"
-    for plugin in sorted(cache.glob("*/*")):
-        if not plugin.is_dir():
-            continue
-        try:
-            versions = [p for p in plugin.iterdir()
-                        if re.fullmatch(r"\d+(\.\d+)*", p.name) and p.is_dir()]
-        except OSError as exc:
-            errors.append({"path": str(plugin), "error": str(exc)})
-            continue
-        if versions:
-            latest = max(versions, key=lambda p: (tuple(map(int, p.name.split("."))), p.name))
-            files.extend((p, rule_paragraphs) for p in sorted(
-                latest.glob("skills/*/SKILL.md")))
+    files.extend((d / "SKILL.md", rule_paragraphs) for d in _subdirs(home / ".claude/skills", errors))
+    for market in _subdirs(home / ".claude/plugins/cache", errors):
+        for plugin in _subdirs(market, errors):
+            versions = [p for p in _subdirs(plugin, errors) if re.fullmatch(r"\d+(\.\d+)*", p.name)]
+            if versions:
+                latest = max(versions, key=lambda p: (tuple(map(int, p.name.split("."))), p.name))
+                files.extend((d / "SKILL.md", rule_paragraphs)
+                             for d in _subdirs(latest / "skills", errors))
     docs = []
     for path, reader in files:
         try:

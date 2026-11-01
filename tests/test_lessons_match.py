@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import os
 from pathlib import Path
 
 import pytest
@@ -75,12 +76,35 @@ def test_rule_docs_pick_highest_plugin_version(tmp_path):
     for version in ("1.9.0", "1.10.0", "latest", "2.0-beta"):
         write(cache / version / "skills/demo/SKILL.md", version + " rule" * 30)
     errors = []
-    docs = match.rule_docs(home, ["demo", "../escape", "a/b", "bad..name"], workspace, errors)
+    docs = match.rule_docs(home, ["demo"], workspace, errors)
     expected = {str(p).replace(str(home), "~", 1) for p in (
         global_rule, project_rule, skill, cache / "1.10.0/skills/demo/SKILL.md")}
     assert {d["ref"] for d in docs} == expected
     assert all(d["source"] == "rule" and d["line"] == 1 for d in docs)
     assert errors == []
+
+
+def test_rule_docs_never_read_a_project_name_that_leaves_the_workspace(tmp_path):
+    home, workspace = tmp_path / "home", tmp_path / "workspace"
+    workspace.mkdir()
+    # real files behind each bad name: without the guard they WOULD be read
+    write(tmp_path / "escape/CLAUDE.md", "- Escaped via dotdot\n")
+    write(workspace / "a/b/CLAUDE.md", "- Separator name\n")
+    write(workspace / "bad..name/CLAUDE.md", "- Dotdot inside the name\n")
+    write(workspace / "back\\slash/CLAUDE.md", "- Backslash name\n")
+    errors = []
+    docs = match.rule_docs(home, ["../escape", "a/b", "bad..name", "back\\slash"], workspace, errors)
+    assert docs == [] and errors == []
+
+
+def test_rule_docs_containment_check_rejects_a_symlink_out_of_the_workspace(tmp_path):
+    home, workspace = tmp_path / "home", tmp_path / "workspace"
+    workspace.mkdir()
+    write(tmp_path / "outside/CLAUDE.md", "- Outside the workspace\n")
+    (workspace / "linked").symlink_to(tmp_path / "outside")
+    write(workspace / "inside/CLAUDE.md", "- Inside\n")
+    docs = match.rule_docs(home, ["linked", "inside"], workspace, [])
+    assert [d["text"] for d in docs] == ["Inside"]
 
 
 def test_rule_docs_skip_missing_and_report_read_errors(tmp_path, monkeypatch):
@@ -248,6 +272,14 @@ def test_view_limits_documents_but_keeps_the_whole_sources_idf():
     assert only_b[0]["ref"] == "b"
     # idf is the whole source's (3 documents), not the view's (2): the score matches the full index's
     assert only_b[1] == pytest.approx(index.top(["alpha"], {1})[1])
+    # independently: a document of {alpha, gamma} against the query "alpha", idf over 3 documents
+    # (df alpha=2, gamma=1, count 3): weights alpha 1+ln(4/3), gamma 1+ln(4/2); cosine on alpha only
+    alpha, gamma = 1 + math.log(4 / 3), 1 + math.log(4 / 2)
+    expected = alpha / math.hypot(alpha, gamma)
+    assert expected == pytest.approx(0.6053, abs=1e-4)
+    assert only_b[1] == pytest.approx(expected)
+    # recomputed over the two allowed documents only (df alpha=2, gamma=1, count 2) it would be 0.7071
+    assert only_b[1] != pytest.approx(0.7071, abs=1e-3)
     assert match.best_candidate("alpha", {"memory": index.view({2})}) is None
 
 
@@ -270,3 +302,39 @@ def test_gate_prompt_fills_each_placeholder_once():
     assert match.gate("lesson <<C>> <<S>>", candidate, runner) is True
     # text that looks like a placeholder is data, not a second substitution
     assert "lesson <<C>> <<S>>" in seen["p"] and "(memory) cand <<A>> <<S>>" in seen["p"]
+
+
+def test_fence_closes_only_on_the_same_character_and_enough_of_it(tmp_path):
+    text = "Visible rule " * 8
+    hidden = "hidden " * 30
+    # a four-backtick fence is not closed by a three-backtick line
+    path = write(tmp_path / "A.md", text + "\n\n````\n```\n" + hidden + "\n```\n" + hidden + "\n````\n\n" + text + "again")
+    assert [p for _, p in match.rule_paragraphs(path)] == [text.strip(), text + "again"]
+    # a tilde fence is not closed by backticks
+    path = write(tmp_path / "B.md", text + "\n\n~~~\n" + hidden + "\n```\n" + hidden + "\n~~~\n\n" + text + "again")
+    assert [p for _, p in match.rule_paragraphs(path)] == [text.strip(), text + "again"]
+    # a closing fence may be longer than the opening one, but not shorter
+    path = write(tmp_path / "C.md", "- Shown\n````\n- Hidden\n```\n- Still hidden\n`````\n- Also shown\n")
+    assert [b for _, b in match.rule_bullets(path)] == ["Shown", "Also shown"]
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
+@pytest.mark.parametrize("blocked", [".claude/skills", ".claude/plugins/cache",
+                                     ".claude/plugins/cache/market", ".claude/plugins/cache/market/plugin/1.0.0/skills"])
+def test_rule_docs_report_an_unreadable_directory(tmp_path, blocked):
+    home = tmp_path / "home"
+    write(home / ".claude/skills/local/SKILL.md", "Local rule " * 10)
+    write(home / ".claude/plugins/cache/market/plugin/1.0.0/skills/demo/SKILL.md", "Plugin rule " * 10)
+    target = home / blocked
+    target.chmod(0)
+    errors = []
+    try:
+        match.rule_docs(home, [], tmp_path, errors)
+    finally:
+        target.chmod(0o700)
+    assert [Path(e["path"]) for e in errors] == [target]
+
+
+def test_rule_docs_missing_directories_are_not_errors(tmp_path):
+    errors = []
+    assert match.rule_docs(tmp_path / "home", [], tmp_path, errors) == [] and errors == []

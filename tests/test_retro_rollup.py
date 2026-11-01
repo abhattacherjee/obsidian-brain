@@ -1898,7 +1898,88 @@ def test_unreadable_rule_file_is_skipped_with_error(menv, capsys):
     assert run(menv.base, "match") == 1
     out = capsys.readouterr().out
     assert "CLAUDE.md" in out
-    assert lesson_of(menv.state, "Follow rule A")[1]["match"]["ref"] == "feedback_preflight"  # others saved
+    # a partial rule set could hide the covering rule: nothing is checked, nothing is recorded
+    assert all("match" not in r for r in state_of(menv.state)["lessons"].values())
+    assert menv.gate == []
+
+
+def test_rule_read_error_keeps_the_previous_match(menv, capsys):
+    menv.memory("feedback_preflight", PREFLIGHT_DOC)
+    assert run(menv.base, "update") == 0 and run(menv.base, "match") == 0
+    before = lesson_of(menv.state, "Follow rule A")[1]["match"]
+    assert before["ref"] == "feedback_preflight"
+    (Path.home() / ".claude").mkdir(exist_ok=True)
+    (Path.home() / ".claude/CLAUDE.md").mkdir()  # reading a directory raises OSError
+    menv.gate_reply = lambda p: json.dumps({"covers": False})  # would overwrite the match if asked
+    capsys.readouterr()
+    assert run(menv.base, "match", "--all") == 1
+    assert "CLAUDE.md" in capsys.readouterr().out
+    assert lesson_of(menv.state, "Follow rule A")[1]["match"] == before
+    assert len(menv.gate) == 1  # only the first run asked
+
+
+def test_invalid_configured_project_repo_leaves_lessons_unchecked(menv, monkeypatch, capsys):
+    import obsidian_utils
+    menv.memory("feedback_preflight", PREFLIGHT_DOC)
+    assert run(menv.base, "update") == 0 and run(menv.base, "match") == 0
+    before = lesson_of(menv.state, "Follow rule A")[1]["match"]
+    monkeypatch.setattr(obsidian_utils, "load_config",
+                        lambda: {"project_repos": {"p1": "not a repo!", "p2": "o/r"}})
+    menv.gate_reply = lambda p: json.dumps({"covers": False})
+    capsys.readouterr()
+    assert run(menv.base, "match", "--all") == 1
+    out = capsys.readouterr().out
+    assert "p1" in out and "project_repos" in out
+    assert lesson_of(menv.state, "Follow rule A")[1]["match"] == before
+    assert len(menv.gate) == 1
+
+
+def test_unconfigured_project_without_an_origin_is_not_an_error(menv, monkeypatch):
+    import obsidian_utils
+    menv.memory("feedback_preflight", PREFLIGHT_DOC)
+    monkeypatch.setattr(obsidian_utils, "load_config", lambda: {"project_repos": {}})
+    monkeypatch.setattr(retro_rollup, "_origin_repo", lambda project: None)
+    assert run(menv.base, "update") == 0
+    assert run(menv.base, "match") == 0
+    assert lesson_of(menv.state, "Follow rule A")[1]["match"]["ref"] == "feedback_preflight"
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
+def test_unreadable_skills_dir_leaves_lessons_unchecked(menv, capsys):
+    menv.memory("feedback_preflight", PREFLIGHT_DOC)
+    skills = Path.home() / ".claude/skills"
+    skills.mkdir(parents=True)
+    assert run(menv.base, "update") == 0
+    capsys.readouterr()
+    skills.chmod(0)
+    try:
+        assert run(menv.base, "match") == 1
+        assert "skills" in capsys.readouterr().out
+    finally:
+        skills.chmod(0o700)
+    assert all("match" not in r for r in state_of(menv.state)["lessons"].values())
+    assert menv.gate == []
+
+
+def test_accepted_local_match_clears_a_stale_gone_marker(menv):
+    menv.memory("feedback_preflight", PREFLIGHT_DOC)
+    assert run(menv.base, "update") == 0
+    edit_state(menv.state, lambda s: s["tracking"].update({"memory:feedback_preflight": {"exists": False}}))
+    assert run(menv.base, "match") == 0
+    s = state_of(menv.state)
+    _, a = lesson_of(menv.state, "Follow rule A")
+    assert a["match"]["ref"] == "feedback_preflight"
+    assert s["tracking"]["memory:feedback_preflight"] == {"exists": True}
+    assert a["classify"]["tracking_gone"] is False and a["classify"]["bucket"] != "file"
+
+
+def test_a_matched_issues_facts_are_recorded_by_match_itself(menv):
+    menv.issues["o/r"] = [{**ISSUE_7, "state": "CLOSED", "closedAt": "2026-10-09T09:00:00Z",
+                           "milestone": {"title": "v3.10"}, "labels": [{"name": "P2-medium"}]}]
+    assert run(menv.base, "update") == 0 and run(menv.base, "match") == 0
+    assert state_of(menv.state)["tracking"]["issue:o/r#7"] == {
+        "exists": True, "state": "CLOSED", "milestone": "v3.10", "priority": "P2-medium",
+        "created": "2026-10-05", "closed": "2026-10-09"}
 
 
 def test_haiku_non_answer_is_not_cached_as_no_match(menv, capsys):
