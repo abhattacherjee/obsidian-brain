@@ -621,11 +621,17 @@ def match_lessons(ctx: Ctx, state: dict, *, recheck: bool = False) -> dict:
     projects = sorted({item["project"] for item in by_key.values()})
     rule_errors: list = []
     rules, seen = [], set()
-    for root in roots:
-        for doc in lessons_match.rule_docs(home, projects, root, rule_errors):
-            if (doc["ref"], doc["line"]) not in seen:
-                seen.add((doc["ref"], doc["line"]))
-                rules.append(doc)
+    try:
+        for root in roots:
+            for doc in lessons_match.rule_docs(home, projects, root, rule_errors):
+                if (doc["ref"], doc["line"]) not in seen:
+                    seen.add((doc["ref"], doc["line"]))
+                    rules.append(doc)
+    except OSError as exc:
+        # The rules could not be listed: like a memory scan error, check nothing rather than record "no match".
+        errors.append({"ref": "rules", "error": str(exc)[:200]})
+        summary["unchecked"] = len(todo)
+        return summary
     errors.extend({"ref": e["path"], "error": e["error"]}
                   for e in {e["path"]: e for e in rule_errors}.values())
     project_rules = {p: {_home_ref(home, root / p / "CLAUDE.md") for root in roots} for p in projects}

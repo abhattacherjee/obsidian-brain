@@ -74,7 +74,7 @@ def _outside_fences(path: Path):
     """Yield line numbers and text, with boundaries at blank lines and fences."""
     fenced = False
     for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-        if line.lstrip().startswith("```"):
+        if line.lstrip().startswith(("```", "~~~")):
             fenced = not fenced
             yield number, ""
         elif not fenced:
@@ -256,8 +256,9 @@ def gate(anchor: str, candidate: dict, runner) -> bool | None:
     source = candidate["source"]
     if source == "issue" and candidate.get("state") in ("OPEN", "CLOSED"):
         source += ", " + candidate["state"].lower()
-    prompt = GATE_PROMPT.replace("<<A>>", anchor).replace("<<S>>", source).replace(
-        "<<C>>", candidate["text"][:800])
+    fill = {"<<A>>": anchor, "<<S>>": source, "<<C>>": candidate["text"][:800]}
+    # One pass: text that looks like a placeholder inside the lesson or candidate stays as it is.
+    prompt = re.sub("<<[ASC]>>", lambda m: fill[m.group()], GATE_PROMPT)
     for _ in range(2):
         verdict = parse_gate(runner(prompt))
         if verdict is not None:

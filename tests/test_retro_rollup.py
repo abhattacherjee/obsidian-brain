@@ -2099,3 +2099,18 @@ def test_a_lesson_sees_its_own_projects_rules_not_other_projects(menv, monkeypat
     assert run(menv.base, "match") == 0
     _, a = lesson_of(menv.state, "Follow rule A")
     assert a["match"]["kind"] == "path" and a["match"]["ref"] == str(root / "p1" / "CLAUDE.md")
+
+
+def test_rule_scan_that_raises_leaves_lessons_unchecked_and_exits_1(menv, monkeypatch, capsys):
+    menv.memory("feedback_preflight", PREFLIGHT_DOC)
+
+    def boom(*args):
+        raise PermissionError("cannot list the skills folder")
+
+    monkeypatch.setattr(lessons_match, "rule_docs", boom)
+    assert run(menv.base, "update") == 0
+    capsys.readouterr()
+    assert run(menv.base, "match") == 1
+    assert "cannot list the skills folder" in capsys.readouterr().out
+    assert all("match" not in r for r in state_of(menv.state)["lessons"].values())
+    assert menv.gate == []

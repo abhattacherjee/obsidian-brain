@@ -249,3 +249,24 @@ def test_view_limits_documents_but_keeps_the_whole_sources_idf():
     # idf is the whole source's (3 documents), not the view's (2): the score matches the full index's
     assert only_b[1] == pytest.approx(index.top(["alpha"], {1})[1])
     assert match.best_candidate("alpha", {"memory": index.view({2})}) is None
+
+
+def test_tilde_fences_hide_their_lines_too(tmp_path):
+    text = "Visible rule " * 8
+    path = write(tmp_path / "SKILL.md", text + "\n\n~~~\n" + "hidden " * 30 + "\n~~~\n\n" + text + "again")
+    assert [p for _, p in match.rule_paragraphs(path)] == [text.strip(), text + "again"]
+    bullets = write(tmp_path / "CLAUDE.md", "- Shown\n~~~\n- Hidden\n~~~\n- Also shown\n")
+    assert [b for _, b in match.rule_bullets(bullets)] == ["Shown", "Also shown"]
+
+
+def test_gate_prompt_fills_each_placeholder_once():
+    seen = {}
+
+    def runner(prompt):
+        seen["p"] = prompt
+        return '{"covers": true}'
+
+    candidate = {"source": "memory", "text": "cand <<A>> <<S>>"}
+    assert match.gate("lesson <<C>> <<S>>", candidate, runner) is True
+    # text that looks like a placeholder is data, not a second substitution
+    assert "lesson <<C>> <<S>>" in seen["p"] and "(memory) cand <<A>> <<S>>" in seen["p"]
