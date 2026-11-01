@@ -435,28 +435,50 @@ def test_backfill_traces_the_first_of_two_identical_items(env, tmp_path):
                      "- [ ] Run preflight alone RULE-A"]
 
 
+def _tree(vault, state):
+    """Every lesson file, the state file and the retired list, as bytes."""
+    d = vault / "claude-insights" / "lessons"
+    files = {str(p.relative_to(d)): p.read_bytes() for p in sorted(d.rglob("*")) if p.is_file()}
+    return files, (state / "lessons-state.json").read_bytes()
+
+
 @pytest.mark.parametrize("cmd", ["update", "rebuild", "refresh-tracking"])
-def test_unreadable_note_keeps_vanishing_lessons_and_exits_1(env, cmd, capsys):
+def test_unreadable_note_with_lessons_leaves_everything_as_it_was_and_exits_1(env, cmd, capsys):
     vault, state, base = env
     assert run(base, "update") == 0
     lid_b, s = _lesson_with(state, 2)  # RULE-B spans a1 and b2 only
     p = vault / "claude-insights" / "lessons" / s["notes"][lid_b]
     p.write_text(p.read_text().replace("snoozed_until: null", 'snoozed_until: "2026-12-01"'))
-    kept_text, rows = p.read_text(), _cache_rows(state)
+    before, rows = _tree(vault, state), _cache_rows(state)
     b2 = vault / "claude-insights" / "2026-10-08-retro-b2.md"
-    good = b2.read_text()
     b2.write_text("---\ntype: claude-retro\n")
     capsys.readouterr()
     assert run(base, cmd) == 1
     err = capsys.readouterr().err
-    assert "1 unreadable" in err and lid_b in err
-    assert p.read_text() == kept_text
+    assert "1 unreadable" in err and str(b2) in err and "left as they were" in err
+    assert _tree(vault, state) == before
     assert _cache_rows(state) == rows
-    s2 = state_of(state)
-    assert s2["lessons"][lid_b] == s["lessons"][lid_b] and s2["notes"][lid_b] == s["notes"][lid_b]
-    b2.write_text(good)
-    assert run(base, "rebuild") == 0
-    assert lid_b in state_of(state)["lessons"] and 'snoozed_until: "2026-12-01"' in p.read_text()
+
+
+def test_unreadable_note_never_puts_one_item_in_two_lessons(grouped):
+    vault, state, base = grouped
+    # LA = notes 1-4 (G1), LB = notes 5-6 (G2); note 1 then becomes unreadable.
+    _notes_with_tags(vault, {1: "G1", 2: "G1", 3: "G1", 4: "G1", 5: "G2", 6: "G2"})
+    assert run(base, "update") == 0
+    before = _tree(vault, state)
+    (vault / "claude-insights" / "2026-10-01-retro-n1.md").write_text("---\ntype: claude-retro\n")
+    assert run(base, "update") == 1
+    assert _tree(vault, state) == before
+    members = [k for l in state_of(state)["lessons"].values() for k in l["members"]]
+    assert len(members) == len(set(members)) == 6
+
+
+def test_unreadable_note_with_no_lessons_still_groups_the_readable_items(env, capsys):
+    vault, state, base = env
+    (vault / "claude-insights" / "2026-10-20-retro-bad.md").write_text("---\ntype: claude-retro\n")
+    assert run(base, "update") == 1
+    assert len(state_of(state)["lessons"]) == 2
+    assert "1 unreadable" in capsys.readouterr().err
 
 
 def test_unreadable_note_runs_clean_after_it_is_fixed_and_prunes(env):
@@ -631,3 +653,45 @@ def test_merged_lesson_keeps_the_snooze_of_a_retired_id(grouped):
     assert _snoozed_dates(vault, state) == {survivor: "2026-12-01"}
     assert json.loads((vault / "claude-insights" / "lessons" / "retired.json").read_text()) == {
         retiring: {"merged_into": survivor}}
+
+
+def test_memory_scan_error_keeps_a_known_gone_memory_ref_gone(env, tmp_path, monkeypatch, capsys):
+    vault, state, base = env
+    _trace_items(vault, "2026-10-01-retro-a1.md", {"Grep callers first RULE-B": "memory `feedback_gone`"})
+    assert run(base, "update") == 0
+    import memory_sources
+    monkeypatch.setattr(memory_sources, "memory_sources", lambda host, *a, **k: [])
+    assert run(base, "refresh-tracking") == 0
+    assert state_of(state)["tracking"]["memory:feedback_gone"] == {"exists": False}
+
+    def failing(host, config=None, errors=None):
+        errors.append({"path": "/denied", "error": "permission denied"})
+        return []
+
+    monkeypatch.setattr(memory_sources, "memory_sources", failing)
+    assert run(base, "refresh-tracking") == 1
+    assert state_of(state)["tracking"]["memory:feedback_gone"] == {"exists": False}
+    f = _accept(tmp_path, state, "feedback_gone")
+    capsys.readouterr()
+    assert run(base, "backfill", "--apply", "--accept", str(f)) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert [e["reason"] for e in result["skipped_entries"]] == ["tracking gone"]
+
+
+def test_split_child_with_a_new_id_keeps_the_since_of_the_lesson_it_came_from(grouped, tmp_path):
+    vault, state, base = grouped
+    _notes_with_tags(vault, {1: "G1", 2: "G1", 3: "G1 G2", 4: "G2", 5: "G2"})
+    _trace_items(vault, "2026-10-05-retro-n5.md", {"Do the thing number 5 G2": "memory `feedback_x`"})
+    assert run(base, "update") == 0
+    (old_id,) = state_of(state)["lessons"]
+    assert state_of(state)["lessons"][old_id]["tracking"]["since"] == "2026-10-05"
+    f = _accept(tmp_path, state, "feedback_x")
+    assert run(base, "backfill", "--apply", "--accept", str(f)) == 0  # older notes now carry the trace
+    (vault / "claude-insights" / "2026-10-03-retro-n3.md").unlink()  # the bridge goes: a split
+    assert run(base, "update") == 0
+    s = state_of(state)
+    assert len(s["lessons"]) == 2
+    assert {l.get("split_from") for l in s["lessons"].values()} == {None, old_id}
+    for rec in s["lessons"].values():
+        assert rec["tracking"]["since"] == "2026-10-05"
+        assert rec["classify"]["bucket"] == "quiet"

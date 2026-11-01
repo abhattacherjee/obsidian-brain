@@ -183,7 +183,7 @@ def regroup(ctx: Ctx, state: dict, *, judge: bool, note: str | None = None, cach
         # Retro notes missing mid-sync or all unreadable: keep notes and state as they are.
         raise Refused(f"no retro items found in {ctx.insights!r} ({len(skipped)} unreadable); "
                       f"refusing to drop {len(state['lessons'])} lessons")
-    unreadable = bool(skipped)  # an unreadable note hides items: never prune or delete on partial data
+    unreadable = bool(skipped)  # an unreadable note hides items: never prune on partial data
     texts = {k: v["text"] for k, v in by_key.items()}
     note_of = {k: v["note"] for k, v in by_key.items()}
     _ensure_state_dir(ctx)
@@ -212,6 +212,11 @@ def regroup(ctx: Ctx, state: dict, *, judge: bool, note: str | None = None, cach
         if own_cache:
             cache.close()
 
+    if unreadable and state["lessons"]:
+        # Regrouping hidden items would split or drop lessons: leave notes, state and retired.json alone.
+        raise Refused(f"{len(skipped)} unreadable retro notes (first: {skipped[0]['path']}); "
+                      f"lessons were left as they were")
+
     lessons = lessons_group.star_lessons(sorted(by_key), edges, note_of)
     old = {lid: rec["members"] for lid, rec in state["lessons"].items()}
     retired_before = _load_retired(ctx)
@@ -225,8 +230,9 @@ def regroup(ctx: Ctx, state: dict, *, judge: bool, note: str | None = None, cach
     for lesson in lessons:
         lid = lesson["id"]
         lesson["name"] = state["lessons"].get(lid, {}).get("name") or names.get(lid) or lid
-        tracking = lessons_group.lesson_tracking(
-            lesson["members"], by_key, state["lessons"].get(lid, {}).get("tracking"))
+        # `since` is sticky for the id's own record; a split child with a new id inherits its parent's.
+        prev_rec = state["lessons"].get(lid) or state["lessons"].get(lesson.get("split_from")) or {}
+        tracking = lessons_group.lesson_tracking(lesson["members"], by_key, prev_rec.get("tracking"))
         info = state["tracking"].get(_tracking_key(tracking)) if tracking else None
         c = lessons_group.classify(lesson, by_key, tracking, info, ctx.today, ctx.recent_days)
         snooze = snoozes.get(lid)
@@ -247,18 +253,6 @@ def regroup(ctx: Ctx, state: dict, *, judge: bool, note: str | None = None, cach
             rec["split_from"] = lesson["split_from"]
         out_lessons[lid] = rec
         out_notes[lid] = filename
-
-    kept = []
-    if unreadable:
-        # Keep every old lesson that would vanish: its state record and its note stay as they were.
-        for lid, rec in state["lessons"].items():
-            if lid not in out_lessons:
-                out_lessons[lid] = rec
-                if lid in old_notes:
-                    out_notes[lid] = old_notes[lid]
-                if lid not in retired_before:
-                    retired.pop(lid, None)
-                kept.append(lid)
 
     removed = 0
     for lid, filename in old_notes.items():
@@ -285,17 +279,15 @@ def regroup(ctx: Ctx, state: dict, *, judge: bool, note: str | None = None, cach
     save_state(ctx, state)
     return {"lessons": len(out_lessons), "new": len(new), "items_in_lessons": in_lessons,
             "unjudged": unjudged, "failed": verify["failed"], "notes_written": written,
-            "notes_removed": removed, "unreadable": len(skipped),
-            "kept": [f"{lid} ({out_lessons[lid]['name']})" for lid in kept]}
+            "notes_removed": removed, "unreadable": len(skipped)}
 
 
 def _report_unreadable(summary: dict) -> bool:
-    """Say which lessons were kept because retro notes were unreadable; True when any were."""
+    """Say that retro notes were unreadable (only reached with no prior lessons); True when any were."""
     if not summary["unreadable"]:
         return False
-    kept = ", ".join(summary["kept"]) or "none"
-    print(f"retro_rollup: {summary['unreadable']} unreadable retro notes; nothing was pruned or deleted; "
-          f"kept lessons: {kept}", file=sys.stderr)
+    print(f"retro_rollup: {summary['unreadable']} unreadable retro notes; nothing was pruned",
+          file=sys.stderr)
     return True
 
 
@@ -365,8 +357,11 @@ def refresh_tracking(ctx: Ctx, state: dict) -> list[dict]:
                 memory_failed = bool(scan_errors)
                 errors.extend({"ref": e.get("path", "memory"), "error": e.get("error", "memory scan failed")}
                               for e in scan_errors)
-            # A scan that hit errors cannot say a stem is gone.
-            state["tracking"][key] = {"exists": None if memory_failed else t["ref"] in memory_stems}
+            # A scan that hit errors cannot say a stem is gone or back: keep what was there.
+            if memory_failed:
+                state["tracking"].setdefault(key, {"exists": None})
+            else:
+                state["tracking"][key] = {"exists": t["ref"] in memory_stems}
         elif t["kind"] == "path":
             raw = t["ref"]
             if raw.startswith(("~", "/")):
