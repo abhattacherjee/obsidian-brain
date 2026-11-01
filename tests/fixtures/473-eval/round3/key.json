@@ -1,0 +1,493 @@
+{
+ "065f6af9a574": {
+  "item": "2faec2fa",
+  "random": true,
+  "sets": [],
+  "unit": "L45b4158b"
+ },
+ "0a37873eef05": {
+  "item": "9c89cea4",
+  "random": false,
+  "sets": [
+   "design",
+   "tfidf1"
+  ],
+  "unit": "L5ab63e45"
+ },
+ "0cad80db410c": {
+  "item": "c03edeb6",
+  "random": true,
+  "sets": [
+   "design",
+   "tfidf1"
+  ],
+  "unit": "Le21c835a"
+ },
+ "12600e8d5336": {
+  "item": "97560d8c",
+  "random": false,
+  "sets": [
+   "design",
+   "tfidf1"
+  ],
+  "unit": "L3d7a8668"
+ },
+ "12f6c9513e77": {
+  "item": "bc3e6f71",
+  "random": false,
+  "sets": [
+   "design",
+   "tfidf1"
+  ],
+  "unit": "Lec338084"
+ },
+ "15b05ce7d57d": {
+  "item": "e75b2de8",
+  "random": false,
+  "sets": [
+   "design",
+   "tfidf1"
+  ],
+  "unit": "Lbcbf5105"
+ },
+ "189f707de3b9": {
+  "item": "5de2f6a6",
+  "random": false,
+  "sets": [
+   "design"
+  ],
+  "unit": "Lbcbf5105"
+ },
+ "1c872240e97f": {
+  "item": "122383b2",
+  "random": true,
+  "sets": [
+   "design",
+   "tfidf1"
+  ],
+  "unit": "L1cc2771c"
+ },
+ "1db028954ef7": {
+  "item": "904c9b5c",
+  "random": true,
+  "sets": [
+   "design"
+  ],
+  "unit": "L5ab63e45"
+ },
+ "203fcd3eb147": {
+  "item": "7d1c4935",
+  "random": true,
+  "sets": [
+   "tfidf1"
+  ],
+  "unit": "Lb8b05876"
+ },
+ "211884d0ba33": {
+  "item": "8504bf21",
+  "random": false,
+  "sets": [
+   "design",
+   "tfidf1"
+  ],
+  "unit": "Lcd47d288"
+ },
+ "2ab21066caa3": {
+  "item": "3f077255",
+  "random": true,
+  "sets": [],
+  "unit": "L12775254"
+ },
+ "2d7052b44ce8": {
+  "item": "3773640c",
+  "random": false,
+  "sets": [
+   "design"
+  ],
+  "unit": "Lec338084"
+ },
+ "3f09e6a37644": {
+  "item": "0438e71a",
+  "random": false,
+  "sets": [
+   "design"
+  ],
+  "unit": "Lb8b05876"
+ },
+ "3f7c49bcab7d": {
+  "item": "5eaaeb1d",
+  "random": false,
+  "sets": [
+   "design"
+  ],
+  "unit": "Lddca6bd8"
+ },
+ "46eab9297e69": {
+  "item": "0634d945",
+  "random": false,
+  "sets": [
+   "design",
+   "tfidf1"
+  ],
+  "unit": "L12775254"
+ },
+ "5054cd5f7988": {
+  "item": "7908f3e7",
+  "random": true,
+  "sets": [],
+  "unit": "Lf993b00e"
+ },
+ "543ef21e183b": {
+  "item": "8c7576b8",
+  "random": false,
+  "sets": [
+   "design",
+   "tfidf1"
+  ],
+  "unit": "Ld6766526"
+ },
+ "590a3705b525": {
+  "item": "d2712da7",
+  "random": true,
+  "sets": [],
+  "unit": "Lf993b00e"
+ },
+ "5dfbc6067611": {
+  "item": "265f183c",
+  "random": true,
+  "sets": [
+   "design",
+   "tfidf1"
+  ],
+  "unit": "L45b4158b"
+ },
+ "61387199d816": {
+  "item": "e0f2f8e5",
+  "random": true,
+  "sets": [],
+  "unit": "L74175361"
+ },
+ "618b5cb680e5": {
+  "item": "1747ede4",
+  "random": true,
+  "sets": [],
+  "unit": "Lddca6bd8"
+ },
+ "618c9ae428b0": {
+  "item": "d66a08f2",
+  "random": true,
+  "sets": [],
+  "unit": "L4200b82c"
+ },
+ "61ab3180f638": {
+  "item": "a6c50d71",
+  "random": false,
+  "sets": [
+   "design"
+  ],
+  "unit": "Lec338084"
+ },
+ "655ec80febd3": {
+  "item": "f054bc4a",
+  "random": true,
+  "sets": [],
+  "unit": "L3d7a8668"
+ },
+ "679626600a75": {
+  "item": "2c0a90fe",
+  "random": false,
+  "sets": [
+   "design",
+   "tfidf1"
+  ],
+  "unit": "L330c6e3c"
+ },
+ "6cfdf96c5ff8": {
+  "item": "c7f8be53",
+  "random": true,
+  "sets": [],
+  "unit": "L9aa6bf1c"
+ },
+ "7c35033040f5": {
+  "item": "a0052648",
+  "random": true,
+  "sets": [],
+  "unit": "L330c6e3c"
+ },
+ "844d13c23a72": {
+  "item": "9a7afdda",
+  "random": true,
+  "sets": [
+   "design",
+   "tfidf1"
+  ],
+  "unit": "L84043eed"
+ },
+ "868694abe19f": {
+  "item": "45974e8e",
+  "random": true,
+  "sets": [],
+  "unit": "L4200b82c"
+ },
+ "8697d06f28ae": {
+  "item": "ad150af2",
+  "random": false,
+  "sets": [
+   "design",
+   "tfidf1"
+  ],
+  "unit": "Lf993b00e"
+ },
+ "89b6c959df42": {
+  "item": "0ef23eac",
+  "random": false,
+  "sets": [
+   "design",
+   "tfidf1"
+  ],
+  "unit": "L5c36698a"
+ },
+ "8a4cf8150edd": {
+  "item": "ec7ad716",
+  "random": true,
+  "sets": [],
+  "unit": "Lec338084"
+ },
+ "8c004e766edd": {
+  "item": "9a9f80d8",
+  "random": true,
+  "sets": [],
+  "unit": "Le21c835a"
+ },
+ "8f5ee13ff852": {
+  "item": "ec2a3eef",
+  "random": true,
+  "sets": [],
+  "unit": "L5ab63e45"
+ },
+ "944f61ed0755": {
+  "item": "bdaad1d4",
+  "random": true,
+  "sets": [],
+  "unit": "Lb8b05876"
+ },
+ "949972ebc60d": {
+  "item": "f5fceedb",
+  "random": true,
+  "sets": [],
+  "unit": "L12775254"
+ },
+ "963534cea8c8": {
+  "item": "59151939",
+  "random": true,
+  "sets": [],
+  "unit": "Ld145465e"
+ },
+ "9fba37ff67e6": {
+  "item": "1203dd64",
+  "random": true,
+  "sets": [],
+  "unit": "L74175361"
+ },
+ "a02693dfa702": {
+  "item": "602edb22",
+  "random": true,
+  "sets": [],
+  "unit": "L9aa6bf1c"
+ },
+ "a2590a9d397a": {
+  "item": "1236bc27",
+  "random": false,
+  "sets": [
+   "design"
+  ],
+  "unit": "Lddca6bd8"
+ },
+ "a37b1543b335": {
+  "item": "c44e2230",
+  "random": true,
+  "sets": [],
+  "unit": "Lec338084"
+ },
+ "ac19e9bfbd35": {
+  "item": "d8e1a6a8",
+  "random": true,
+  "sets": [
+   "design"
+  ],
+  "unit": "Lddca6bd8"
+ },
+ "b2a8b29f1404": {
+  "item": "078bd7ee",
+  "random": true,
+  "sets": [],
+  "unit": "L5c36698a"
+ },
+ "b450cf39aea2": {
+  "item": "f47ec6d8",
+  "random": true,
+  "sets": [],
+  "unit": "Ld6766526"
+ },
+ "b4c93a791c4b": {
+  "item": "2d18480a",
+  "random": true,
+  "sets": [],
+  "unit": "Ld145465e"
+ },
+ "bbe9a780c132": {
+  "item": "579ae0f2",
+  "random": true,
+  "sets": [],
+  "unit": "L330c6e3c"
+ },
+ "bf4cb5bca7ad": {
+  "item": "e897da04",
+  "random": false,
+  "sets": [
+   "design",
+   "tfidf1"
+  ],
+  "unit": "Lddca6bd8"
+ },
+ "bf9601f1a2df": {
+  "item": "89f81870",
+  "random": true,
+  "sets": [],
+  "unit": "L5c36698a"
+ },
+ "c18fa109751d": {
+  "item": "9c729c71",
+  "random": false,
+  "sets": [
+   "design"
+  ],
+  "unit": "L5c36698a"
+ },
+ "c19f4aacaae1": {
+  "item": "6977c472",
+  "random": true,
+  "sets": [],
+  "unit": "L84043eed"
+ },
+ "c32fb0e2c19c": {
+  "item": "1760f7cb",
+  "random": true,
+  "sets": [],
+  "unit": "L3d7a8668"
+ },
+ "c560f586d3b5": {
+  "item": "fcd6934b",
+  "random": true,
+  "sets": [],
+  "unit": "L1cc2771c"
+ },
+ "c74d676ea462": {
+  "item": "8e248586",
+  "random": true,
+  "sets": [],
+  "unit": "Lbcbf5105"
+ },
+ "cc7675f0a3e1": {
+  "item": "3d582786",
+  "random": false,
+  "sets": [
+   "design"
+  ],
+  "unit": "Lb8b05876"
+ },
+ "d0c388a34165": {
+  "item": "0b3f56e8",
+  "random": false,
+  "sets": [
+   "design"
+  ],
+  "unit": "L45b4158b"
+ },
+ "dd48c78fa606": {
+  "item": "42457ba9",
+  "random": true,
+  "sets": [],
+  "unit": "Ld6766526"
+ },
+ "e0747a76fcda": {
+  "item": "930ecd13",
+  "random": false,
+  "sets": [
+   "design"
+  ],
+  "unit": "L330c6e3c"
+ },
+ "e5664404a271": {
+  "item": "4b2439be",
+  "random": false,
+  "sets": [
+   "design",
+   "tfidf1"
+  ],
+  "unit": "L9aa6bf1c"
+ },
+ "e76ba90a8723": {
+  "item": "d45cb6eb",
+  "random": false,
+  "sets": [
+   "design",
+   "tfidf1"
+  ],
+  "unit": "Ld145465e"
+ },
+ "e7f59f406f36": {
+  "item": "c20754d7",
+  "random": true,
+  "sets": [
+   "design"
+  ],
+  "unit": "Lcd47d288"
+ },
+ "e9953f3b1a72": {
+  "item": "cf6d91e2",
+  "random": false,
+  "sets": [
+   "design",
+   "tfidf1"
+  ],
+  "unit": "L4200b82c"
+ },
+ "ed5359a1c48a": {
+  "item": "17c333bf",
+  "random": false,
+  "sets": [
+   "design"
+  ],
+  "unit": "Ld145465e"
+ },
+ "ed709e2af64d": {
+  "item": "6846f13a",
+  "random": false,
+  "sets": [
+   "design"
+  ],
+  "unit": "L330c6e3c"
+ },
+ "f64da98baddb": {
+  "item": "cd709155",
+  "random": true,
+  "sets": [],
+  "unit": "Lbcbf5105"
+ },
+ "f9487cbe7cf9": {
+  "item": "eb470538",
+  "random": true,
+  "sets": [],
+  "unit": "Lcd47d288"
+ },
+ "fe2d4944e2bd": {
+  "item": "af72479f",
+  "random": false,
+  "sets": [
+   "design",
+   "tfidf1"
+  ],
+  "unit": "L74175361"
+ }
+}

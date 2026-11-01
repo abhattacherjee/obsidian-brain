@@ -1,0 +1,270 @@
+[
+ {
+  "id": "065f6af9a574",
+  "label": "drop"
+ },
+ {
+  "id": "0a37873eef05",
+  "label": "keep"
+ },
+ {
+  "id": "0cad80db410c",
+  "label": "keep"
+ },
+ {
+  "id": "12600e8d5336",
+  "label": "keep"
+ },
+ {
+  "id": "12f6c9513e77",
+  "label": "keep"
+ },
+ {
+  "id": "15b05ce7d57d",
+  "label": "keep"
+ },
+ {
+  "id": "189f707de3b9",
+  "label": "keep"
+ },
+ {
+  "id": "1c872240e97f",
+  "label": "keep"
+ },
+ {
+  "id": "1db028954ef7",
+  "label": "keep"
+ },
+ {
+  "id": "203fcd3eb147",
+  "label": "keep"
+ },
+ {
+  "id": "211884d0ba33",
+  "label": "keep"
+ },
+ {
+  "id": "2ab21066caa3",
+  "label": "drop"
+ },
+ {
+  "id": "2d7052b44ce8",
+  "label": "keep"
+ },
+ {
+  "id": "3f09e6a37644",
+  "label": "keep"
+ },
+ {
+  "id": "3f7c49bcab7d",
+  "label": "keep"
+ },
+ {
+  "id": "46eab9297e69",
+  "label": "keep"
+ },
+ {
+  "id": "5054cd5f7988",
+  "label": "drop"
+ },
+ {
+  "id": "543ef21e183b",
+  "label": "keep"
+ },
+ {
+  "id": "590a3705b525",
+  "label": "drop"
+ },
+ {
+  "id": "5dfbc6067611",
+  "label": "keep"
+ },
+ {
+  "id": "61387199d816",
+  "label": "drop"
+ },
+ {
+  "id": "618b5cb680e5",
+  "label": "drop"
+ },
+ {
+  "id": "618c9ae428b0",
+  "label": "drop"
+ },
+ {
+  "id": "61ab3180f638",
+  "label": "keep"
+ },
+ {
+  "id": "655ec80febd3",
+  "label": "drop"
+ },
+ {
+  "id": "679626600a75",
+  "label": "keep"
+ },
+ {
+  "id": "6cfdf96c5ff8",
+  "label": "drop"
+ },
+ {
+  "id": "7c35033040f5",
+  "label": "drop"
+ },
+ {
+  "id": "844d13c23a72",
+  "label": "keep"
+ },
+ {
+  "id": "868694abe19f",
+  "label": "drop"
+ },
+ {
+  "id": "8697d06f28ae",
+  "label": "keep"
+ },
+ {
+  "id": "89b6c959df42",
+  "label": "keep"
+ },
+ {
+  "id": "8a4cf8150edd",
+  "label": "drop"
+ },
+ {
+  "id": "8c004e766edd",
+  "label": "drop"
+ },
+ {
+  "id": "8f5ee13ff852",
+  "label": "drop"
+ },
+ {
+  "id": "944f61ed0755",
+  "label": "drop"
+ },
+ {
+  "id": "949972ebc60d",
+  "label": "drop"
+ },
+ {
+  "id": "963534cea8c8",
+  "label": "drop"
+ },
+ {
+  "id": "9fba37ff67e6",
+  "label": "keep"
+ },
+ {
+  "id": "a02693dfa702",
+  "label": "drop"
+ },
+ {
+  "id": "a2590a9d397a",
+  "label": "keep"
+ },
+ {
+  "id": "a37b1543b335",
+  "label": "drop"
+ },
+ {
+  "id": "ac19e9bfbd35",
+  "label": "keep"
+ },
+ {
+  "id": "b2a8b29f1404",
+  "label": "drop"
+ },
+ {
+  "id": "b450cf39aea2",
+  "label": "drop"
+ },
+ {
+  "id": "b4c93a791c4b",
+  "label": "drop"
+ },
+ {
+  "id": "bbe9a780c132",
+  "label": "keep"
+ },
+ {
+  "id": "bf4cb5bca7ad",
+  "label": "keep"
+ },
+ {
+  "id": "bf9601f1a2df",
+  "label": "drop"
+ },
+ {
+  "id": "c18fa109751d",
+  "label": "keep"
+ },
+ {
+  "id": "c19f4aacaae1",
+  "label": "drop"
+ },
+ {
+  "id": "c32fb0e2c19c",
+  "label": "drop"
+ },
+ {
+  "id": "c560f586d3b5",
+  "label": "drop"
+ },
+ {
+  "id": "c74d676ea462",
+  "label": "drop"
+ },
+ {
+  "id": "cc7675f0a3e1",
+  "label": "keep"
+ },
+ {
+  "id": "d0c388a34165",
+  "label": "keep"
+ },
+ {
+  "id": "dd48c78fa606",
+  "label": "drop"
+ },
+ {
+  "id": "e0747a76fcda",
+  "label": "keep"
+ },
+ {
+  "id": "e5664404a271",
+  "label": "keep"
+ },
+ {
+  "id": "e76ba90a8723",
+  "label": "keep"
+ },
+ {
+  "id": "e7f59f406f36",
+  "label": "keep"
+ },
+ {
+  "id": "e9953f3b1a72",
+  "label": "keep"
+ },
+ {
+  "id": "ed5359a1c48a",
+  "label": "keep"
+ },
+ {
+  "id": "ed709e2af64d",
+  "label": "keep"
+ },
+ {
+  "id": "f64da98baddb",
+  "label": "drop"
+ },
+ {
+  "id": "f9487cbe7cf9",
+  "label": "drop"
+ },
+ {
+  "id": "fe2d4944e2bd",
+  "label": "keep"
+ }
+]

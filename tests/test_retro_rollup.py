@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+import lessons_match
 import lessons_verify
 import retro_rollup
 
@@ -286,7 +287,7 @@ def test_report_json_contract_fields(env, capsys):
     assert set(rep) == {"generated", "totals", "lessons"}
     assert set(rep["lessons"][0]) == {
         "id", "name", "bucket", "dormant", "sessions", "recent_sessions", "projects", "first_seen",
-        "last_seen", "tracking", "tracking_ref", "issue_state", "issue_milestone", "issue_priority",
+        "last_seen", "tracking", "tracking_ref", "tracking_source", "issue_state", "issue_milestone", "issue_priority",
         "sessions_after_tracking", "snoozed_until", "members"}
     assert "RULE" not in json.dumps(rep["lessons"][0]["members"])
 
@@ -443,7 +444,7 @@ def _tree(vault, state):
     return files, (state / "lessons-state.json").read_bytes()
 
 
-@pytest.mark.parametrize("cmd", ["update", "rebuild", "refresh-tracking"])
+@pytest.mark.parametrize("cmd", ["update", "rebuild", "refresh-tracking", "match"])
 def test_unreadable_note_with_lessons_leaves_everything_as_it_was_and_exits_1(env, cmd, capsys):
     vault, state, base = env
     assert run(base, "update") == 0
@@ -1667,3 +1668,543 @@ def test_x025_failed_listing_keeps_the_survivors_pending_record_over_an_inherite
     assert s["filed"][survivor] == _pending(survivor, "o/r")  # its marker is kept for a later reconcile
     assert not s["lessons"][survivor].get("tracking")
     assert out["skipped_entries"][0]["reason"] == "cannot check for an earlier filing"
+
+
+# --- matching a lesson to existing tracking (#473) -------------------------------
+
+PREFLIGHT_DOC = ("---\nname: Preflight alone\ndescription: run preflight alone\n---\n"
+                 "Never chain preflight and commit. Preflight as its own call.\n")
+GREP_DOC = ("---\nname: Grep callers\ndescription: grep callers first\n---\n"
+            "Grep every caller before edits.\n")
+ISSUE_7 = {"number": 7, "title": "Run preflight alone",
+           "body": "Never chain preflight and commit; preflight as its own call", "state": "OPEN",
+           "createdAt": "2026-10-05T10:00:00Z", "closedAt": None, "milestone": None, "labels": []}
+
+
+class _R:
+    def __init__(self, returncode=0, stdout=""):
+        self.returncode, self.stdout = returncode, stdout
+
+
+def fake_gate(prompt: str) -> str:
+    """Covers iff the lesson and the candidate talk about the same word (preflight or grep)."""
+    lesson, cand = prompt.split("LESSON:\n", 1)[1].split("\n\nCANDIDATE:\n", 1)
+    word = "preflight" if "preflight" in lesson.lower() else "grep"
+    return json.dumps({"covers": word in cand.lower()})
+
+
+@pytest.fixture
+def menv(env, monkeypatch):
+    """The three-note vault with gh and Haiku faked. Issue listings are served from `issues`;
+    a value that is None fails the listing, a str is raw stdout, an Exception is raised."""
+    import types
+    import obsidian_utils
+    vault, state, base = env
+    monkeypatch.setattr(obsidian_utils, "load_config",
+                        lambda: {"project_repos": {"p1": "o/r", "p2": "o/r"}})
+    ns = types.SimpleNamespace(vault=vault, state=state, base=base, gh=[], gate=[], issues={"o/r": []},
+                               views={}, gate_reply=fake_gate)
+
+    def gh(args, timeout=10):
+        ns.gh.append((list(args), timeout))
+        if args[:2] == ["issue", "view"]:
+            return _R(0, json.dumps(ns.views[args[2]]))
+        assert args[:2] == ["issue", "list"], f"match must only read: {args}"
+        data = ns.issues.get(args[args.index("--repo") + 1])
+        if isinstance(data, Exception):
+            raise data
+        if data is None:
+            return _R(1, "")
+        return _R(0, data if isinstance(data, str) else json.dumps(data))
+
+    def haiku(prompt, timeouts=(120, 240)):
+        if prompt.startswith("You are matching"):
+            ns.gate.append(prompt)
+            return ns.gate_reply(prompt)
+        return fake_haiku(prompt)
+
+    def memory(stem, text, day="2026-10-05"):
+        path = Path.home() / ".claude/projects/proj/memory" / f"{stem}.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        ts = __import__("time").mktime(__import__("time").strptime(day + " 12", "%Y-%m-%d %H"))
+        os.utime(path, (ts, ts))
+        return path
+
+    ns.memory = memory
+    monkeypatch.setattr(retro_rollup, "_run_gh", gh)
+    monkeypatch.setattr(lessons_verify, "run_haiku", haiku)
+    return ns
+
+
+def lesson_of(state: Path, name: str):
+    return next((lid, rec) for lid, rec in state_of(state)["lessons"].items() if rec["name"] == name)
+
+
+def report_json(menv, capsys):
+    capsys.readouterr()
+    assert run(menv.base, "report", "--json") == 0
+    return {l["name"]: l for l in json.loads(capsys.readouterr().out)["lessons"]}
+
+
+def edit_state(state: Path, fn) -> None:
+    s = state_of(state)
+    fn(s)
+    (state / "lessons-state.json").write_text(json.dumps(s))
+
+
+def test_match_accepts_top_candidate_and_lesson_leaves_file_bucket(menv):
+    menv.memory("feedback_preflight", PREFLIGHT_DOC)
+    assert run(menv.base, "update") == 0
+    assert {r["classify"]["bucket"] for r in state_of(menv.state)["lessons"].values()} == {"file"}
+    assert run(menv.base, "match") == 0
+    _, a = lesson_of(menv.state, "Follow rule A")
+    assert a["match"]["kind"] == "memory" and a["match"]["ref"] == "feedback_preflight"
+    assert a["match"]["since"] == "2026-10-05"
+    assert a["tracking"] == {"kind": "memory", "ref": "feedback_preflight",
+                             "since": "2026-10-05", "source": "match"}
+    assert a["classify"]["bucket"] == "rule_not_followed"  # 10-08 and 10-15 are after 10-05
+    assert a["classify"]["sessions_after_tracking"] == 2
+    _, b = lesson_of(menv.state, "Follow rule B")
+    assert b["match"] == {"none": True, "candidate": None}  # nothing to propose
+    assert b["tracking"] is None and b["classify"]["bucket"] == "file"
+    assert len(menv.gate) == 1
+
+
+def test_match_rejected_lesson_stays_in_file_bucket_and_is_not_rechecked(menv):
+    menv.memory("feedback_preflight", PREFLIGHT_DOC)
+    menv.gate_reply = lambda p: json.dumps({"covers": False})
+    assert run(menv.base, "update") == 0
+    assert run(menv.base, "match") == 0
+    _, a = lesson_of(menv.state, "Follow rule A")
+    assert a["match"]["none"] is True and re.fullmatch(r"[0-9a-f]{12}", a["match"]["candidate"])
+    assert a["tracking"] is None and a["classify"]["bucket"] == "file"
+    assert len(menv.gate) == 1
+    assert run(menv.base, "match") == 0 and run(menv.base, "refresh-tracking") == 0
+    assert len(menv.gate) == 1  # same top candidate: no second Haiku call
+
+
+def test_recurring_lesson_keeps_its_match_without_a_haiku_call(menv):
+    menv.memory("feedback_preflight", PREFLIGHT_DOC)
+    assert run(menv.base, "update") == 0 and run(menv.base, "match") == 0
+    lid, before = lesson_of(menv.state, "Follow rule A")
+    note(menv.vault, "2026-10-22-retro-d4.md", "2026-10-22", "p1", ["Preflight again as its own call RULE-A"])
+    assert run(menv.base, "update") == 0
+    lid2, after = lesson_of(menv.state, "Follow rule A")
+    assert lid2 == lid and len(after["members"]) == len(before["members"]) + 1
+    assert after["match"] == before["match"]
+    assert run(menv.base, "match") == 0
+    assert len(menv.gate) == 1 and lesson_of(menv.state, "Follow rule A")[1]["match"] == before["match"]
+
+
+def test_changed_top_candidate_is_regated(menv):
+    first_doc = menv.memory("feedback_preflight", PREFLIGHT_DOC)
+    assert run(menv.base, "update") == 0 and run(menv.base, "match") == 0
+    first = lesson_of(menv.state, "Follow rule A")[1]["match"]
+    menv.memory("feedback_preflight", PREFLIGHT_DOC + "Also: preflight alone, always.\n")  # same ref, new text
+    assert run(menv.base, "match") == 0
+    second = lesson_of(menv.state, "Follow rule A")[1]["match"]
+    assert second["ref"] == first["ref"] and second["candidate"] != first["candidate"]
+    assert len(menv.gate) == 2
+    first_doc.unlink()  # another ref becomes the top candidate
+    menv.memory("feedback_preflight2", PREFLIGHT_DOC)
+    assert run(menv.base, "match") == 0
+    third = lesson_of(menv.state, "Follow rule A")[1]["match"]
+    assert third["ref"] == "feedback_preflight2" and len(menv.gate) == 3
+
+
+def test_match_all_regates_every_untracked_lesson(menv):
+    menv.memory("feedback_preflight", PREFLIGHT_DOC)
+    assert run(menv.base, "update") == 0 and run(menv.base, "match") == 0
+    assert run(menv.base, "match", "--all") == 0
+    assert len(menv.gate) == 2
+
+
+def test_refresh_tracking_gates_unchecked_lessons(menv):
+    menv.memory("feedback_preflight", PREFLIGHT_DOC)
+    assert run(menv.base, "update") == 0
+    assert run(menv.base, "refresh-tracking") == 0
+    _, a = lesson_of(menv.state, "Follow rule A")
+    assert a["match"]["ref"] == "feedback_preflight" and a["tracking"]["source"] == "match"
+    assert len(menv.gate) == 1
+
+
+def test_lessons_with_a_pending_filing_are_not_matched(menv):
+    menv.memory("feedback_preflight", PREFLIGHT_DOC)
+    assert run(menv.base, "update") == 0
+    lid, _ = lesson_of(menv.state, "Follow rule A")
+    edit_state(menv.state, lambda s: s["filed"].update(
+        {lid: {"pending": True, "repo": "o/r", "marker": f"<!-- retro-lesson:{lid} -->"}}))
+    assert run(menv.base, "match") == 0
+    _, a = lesson_of(menv.state, "Follow rule A")
+    assert "match" not in a and a["tracking"] is None
+    assert menv.gate == []
+
+
+def test_lessons_with_member_trace_are_not_matched(menv):
+    menv.memory("feedback_preflight", PREFLIGHT_DOC)
+    _trace_items(menv.vault, "2026-10-01-retro-a1.md",
+                 {"Run preflight alone RULE-A": "[o/r#5](https://github.com/o/r/issues/5)"})
+    assert run(menv.base, "update") == 0 and run(menv.base, "match") == 0
+    _, a = lesson_of(menv.state, "Follow rule A")
+    assert "match" not in a and a["tracking"]["source"] == "trace"
+    assert menv.gate == []
+
+
+def test_full_issue_page_prints_a_warning_not_an_error(menv, monkeypatch, capsys):
+    monkeypatch.setattr(retro_rollup, "RECENT_LIMIT", 2)
+    menv.issues["o/r"] = [{**ISSUE_7, "number": 1}, {**ISSUE_7, "number": 2}]
+    assert run(menv.base, "update") == 0
+    capsys.readouterr()
+    assert run(menv.base, "match") == 0
+    err = capsys.readouterr().err
+    assert "older issues are not candidates" in err and "o/r" in err
+
+
+@pytest.mark.parametrize("failure", [None, "not json", {"not": "a list"}, subprocess.TimeoutExpired("gh", 60),
+                                     OSError("no gh")])
+def test_failed_issue_listing_leaves_lessons_unchecked_and_exits_1(menv, failure, capsys):
+    menv.memory("feedback_preflight", PREFLIGHT_DOC)
+    menv.issues["o/r"] = failure
+    assert run(menv.base, "update") == 0
+    capsys.readouterr()
+    assert run(menv.base, "match") == 1
+    assert "o/r" in capsys.readouterr().out
+    assert all("match" not in r for r in state_of(menv.state)["lessons"].values())
+    assert menv.gate == []
+
+
+def test_memory_scan_error_leaves_lessons_unchecked(menv, monkeypatch, capsys):
+    import memory_sources
+
+    def scan(host, config=None, errors=None):
+        errors.append({"path": "/m/proj/memory", "error": "boom"})
+        return []
+
+    monkeypatch.setattr(memory_sources, "memory_sources", scan)
+    assert run(menv.base, "update") == 0
+    capsys.readouterr()
+    assert run(menv.base, "match") == 1
+    assert "boom" in capsys.readouterr().out
+    assert all("match" not in r for r in state_of(menv.state)["lessons"].values())
+
+
+def test_unreadable_rule_file_is_skipped_with_error(menv, capsys):
+    menv.memory("feedback_preflight", PREFLIGHT_DOC)
+    (Path.home() / ".claude").mkdir(exist_ok=True)
+    (Path.home() / ".claude/CLAUDE.md").mkdir()  # reading a directory raises OSError
+    assert run(menv.base, "update") == 0
+    capsys.readouterr()
+    assert run(menv.base, "match") == 1
+    out = capsys.readouterr().out
+    assert "CLAUDE.md" in out
+    # a partial rule set could hide the covering rule: nothing is checked, nothing is recorded
+    assert all("match" not in r for r in state_of(menv.state)["lessons"].values())
+    assert menv.gate == []
+
+
+def test_rule_read_error_keeps_the_previous_match(menv, capsys):
+    menv.memory("feedback_preflight", PREFLIGHT_DOC)
+    assert run(menv.base, "update") == 0 and run(menv.base, "match") == 0
+    before = lesson_of(menv.state, "Follow rule A")[1]["match"]
+    assert before["ref"] == "feedback_preflight"
+    (Path.home() / ".claude").mkdir(exist_ok=True)
+    (Path.home() / ".claude/CLAUDE.md").mkdir()  # reading a directory raises OSError
+    menv.gate_reply = lambda p: json.dumps({"covers": False})  # would overwrite the match if asked
+    capsys.readouterr()
+    assert run(menv.base, "match", "--all") == 1
+    assert "CLAUDE.md" in capsys.readouterr().out
+    assert lesson_of(menv.state, "Follow rule A")[1]["match"] == before
+    assert len(menv.gate) == 1  # only the first run asked
+
+
+def test_invalid_configured_project_repo_leaves_lessons_unchecked(menv, monkeypatch, capsys):
+    import obsidian_utils
+    menv.memory("feedback_preflight", PREFLIGHT_DOC)
+    assert run(menv.base, "update") == 0 and run(menv.base, "match") == 0
+    before = lesson_of(menv.state, "Follow rule A")[1]["match"]
+    monkeypatch.setattr(obsidian_utils, "load_config",
+                        lambda: {"project_repos": {"p1": "not a repo!", "p2": "o/r"}})
+    menv.gate_reply = lambda p: json.dumps({"covers": False})
+    capsys.readouterr()
+    assert run(menv.base, "match", "--all") == 1
+    out = capsys.readouterr().out
+    assert "p1" in out and "project_repos" in out
+    assert lesson_of(menv.state, "Follow rule A")[1]["match"] == before
+    assert len(menv.gate) == 1
+
+
+def test_unconfigured_project_without_an_origin_is_not_an_error(menv, monkeypatch):
+    import obsidian_utils
+    menv.memory("feedback_preflight", PREFLIGHT_DOC)
+    monkeypatch.setattr(obsidian_utils, "load_config", lambda: {"project_repos": {}})
+    monkeypatch.setattr(retro_rollup, "_origin_repo", lambda project: None)
+    assert run(menv.base, "update") == 0
+    assert run(menv.base, "match") == 0
+    assert lesson_of(menv.state, "Follow rule A")[1]["match"]["ref"] == "feedback_preflight"
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
+def test_unreadable_skills_dir_leaves_lessons_unchecked(menv, capsys):
+    menv.memory("feedback_preflight", PREFLIGHT_DOC)
+    skills = Path.home() / ".claude/skills"
+    skills.mkdir(parents=True)
+    assert run(menv.base, "update") == 0
+    capsys.readouterr()
+    skills.chmod(0)
+    try:
+        assert run(menv.base, "match") == 1
+        assert "skills" in capsys.readouterr().out
+    finally:
+        skills.chmod(0o700)
+    assert all("match" not in r for r in state_of(menv.state)["lessons"].values())
+    assert menv.gate == []
+
+
+def test_accepted_local_match_clears_a_stale_gone_marker(menv):
+    menv.memory("feedback_preflight", PREFLIGHT_DOC)
+    assert run(menv.base, "update") == 0
+    edit_state(menv.state, lambda s: s["tracking"].update({"memory:feedback_preflight": {"exists": False}}))
+    assert run(menv.base, "match") == 0
+    s = state_of(menv.state)
+    _, a = lesson_of(menv.state, "Follow rule A")
+    assert a["match"]["ref"] == "feedback_preflight"
+    assert s["tracking"]["memory:feedback_preflight"] == {"exists": True}
+    assert a["classify"]["tracking_gone"] is False and a["classify"]["bucket"] != "file"
+
+
+def test_unchanged_local_match_clears_a_stale_gone_marker(menv):
+    menv.memory("feedback_preflight", PREFLIGHT_DOC)
+    assert run(menv.base, "update") == 0 and run(menv.base, "match") == 0
+    edit_state(menv.state, lambda s: s["tracking"].update({"memory:feedback_preflight": {"exists": False}}))
+    calls = len(menv.gate)
+    assert run(menv.base, "match") == 0
+    assert len(menv.gate) == calls  # candidate unchanged: no Haiku call
+    s = state_of(menv.state)
+    _, a = lesson_of(menv.state, "Follow rule A")
+    assert s["tracking"]["memory:feedback_preflight"] == {"exists": True}
+    assert a["classify"]["tracking_gone"] is False and a["classify"]["bucket"] != "file"
+
+
+def test_a_matched_issues_facts_are_recorded_by_match_itself(menv):
+    menv.issues["o/r"] = [{**ISSUE_7, "state": "CLOSED", "closedAt": "2026-10-09T09:00:00Z",
+                           "milestone": {"title": "v3.10"}, "labels": [{"name": "P2-medium"}]}]
+    assert run(menv.base, "update") == 0 and run(menv.base, "match") == 0
+    assert state_of(menv.state)["tracking"]["issue:o/r#7"] == {
+        "exists": True, "state": "CLOSED", "milestone": "v3.10", "priority": "P2-medium",
+        "created": "2026-10-05", "closed": "2026-10-09"}
+
+
+def test_haiku_non_answer_is_not_cached_as_no_match(menv, capsys):
+    menv.memory("feedback_preflight", PREFLIGHT_DOC)
+    menv.gate_reply = lambda p: "no idea"
+    assert run(menv.base, "update") == 0
+    assert run(menv.base, "match") == 1
+    assert len(menv.gate) == 2  # the gate retries once
+    assert "match" not in lesson_of(menv.state, "Follow rule A")[1]
+    menv.gate_reply = fake_gate
+    assert run(menv.base, "match") == 0
+    assert lesson_of(menv.state, "Follow rule A")[1]["match"]["ref"] == "feedback_preflight"
+
+
+def test_match_exit_codes(menv):
+    menv.memory("feedback_preflight", PREFLIGHT_DOC)
+    assert run(menv.base, "update") == 0
+    assert run(menv.base, "match") == 0
+    menv.issues["o/r"] = None
+    assert run(menv.base, "match", "--all") == 1
+    assert run(menv.base, "match", "--concurrency", "0") == 2
+    assert run(menv.base, "match", "--concurrency", "17") == 2
+    assert run(menv.base, "match", "--bogus") == 2
+
+
+def test_match_with_no_since_is_quiet_not_rule_not_followed(menv, monkeypatch):
+    menv.memory("feedback_preflight", PREFLIGHT_DOC)
+    monkeypatch.setattr(retro_rollup, "_file_day", lambda path: None)
+    assert run(menv.base, "update") == 0 and run(menv.base, "match") == 0
+    _, a = lesson_of(menv.state, "Follow rule A")
+    assert a["match"]["ref"] == "feedback_preflight" and a["match"]["since"] is None
+    assert a["classify"]["sessions_after_tracking"] is None and a["classify"]["bucket"] == "quiet"
+
+
+def test_refresh_tracking_refreshes_a_matched_issue_and_a_matched_rule_path(menv, capsys):
+    claude_md = Path.home() / ".claude/CLAUDE.md"
+    claude_md.parent.mkdir(parents=True, exist_ok=True)
+    claude_md.write_text("- Grep every caller before edits; grep callers first, always.\n")
+    menv.issues["o/r"] = [ISSUE_7]
+    assert run(menv.base, "update") == 0 and run(menv.base, "match") == 0
+    _, a = lesson_of(menv.state, "Follow rule A")
+    _, b = lesson_of(menv.state, "Follow rule B")
+    assert a["match"] == {"kind": "issue", "ref": "o/r#7", "since": "2026-10-05", "candidate": a["match"]["candidate"]}
+    assert b["match"]["kind"] == "path" and b["match"]["ref"] == "~/.claude/CLAUDE.md"
+    assert a["classify"]["bucket"] == "raise"  # open issue, two retros after 10-05
+    menv.views["7"] = {**ISSUE_7, "state": "CLOSED", "closedAt": "2026-10-10T09:00:00Z",
+                       "milestone": {"title": "v3.10"}, "labels": [{"name": "P2-medium"}]}
+    assert run(menv.base, "refresh-tracking") == 0
+    s = state_of(menv.state)
+    assert s["lessons"][lesson_of(menv.state, "Follow rule A")[0]]["classify"]["bucket"] == "didnt_hold"
+    assert s["tracking"]["issue:o/r#7"]["state"] == "CLOSED"
+    assert s["tracking"]["path:~/.claude/CLAUDE.md"] == {"exists": True}
+    claude_md.unlink()
+    import argparse
+    ctx = retro_rollup.Ctx(argparse.Namespace(vault=str(menv.vault), insights_folder="claude-insights",
+                                              state_dir=str(menv.state), concurrency=None))
+    st = retro_rollup.load_state(ctx)
+    assert retro_rollup.refresh_tracking(ctx, st) == []
+    assert st["tracking"]["path:~/.claude/CLAUDE.md"] == {"exists": False}
+
+
+def test_report_and_note_show_tracking_source(menv, capsys):
+    menv.memory("feedback_preflight", PREFLIGHT_DOC)
+    assert run(menv.base, "update") == 0 and run(menv.base, "match") == 0
+    rep = report_json(menv, capsys)
+    assert rep["Follow rule A"]["tracking_source"] == "match"
+    assert rep["Follow rule B"]["tracking_source"] == "none"
+    assert 'tracking_source: "match"' in "".join(lesson_notes(menv.vault).values())
+    assert run(menv.base, "report") == 0
+    assert "feedback_preflight (match)" in capsys.readouterr().out
+    lid_b, _ = lesson_of(menv.state, "Follow rule B")
+    edit_state(menv.state, lambda s: s["filed"].update({lid_b: "o/r#9"}))
+    assert run(menv.base, "rebuild") == 0
+    assert report_json(menv, capsys)["Follow rule B"]["tracking_source"] == "filed"
+    _trace_items(menv.vault, "2026-10-01-retro-a1.md", {"Grep callers first RULE-B": "memory `feedback_x`"})
+    assert run(menv.base, "rebuild") == 0
+    assert report_json(menv, capsys)["Follow rule B"]["tracking_source"] == "trace"
+
+
+def test_member_trace_and_filed_issue_beat_a_match(menv):
+    menv.memory("feedback_preflight", PREFLIGHT_DOC)
+    menv.memory("feedback_grep", GREP_DOC)
+    assert run(menv.base, "update") == 0 and run(menv.base, "match") == 0
+    lid_a, a = lesson_of(menv.state, "Follow rule A")
+    lid_b, b = lesson_of(menv.state, "Follow rule B")
+    assert a["tracking"]["source"] == b["tracking"]["source"] == "match"
+    _trace_items(menv.vault, "2026-10-01-retro-a1.md",
+                 {"Run preflight alone RULE-A": "[o/r#5](https://github.com/o/r/issues/5)"})
+    edit_state(menv.state, lambda s: s["filed"].update({lid_b: "o/r#9"}))
+    assert run(menv.base, "rebuild") == 0
+    _, a2 = lesson_of(menv.state, "Follow rule A")
+    _, b2 = lesson_of(menv.state, "Follow rule B")
+    assert (a2["tracking"]["ref"], a2["tracking"]["source"]) == ("o/r#5", "trace")
+    assert (b2["tracking"]["ref"], b2["tracking"]["source"]) == ("o/r#9", "filed")
+    assert a2["match"] == a["match"] and b2["match"] == b["match"]  # kept for later
+
+
+def _accept_file(tmp_path, entries):
+    path = tmp_path / "accept.json"
+    path.write_text(json.dumps(entries))
+    return str(path)
+
+
+def test_backfill_traces_a_match_only_with_a_matching_accept_entry(menv, tmp_path, capsys):
+    menv.memory("feedback_preflight", PREFLIGHT_DOC)
+    assert run(menv.base, "update") == 0 and run(menv.base, "match") == 0
+    lid, _ = lesson_of(menv.state, "Follow rule A")
+    before = retro_bytes(menv.vault)
+    capsys.readouterr()
+    assert run(menv.base, "backfill", "--apply", "--accept",
+               _accept_file(tmp_path, [{"lesson_id": lid, "tracking_ref": "feedback_other"}])) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["notes_written"] == 0 and out["skipped_entries"][0]["reason"] == "tracking changed"
+    assert retro_bytes(menv.vault) == before
+    assert run(menv.base, "backfill", "--apply", "--accept",
+               _accept_file(tmp_path, [{"lesson_id": lid, "tracking_ref": "feedback_preflight"}])) == 0
+    assert json.loads(capsys.readouterr().out)["notes_written"] == 3
+    traced = [t for p, t in ((p, p.read_text()) for p in (menv.vault / "claude-insights").glob("*-retro-*.md"))
+              if "feedback_preflight" in t]
+    assert len(traced) == 3
+
+
+def test_match_and_update_never_write_a_trace(menv):
+    menv.memory("feedback_preflight", PREFLIGHT_DOC)
+    menv.issues["o/r"] = [ISSUE_7]
+    before = retro_bytes(menv.vault)
+    for cmd in ("update", "match", "match", "rebuild", "refresh-tracking"):
+        menv.views["7"] = ISSUE_7
+        assert run(menv.base, cmd) == 0
+        assert retro_bytes(menv.vault) == before, cmd
+    assert any("match" in r for r in state_of(menv.state)["lessons"].values())
+
+
+def test_untraced_reason_lesson_matched(menv, capsys):
+    menv.memory("feedback_preflight", PREFLIGHT_DOC)
+    assert run(menv.base, "update") == 0 and run(menv.base, "match") == 0
+    capsys.readouterr()
+    assert run(menv.base, "backfill") == 0
+    reasons = {}
+    for row in json.loads(capsys.readouterr().out)["items"]:
+        reasons.setdefault(row["lesson"], set()).add(row["reason"])
+    lid_a, _ = lesson_of(menv.state, "Follow rule A")
+    lid_b, _ = lesson_of(menv.state, "Follow rule B")
+    assert reasons[lid_a] == {"lesson-matched"} and reasons[lid_b] == {"lesson-untracked"}
+
+
+def test_planned_filings_skip_matched_lessons(menv, capsys):
+    menv.memory("feedback_preflight", PREFLIGHT_DOC)
+    assert run(menv.base, "update") == 0 and run(menv.base, "match") == 0
+    capsys.readouterr()
+    assert run(menv.base, "backfill") == 0
+    planned = json.loads(capsys.readouterr().out)["planned_filings"]
+    assert [p["lesson"] for p in planned] == [lesson_of(menv.state, "Follow rule B")[0]]
+
+
+def test_match_makes_no_gh_write(menv):
+    menv.issues["o/r"] = [ISSUE_7]
+    assert run(menv.base, "update") == 0 and run(menv.base, "match") == 0
+    assert menv.gh
+    for args, timeout in menv.gh:
+        assert args[:2] == ["issue", "list"] and timeout == 60
+        assert "--limit" in args and not {"create", "edit", "comment", "close"} & set(args)
+
+
+def test_match_builds_one_index_per_source_set_not_one_per_lesson(menv, monkeypatch):
+    menv.memory("feedback_preflight", PREFLIGHT_DOC)
+    menv.issues["o/r"] = [ISSUE_7]
+    built = []
+    real = lessons_match.Index.__init__
+
+    def counting(self, docs):
+        built.append(len(docs))
+        real(self, docs)
+
+    monkeypatch.setattr(lessons_match.Index, "__init__", counting)
+    assert run(menv.base, "update") == 0 and run(menv.base, "match") == 0
+    # two lessons, one repo, no project rules: memory + one issue set + one rule set
+    assert len(built) == 3
+
+
+def test_a_lesson_sees_its_own_projects_rules_not_other_projects(menv, monkeypatch, tmp_path):
+    import obsidian_utils
+    root = tmp_path / "ws"
+    rule = "- Run preflight alone, never chain preflight and commit; preflight as its own call.\n"
+    (root / "p3").mkdir(parents=True)
+    (root / "p3" / "CLAUDE.md").write_text(rule)
+    note(menv.vault, "2026-10-20-retro-e5.md", "2026-10-20", "p3", ["Unrelated walrus item two"])
+    monkeypatch.setattr(obsidian_utils, "get_workspace_roots", lambda: [str(root)])
+    (Path.home() / ".claude").mkdir(exist_ok=True)
+    (Path.home() / ".claude/CLAUDE.md").write_text("- Grep every caller before edits; grep callers first, always.\n")
+    assert run(menv.base, "update") == 0 and run(menv.base, "match") == 0
+    # a global rule stays visible next to the per-project ones
+    assert lesson_of(menv.state, "Follow rule B")[1]["match"]["ref"] == "~/.claude/CLAUDE.md"
+    _, a = lesson_of(menv.state, "Follow rule A")  # lesson A spans p1 and p2, never p3
+    assert a["match"] == {"none": True, "candidate": None}
+    (root / "p1").mkdir()
+    (root / "p1" / "CLAUDE.md").write_text(rule)
+    assert run(menv.base, "match") == 0
+    _, a = lesson_of(menv.state, "Follow rule A")
+    assert a["match"]["kind"] == "path" and a["match"]["ref"] == str(root / "p1" / "CLAUDE.md")
+
+
+def test_rule_scan_that_raises_leaves_lessons_unchecked_and_exits_1(menv, monkeypatch, capsys):
+    menv.memory("feedback_preflight", PREFLIGHT_DOC)
+
+    def boom(*args):
+        raise PermissionError("cannot list the skills folder")
+
+    monkeypatch.setattr(lessons_match, "rule_docs", boom)
+    assert run(menv.base, "update") == 0
+    capsys.readouterr()
+    assert run(menv.base, "match") == 1
+    assert "cannot list the skills folder" in capsys.readouterr().out
+    assert all("match" not in r for r in state_of(menv.state)["lessons"].values())
+    assert menv.gate == []

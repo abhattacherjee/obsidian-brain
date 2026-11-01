@@ -2,10 +2,15 @@
 recurring lessons, render lesson notes and report, and trace accepted lessons
 back into the source retros.
 
-Commands: update, rebuild, refresh-tracking, report, backfill. Exit 0 on
+Commands: update, rebuild, refresh-tracking, report, backfill, match. Exit 0 on
 success, 1 on a runtime or partial failure (unjudged anchors, gh errors, the
 lock held, a write error) with the output still printed, 2 on a usage or
 config error.
+
+``match`` (#473) looks for an issue, memory entry or rule that already covers a
+lesson that has no tracking of its own. It only reads GitHub, and it never
+writes a trace: a match reaches the retro notes only through ``backfill --apply
+--accept FILE``.
 """
 from __future__ import annotations
 
@@ -24,8 +29,10 @@ import time
 
 import lessons_corpus
 import lessons_group
+import lessons_match
 import lessons_notes
 import lessons_verify
+import memory_sources
 import retro_trace
 
 STATE_NAME = "lessons-state.json"
@@ -46,6 +53,8 @@ _CREATED = re.compile(r"^https://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)
 GH_CREATE_TIMEOUT_SECONDS = 60
 RECENT_LIMIT = 1000  # my issues listed in one `gh issue list` (gh paginates); a full page proves nothing
 GIT_TIMEOUT_SECONDS = 10
+MATCH_LIST_TIMEOUT_SECONDS = 60
+MATCH_ISSUE_FIELDS = "number,title,body,state,stateReason,milestone,labels,createdAt,closedAt"
 
 
 class UsageError(Exception):
@@ -298,6 +307,8 @@ def regroup(ctx: Ctx, state: dict, *, judge: bool, note: str | None = None, cach
         # `since` is sticky for the id's own record; a split child with a new id inherits its parent's.
         prev_rec = state["lessons"].get(lid) or state["lessons"].get(lesson.get("split_from")) or {}
         tracking = lessons_group.lesson_tracking(lesson["members"], by_key, prev_rec.get("tracking"))
+        if tracking is not None:
+            tracking["source"] = "trace"
         if tracking is None and _is_pending(state["filed"].get(lid)):
             pass  # an issue may exist under this id: the pending record stays for backfill to reconcile
         elif tracking is None:
@@ -312,8 +323,13 @@ def regroup(ctx: Ctx, state: dict, *, judge: bool, note: str | None = None, cach
                 if not since:
                     old_tracking = (state["lessons"].get(source) or {}).get("tracking") or {}
                     since = old_tracking.get("since") if old_tracking.get("ref") == filed_ref else None
-                tracking = {"kind": "issue", "ref": filed_ref, "since": since or ctx.today}
+                tracking = {"kind": "issue", "ref": filed_ref, "since": since or ctx.today,
+                            "source": "filed"}
                 state["filed"][lid] = filed_ref  # a later file_issue accept on this id finds it
+        # Last in line: the lesson's own match, keyed by its id (a recurring lesson keeps it).
+        own_match = (state["lessons"].get(lid) or {}).get("match")
+        if tracking is None and not _is_pending(state["filed"].get(lid)):
+            tracking = _match_tracking(own_match)
         info = state["tracking"].get(_tracking_key(tracking)) if tracking else None
         c = lessons_group.classify(lesson, by_key, tracking, info, ctx.today, ctx.recent_days)
         snooze = snoozes.get(lid)
@@ -332,6 +348,8 @@ def regroup(ctx: Ctx, state: dict, *, judge: bool, note: str | None = None, cach
                "tracking": tracking, "info": info, "classify": c}
         if lesson.get("split_from"):
             rec["split_from"] = lesson["split_from"]
+        if own_match is not None:
+            rec["match"] = own_match
         out_lessons[lid] = rec
         out_notes[lid] = filename
 
@@ -431,7 +449,6 @@ def refresh_tracking(ctx: Ctx, state: dict) -> list[dict]:
     for key, t in refs.items():
         if t["kind"] == "memory":
             if memory_stems is None:
-                import memory_sources
                 scan_errors: list = []
                 memory_stems = {Path(p).stem for p in
                                 memory_sources.memory_sources("claude-code", errors=scan_errors)}
@@ -450,6 +467,293 @@ def refresh_tracking(ctx: Ctx, state: dict) -> list[dict]:
             else:
                 state["tracking"][key] = {"exists": None}  # repo-relative: cannot check here
     return errors
+
+
+# --- matching a lesson to tracking that already exists (#473) ---------------------
+
+_MATCH_KIND = {"issue": "issue", "memory": "memory", "rule": "path"}
+
+
+def _match_tracking(match) -> dict | None:
+    """The tracking an accepted match gives a lesson; None for a rejection or a malformed record."""
+    if not isinstance(match, dict) or match.get("none"):
+        return None
+    kind, ref, since = match.get("kind"), match.get("ref"), match.get("since")
+    if kind not in ("issue", "memory", "path") or not isinstance(ref, str) or not ref:
+        return None
+    if kind == "issue" and not _REF.match(ref):
+        return None
+    if not (isinstance(since, str) and lessons_corpus._iso_date(since)):
+        since = None
+    return {"kind": kind, "ref": ref, "since": since, "source": "match"}
+
+
+def _wants_match(state: dict, lid: str, rec: dict) -> bool:
+    """A lesson is matched only when nothing else tracks it: no member trace, no filed or pending issue."""
+    tracking = rec.get("tracking")
+    if tracking and tracking.get("source") != "match":
+        return False
+    filed = state["filed"].get(lid)
+    return not (isinstance(filed, str) or _is_pending(filed))
+
+
+def _file_day(path) -> str | None:
+    try:
+        return date.fromtimestamp(Path(path).stat().st_mtime).isoformat()
+    except (OSError, OverflowError, ValueError):
+        return None
+
+
+def _rule_since(ref: str, line) -> str | None:
+    """The day a rule was written: the last commit that touched its first 60 characters when its file
+    sits in a git repo, else the file's mtime. A path that is not in a repo never raises."""
+    path = Path(os.path.expanduser(ref))
+    fallback = _file_day(path)
+    if not isinstance(line, int) or isinstance(line, bool) or line < 1:
+        return fallback
+    try:
+        needle = path.read_text(encoding="utf-8").splitlines()[line - 1].strip()
+        needle = (needle[2:] if needle.startswith("- ") else needle).strip()[:60]
+        if not needle:
+            return fallback
+        git = ["git", "-C", str(path.parent)]
+        top = subprocess.run([*git, "rev-parse", "--show-toplevel"], stdin=subprocess.DEVNULL,
+                             capture_output=True, text=True, timeout=GIT_TIMEOUT_SECONDS)
+        if top.returncode:
+            return fallback
+        log = subprocess.run([*git, "log", "-1", "--format=%cs", "-S", needle, "--", str(path)],
+                             stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                             timeout=GIT_TIMEOUT_SECONDS)
+    except (OSError, UnicodeError, IndexError, subprocess.TimeoutExpired):
+        return fallback
+    day = log.stdout.strip()
+    return day if log.returncode == 0 and re.fullmatch(r"\d{4}-\d{2}-\d{2}", day) else fallback
+
+
+def _list_repo_issues(repo: str):
+    """Every issue in a repo, read-only. Returns (issues, None) or (None, error)."""
+    try:
+        result = _run_gh(["issue", "list", "--repo", repo, "--state", "all", "--limit", str(RECENT_LIMIT),
+                          "--json", MATCH_ISSUE_FIELDS], timeout=MATCH_LIST_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        return None, "gh timed out"
+    except OSError as exc:
+        return None, str(exc)[:200]
+    if result.returncode:
+        return None, f"gh exited with code {result.returncode}"
+    try:
+        data = json.loads(result.stdout)
+    except ValueError:
+        return None, "gh returned invalid JSON"
+    if not isinstance(data, list) or not all(isinstance(i, dict) for i in data):
+        return None, "gh JSON is not a list of issues"
+    return data, None
+
+
+def _project_repo(ctx: Ctx, project: str, cache: dict) -> str | None:
+    """The repo a project's issues live in: project_repos first, then the origin remote."""
+    if project not in cache:
+        configured = ctx.project_repos.get(project)
+        if configured is not None:
+            cache[project] = configured if _valid_repo(configured) else None
+        else:
+            cache[project] = _origin_repo(project)
+    return cache[project]
+
+
+def _home_ref(home: Path, path: Path) -> str:
+    try:
+        return "~/" + str(path.relative_to(home))
+    except ValueError:
+        return str(path)
+
+
+def _listed_issue_info(meta: dict) -> dict:
+    """Tracking facts for a matched issue, as refresh-tracking would record them."""
+    milestone = meta.get("milestone")
+    labels = [l.get("name", "") for l in meta.get("labels") or [] if isinstance(l, dict)]
+    state = meta.get("state")
+    return {"exists": True, "state": state.upper() if isinstance(state, str) and state else "OPEN",
+            "milestone": milestone.get("title") if isinstance(milestone, dict) else None,
+            "priority": next((l for l in labels if isinstance(l, str) and _PRIORITY.match(l)), None),
+            "created": (meta.get("createdAt") or "")[:10] or None,
+            "closed": (meta.get("closedAt") or "")[:10] or None}
+
+
+def match_lessons(ctx: Ctx, state: dict, *, recheck: bool = False) -> dict:
+    """Give each untracked lesson the issue, memory entry or rule that already covers it.
+
+    The single highest-cosine candidate across issues, memory and rules is accepted or rejected by one
+    Haiku call (spike round 4, #473). A lesson is checked again only when its top candidate changed, or
+    with ``recheck``. Anything that cannot be read or answered leaves the lesson unchecked (its old
+    match, if any, stands) and is reported in ``errors``; it is never recorded as "no match".
+    """
+    summary = {"matched": 0, "rejected": 0, "no_proposal": 0, "unchanged": 0, "unchecked": 0, "errors": []}
+    errors = summary["errors"]
+    _, by_key, skipped = _load(ctx)
+    if skipped:
+        return summary  # unreadable notes hide items: regroup refuses the run, so write nothing here
+    todo = []
+    for lid, rec in sorted(state["lessons"].items()):
+        if _wants_match(state, lid, rec):
+            members = [by_key[k] for k in rec["members"] if k in by_key]
+            if members:
+                todo.append((lid, rec, members))
+    if not todo:
+        return summary
+
+    memory_errors: list = []
+    paths = memory_sources.memory_sources("claude-code", errors=memory_errors)
+    memory = lessons_match.memory_docs([str(p) for p in paths], memory_errors)
+    if memory_errors:
+        # A partial memory scan could hide the covering entry: check nothing rather than record "no match".
+        errors.extend({"ref": e.get("path", "memory"), "error": e.get("error", "memory scan failed")}
+                      for e in memory_errors)
+        summary["unchecked"] = len(todo)
+        return summary
+
+    import obsidian_utils
+    home = Path.home()
+    roots = [Path(r) for r in obsidian_utils.get_workspace_roots()] or [home / "dev" / "claude_workspace"]
+    # Rankings use idf over the whole source: every project's repo and rules, not just the lessons being
+    # checked now. A lesson is then limited to its own repos and its own projects' rules, so a rerun with
+    # fewer lessons to check ranks the rest the same way.
+    projects = sorted({item["project"] for item in by_key.values()})
+    rule_errors: list = []
+    rules, seen = [], set()
+    try:
+        for root in roots:
+            for doc in lessons_match.rule_docs(home, projects, root, rule_errors):
+                if (doc["ref"], doc["line"]) not in seen:
+                    seen.add((doc["ref"], doc["line"]))
+                    rules.append(doc)
+    except OSError as exc:
+        # The rules could not be listed: like a memory scan error, check nothing rather than record "no match".
+        errors.append({"ref": "rules", "error": str(exc)[:200]})
+        summary["unchecked"] = len(todo)
+        return summary
+    if rule_errors:
+        # A rule file or directory that cannot be read could hide the covering rule: like a memory scan
+        # error, check nothing rather than record "no match" or erase an earlier accept.
+        errors.extend({"ref": e["path"], "error": e["error"]}
+                      for e in {e["path"]: e for e in rule_errors}.values())
+        summary["unchecked"] = len(todo)
+        return summary
+    project_rules = {p: {_home_ref(home, root / p / "CLAUDE.md") for root in roots} for p in projects}
+    every_project_rule = set().union(*project_rules.values()) if project_rules else set()
+    rule_at: dict[str, list[int]] = {}
+    for i, doc in enumerate(rules):
+        rule_at.setdefault(doc["ref"], []).append(i)
+    global_rules = {i for ref, at in rule_at.items() if ref not in every_project_rule for i in at}
+
+    repo_cache: dict = {}
+    lesson_projects = {lid: sorted({m["project"] for m in members}) for lid, _, members in todo}
+    # A configured project_repos value that is not a repo is a setup error, not "no repo": the project's
+    # issues cannot be read, so its lessons stay unchecked. No value and no origin is simply no issue source.
+    bad_repo = {p: v for p in projects
+                if (v := ctx.project_repos.get(p)) is not None and not _valid_repo(v)}
+    for p in sorted({p for lid, ps in lesson_projects.items() for p in ps} & set(bad_repo)):
+        errors.append({"ref": p, "error": f"project_repos[{p!r}] is not an owner/name repo: "
+                                          f"{str(bad_repo[p])[:80]!r}"})
+    lesson_repos = {lid: sorted({r for p in ps if (r := _project_repo(ctx, p, repo_cache))})
+                    for lid, ps in lesson_projects.items()}
+    repos = sorted({r for p in projects if (r := _project_repo(ctx, p, repo_cache))})
+    issue_docs, issue_meta, failed = [], {}, set()
+    issue_at: dict[str, list[int]] = {}
+    if repos:
+        with ThreadPoolExecutor(max_workers=min(GH_MAX_WORKERS, len(repos))) as pool:
+            listings = list(pool.map(_list_repo_issues, repos))
+        for repo, (data, error) in zip(repos, listings):
+            if error:
+                failed.add(repo)
+                if any(repo in rs for rs in lesson_repos.values()):  # only a repo a pending lesson needs
+                    errors.append({"ref": repo, "error": error})
+                continue
+            if len(data) >= RECENT_LIMIT:
+                print(f"retro_rollup: {repo}: the listing is full ({len(data)} issues); "
+                      f"older issues are not candidates", file=sys.stderr)
+            docs = lessons_match.issue_docs(repo, data)
+            issue_at[repo] = list(range(len(issue_docs), len(issue_docs) + len(docs)))
+            issue_docs.extend(docs)
+            issue_meta.update({f"{repo}#{i['number']}": i for i in data
+                               if type(i.get("number")) is int})
+    issue_index = lessons_match.Index(issue_docs)
+    memory_index = lessons_match.Index(memory)
+    rule_index = lessons_match.Index(rules)
+    issue_views, rule_views = {}, {}
+
+    jobs, changed = [], False
+    for lid, rec, members in todo:
+        if failed & set(lesson_repos[lid]) or bad_repo.keys() & set(lesson_projects[lid]):
+            summary["unchecked"] += 1
+            continue
+        repo_key = tuple(lesson_repos[lid])
+        if repo_key not in issue_views:
+            issue_views[repo_key] = issue_index.view({i for r in repo_key for i in issue_at[r]})
+        applicable = frozenset(ref for p in lesson_projects[lid] for ref in project_rules[p])
+        if applicable not in rule_views:
+            rule_views[applicable] = rule_index.view(
+                global_rules | {i for ref in applicable for i in rule_at.get(ref, ())})
+        sources = {"issue": issue_views[repo_key], "memory": memory_index, "rule": rule_views[applicable]}
+        texts = [m["text"] for m in members]
+        best = lessons_match.best_candidate(lessons_match.lesson_text(rec["name"], texts), sources)
+        doc = best[0] if best else None
+        chash = (lessons_match.short_hash(f"{doc['source']}|{doc['ref']}|{doc['text']}")
+                 if doc else None)
+        prev = rec.get("match")
+        if isinstance(prev, dict) and prev.get("candidate") == chash and not recheck:
+            summary["unchanged"] += 1
+            if (doc and doc["source"] != "issue" and prev.get("kind") == _MATCH_KIND[doc["source"]]
+                    and prev.get("ref") == doc["ref"]):
+                # The file was read just now: drop a stale "gone" left by an earlier refresh-tracking.
+                key = f"{prev['kind']}:{doc['ref']}"
+                if state["tracking"].get(key) != {"exists": True}:
+                    state["tracking"][key] = {"exists": True}
+                    changed = True
+            continue
+        if doc is None:
+            rec["match"] = {"none": True, "candidate": None}
+            summary["no_proposal"] += 1
+            changed = True
+            continue
+        jobs.append((lid, rec, doc, chash, lessons_match.anchor_text(rec["name"], texts)))
+
+    def ask(job):
+        return lessons_match.gate(job[4], job[2], lambda prompt: lessons_verify.run_haiku(prompt))
+
+    if jobs:
+        with ThreadPoolExecutor(max_workers=min(ctx.concurrency, len(jobs))) as pool:
+            verdicts = list(pool.map(ask, jobs))
+        for (lid, rec, doc, chash, _), verdict in zip(jobs, verdicts):
+            if verdict is None:
+                summary["unchecked"] += 1
+                errors.append({"ref": lid, "error": "Haiku gave no usable answer"})
+            elif verdict:
+                if doc["source"] == "issue":
+                    since = doc.get("created")
+                elif doc["source"] == "memory":
+                    since = _file_day(doc["path"])
+                else:
+                    since = _rule_since(doc["ref"], doc.get("line"))
+                rec["match"] = {"kind": _MATCH_KIND[doc["source"]], "ref": doc["ref"],
+                                "since": since, "candidate": chash}
+                if doc["source"] == "issue":
+                    state["tracking"][f"issue:{doc['ref']}"] = _listed_issue_info(issue_meta[doc["ref"]])
+                else:
+                    # The file was read just now: drop a stale "gone" left by an earlier refresh-tracking.
+                    state["tracking"][f"{rec['match']['kind']}:{doc['ref']}"] = {"exists": True}
+                summary["matched"] += 1
+                changed = True
+            else:
+                rec["match"] = {"none": True, "candidate": chash}
+                summary["rejected"] += 1
+                changed = True
+    if changed:
+        for _, rec, _ in todo:
+            # Same result regroup reaches; set now so refresh-tracking sees a new match.
+            rec["tracking"] = _match_tracking(rec.get("match"))
+        save_state(ctx, state)
+    return summary
 
 
 # --- backfill ---------------------------------------------------------------
@@ -476,6 +780,8 @@ def _untraced_report(ctx: Ctx, state: dict, accepted: set[str]) -> dict:
                 reason = "accepted-not-written"
             elif not state["lessons"][lid].get("tracking"):
                 reason = "lesson-untracked"
+            elif state["lessons"][lid]["tracking"].get("source") == "match":
+                reason = "lesson-matched"
             else:
                 reason = "not-accepted"
             rows.append({"note": item["note"], "item": item["item"], "line": item["line"],
@@ -918,6 +1224,8 @@ def _print_table(rep: dict) -> None:
         print(f"\n## {titles[bucket]} ({len(rows)})")
         for l in rows[:25]:
             track = l["tracking_ref"] or "no tracking"
+            if l.get("tracking_source") == "match":
+                track += " (match)"
             ms = f" · milestone {l['issue_milestone']}" if l.get("issue_milestone") else ""
             print(f"- {len(l['members'])} items · {l['recent_sessions']}/{l['sessions']} sessions · "
                   f"{len(l['projects'])} projects · {l['first_seen']} to {l['last_seen']} · "
@@ -938,6 +1246,9 @@ def _parser() -> argparse.ArgumentParser:
     u.add_argument("--concurrency", type=int)
     sub.add_parser("rebuild", parents=[common])
     sub.add_parser("refresh-tracking", parents=[common])
+    m = sub.add_parser("match", parents=[common])
+    m.add_argument("--concurrency", type=int)
+    m.add_argument("--all", action="store_true", help="check every untracked lesson again")
     r = sub.add_parser("report", parents=[common])
     r.add_argument("--json", action="store_true")
     b = sub.add_parser("backfill", parents=[common])
@@ -983,10 +1294,16 @@ def main(argv=None) -> int:
                   f"failed: {summary['failed']}, notes written: {summary['notes_written']}, "
                   f"removed: {summary['notes_removed']}, unreadable notes: {summary['unreadable']}")
             return 1 if _report_unreadable(summary) or summary["failed"] else 0
-        if args.cmd == "refresh-tracking":
-            errors = refresh_tracking(ctx, state)
+        if args.cmd == "match":
+            found = match_lessons(ctx, state, recheck=args.all)
             summary = regroup(ctx, state, judge=False)
-            print(json.dumps({"errors": errors, "notes_written": summary["notes_written"]}))
+            print(json.dumps({**found, "notes_written": summary["notes_written"]}))
+            return 1 if _report_unreadable(summary) or found["errors"] else 0
+        if args.cmd == "refresh-tracking":
+            found = match_lessons(ctx, state)  # a lesson's match is looked up before tracking is re-read
+            errors = found.pop("errors") + refresh_tracking(ctx, state)
+            summary = regroup(ctx, state, judge=False)
+            print(json.dumps({"errors": errors, "match": found, "notes_written": summary["notes_written"]}))
             return 1 if _report_unreadable(summary) or errors else 0
         result, ok = backfill(ctx, state, accept)
         print(json.dumps(result, indent=1))
