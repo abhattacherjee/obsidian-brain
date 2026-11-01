@@ -215,14 +215,15 @@ print(_ob_repo())"""
 # #470: two FORM_B sites in /retro Step 7.5 (retro_trace.py items and
 # apply) and one FORM_A site in /check-items Step 2b (closed-issue
 # candidates). 77 -> 80.
+# #474: one FORM_A site in /lessons Step 1. 80 -> 81.
 EXPECTED_FORM_COUNTS = {
-    FORM_A: 58,
+    FORM_A: 59,
     FORM_A_SINGLE: 2,
     FORM_B: 16,
     FORM_C: 1,
     FORM_D: 3,
 }
-EXPECTED_SITE_COUNT = 80
+EXPECTED_SITE_COUNT = 81
 
 #: Every canonical form, mapped to its constant NAME. One table, consulted by
 #: both ``_distinct_blocks()`` and ``test_canonical_form_family_counts_are_exact``
