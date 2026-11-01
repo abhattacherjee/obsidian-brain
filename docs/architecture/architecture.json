@@ -3,7 +3,7 @@
   "displayName": "Obsidian Brain",
   "version": "3.9.1",
   "tagline": "A Claude Code plugin that turns an Obsidian vault into a persistent brain across sessions — auto-logging, curated knowledge capture, snapshot-on-compact, and fast cross-project recall, all via direct filesystem writes.",
-  "lastUpdated": "2026-10-29",
+  "lastUpdated": "2026-11-01",
   "repository": "https://github.com/abhattacherjee/obsidian-brain",
   "defaultBranch": "main",
   "techStack": {
@@ -1131,6 +1131,59 @@
       ]
     },
     {
+      "id": "retro-lessons",
+      "name": "Retro Lessons (rollup)",
+      "color": "#84CC16",
+      "description": "Groups open retro Process Improvements items across sessions into recurring lessons (#471): TF-IDF top-10 candidates, a Haiku same-lesson verdict per pair (cached), star grouping, stable ids, tracking inherited from member traces, five buckets, and one generated note per lesson for the Retro Lessons dashboard.",
+      "components": [
+        {
+          "id": "retro-rollup-cli",
+          "name": "retro_rollup.py",
+          "kind": "cli",
+          "files": [
+            "hooks/retro_rollup.py"
+          ],
+          "purpose": "CLI: update (judge unjudged anchors with Haiku, regroup, name new lessons, write changed notes), rebuild (regroup from the cache; no verdict calls), refresh-tracking (gh issue view per tracked issue, memory/path existence), report [--json] (from the private state file), backfill [--apply --accept FILE] (dry run lists planned traces; apply traces only accepted lessons via retro_trace partial apply). Holds a non-blocking fcntl lock, moves a corrupt state file aside, exit 0 ok / 1 failure / 2 usage."
+        },
+        {
+          "id": "lessons-corpus",
+          "name": "lessons_corpus.py",
+          "kind": "module",
+          "files": [
+            "hooks/lessons_corpus.py"
+          ],
+          "purpose": "item_key (note stem + text hash), load_items over retro notes' Process Improvements items (via retro_trace.parse_items), and pure-Python TF-IDF top_candidates (10 per anchor, other notes only)."
+        },
+        {
+          "id": "lessons-verify",
+          "name": "lessons_verify.py",
+          "kind": "module",
+          "files": [
+            "hooks/lessons_verify.py"
+          ],
+          "purpose": "Round 2 RUBRIC (RUBRIC_VERSION r2-2026-10-31), build_prompt / parse_verdicts, run_haiku (claude -p --model haiku, stdin closed, timeout), verify_anchors (per anchor, bounded concurrency), name_lessons, and VerdictCache: SQLite keyed by pair + rubric version + model (WAL, 0600 incl. -wal/-shm)."
+        },
+        {
+          "id": "lessons-group",
+          "name": "lessons_group.py",
+          "kind": "module",
+          "files": [
+            "hooks/lessons_group.py"
+          ],
+          "purpose": "star_lessons (greedy disjoint stars over confirmed edges, spanning >= 2 notes), assign_ids (reuse an id at half overlap; record merged_into / split_from), lesson_tracking (most frequent member trace), classify (sessions, recent sessions, dormant, bucket raise/file/didnt_hold/rule_not_followed/quiet), rank_key."
+        },
+        {
+          "id": "lessons-notes",
+          "name": "lessons_notes.py",
+          "kind": "module",
+          "files": [
+            "hooks/lessons_notes.py"
+          ],
+          "purpose": "note_filename, render_note (type claude-lesson, tags claude/lesson + claude/project/*), read_snooze (snoozed_until carries over), write_if_changed (atomic, only when bytes differ), and the text/JSON report."
+        }
+      ]
+    },
+    {
       "id": "note-schema",
       "name": "Note Schema & Dashboards",
       "color": "#06B6D4",
@@ -1157,7 +1210,7 @@
           "files": [
             "CLAUDE.md"
           ],
-          "purpose": "Every frontmatter tag uses the claude/ prefix: type tag (claude/session, claude/insight), claude/project/<name>, claude/topic/<topic>, claude/auto, claude/imported, claude/reconstructed, claude/retro, claude/standup. Dashboards filter exclusively on these."
+          "purpose": "Every frontmatter tag uses the claude/ prefix: type tag (claude/session, claude/insight), claude/project/<name>, claude/topic/<topic>, claude/auto, claude/imported, claude/reconstructed, claude/retro, claude/standup. Dashboards filter exclusively on these. claude/lesson marks generated retro lesson notes (type claude-lesson), which vault_index._UNINDEXED_TYPES keeps out of the index."
         },
         {
           "id": "dataview-dashboards",
@@ -1169,9 +1222,10 @@
             "dashboards/decision-timeline.md",
             "dashboards/learning-velocity.md",
             "dashboards/project-index.md",
-            "dashboards/weekly-review.md"
+            "dashboards/weekly-review.md",
+            "dashboards/retro-lessons.md"
           ],
-          "purpose": "Six Dataview/dataviewjs dashboards over claude-sessions + claude-insights: recent sessions, open items by project, decision timeline, topic/error-pattern velocity, project index, and a 7-day weekly review. Every query that lists or groups claude-insights notes leaves provisional notes out unless it already filters to a status (the retro-only Recent Retrospectives query is exempt, since auto capture never writes retros), and every list query over them has a LIMIT (#458); tests/test_dashboards.py checks this and that the inline copies in skills/obsidian-setup Step 6 equal these files. Require the Obsidian Dataview plugin."
+          "purpose": "Seven Dataview/dataviewjs dashboards over claude-sessions + claude-insights: recent sessions, open items by project, decision timeline, topic/error-pattern velocity, project index, and a 7-day weekly review. Every query that lists or groups claude-insights notes leaves provisional notes out unless it already filters to a status (the retro-only Recent Retrospectives query is exempt, since auto capture never writes retros), and every list query over them has a LIMIT (#458); tests/test_dashboards.py checks this and that the inline copies in skills/obsidian-setup Step 6 equal these files. Require the Obsidian Dataview plugin. retro-lessons.md (#471) reads the generated lesson notes in claude-insights/lessons/: five bucket tables and a dormant table."
         }
       ]
     },
@@ -1234,6 +1288,24 @@
           "kind": "datastore",
           "files": [],
           "purpose": "<secure dir>/capture/: <sid>.json state, <sid>.claim, <sid>.flush, installed_at, cli_path (where the mod finds capture_cli.py), worker.log, worker-cwd/ and the captures.jsonl ledger (one row per saved capture: id, session, project, type, title, a 200-char summary, kind new/updated, note_path, status active/rejected; a split update also carries split_from and split_heading; #455 adds score, about_issue, repo, duplicate_of and superseded_by (capture ids), and the cached novelty) and split-backup-<UTC time>/ (0700) with a 0600 copy of each note split-updates --apply touched. #455 adds issue-check-<project>.json (the closed-issue check's 6 h stamp), backlog-scores.json (Haiku rubric v2 scores) and backlog-backup-<UTC time>/ (0700) with a 0600 copy of each note the backlog --apply touched."
+        },
+        {
+          "id": "db-lessons-verdicts",
+          "name": "lessons-verdicts.db",
+          "kind": "datastore",
+          "files": [
+            "hooks/lessons_verify.py"
+          ],
+          "purpose": "<secure dir>/lessons-verdicts.db: SQLite cache of Haiku same-lesson verdicts, one row per (anchor, candidate, rubric version, model); judged anchors are never re-sent. Rebuildable but costly (about 3,900 Haiku calls for a full vault)."
+        },
+        {
+          "id": "db-lessons-state",
+          "name": "lessons-state.json",
+          "kind": "datastore",
+          "files": [
+            "hooks/retro_rollup.py"
+          ],
+          "purpose": "<secure dir>/lessons-state.json (0600): lessons (members, tracking, info), tracking refresh results, note hashes and totals. report --json reads it. retired.json (merged and split ids) lives beside the lesson notes in <insights>/lessons/."
         }
       ]
     },
@@ -2442,6 +2514,70 @@
           "label": "candidates ([closed on GH] preselected only when completed) + errors (printed, no tick)"
         }
       ]
+    },
+    {
+      "id": "lessons-update",
+      "name": "Retro lessons update",
+      "description": "retro_rollup.py update judges new items, regroups and rewrites changed lesson notes.",
+      "steps": [
+        {
+          "from": "retro-rollup-cli",
+          "to": "lessons-corpus",
+          "label": "load open retro items, TF-IDF top 10"
+        },
+        {
+          "from": "retro-rollup-cli",
+          "to": "lessons-verify",
+          "label": "Haiku verdicts for unjudged anchors"
+        },
+        {
+          "from": "lessons-verify",
+          "to": "db-lessons-verdicts",
+          "label": "record verdicts"
+        },
+        {
+          "from": "retro-rollup-cli",
+          "to": "lessons-group",
+          "label": "star lessons, ids, tracking, buckets"
+        },
+        {
+          "from": "retro-rollup-cli",
+          "to": "db-lessons-state",
+          "label": "write state"
+        },
+        {
+          "from": "retro-rollup-cli",
+          "to": "lessons-notes",
+          "label": "render notes"
+        },
+        {
+          "from": "lessons-notes",
+          "to": "db-vault",
+          "label": "write changed notes to claude-insights/lessons/"
+        }
+      ]
+    },
+    {
+      "id": "lessons-backfill",
+      "name": "Retro lessons backfill (apply)",
+      "description": "backfill --apply --accept FILE traces the untraced members of accepted lessons.",
+      "steps": [
+        {
+          "from": "retro-rollup-cli",
+          "to": "db-lessons-state",
+          "label": "read lessons and tracking"
+        },
+        {
+          "from": "retro-rollup-cli",
+          "to": "retro-trace-cli",
+          "label": "apply_traces(partial=True) per retro note"
+        },
+        {
+          "from": "retro-trace-cli",
+          "to": "db-vault",
+          "label": "atomic write of traced items"
+        }
+      ]
     }
   ],
   "types": [
@@ -2766,7 +2902,7 @@
   "testing": {
     "unitSuite": {
       "tool": "pytest",
-      "fileCount": 134,
+      "fileCount": 155,
       "duration": "fast (stdlib, no network)",
       "environments": {
         "python": "3.12",

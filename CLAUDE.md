@@ -38,6 +38,7 @@ python3 hooks/obsidian_context_snapshot.py
 - `hooks/obsidian_session_log.py` — SessionEnd: writes raw session note immediately (AI summarization deferred to `/recall`), and appends a structured outcome line to `~/.claude/obsidian-brain-hook.log` for every exit path.
 - `hooks/obsidian_session_hint.py` — SessionStart: injects last-session context hint for the current project.
 - `hooks/obsidian_context_snapshot.py` — PreCompact: saves context snapshot before compression.
+- `hooks/retro_rollup.py` — retro lessons CLI (`update`, `rebuild`, `refresh-tracking`, `report`, `backfill`). It uses `hooks/lessons_corpus.py` (items, TF-IDF candidates), `hooks/lessons_verify.py` (Haiku verifier, SQLite verdict cache), `hooks/lessons_group.py` (star lessons, ids, tracking, buckets) and `hooks/lessons_notes.py` (lesson notes, report). State lives in `~/.claude/obsidian-brain/` (`lessons-state.json`, `lessons-verdicts.db`); `retired.json` (merged and split lesson ids) sits beside the lesson notes in `<insights_folder>/lessons/`.
 - `templates/` — Markdown templates for each note type (session, insight, decision, error-fix, snapshot, imported-session).
 - `dashboards/` — Dataview query templates installed to the user's vault.
 
@@ -53,7 +54,7 @@ Machine-local config at `~/.claude/obsidian-brain-config.json` (outside the vaul
 
 ### Tag convention
 
-All frontmatter tags use the `claude/` prefix: `claude/session`, `claude/insight`, `claude/decision`, `claude/error-fix`, `claude/snapshot`, `claude/imported`, `claude/standup`, `claude/retro`, `claude/project/<name>`, `claude/topic/<topic>`, `claude/auto`.
+All frontmatter tags use the `claude/` prefix: `claude/session`, `claude/insight`, `claude/decision`, `claude/error-fix`, `claude/snapshot`, `claude/imported`, `claude/standup`, `claude/retro`, `claude/lesson`, `claude/project/<name>`, `claude/topic/<topic>`, `claude/auto`.
 
 ### Keeping the architecture page current
 
