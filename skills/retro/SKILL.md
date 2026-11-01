@@ -584,6 +584,47 @@ OB_TRACES_EOF_<eof4>
 
 **Hard-fail signal:** if you are about to print "Retrospective saved!" with the gate still armed, you have skipped this step. The Stop hook will catch it — but classify proactively rather than relying on the block.
 
+### Step 7.6 — Queue the lesson update
+
+Step 7.5 has cleared the gate, so the note is final. Start the lesson update for it in the background. It never asks, never waits and never checks the result: the update judges the new items with Haiku (about 7 seconds each) and rewrites the lesson notes that changed. A held lock makes the background run exit 1 into the log, never block `/retro`. Replace `<NOTE_PATH>` with the path from Step 7:
+
+```bash
+cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+HOOKS=$(python3 -c "
+import glob, json, os, re
+def _ob_hooks():
+    try:
+        for _m in json.load(open(os.path.expanduser('~/.claude/plugins/known_marketplaces.json'))).values():
+            _s = _m.get('source') if isinstance(_m, dict) else None
+            if not (isinstance(_s, dict) and _s.get('source') == 'directory'):
+                continue
+            _i = _m.get('installLocation') if isinstance(_m, dict) else None
+            if not (isinstance(_i, str) and os.path.isabs(_i)):
+                continue
+            _h = os.path.join(_i, 'hooks')
+            if os.path.isfile(os.path.join(_h, 'obsidian_utils.py')):
+                return _h
+    except Exception:
+        pass
+    _c = [_d for _d in glob.glob(os.path.expanduser('~/.claude/plugins/cache/*/obsidian-brain/*/hooks')) if re.fullmatch('[0-9]+([.][0-9]+)*', _d.split('/')[-2])]
+    return max(_c, key=lambda _p: ([int(_n) for _n in _p.split('/')[-2].split('.')], _p), default='hooks')
+print(_ob_hooks())
+")
+test -f "$HOOKS/retro_rollup.py" || { echo "lesson update skipped: retro_rollup.py not found under $HOOKS"; exit 0; }
+mkdir -p -m 700 "$HOME/.claude/obsidian-brain"
+LESSONS=$(python3 -c '
+import json, os
+c = json.load(open(os.path.expanduser("~/.claude/obsidian-brain-config.json")))
+print("off" if c.get("lessons_enabled") is False else "on")
+' < /dev/null 2>/dev/null)
+if [ "$LESSONS" != "off" ]; then
+  nohup python3 "$HOOKS/retro_rollup.py" update --note '<NOTE_PATH>' < /dev/null >> "$HOME/.claude/obsidian-brain/lessons-update.log" 2>&1 &
+  echo "lesson update queued"
+fi
+```
+
+Print the one line it prints (`lesson update queued`) and go to Step 8. When `lessons_enabled` is false it prints nothing: skip silently.
+
 ### Step 8 — Confirm
 
 First prove the note exists. Run this in the main session, replacing `<NOTE_PATH>` with the literal path `note_writer.py` printed after `OK:` in Step 7:
