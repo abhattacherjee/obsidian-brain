@@ -51,10 +51,12 @@ Reply with ONLY a JSON object, no prose and no code fences:
 
 ## Data contract changes
 
-- Lesson record (`state["lessons"][lid]`) gains `"match"`: `{"kind": "issue"|"memory"|"path", "ref": str, "since": "YYYY-MM-DD"|None, "anchor": <sha1[:12] of the gate anchor>, "candidate": <sha1[:12] of the candidate text>}` for an accepted match, or `{"none": True, "anchor": ..., "candidate": <hash or None>}` for a rejection or no proposal. Absent = never checked.
-- Tracking dicts gain `"source": "trace"|"filed"|"match"`. Precedence in regroup: member-trace tracking, then the filed issue (existing), then the lesson's own `match` when its `anchor` equals the current anchor hash. A split child or merged survivor does not inherit a match (its anchor changed; `match` re-checks it).
+- Lesson record (`state["lessons"][lid]`) gains `"match"`: `{"kind": "issue"|"memory"|"path", "ref": str, "since": "YYYY-MM-DD"|None, "candidate": <short_hash of "<source>|<ref>|<candidate text>">}` for an accepted match, or `{"none": True, "candidate": <hash, or None when nothing was proposed>}` for a rejection or no proposal. Absent = never checked.
+- **A match lives with the lesson id** (ruling 2026-11-01, so a lesson that recurs keeps its match). It is re-gated only when the lesson's current TF-IDF top candidate hash differs from the stored `candidate` (TF-IDF is cheap; Haiku runs only on a change). A new lesson id (a merge or split that mints one) gets a fresh check; a survivor that keeps its id keeps its match. The candidate hash is deterministic: lesson text built from members in sorted key order, item text with the trace stripped (`lessons_corpus._item_text`).
+- **Where the check runs:** `refresh-tracking` runs it for every lesson needing one (no `match`, or a changed candidate) before re-reading tracking, so `/lessons`, weekly `/standup` and plan-week, which already run `refresh-tracking` first, keep matches current with no new command. `match` is the explicit entry point; `match --all` re-gates every eligible lesson. Lessons with member-trace tracking, a filed issue, or a pending filing record are not matched (the reconcile pass decides a pending one).
+- Tracking dicts gain `"source": "trace"|"filed"|"match"`. Precedence in regroup: member-trace tracking, then the filed issue (existing), then the lesson's own `match` (keyed by lesson id).
 - Kind mapping: issue → `issue` (ref `owner/repo#N`), memory → `memory` (ref = file stem), rule → `path` (ref = the file path with `$HOME` written as `~`, no line number; the #470 path trace form).
-- `since`: issue `createdAt[:10]` (and `refresh-tracking` keeps it current); memory = file mtime date; rule = `git log -1 --format=%cs -S <first 60 chars of the paragraph> -- <file>` run in the file's repo (10 s timeout), else the file mtime date.
+- `since`: issue `createdAt[:10]` (and `refresh-tracking` keeps it current); memory = file mtime date; rule = `git log -1 --format=%cs -S <first 60 chars of the paragraph> -- <file>` when `git -C <dir> rev-parse --show-toplevel` succeeds (stdin closed, 10 s timeout; `~/.claude` is not a git repo, so this helps project `CLAUDE.md` files only), else the file mtime date. A non-repo path never raises.
 - `report --json` and lesson note frontmatter gain `tracking_source` (`trace`, `filed`, `match` or `none`). The text table appends ` (match)` to a matched ref.
 - `_untraced_report` reason for a member of a matched, not accepted lesson: `lesson-matched` (was `not-accepted`).
 
@@ -68,7 +70,7 @@ Reply with ONLY a JSON object, no prose and no code fences:
 - **Unrelated changes:** none; `backfill` filing code is untouched except the untraced reason string and planned-filings exclusion.
 - **Inputs:** reads the retro notes (vault copy in tests), `lessons-state.json`, `gh issue list` per repo (live in real runs, faked in tests), memory files from `memory_sources`, `~/.claude/CLAUDE.md`, `~/dev/claude_workspace/<project>/CLAUDE.md`, `~/.claude/skills/*/SKILL.md` and the highest numeric version dir per plugin under `~/.claude/plugins/cache/*/*/skills/*/SKILL.md`. Source of truth for each match is re-checked by `refresh-tracking` (issue state; memory stem and rule path existence). A missing or unreadable file is skipped with an error line, never a crash. Tests use a tmp HOME. Test: `test_unreadable_rule_file_is_skipped_with_error`.
 - **Bypass routes for C.3 (no trace without accept):** the cheapest route would be `backfill --apply` with an accept entry naming a lesson whose tracking just changed to a match. The existing `tracking_ref` equality check covers it; add `test_backfill_traces_a_match_only_with_a_matching_accept_entry` and `test_match_and_update_never_write_a_trace` (checksum of every retro note before and after `match`, `update`, `rebuild`, `refresh-tracking`).
-- **Stale match:** a match whose lesson anchor changed is ignored by regroup and re-checked by `match`. Test: `test_match_is_dropped_when_the_lesson_anchor_changes`.
+- **Stale match:** a lesson whose TF-IDF top candidate changed is re-gated by `refresh-tracking` or `match`; until then its stored match stands. A lesson that only gained a member, with the same top candidate, keeps its match and makes no Haiku call. Tests: `test_recurring_lesson_keeps_its_match_without_a_haiku_call`, `test_changed_top_candidate_is_regated`, `test_refresh_tracking_gates_unchecked_lessons`.
 - **Outward writes:** none. `match` only reads GitHub, so no retry state table is needed.
 
 ---
@@ -93,7 +95,7 @@ Delegate: codex — self-contained new module plus its tests, 2 files, `Check:` 
 - `parse_gate(stdout: str | None) -> bool | None`: first `{...}` object, `covers` must be a bool.
 - `short_hash(text: str) -> str` (sha1 hex, first 12).
 
-- [ ] **Step 1:** Write `tests/test_lessons_match.py`: `test_lesson_text_and_anchor_shapes`, `test_memory_docs_skip_index_and_report_unreadable`, `test_rule_bullets_join_continuations`, `test_rule_paragraphs_skip_fences_and_short`, `test_unclosed_fence_stops_paragraphs`, `test_rule_docs_pick_highest_plugin_version` (dirs `1.9.0` and `1.10.0`: only `1.10.0` read), `test_issue_docs_skip_bad_numbers`, `test_best_candidate_picks_highest_across_sources_and_breaks_ties_by_ref`, `test_best_candidate_none_when_all_scores_zero`, `test_parse_gate_accepts_only_bool_covers` (inputs: `{"covers": true}`, prose around it, `{"covers": "yes"}` → None, `None` → None, `[]` → None), `test_gate_retries_once_then_none`, `test_gate_prompt_is_verbatim` (compare against the text in this plan).
+- [ ] **Step 1:** Write `tests/test_lessons_match.py`: `test_lesson_text_and_anchor_shapes`, `test_memory_docs_skip_index_and_report_unreadable`, `test_rule_bullets_join_continuations`, `test_rule_paragraphs_skip_fences_and_short`, `test_unclosed_fence_stops_paragraphs`, `test_rule_docs_pick_highest_plugin_version` (dirs `1.9.0` and `1.10.0`: only `1.10.0` read), `test_issue_docs_skip_bad_numbers`, `test_best_candidate_picks_highest_across_sources_and_breaks_ties_by_ref`, `test_best_candidate_none_when_all_scores_zero`, `test_parse_gate_accepts_only_bool_covers` (inputs: `{"covers": true}`, prose around it, `{"covers": "yes"}` → None, `None` → None, `[]` → None), `test_gate_retries_once_then_none`, `test_gate_prompt_holds_the_examples_and_reply_shape` (the three example lines and the `{"covers": true|false}` tail are in `GATE_PROMPT`).
 - [ ] **Step 2:** Run `python3 -m pytest tests/test_lessons_match.py -q -p no:cacheprovider`; expect failures (module missing).
 - [ ] **Step 3:** Implement `hooks/lessons_match.py` to the interfaces above.
 - [ ] **Step 4:** Run the same command; expect all pass.
@@ -113,7 +115,11 @@ Delegate: claude — cross-cutting change to the state contract, regroup precede
 - [ ] **Step 1: tests first.** In `tests/test_retro_rollup.py` (fake `_run_gh` for `issue list`, fake runner for Haiku, tmp HOME with a fake memory dir, `~/.claude/CLAUDE.md` and one `SKILL.md`):
   - `test_match_accepts_top_candidate_and_lesson_leaves_file_bucket` (#473 C.2)
   - `test_match_rejected_lesson_stays_in_file_bucket_and_is_not_rechecked`
-  - `test_match_is_dropped_when_the_lesson_anchor_changes`
+  - `test_recurring_lesson_keeps_its_match_without_a_haiku_call`
+  - `test_changed_top_candidate_is_regated`
+  - `test_refresh_tracking_gates_unchecked_lessons`
+  - `test_lessons_with_a_pending_filing_are_not_matched`
+  - `test_full_issue_page_prints_a_warning_not_an_error`
   - `test_failed_issue_listing_leaves_lessons_unchecked_and_exits_1`
   - `test_memory_scan_error_leaves_lessons_unchecked`
   - `test_haiku_non_answer_is_not_cached_as_no_match`
@@ -129,7 +135,7 @@ Delegate: claude — cross-cutting change to the state contract, regroup precede
   - `test_match_makes_no_gh_write` (the fake `_run_gh` fails the test on anything but `issue list`)
 - [ ] **Step 2:** Run `python3 -m pytest tests/test_retro_rollup.py tests/test_lessons_notes.py -q -p no:cacheprovider`; record the red run.
 - [ ] **Step 3:** Implement:
-  - `match` subcommand (`--concurrency`, default config `lessons_concurrency`, 1-16; `--all` re-checks every untracked lesson). Lessons to check: no member-trace tracking, no filed issue, and `match` absent or its `anchor` differs. One `gh issue list --repo R --state all --limit 1000 --json number,title,body,state,stateReason,milestone,labels,createdAt,closedAt` per repo of those lessons' projects (`_origin_repo` / `project_repos`), read-only, 30 s timeout. A failed repo marks its lessons' issue source as failed: those lessons are skipped this run (unchecked) and the run exits 1.
+  - `match` subcommand (`--concurrency`, default config `lessons_concurrency`, 1-16; `--all` re-checks every untracked lesson). Lessons to check: no member-trace tracking, no filed issue, no pending filing record, and `match` absent or its `candidate` differs from the current top candidate hash. The same check runs at the start of `refresh-tracking`. One `gh issue list --repo R --state all --limit 1000 --json number,title,body,state,stateReason,milestone,labels,createdAt,closedAt` per repo of those lessons' projects (`_origin_repo` / `project_repos`), read-only, 60 s timeout. A full page (1,000 issues) prints a warning line (older issues are not candidates), not an error. A failed repo marks its lessons' issue source as failed: those lessons are skipped this run (unchecked) and the run exits 1.
   - Per lesson: `best_candidate` over issues (its projects' repos), memory, rules (global + its projects); `gate`; save `rec["match"]` as in the data contract; save state after the pass; then re-render (regroup without judging, as `rebuild` does).
   - Regroup precedence and `source` as in the data contract; `refresh_tracking` unchanged in shape but now sees match tracking (it already reads `rec["tracking"]`).
   - `lessons_notes`: `tracking_source` field in frontmatter and report; ` (match)` in the text table.
