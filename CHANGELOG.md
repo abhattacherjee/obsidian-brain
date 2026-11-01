@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.10.0] - 2026-11-01
+
 ### Added
 - Auto-capture promotes at most 10 notes per session, picked by merit (#455). Every new auto note is saved `status: provisional`, out of the default `/recall` related insights and `/vault-ask` candidates; `/vault-search` still lists it. After each slice, new `hooks/capture_select.py` re-ranks the whole session: merit = 0.7 × score/10 + 0.3 × novelty, +0.02 for error-fix and decision, where novelty is 1 − the max TF-IDF cosine to earlier curated notes of the same project from other sessions. Picks are greedy: merit − 0.5 × the max cosine to the notes already picked, and a note at cosine ≥ 0.6 to a pick is skipped. The top 10 become `status: promoted` (`active` for a decision) and the rest stay provisional, so a later, stronger note can displace an earlier pick. Each note records `capture_score`, `capture_novelty`, `capture_merit` and `capture_rank`, and each promotion or demotion writes a `promoted`/`demoted` line to `obsidian-brain-hook.log`.
 - The capture worker scores each candidate 1–10 with rubric v2 and returns `duplicate_of`, `superseded_by` (another element of its answer, or an earlier capture by the `[id]` the prompt now lists) and `about_issue`. A missing or invalid score is 5. A duplicate stays provisional, and so does a superseded note.
