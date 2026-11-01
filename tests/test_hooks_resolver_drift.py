@@ -390,13 +390,14 @@ def test_block_partitions_cover_every_distinct_block():
 # ---------------------------------------------------------------------------
 
 
-def test_resolver_site_count_is_exactly_80():
-    """EQUALITY, deliberately — 80 is derived independently (58 + 2 + 16 + 1 + 3),
+def test_resolver_site_count_is_exactly_84():
+    """EQUALITY, deliberately — 84 is derived independently (59 + 2 + 19 + 1 + 3),
     not read back from the scan. A ``>=`` floor here would let a deleted site,
     or a site reformatted past the extractor, pass silently. (#318 fix-wave
     I1: Step 9's new real block added one FORM_A site, 71 -> 72. #375/#312:
     five FORM_B vault_scan.py sites, 72 -> 77. #470: two FORM_B retro_trace.py
-    sites in /retro and one FORM_A site in /check-items, 77 -> 80.)"""
+    sites in /retro and one FORM_A site in /check-items, 77 -> 80. Later
+    changes took it to 84; see the comment above EXPECTED_FORM_COUNTS.)"""
     assert len(_SITES) == EXPECTED_SITE_COUNT, (
         f"expected exactly {EXPECTED_SITE_COUNT} resolver sites, found "
         f"{len(_SITES)}: "

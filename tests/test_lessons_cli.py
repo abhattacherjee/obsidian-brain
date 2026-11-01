@@ -509,3 +509,131 @@ def test_snooze_refuses_note_outside_lessons(ready, tmp_path):
     before = outside.read_bytes()
     assert run(base, "snooze", lid, "2026-12-01") == 1
     assert outside.read_bytes() == before
+
+
+# --- review survivors (#478): X-001, C-001, C-010 -----------------------------------
+
+def _set_state(state, mutate):
+    s = state_of(state)
+    mutate(s)
+    (state / "lessons-state.json").write_text(json.dumps(s))
+
+
+def _retire_into(vault, old, survivor):
+    d = vault / "claude-insights" / "lessons"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "retired.json").write_text(json.dumps({old: {"merged_into": survivor}}))
+
+
+@pytest.mark.parametrize("second", [
+    {"file_issue": True, "repo": "o/r"}, {"tracking_ref": "o/r#9"}])
+def test_x001_repeated_lesson_id_refuses_the_accept_file(filing, tmp_path, capsys, second):
+    vault, state, base, gh = filing
+    first = entry_for(state, title="First")
+    f = _file_accept(tmp_path, [first, {"lesson_id": first["lesson_id"], **second}])
+    before = retro_bytes(vault), (state / "lessons-state.json").read_bytes()
+    for args in (("backfill", "--accept", str(f)), ("backfill", "--apply", "--accept", str(f))):
+        capsys.readouterr()
+        assert run(base, *args) == 2
+        assert "repeats lesson_id" in capsys.readouterr().err
+    assert gh.calls == gh.list_calls == []
+    assert (retro_bytes(vault), (state / "lessons-state.json").read_bytes()) == before
+
+
+def test_c001_preview_shows_an_inherited_filing_as_adopted_not_filed(filing, tmp_path, capsys):
+    vault, state, base, gh = filing
+    entry = entry_for(state)
+    lid = entry["lesson_id"]
+    _retire_into(vault, "old-lesson", lid)
+    _set_state(state, lambda s: s["filed"].update({"old-lesson": "o/r#7"}))
+    f = _file_accept(tmp_path, [entry])
+    capsys.readouterr()
+    assert run(base, "backfill", "--accept", str(f)) == 0
+    rows = json.loads(capsys.readouterr().out)["planned_filings"]
+    assert [r["lesson"] for r in rows] == [lid]
+    assert "o/r#7" in rows[0]["reason"]
+    assert gh.calls == [] and gh.list_calls == []
+    capsys.readouterr()
+    assert run(base, "backfill", "--apply", "--accept", str(f)) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert gh.calls == [] and out["filed"] == []
+    assert state_of(state)["lessons"][lid]["tracking"]["ref"] == "o/r#7"
+
+
+@pytest.mark.parametrize("list_fail", [None, "rc"])
+def test_c001_preview_matches_apply_for_an_inherited_pending_record(filing, tmp_path, capsys, list_fail):
+    vault, state, base, gh = filing
+    gh.list_fail = list_fail
+    entry = entry_for(state)
+    lid = entry["lesson_id"]
+    _retire_into(vault, "old-lesson", lid)
+    _set_state(state, lambda s: s["filed"].update(
+        {"old-lesson": {"pending": True, "repo": "o/r", "marker": retro_rollup._marker("old-lesson")}}))
+    f = _file_accept(tmp_path, [entry])
+    capsys.readouterr()
+    assert run(base, "backfill", "--accept", str(f)) == 0
+    rows = json.loads(capsys.readouterr().out)["planned_filings"]
+    assert rows[0]["reason"] == "pending reconcile"  # apply may file it, or may not: not a sure issue
+    assert gh.calls == [] and gh.list_calls == []
+    capsys.readouterr()
+    code = run(base, "backfill", "--apply", "--accept", str(f))
+    out = json.loads(capsys.readouterr().out)
+    creates = [c for c in gh.calls if c[:2] == ["issue", "create"]]
+    if list_fail is None:  # the reconcile finds nothing and drops the record, so apply files
+        assert code == 0 and len(creates) == 1 and [x["lesson"] for x in out["filed"]] == [lid]
+    else:  # the reconcile fails: an earlier issue may exist, so nothing is filed
+        assert code == 1 and creates == []
+        assert out["skipped_entries"][0]["reason"] == "cannot check for an earlier filing"
+
+
+def _gone_tracking(s, lid, kind="issue", ref="o/r#4"):
+    s["lessons"][lid]["tracking"] = {"kind": kind, "ref": ref, "since": "2026-10-01"}
+    s["tracking"][f"{kind}:{ref}"] = {"exists": False}
+
+
+def test_c010_gone_tracking_can_be_filed_in_preview_and_apply(filing, tmp_path, capsys):
+    vault, state, base, gh = filing
+    entry = entry_for(state)
+    lid = entry["lesson_id"]
+    _set_state(state, lambda s: _gone_tracking(s, lid))
+    f = _file_accept(tmp_path, [entry])
+    capsys.readouterr()
+    assert run(base, "backfill", "--accept", str(f)) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert [r["lesson"] for r in result["planned_filings"]] == [lid]
+    assert "reason" not in result["planned_filings"][0] and result["skipped_entries"] == []
+    capsys.readouterr()
+    assert run(base, "backfill", "--apply", "--accept", str(f)) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert [x["lesson"] for x in out["filed"]] == [lid]
+    assert sum(1 for c in gh.calls if c[:2] == ["issue", "create"]) == 1
+    new_ref = state_of(state)["lessons"][lid]["tracking"]["ref"]
+    assert new_ref != "o/r#4" and state_of(state)["filed"][lid] == new_ref
+
+
+def test_c010_gone_tracking_without_untraced_members_is_nothing_to_trace(filing, tmp_path, capsys):
+    vault, state, base, gh = filing
+    entry = entry_for(state)
+    lid = entry["lesson_id"]
+    _set_state(state, lambda s: (_gone_tracking(s, lid), s["lessons"][lid].update(members=[])))
+    f = _file_accept(tmp_path, [entry])
+    for args in (("backfill", "--accept", str(f)), ("backfill", "--apply", "--accept", str(f))):
+        capsys.readouterr()
+        assert run(base, *args) == 0
+        out = json.loads(capsys.readouterr().out)
+        assert out["skipped_entries"][0]["reason"] == "nothing to trace"
+    assert gh.calls == []
+
+
+def test_c010_live_tracking_is_still_refused(filing, tmp_path, capsys):
+    vault, state, base, gh = filing
+    entry = entry_for(state)
+    lid = entry["lesson_id"]
+    _set_state(state, lambda s: s["lessons"][lid].update(
+        tracking={"kind": "issue", "ref": "o/r#4", "since": "2026-10-01"}))
+    f = _file_accept(tmp_path, [entry])
+    for args in (("backfill", "--accept", str(f)), ("backfill", "--apply", "--accept", str(f))):
+        capsys.readouterr()
+        assert run(base, *args) == 0
+        assert json.loads(capsys.readouterr().out)["skipped_entries"][0]["reason"] == "already tracked"
+    assert gh.calls == []

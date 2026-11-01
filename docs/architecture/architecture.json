@@ -119,7 +119,7 @@
         ]
       },
       {
-        "arrowLabel": "on demand (19 skills)",
+        "arrowLabel": "on demand (20 skills)",
         "nodes": [
           {
             "label": "Capture / Recall",
@@ -955,7 +955,7 @@
       "id": "skills",
       "name": "Skills (prompt-based procedures)",
       "color": "#8B5CF6",
-      "description": "19 SKILL.md prompt procedures (no code files) that Claude Code follows step-by-step, reaching the backing Python via a canonical resolver duplicated at each call site (#278): the marketplace-registered install location is tried first (validated by the presence of hooks/obsidian_utils.py), falling back to the newest allowlisted plugin-cache version only when no install location resolves — cache-first-with-fallback was rejected because it keeps serving a stale cached module whenever one exists, which silently defeats a directory-source (local checkout) install. Grouped by lifecycle: SETUP, CAPTURE, RECALL/QUERY, MAINTENANCE, TRIAGE. Some fan out to sub-agents; most run inline.",
+      "description": "20 SKILL.md prompt procedures (no code files) that Claude Code follows step-by-step, reaching the backing Python via a canonical resolver duplicated at each call site (#278): the marketplace-registered install location is tried first (validated by the presence of hooks/obsidian_utils.py), falling back to the newest allowlisted plugin-cache version only when no install location resolves — cache-first-with-fallback was rejected because it keeps serving a stale cached module whenever one exists, which silently defeats a directory-source (local checkout) install. Grouped by lifecycle: SETUP, CAPTURE, RECALL/QUERY, MAINTENANCE, TRIAGE. Some fan out to sub-agents; most run inline.",
       "components": [
         {
           "id": "sk-obsidian-setup",
@@ -1018,7 +1018,7 @@
           "files": [
             "skills/lessons/SKILL.md"
           ],
-          "purpose": "TRIAGE. Walks the retro lessons that need action (report --json after refresh-tracking) and asks per lesson: file (bucket file only; drafts title and body from show --json, milestone and priority label read-only), raise (gh issue edit only for a change the user picks), skip, or snooze (retro_rollup.py snooze). Rule and memory matches are confirmed in one batch. Writes an accept file (mkstemp, 0600), shows backfill --accept FILE as a dry run, asks once, then runs backfill --apply --accept FILE. Never runs gh issue create. Skill v1.0.0 (#474)."
+          "purpose": "TRIAGE. Walks the retro lessons that need action (report --json after refresh-tracking) and asks per lesson: file (bucket file: no tracking or gone tracking; drafts title and body from show --json, milestone and priority label read-only), raise (gh issue edit only for a change the user picks), skip, or snooze (retro_rollup.py snooze). Rule and memory matches are confirmed in one batch. Writes an accept file (mkstemp, 0600), shows backfill --accept FILE as a dry run, asks once, then runs backfill --apply --accept FILE. Never runs gh issue create. Skill v1.0.0 (#474)."
         },
         {
           "id": "sk-recall",

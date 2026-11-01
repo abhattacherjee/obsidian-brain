@@ -87,7 +87,7 @@ test -f "$HOOKS/retro_rollup.py" || { echo "ERROR: retro_rollup.py not found und
 python3 "$HOOKS/retro_rollup.py" report --json < /dev/null
 ```
 
-From `lessons[]`, drop every lesson with `dormant` true, and every lesson with `snoozed_until` on or after today (a snooze that ends today still hides the lesson). Walk the rest in bucket order `raise`, `file`, `didnt_hold`, `rule_not_followed`, keeping the report's order inside a bucket (`quiet` is not walked), up to N lessons. If none are left, say "No lessons need action." and stop.
+From `lessons[]`, drop every lesson with `dormant` true, and every lesson with `snoozed_until` on or after today (a snooze that ends today still hides the lesson). Walk the rest in bucket order `raise`, `file`, `didnt_hold`, `rule_not_followed`, keeping the report's order inside a bucket (`quiet` is not walked), up to N lessons. If none are left, go on to Step 5: quiet and `rule_not_followed` matches may still need a batch confirm. Say "No lessons need action." and stop only when Step 5 finds nothing either.
 
 Keep a pending accept list in your head, empty to start. Entries are added in Step 4 and Step 5.
 
@@ -95,7 +95,7 @@ Keep a pending accept list in your head, empty to start. Entries are added in St
 
 Print one line: name, bucket, sessions, projects, tracking ref (or "no tracking"), issue milestone and priority. Then ask one AskUserQuestion with these options:
 
-- **File** — only for bucket `file` (the lesson has no tracking).
+- **File** — only for bucket `file` (the report's `tracking` is `none` or `gone`). The CLI treats gone tracking as none, so File works for both.
 - **Raise** — only for a lesson whose tracking is an issue (buckets `raise` and `didnt_hold`).
 - **Skip** — do nothing, go to the next lesson.
 - **Snooze** — hide the lesson until a date.
@@ -127,7 +127,7 @@ gh api 'repos/<OWNER/REPO>/milestones?state=open' --jq '.[].title' < /dev/null
 gh label list --repo '<OWNER/REPO>' --limit 100 --json name --jq '.[].name' < /dev/null
 ```
 
-   Offer the milestone titles and the priority labels (names that start with `P` and a digit). "None" is allowed for both.
+   Offer the milestone titles and the priority labels (names that start with `P` and a digit). "None" is allowed for both. If either lookup fails, say so and draft with no milestone and no labels.
 5. AskUserQuestion: **Use this draft**, **Edit the draft**, or **Drop it**. Edit loops back to the draft. On "Use this draft", add `{"lesson_id", "file_issue": true, "repo", "title", "body", "milestone", "labels"}` to the pending accept list (leave out `milestone` when none, and `labels` when none). Nothing is sent to GitHub now.
 
 Limits the CLI enforces (a bad entry refuses the whole file): title 1-256 characters on one line; body at most 20,000 characters; milestone 1-100 characters; at most 10 labels of 1-50 characters, none with a comma or newline.
@@ -147,7 +147,7 @@ gh issue edit '<N>' --repo '<OWNER/REPO>' --milestone '<MILESTONE TITLE>' < /dev
 gh issue edit '<N>' --repo '<OWNER/REPO>' --add-label '<NEW P LABEL>' --remove-label '<OLD P LABEL>' < /dev/null
 ```
 
-Then add `{"lesson_id", "tracking_ref"}` (the report's `tracking_ref`, `owner/repo#N`) to the pending accept list, so the lesson's untraced members get the issue trace. Issue traces do not tick items, so no batch review is needed for them.
+If a `gh issue edit` fails, say so, show the error, and do not add the entry below for that lesson. Otherwise add `{"lesson_id", "tracking_ref"}` (the report's `tracking_ref`, `owner/repo#N`) to the pending accept list, so the lesson's untraced members get the issue trace. Issue traces do not tick items, so no batch review is needed for them.
 
 #### Step 4c — Snooze
 
@@ -171,7 +171,7 @@ test -f "$HOOKS/retro_rollup.py" || { echo "ERROR: retro_rollup.py not found und
 python3 "$HOOKS/retro_rollup.py" backfill < /dev/null
 ```
 
-In the output, `plan[]` has one row per untraced item (`lesson`, `note`, `item`, `trace`). Keep the lessons whose report `tracking` is `memory` or `rule` and whose bucket is `rule_not_followed` or `quiet`. Print them as one numbered list: `N. lesson name → matched ref (items to trace)`. If there are none, skip to Step 6.
+In the output, `plan[]` has one row per untraced item (`lesson`, `note`, `item`, `trace`). Keep the lessons whose report `tracking` is `memory` or `rule` and whose bucket is `rule_not_followed` or `quiet`. Drop every lesson Step 3 drops (`dormant` true, or `snoozed_until` on or after today) and every lesson snoozed in Step 4c in this run. Print them as one numbered list: `N. lesson name → matched ref (items to trace)`. If there are none, skip to Step 6.
 
 Ask one AskUserQuestion: **Accept all**, **Accept all except some** (the user names the numbers to leave out), or **Skip this batch**. Each accepted lesson adds `{"lesson_id", "tracking_ref"}` to the pending accept list. These traces tick the items, which is why the user sees the matches first.
 
@@ -195,11 +195,11 @@ python3 "$HOOKS/retro_rollup.py" backfill --accept '<ACCEPT path>' < /dev/null
 
 Exit 2: the file is invalid (the message names the field). Fix the entry and write the file again. Otherwise show:
 
-- `planned_filings`: repo, title, milestone, labels, and `body_chars` for each issue to file; a row with a `reason` cannot be filed.
+- `planned_filings`: repo, title, milestone, labels, and `body_chars` for each issue to file. A row with reason `pending reconcile` may be filed: the CLI first checks GitHub for an earlier issue and files only if there is none. A row with any other `reason` is not filed (an existing issue is adopted, or no repo was found).
 - `skipped_entries`: each entry and its reason.
 - `plan`: the number of traces per lesson.
 
-Ask once: "Apply: N issues to file, M lessons to trace?" with **Yes** and **No**. N is the number of `planned_filings` without a `reason`; M is the number of lessons in `plan` plus N.
+Ask once: "Apply: N issues to file, P pending reconcile (may file), M lessons to trace?" with **Yes** and **No**. N is the number of `planned_filings` without a `reason`; P is the number with reason `pending reconcile`; M is the number of lessons in `plan` plus N.
 
 - **No** — delete the accept file (`rm -f '<ACCEPT path>'`). Nothing changes.
 - **Yes** — run the apply, then delete the accept file whatever the result:

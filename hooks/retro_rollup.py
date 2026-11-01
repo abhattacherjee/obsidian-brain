@@ -803,9 +803,13 @@ def _read_accept(path: str) -> list[dict]:
              '{"lesson_id", "file_issue": true, "repo"?, "title"?, "body"?, "milestone"?, "labels"?}')
     if not isinstance(data, list):
         raise UsageError(usage)
+    seen = set()
     for e in data:
         if not isinstance(e, dict) or not isinstance(e.get("lesson_id"), str):
             raise UsageError(usage)
+        if e["lesson_id"] in seen:
+            raise UsageError(f"accept file repeats lesson_id {e['lesson_id']!r}")
+        seen.add(e["lesson_id"])
         if "file_issue" in e:
             if e["file_issue"] is not True or "tracking_ref" in e:
                 raise UsageError(usage)
@@ -1018,9 +1022,51 @@ def _adopted_info(issue: dict, today: str) -> dict:
             "created": day(issue.get("createdAt")) or today, "closed": day(issue.get("closedAt"))}
 
 
+def _ref_gone(state: dict, ref: str) -> bool:
+    return (state["tracking"].get(f"issue:{ref}") or {}).get("exists") is False
+
+
+def _live_tracking(state: dict, rec: dict) -> bool:
+    """True when the lesson has tracking that still exists. Gone tracking (the bucket is `file`) counts
+    as none, so a lesson the report offers for filing can be filed."""
+    tracking = rec.get("tracking")
+    if not tracking:
+        return False
+    if (state["tracking"].get(_tracking_key(tracking)) or {}).get("exists") is False:
+        return False
+    return not (rec.get("classify") or {}).get("tracking_gone")
+
+
+def _live_filed(state: dict, lid: str):
+    """The lesson's own filed ref when it is a valid ref to an issue that still exists, else None."""
+    ref = state["filed"].get(lid)
+    return ref if isinstance(ref, str) and _REF.match(ref) and not _ref_gone(state, ref) else None
+
+
+def _adopt_decision(state: dict, lid: str, rec: dict, retired: dict):
+    """What backfill --apply does before it files an issue for an untracked lesson.
+
+    ("adopt", ref, source): an issue filed under a merged-in or split-from id counts, so apply adopts
+    it. ("pending", None, None): a pending filing record under an id this lesson came from means an
+    earlier issue may exist. Apply reconciles it first and refuses to file if that fails.
+    (None, None, None): apply goes on to file. An own pending or own filed record is none of these:
+    apply reconciles or uses it first.
+    """
+    filed = state["filed"].get(lid)
+    if _is_pending(filed) or _live_filed(state, lid):
+        return None, None, None
+    ref, source = _inherited_filing(state, lid, rec, retired)
+    if ref is not None and not _ref_gone(state, ref):
+        return "adopt", ref, source
+    if _inherited_pending(state, lid, rec, retired) is not None:
+        return "pending", None, None
+    return None, None, None
+
+
 def _planned_filings(ctx: Ctx, state: dict, by_key: dict,
                      entries: list[dict] | None = None) -> list[dict]:
     plans, cache = [], {}
+    retired = _load_retired(ctx)
     selected = ({e["lesson_id"]: e for e in entries if e.get("file_issue")}
                 if entries is not None else {lid: {} for lid in state["lessons"]})
     for lid, entry in sorted(selected.items()):
@@ -1028,16 +1074,24 @@ def _planned_filings(ctx: Ctx, state: dict, by_key: dict,
         if rec is None:
             continue
         filed = state["filed"].get(lid)
-        if rec.get("tracking") or isinstance(filed, str):
+        if _live_tracking(state, rec) or _live_filed(state, lid):
             continue
         untraced = sum(1 for k in rec["members"] if k in by_key and by_key[k]["trace"] is None)
+        # The same decisions apply makes before it files (see _adopt_decision): a lesson apply would
+        # adopt, or cannot check, is not a planned issue.
+        decision, found, _source = _adopt_decision(state, lid, rec, retired)
+        if decision == "adopt":
+            plans.append({"lesson": lid, "repo": found.rsplit("#", 1)[0],
+                          "title": rec["name"], "members": untraced, "milestone": None,
+                          "labels": [], "reason": f"adopts existing issue {found}"})
+            continue
         if not untraced:
             continue
         if _is_pending(filed) and entries is None:
             repo, reason = filed["repo"], "pending reconcile"
         else:
             repo, reason = _resolve_repo(ctx, rec, by_key, entry.get("repo"), cache)
-            if _is_pending(filed) and reason is None:
+            if (_is_pending(filed) or decision == "pending") and reason is None:
                 reason = "pending reconcile"
         plan = {"lesson": lid, "repo": repo,
                 "title": _filing_title(lid, rec, entry) if entries is not None else rec["name"],
@@ -1124,7 +1178,7 @@ def backfill(ctx: Ctx, state: dict, accept: list[dict] | None,
                 row = preview_by_id.get(lid)
                 reason = None
                 if row is None:
-                    reason = ("already tracked" if rec.get("tracking") or isinstance(state["filed"].get(lid), str)
+                    reason = ("already tracked" if _live_tracking(state, rec) or _live_filed(state, lid)
                               else "nothing to trace")
                 elif row["repo"] is None:
                     reason = row["reason"]
@@ -1132,14 +1186,12 @@ def backfill(ctx: Ctx, state: dict, accept: list[dict] | None,
                 if reason:
                     skipped_entries.append({**entry, "reason": reason})
                 continue
-            ref = state["filed"].get(lid)
-            if not (isinstance(ref, str) and _REF.match(ref)):
-                ref = None
-            if ref is None and not rec.get("tracking") and not _is_pending(state["filed"].get(lid)):
+            ref = _live_filed(state, lid)
+            if ref is None and not _live_tracking(state, rec) and not _is_pending(state["filed"].get(lid)):
                 # An issue filed under a merged-in or split-from id counts: do not file a second one.
                 # An own pending record still here means its reconcile failed: keep it, never overwrite.
-                ref, source = _inherited_filing(state, lid, rec, retired)
-                if ref is not None:
+                decision, ref, source = _adopt_decision(state, lid, rec, retired)
+                if decision == "adopt":
                     state["filed"][lid] = ref
                     since = ((state["tracking"].get(f"issue:{ref}") or {}).get("created")
                              or ((state["lessons"].get(source) or {}).get("tracking") or {}).get("since")
@@ -1154,13 +1206,14 @@ def backfill(ctx: Ctx, state: dict, accept: list[dict] | None,
                         ok = False
                         continue
             if ref is None:
-                if rec.get("tracking"):
+                if _live_tracking(state, rec):
                     skipped_entries.append({**entry, "reason": "already tracked"})
                     continue
                 if not any(k in by_key and by_key[k]["trace"] is None for k in rec["members"]):
                     skipped_entries.append({**entry, "reason": "nothing to trace"})
                     continue
-                if not can_file or _inherited_pending(state, lid, rec, retired) is not None:
+                if (not can_file or _is_pending(state["filed"].get(lid))
+                        or _adopt_decision(state, lid, rec, retired)[0] == "pending"):
                     # A reconcile failed (or could not be saved): an earlier issue may exist.
                     skipped_entries.append({**entry, "reason": "cannot check for an earlier filing"})
                     ok = False
@@ -1209,7 +1262,7 @@ def backfill(ctx: Ctx, state: dict, accept: list[dict] | None,
                     ok = False
                     continue
                 filed.append({"lesson": lid, "repo": repo, "issue": number})
-            elif rec.get("tracking") and rec["tracking"]["ref"] != ref:
+            elif _live_tracking(state, rec) and rec["tracking"]["ref"] != ref:
                 skipped_entries.append({**entry, "reason": "already tracked"})
                 continue
             accepted[lid] = {**rec, "tracking": {"kind": "issue", "ref": ref}}
