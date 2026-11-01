@@ -766,8 +766,9 @@ def backfill(ctx: Ctx, state: dict, accept: list[dict] | None) -> tuple[dict, bo
             ref = state["filed"].get(lid)
             if not (isinstance(ref, str) and _REF.match(ref)):
                 ref = None
-            if ref is None and not rec.get("tracking"):
+            if ref is None and not rec.get("tracking") and not _is_pending(state["filed"].get(lid)):
                 # An issue filed under a merged-in or split-from id counts: do not file a second one.
+                # An own pending record still here means its reconcile failed: keep it, never overwrite.
                 ref, source = _inherited_filing(state, lid, rec, retired)
                 if ref is not None:
                     state["filed"][lid] = ref

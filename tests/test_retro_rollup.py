@@ -1649,3 +1649,21 @@ def test_unsaved_reconcile_result_files_nothing_this_run(filing, tmp_path, monke
     assert run(base, "backfill", "--apply", "--accept", str(_accept_file_issue(tmp_path, lid))) == 1
     captured = capsys.readouterr()
     assert gh.calls == [] and "disk full" in captured.err
+
+
+def test_x025_failed_listing_keeps_the_survivors_pending_record_over_an_inherited_issue(grouped, monkeypatch, capsys):
+    vault, state, base = grouped
+    survivor, retiring = _merge_setup(vault, state, base, monkeypatch)
+    _save_filed(state, {survivor: _pending(survivor, "o/r"), retiring: "o/r#5"})
+    _notes_with_tags(vault, {3: "G1 G2"})
+    assert run(base, "update") == 0
+    gh = _gh_with(monkeypatch, list_fail="rc")  # the survivor's pending attempt cannot be checked
+    f = _file_accept(vault.parent, [{"lesson_id": survivor, "file_issue": True, "repo": "o/r"}])
+    capsys.readouterr()
+    assert run(base, "backfill", "--apply", "--accept", str(f)) == 1
+    out = json.loads(capsys.readouterr().out)
+    assert gh.calls == []  # no issue create
+    s = state_of(state)
+    assert s["filed"][survivor] == _pending(survivor, "o/r")  # its marker is kept for a later reconcile
+    assert not s["lessons"][survivor].get("tracking")
+    assert out["skipped_entries"][0]["reason"] == "cannot check for an earlier filing"
