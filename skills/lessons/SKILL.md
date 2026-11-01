@@ -16,6 +16,7 @@ Reads the lessons rollup (`retro_rollup.py`, #471) and walks the lessons that ke
 - **No GitHub change without an explicit choice.** Issues are created only by `backfill --apply --accept FILE`, after the dry run is shown and the user answers yes in Step 6. This skill never runs `gh issue create` and never POSTs to the GitHub API. `gh issue edit` runs only in the Raise step, after the user picked that exact change. If an edit fails, show the error and move on; never retry.
 - Every `gh` and `python3` call runs with stdin closed (`< /dev/null`). `gh` calls other than the Raise edits are read-only.
 - Retro item text leaves the machine only inside a draft the user confirmed in the File step.
+- Titles, bodies, milestones and labels go into the accept file (JSON), never into a shell command. The Raise edits are the only commands that carry a milestone or label name: single-quote each value there, and write a `'` inside a value as `'\''`.
 - Argument: an optional number N, the most lessons to walk (default 10).
 
 ## Procedure

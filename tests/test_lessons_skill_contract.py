@@ -105,6 +105,14 @@ def test_snooze_boundary_is_stated():
     assert "on or after today" in TEXT
 
 
+def test_raise_values_are_single_quoted_and_escaped():
+    assert "write a `'` inside a value as `'\\''`" in TEXT
+    for line in re.findall(r"^gh issue edit .*$", TEXT, re.M):
+        for flag in ("--milestone", "--add-label", "--remove-label"):
+            for value in re.findall(rf"{flag} (\S+)", line):
+                assert value.startswith("'"), (flag, line)
+
+
 def test_accept_file_is_owner_only_and_in_the_state_dir():
     assert "mkstemp" in TEXT and ".claude/obsidian-brain" in TEXT
     assert "rm -f" in TEXT  # deleted after No and after apply
