@@ -76,7 +76,7 @@ Obsidian Brain Configuration
 Enter a number to change, or 'done' to exit.
 ```
 
-For any key not present in the config, show its default value: `wiki_folder` defaults to `claude-wiki`, `log_raw_messages` defaults to `true`, `min_turns` defaults to `3`, `min_duration_minutes` defaults to `2`, `snapshot_on_compact` defaults to `true`, `snapshot_on_clear` defaults to `true`, `lessons_enabled` defaults to `true`, `lessons_recent_days` defaults to `90`, `lessons_concurrency` defaults to `8`, `project_repos` defaults to `{}` (show each entry as `project -> owner/repo`, or `(none)`). `lessons_enabled` is read by the `/retro` lesson update (#475) and `project_repos` by lesson-to-issue matching (#473); until those ship, changing them has no effect. Issue traces already name their repo (`owner/repo#N`).
+For any key not present in the config, show its default value: `wiki_folder` defaults to `claude-wiki`, `log_raw_messages` defaults to `true`, `min_turns` defaults to `3`, `min_duration_minutes` defaults to `2`, `snapshot_on_compact` defaults to `true`, `snapshot_on_clear` defaults to `true`, `lessons_enabled` defaults to `true`, `lessons_recent_days` defaults to `90`, `lessons_concurrency` defaults to `8`, `project_repos` defaults to `{}` (show each entry as `project -> owner/repo`, or `(none)`). `lessons_enabled` is read by the `/retro` lesson update, the `/standup` offer and `/lessons` (#474, #475), and `project_repos` by lesson-to-issue matching (#473). Issue traces already name their repo (`owner/repo#N`).
 
 When rendering rows 8 or 9, if the value is `False`, append this warning inline on the same row:
 

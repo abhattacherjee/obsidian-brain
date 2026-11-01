@@ -1009,7 +1009,16 @@
           "files": [
             "skills/retro/SKILL.md"
           ],
-          "purpose": "CAPTURE. Honest session retrospective pulling prior-session snapshots/insights as first-class evidence via gather_session_evidence. Step 3a detects a compact boundary in the active conversation (continuation preamble + cited transcript path) and recovers the prior session id to pass as also_session_ids (#184), validating each candidate against a strict id-shape regex before it reaches the vault scan. When gather_session_evidence returns prior claude-retro notes, Step 3a scopes the retrospective to the arc after the most recent one by bundle['prior_retro_key'] — a boundary marker, deliberately excluded from the per-snapshot coverage rule (#285). The Scope line names that key (#329)."
+          "purpose": "CAPTURE. Honest session retrospective pulling prior-session snapshots/insights as first-class evidence via gather_session_evidence. Step 3a detects a compact boundary in the active conversation (continuation preamble + cited transcript path) and recovers the prior session id to pass as also_session_ids (#184), validating each candidate against a strict id-shape regex before it reaches the vault scan. When gather_session_evidence returns prior claude-retro notes, Step 3a scopes the retrospective to the arc after the most recent one by bundle['prior_retro_key'] — a boundary marker, deliberately excluded from the per-snapshot coverage rule (#285). The Scope line names that key (#329). Step 7.6 starts retro_rollup.py update --note in the background (nohup, stdin closed) and prints one line; no prompt, no wait, skipped when lessons_enabled is false (#475)."
+        },
+        {
+          "id": "sk-lessons",
+          "name": "/lessons",
+          "kind": "module",
+          "files": [
+            "skills/lessons/SKILL.md"
+          ],
+          "purpose": "TRIAGE. Walks the retro lessons that need action (report --json after refresh-tracking) and asks per lesson: file (bucket file only; drafts title and body from show --json, milestone and priority label read-only), raise (gh issue edit only for a change the user picks), skip, or snooze (retro_rollup.py snooze). Rule and memory matches are confirmed in one batch. Writes an accept file (mkstemp, 0600), shows backfill --accept FILE as a dry run, asks once, then runs backfill --apply --accept FILE. Never runs gh issue create. Skill v1.0.0 (#474)."
         },
         {
           "id": "sk-recall",
@@ -1045,7 +1054,7 @@
           "files": [
             "skills/standup/SKILL.md"
           ],
-          "purpose": "RECALL. Daily/weekly cross-project standup; deep mode adds the AI item-classification + cascade-checkoff pipeline via deep_cli."
+          "purpose": "RECALL. Daily/weekly cross-project standup; deep mode adds the AI item-classification + cascade-checkoff pipeline via deep_cli. A Recurring lessons section (top 5 from retro_rollup.py report --json) and, in weekly mode with lessons waiting, an offer to run /lessons (#475)."
         },
         {
           "id": "sk-link",
@@ -1117,7 +1126,7 @@
           "files": [
             "skills/emerge/SKILL.md"
           ],
-          "purpose": "TRIAGE. Surfaces cross-cutting patterns over themes (not raw notes) updated in a window: run_emerge_themes builds the theme corpus, a synthesis Agent reads emerge-themes.json and writes Growing/Decaying/Cross-Project/Contradictions/New-Candidates sections, run_build_note saves the claude-emerge note. Nudges to /consolidate or a wider window when STATUS=SPARSE. Skill v2.0.0."
+          "purpose": "TRIAGE. Surfaces cross-cutting patterns over themes (not raw notes) updated in a window: run_emerge_themes builds the theme corpus, a synthesis Agent reads emerge-themes.json and writes Growing/Decaying/Cross-Project/Contradictions/New-Candidates sections, run_build_note saves the claude-emerge note. Nudges to /consolidate or a wider window when STATUS=SPARSE. Skill v2.0.0. Step 4 adds Lessons growing in this window from report --json member dates (#475)."
         },
         {
           "id": "sk-consolidate",
@@ -1143,7 +1152,7 @@
           "files": [
             "hooks/retro_rollup.py"
           ],
-          "purpose": "CLI: update (judge unjudged anchors with Haiku, regroup, name new lessons, write changed notes), rebuild (regroup from the cache; no verdict calls), refresh-tracking (gh issue view per tracked issue, memory/path existence), report [--json] (from the private state file), match [--all] [--concurrency N] (#473: for each lesson with no member trace, filed issue or pending filing, rank issues, memory and rules by TF-IDF and ask Haiku once about the top candidate; saves rec[match]; reads GitHub only through gh issue list and never writes a trace; refresh-tracking runs the same check first), backfill [--apply --accept FILE] (dry run lists planned traces and planned filings; apply traces only accepted lessons via retro_trace partial apply, and runs gh issue create for an accepted lesson with no tracking, saving a pending record with a marker before gh issue create, and reconciling it by marker search on a rerun; the issue and the lesson's tracking are saved before any trace is written). Holds a non-blocking fcntl lock, moves a corrupt state file aside, exit 0 ok / 1 failure (including a failed issue listing, a memory scan error, an unreadable rule file or directory, an invalid configured project_repos value or a Haiku non-answer, which leave the lesson unchecked) / 2 usage."
+          "purpose": "CLI: update (judge unjudged anchors with Haiku, regroup, name new lessons, write changed notes), rebuild (regroup from the cache; no verdict calls), refresh-tracking (gh issue view per tracked issue, memory/path existence), report [--json] (from the private state file), match [--all] [--concurrency N] (#473: for each lesson with no member trace, filed issue or pending filing, rank issues, memory and rules by TF-IDF and ask Haiku once about the top candidate; saves rec[match]; reads GitHub only through gh issue list and never writes a trace; refresh-tracking runs the same check first), backfill [--apply --accept FILE] (dry run lists planned traces and planned filings; apply traces only accepted lessons via retro_trace partial apply, and runs gh issue create for an accepted lesson with no tracking, saving a pending record with a marker before gh issue create, and reconciling it by marker search on a rerun; the issue and the lesson's tracking are saved before any trace is written). Holds a non-blocking fcntl lock, moves a corrupt state file aside, exit 0 ok / 1 failure (including a failed issue listing, a memory scan error, an unreadable rule file or directory, an invalid configured project_repos value or a Haiku non-answer, which leave the lesson unchecked) / 2 usage. #474/#475: snooze <id> <date|none> (sets or clears snoozed_until in the lesson note under the lock), show <id> [--json] (read-only: tracking plus each member's live text and trace, scrubbed), report --json members carry date, backfill --accept FILE without --apply previews the file (no gh call, no write), the file_issue entry takes title, body, milestone and labels (validated; body scrubbed; marker kept first), and update --note exits 0 and does nothing when config lessons_enabled is false."
         },
         {
           "id": "lessons-corpus",
@@ -1188,7 +1197,7 @@
           "files": [
             "hooks/lessons_notes.py"
           ],
-          "purpose": "note_filename, render_note (type claude-lesson, tags claude/lesson + claude/project/*), read_snooze (snoozed_until carries over), write_if_changed (atomic, only when bytes differ), and the text/JSON report. Frontmatter and report carry tracking_source (trace, filed, match or none)."
+          "purpose": "note_filename, render_note (type claude-lesson, tags claude/lesson + claude/project/*), read_snooze (snoozed_until carries over), write_if_changed (atomic, only when bytes differ), and the text/JSON report. Frontmatter and report carry tracking_source (trace, filed, match or none). set_snooze edits only the snoozed_until frontmatter line (clearing writes null, the shape render_note writes); report members carry date."
         }
       ]
     },
@@ -2606,7 +2615,7 @@
     {
       "id": "lessons-backfill",
       "name": "Retro lessons backfill (apply)",
-      "description": "backfill --apply --accept FILE traces the untraced members of accepted lessons; an accepted lesson with no tracking first gets one GitHub issue.",
+      "description": "backfill --apply --accept FILE traces the untraced members of accepted lessons; an accepted lesson with no tracking first gets one GitHub issue. An entry may carry title, body, milestone and labels; backfill --accept FILE without --apply previews it.",
       "steps": [
         {
           "from": "retro-rollup-cli",
@@ -2627,6 +2636,65 @@
           "from": "retro-trace-cli",
           "to": "db-vault",
           "label": "atomic write of traced items"
+        }
+      ]
+    },
+    {
+      "id": "lessons-skill",
+      "name": "/lessons file, raise, snooze and confirm",
+      "description": "The skill reads the report, asks per lesson, and changes GitHub only through the CLI's apply after one confirm (or gh issue edit after a picked raise).",
+      "steps": [
+        {
+          "from": "sk-lessons",
+          "to": "retro-rollup-cli",
+          "label": "refresh-tracking, report --json, show <id> --json (all with stdin closed)"
+        },
+        {
+          "from": "retro-rollup-cli",
+          "to": "db-lessons-state",
+          "label": "read lessons, tracking and members"
+        },
+        {
+          "from": "sk-lessons",
+          "to": "retro-rollup-cli",
+          "label": "snooze <id> <date>: sets snoozed_until in the lesson note"
+        },
+        {
+          "from": "retro-rollup-cli",
+          "to": "lessons-notes",
+          "label": "set_snooze; write_if_changed (atomic)"
+        },
+        {
+          "from": "sk-lessons",
+          "to": "retro-rollup-cli",
+          "label": "backfill --accept FILE (dry run), then backfill --apply --accept FILE after the user's yes"
+        },
+        {
+          "from": "retro-rollup-cli",
+          "to": "retro-trace-cli",
+          "label": "apply_traces(partial=True) per retro note"
+        }
+      ]
+    },
+    {
+      "id": "lessons-wiring",
+      "name": "Lessons kept current and shown in /retro, /standup, /emerge",
+      "description": "/retro queues a detached update; /standup and /emerge read report --json.",
+      "steps": [
+        {
+          "from": "sk-retro",
+          "to": "retro-rollup-cli",
+          "label": "Step 7.6: nohup update --note <note> in the background (skipped when lessons_enabled is false)"
+        },
+        {
+          "from": "sk-standup",
+          "to": "retro-rollup-cli",
+          "label": "report --json (weekly mode: refresh-tracking first)"
+        },
+        {
+          "from": "sk-emerge",
+          "to": "retro-rollup-cli",
+          "label": "report --json: lessons with member dates in the window"
         }
       ]
     }
