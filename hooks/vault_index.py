@@ -751,9 +751,10 @@ def _delete_note(conn: sqlite3.Connection, rel_path: str) -> None:
 _MALFORMED_FILES_CAP = 20
 
 # Note types written into indexed folders that are not knowledge: the LLM
-# wiki's own index and log files (#383). _sync skips them, and removes a row
-# whose note changed to one of these types.
-_UNINDEXED_TYPES = frozenset({"claude-wiki-index"})
+# wiki's own index and log files (#383), and the generated retro lesson notes
+# (#471), which only regroup retro items already indexed. _sync and index_note
+# skip them, and remove a row whose note changed to one of these types.
+_UNINDEXED_TYPES = frozenset({"claude-wiki-index", "claude-lesson"})
 
 # Cap on the length of a filename recorded in `stats["malformed_files"]`.
 # 120 chars is generous headroom over any realistic vault filename.
@@ -1781,6 +1782,12 @@ def index_note(db_path: str, note_path: str) -> bool:
 
     try:
         try:
+            if parsed.get("type") in _UNINDEXED_TYPES:
+                # Same rule as _sync (#471): never a row; drop a stale one.
+                conn.execute("BEGIN IMMEDIATE")
+                _delete_note(conn, note_path)
+                conn.commit()
+                return True
             # BEGIN IMMEDIATE so _upsert_note's read-modify-write
             # (_prior_tokens_for → _update_term_df → SELECT COUNT → INSERT)
             # is serialized against other writers (concurrent hooks,

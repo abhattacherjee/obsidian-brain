@@ -25,7 +25,7 @@ def _paths(db: str) -> set:
 
 
 def test_constant():
-    assert vault_index._UNINDEXED_TYPES == frozenset({"claude-wiki-index"})
+    assert vault_index._UNINDEXED_TYPES == frozenset({"claude-wiki-index", "claude-lesson"})
 
 
 def test_wiki_index_file_not_indexed_but_pages_are(tmp_path):
@@ -120,3 +120,27 @@ def test_preserve_rebuild_reports_zero_foreign_when_nothing_dropped(tmp_path):
     stats = vault_index.rebuild_index(str(vault), ["claude-sessions", "claude-insights", "claude-wiki"], db_path=db)
     assert stats["foreign_deleted"] == 0
     assert stats["excluded"] == 0
+
+
+def test_lesson_notes_are_not_indexed_by_sync(tmp_path):
+    vault = tmp_path / "v"
+    _write(vault / "claude-insights" / "lessons" / "run-x-L1.md", "claude-lesson")
+    _write(vault / "claude-insights" / "a-insight.md", "claude-insight")
+    db = vault_index.ensure_index(str(vault), ["claude-insights"], db_path=str(tmp_path / "i.db"))
+    assert _paths(db) == {"a-insight.md"}
+
+
+def test_index_note_skips_unindexed_types_and_drops_a_stale_row(tmp_path):
+    # #471: index_note follows the same rule as _sync.
+    vault = tmp_path / "v"
+    note = vault / "claude-insights" / "x.md"
+    _write(note, "claude-insight")
+    db = vault_index.ensure_index(str(vault), ["claude-insights"], db_path=str(tmp_path / "i.db"))
+    assert _paths(db) == {"x.md"}
+    _write(note, "claude-lesson")
+    assert vault_index.index_note(db, str(note)) is True
+    assert _paths(db) == set()
+    lesson = vault / "claude-insights" / "lessons" / "y.md"
+    _write(lesson, "claude-lesson")
+    assert vault_index.index_note(db, str(lesson)) is True
+    assert _paths(db) == set()

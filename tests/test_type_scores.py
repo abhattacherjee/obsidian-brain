@@ -70,6 +70,7 @@ def test_scan_finds_exactly_the_known_types():
     assert collect_written_types() == _ORIGINAL_TYPES | {
         "claude-snapshot", "claude-memory", "claude-emerge", "claude-stats",
         "claude-check-items-report", "claude-wiki", "claude-wiki-index",
+        "claude-lesson",  # #471: generated retro lesson notes (unindexed)
     }
 
 
