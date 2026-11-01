@@ -334,3 +334,21 @@ Run: `~/.claude/skills/architecture-page/scripts/smoke-test.sh --json docs/archi
 Run: `./scripts/commit-preflight.sh` — Expected: pass, coverage ≥ 90%.
 
 - [ ] **Step 5: Commit** — `docs(obsidian-brain): retro lessons fixture, README, architecture, CHANGELOG (#471)`
+
+### Task 9: File an issue per accepted untracked lesson; verify item keys under the lock
+
+Delegate: claude — Codex is this PR's review adversary and re-checks this change; it spans retro_rollup, retro_trace and the docs.
+
+Added at the merge gate (2026-11-01): the user failed C.3 as first shipped, because members of lessons with no tracking stayed untraced. They chose "file an issue per lesson". The same pass closes review finding X-002.
+
+**Files:** `hooks/retro_rollup.py` (backfill), `hooks/retro_trace.py` (`apply_traces` gains `verify`), `tests/test_retro_rollup.py`, `tests/test_retro_trace.py`, README, CHANGELOG, `docs/plans/471-retro-lessons-design.md`, `docs/architecture/architecture.json` (+ render).
+
+**Behaviour:**
+- Accept entries: `{"lesson_id", "tracking_ref"}` as now, or `{"lesson_id", "file_issue": true}` (optional `"repo": "owner/repo"`) for an untracked lesson. A `file_issue` entry for a lesson that already has tracking is skipped ("already tracked").
+- Repo: the accept's `repo`, else `project_repos[project]`, else the `origin` remote of `<workspace root>/<project>` (`obsidian_utils.get_workspace_roots()`), for the lesson's project with the most member sessions (ties: name). No repo → entry skipped ("no repo for project X"), exit 1.
+- Filing: `gh issue create --repo R --title <lesson name> --body-file <0o600 temp file in the state dir>`, stdin closed, timeout. The body has the lesson id, sessions, projects, first and last seen, and member refs (`note#item`) only; no item text. The created `owner/repo#N` is saved to `state["filed"][lesson_id]` (atomic state write) before any trace is written; a rerun reuses it and never files twice.
+- Then every untraced member is traced to that issue with the #470 issue form.
+- Dry run lists the planned filings (lesson, repo, title) and the traces, makes no `gh` call, writes nothing.
+- X-002: `apply_traces(..., verify=None)`; `verify(item) -> bool` runs under the note lock for each traced item, and a False raises `TraceError` with nothing written. Backfill passes a check that the item's key equals the expected key.
+
+**Tests (fail first):** filing + tracing with a fake `gh`; rerun files nothing; a crash after filing (fake trace failure) then rerun reuses the saved issue; repo resolution order; no-repo skip; dry run calls no `gh`; `verify` False leaves the note byte-identical; an item inserted above the target between plan and apply is refused, not mis-traced.

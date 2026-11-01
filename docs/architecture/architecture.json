@@ -1143,7 +1143,7 @@
           "files": [
             "hooks/retro_rollup.py"
           ],
-          "purpose": "CLI: update (judge unjudged anchors with Haiku, regroup, name new lessons, write changed notes), rebuild (regroup from the cache; no verdict calls), refresh-tracking (gh issue view per tracked issue, memory/path existence), report [--json] (from the private state file), backfill [--apply --accept FILE] (dry run lists planned traces; apply traces only accepted lessons via retro_trace partial apply). Holds a non-blocking fcntl lock, moves a corrupt state file aside, exit 0 ok / 1 failure / 2 usage."
+          "purpose": "CLI: update (judge unjudged anchors with Haiku, regroup, name new lessons, write changed notes), rebuild (regroup from the cache; no verdict calls), refresh-tracking (gh issue view per tracked issue, memory/path existence), report [--json] (from the private state file), backfill [--apply --accept FILE] (dry run lists planned traces and planned filings; apply traces only accepted lessons via retro_trace partial apply, and runs gh issue create for an accepted lesson with no tracking, saving the new issue in the state file before any trace is written). Holds a non-blocking fcntl lock, moves a corrupt state file aside, exit 0 ok / 1 failure / 2 usage."
         },
         {
           "id": "lessons-corpus",
@@ -2560,7 +2560,7 @@
     {
       "id": "lessons-backfill",
       "name": "Retro lessons backfill (apply)",
-      "description": "backfill --apply --accept FILE traces the untraced members of accepted lessons.",
+      "description": "backfill --apply --accept FILE traces the untraced members of accepted lessons; an accepted lesson with no tracking first gets one GitHub issue.",
       "steps": [
         {
           "from": "retro-rollup-cli",
@@ -2569,8 +2569,13 @@
         },
         {
           "from": "retro-rollup-cli",
+          "to": "db-lessons-state",
+          "label": "gh issue create for an untracked accepted lesson; save the issue in state[filed] before any trace"
+        },
+        {
+          "from": "retro-rollup-cli",
           "to": "retro-trace-cli",
-          "label": "apply_traces(partial=True) per retro note"
+          "label": "apply_traces(partial=True, verify=item key check under the note lock) per retro note"
         },
         {
           "from": "retro-trace-cli",

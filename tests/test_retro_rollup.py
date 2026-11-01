@@ -707,3 +707,363 @@ def test_report_table_shows_items_dates_and_tracking(env, capsys):
     out = capsys.readouterr().out
     assert re.search(r"^- 3 items · \d+/3 sessions · 2 projects · 2026-10-01 to 2026-10-15 · no tracking · ", out, re.M), out
     assert re.search(r"^- 2 items · \d+/2 sessions · 2 projects · 2026-10-01 to 2026-10-08 · feedback_grep · ", out, re.M), out
+
+
+# --- file an issue per accepted untracked lesson (#471 Task 9) --------------------
+
+class FakeGh:
+    """Fakes `gh issue create`: records calls, reads the body file while it exists."""
+
+    def __init__(self, number=7, stdout=None, returncode=0):
+        self.calls, self.bodies, self.modes = [], [], []
+        self.number, self.stdout, self.returncode = number, stdout, returncode
+
+    def __call__(self, args, timeout=10):
+        assert args[:2] == ["issue", "create"], args
+        self.calls.append(args)
+        body = Path(args[args.index("--body-file") + 1])
+        self.bodies.append(body.read_text())
+        self.modes.append(body.stat().st_mode & 0o777)
+        repo = args[args.index("--repo") + 1]
+        out = self.stdout if self.stdout is not None else (
+            f"Creating issue in {repo}\n\nhttps://github.com/{repo}/issues/{self.number}\n")
+        return type("R", (), {"returncode": self.returncode, "stdout": out, "stderr": "boom"})()
+
+
+@pytest.fixture
+def filing(env, monkeypatch):
+    vault, state, base = env
+    gh = FakeGh()
+    monkeypatch.setattr(retro_rollup, "_run_gh", gh)
+    monkeypatch.setattr(retro_rollup, "_git_origin", lambda path: None)
+    import obsidian_utils
+    monkeypatch.setattr(obsidian_utils, "load_config", lambda: {})
+    assert run(base, "update") == 0
+    return vault, state, base, gh
+
+
+def _lesson_named(state, size):
+    s = state_of(state)
+    return next(k for k, l in s["lessons"].items() if len(l["members"]) == size)
+
+
+def _file_accept(tmp_path, entries):
+    f = tmp_path / "accept-file.json"
+    f.write_text(json.dumps(entries))
+    return f
+
+
+def _issue_trace(repo, n):
+    return f"[{repo}#{n}](https://github.com/{repo}/issues/{n})"
+
+
+def test_file_issue_files_one_issue_and_traces_every_member(filing, tmp_path, capsys):
+    vault, state, base, gh = filing
+    lid = _lesson_named(state, 3)
+    f = _file_accept(tmp_path, [{"lesson_id": lid, "file_issue": True, "repo": "o/r"}])
+    capsys.readouterr()
+    assert run(base, "backfill", "--apply", "--accept", str(f)) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["filed"] == [{"lesson": lid, "repo": "o/r", "issue": 7}]
+    assert len(gh.calls) == 1
+    args = gh.calls[0]
+    assert args[:6] == ["issue", "create", "--repo", "o/r", "--title", "Follow rule A"]
+    assert gh.modes == [0o600] and gh.bodies[0]
+    body = gh.bodies[0]
+    assert lid in body and "p1" in body and "p2" in body and "2026-10-01" in body
+    assert "2026-10-01-retro-a1#1" in body and "RULE" not in body and "preflight" not in body.lower()
+    assert not list(state.glob("*.md")) and not list(state.glob(".gh-body*"))  # temp body removed
+    trace = _issue_trace("o/r", 7)
+    for name, text in (("2026-10-01-retro-a1.md", "Run preflight alone RULE-A"),
+                       ("2026-10-08-retro-b2.md", "Never chain preflight and commit RULE-A"),
+                       ("2026-10-15-retro-c3.md", "Preflight as its own call RULE-A")):
+        assert f"- [ ] {text} → {trace}" in (vault / "claude-insights" / name).read_text()
+    assert state_of(state)["filed"] == {lid: "o/r#7"}
+    assert "RULE-B" in (vault / "claude-insights" / "2026-10-01-retro-a1.md").read_text()
+
+
+def test_file_issue_rerun_files_nothing_and_after_update_too(filing, tmp_path, capsys):
+    vault, state, base, gh = filing
+    lid = _lesson_named(state, 3)
+    f = _file_accept(tmp_path, [{"lesson_id": lid, "file_issue": True, "repo": "o/r"}])
+    assert run(base, "backfill", "--apply", "--accept", str(f)) == 0
+    before = retro_bytes(vault)
+    capsys.readouterr()
+    assert run(base, "backfill", "--apply", "--accept", str(f)) == 0
+    assert json.loads(capsys.readouterr().out)["filed"] == []
+    assert run(base, "update") == 0  # the lesson now has tracking from its member traces
+    assert state_of(state)["lessons"][lid]["tracking"]["ref"] == "o/r#7"
+    assert run(base, "backfill", "--apply", "--accept", str(f)) == 0
+    assert len(gh.calls) == 1 and retro_bytes(vault) == before
+
+
+def test_crash_after_filing_then_rerun_reuses_the_saved_issue(filing, tmp_path, monkeypatch):
+    vault, state, base, gh = filing
+    lid = _lesson_named(state, 3)
+    f = _file_accept(tmp_path, [{"lesson_id": lid, "file_issue": True, "repo": "o/r"}])
+    before = retro_bytes(vault)
+    real = retro_rollup.retro_trace.apply_traces
+
+    def boom(*a, **k):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(retro_rollup.retro_trace, "apply_traces", boom)
+    assert run(base, "backfill", "--apply", "--accept", str(f)) == 1
+    assert retro_bytes(vault) == before
+    assert state_of(state)["filed"] == {lid: "o/r#7"}  # saved before any trace
+    monkeypatch.setattr(retro_rollup.retro_trace, "apply_traces", real)
+    assert run(base, "backfill", "--apply", "--accept", str(f)) == 0
+    assert len(gh.calls) == 1
+    assert _issue_trace("o/r", 7) in (vault / "claude-insights" / "2026-10-08-retro-b2.md").read_text()
+
+
+def test_partly_traced_filed_lesson_is_finished_by_a_rerun(filing, tmp_path, monkeypatch):
+    vault, state, base, gh = filing
+    lid = _lesson_named(state, 3)
+    f = _file_accept(tmp_path, [{"lesson_id": lid, "file_issue": True, "repo": "o/r"}])
+    real = retro_rollup.retro_trace.apply_traces
+
+    def first_only(vault_, path, traces, **k):
+        if "b2" in str(path):
+            raise OSError("locked")
+        return real(vault_, path, traces, **k)
+
+    monkeypatch.setattr(retro_rollup.retro_trace, "apply_traces", first_only)
+    assert run(base, "backfill", "--apply", "--accept", str(f)) == 1
+    assert run(base, "update") == 0  # now tracked by the two traces that landed
+    monkeypatch.setattr(retro_rollup.retro_trace, "apply_traces", real)
+    assert run(base, "backfill", "--apply", "--accept", str(f)) == 0
+    assert len(gh.calls) == 1
+    assert _issue_trace("o/r", 7) in (vault / "claude-insights" / "2026-10-08-retro-b2.md").read_text()
+
+
+def _filed_repo(filing, tmp_path, monkeypatch, entry, config=None, origin=None, size=3):
+    import obsidian_utils
+    vault, state, base, gh = filing
+    monkeypatch.setattr(obsidian_utils, "load_config", lambda: config or {})
+    monkeypatch.setattr(retro_rollup, "_git_origin", lambda path: origin(path) if origin else None)
+    lid = _lesson_named(state, size)
+    f = _file_accept(tmp_path, [{"lesson_id": lid, **entry}])
+    code = run(base, "backfill", "--apply", "--accept", str(f))
+    return code, gh
+
+
+def test_repo_accept_override_beats_config_beats_origin(filing, tmp_path, monkeypatch):
+    cfg = {"project_repos": {"p1": "cfg/repo"}}
+    origin = lambda path: "https://github.com/git/origin"
+    code, gh = _filed_repo(filing, tmp_path, monkeypatch, {"file_issue": True, "repo": "acc/repo"}, cfg, origin)
+    assert code == 0 and gh.calls[0][3] == "acc/repo"
+
+
+def test_repo_config_beats_origin_and_uses_the_busiest_project(filing, tmp_path, monkeypatch):
+    # RULE-A members: p1 in two retros, p2 in one -> p1.
+    cfg = {"project_repos": {"p1": "cfg/one", "p2": "cfg/two"}}
+    code, gh = _filed_repo(filing, tmp_path, monkeypatch, {"file_issue": True}, cfg, lambda path: "https://github.com/git/origin")
+    assert code == 0 and gh.calls[0][3] == "cfg/one"
+
+
+def test_repo_tie_between_projects_goes_to_the_smaller_name(filing, tmp_path, monkeypatch):
+    cfg = {"project_repos": {"p1": "cfg/one", "p2": "cfg/two"}}
+    code, gh = _filed_repo(filing, tmp_path, monkeypatch, {"file_issue": True}, cfg, size=2)  # RULE-B: p1 and p2 once each
+    assert code == 0 and gh.calls[0][3] == "cfg/one"
+
+
+def test_repo_falls_back_to_the_origin_of_the_workspace_checkout(filing, tmp_path, monkeypatch):
+    import obsidian_utils
+    root = tmp_path / "ws"
+    (root / "p1").mkdir(parents=True)
+    monkeypatch.setattr(obsidian_utils, "get_workspace_roots", lambda: [str(root)])
+    asked = []
+
+    def origin(path):
+        asked.append(path)
+        return "git@github.com:org/from-origin.git"
+
+    code, gh = _filed_repo(filing, tmp_path, monkeypatch, {"file_issue": True}, {}, origin)
+    assert code == 0 and gh.calls[0][3] == "org/from-origin"
+    assert asked == [str(root / "p1")]
+
+
+def test_no_repo_skips_the_entry_and_exits_1(filing, tmp_path, monkeypatch, capsys):
+    vault, state, base, gh = filing
+    before = retro_bytes(vault)
+    capsys.readouterr()
+    code, gh = _filed_repo(filing, tmp_path, monkeypatch, {"file_issue": True})
+    assert code == 1 and gh.calls == [] and retro_bytes(vault) == before
+    result = json.loads(capsys.readouterr().out)
+    assert result["skipped_entries"][0]["reason"] == "no repo for project p1"
+    assert "filed" not in state_of(state) or state_of(state)["filed"] == {}
+
+
+def test_repo_from_config_is_validated(filing, tmp_path, monkeypatch, capsys):
+    code, gh = _filed_repo(filing, tmp_path, monkeypatch, {"file_issue": True},
+                           {"project_repos": {"p1": "bad repo; rm -rf /"}})
+    assert code == 1 and gh.calls == []
+    assert "invalid repo" in json.loads(capsys.readouterr().out)["skipped_entries"][0]["reason"]
+
+
+def test_file_issue_for_a_tracked_lesson_is_skipped(env, tmp_path, monkeypatch, capsys):
+    vault, state, base = env
+    monkeypatch.setattr(retro_rollup, "_run_gh", FakeGh())
+    _trace_items(vault, "2026-10-01-retro-a1.md", {"Grep callers first RULE-B": "memory `feedback_grep`"})
+    assert run(base, "update") == 0
+    lid = next(k for k, l in state_of(state)["lessons"].items() if l["tracking"])
+    f = _file_accept(tmp_path, [{"lesson_id": lid, "file_issue": True, "repo": "o/r"}])
+    before = retro_bytes(vault)
+    capsys.readouterr()
+    assert run(base, "backfill", "--apply", "--accept", str(f)) == 0
+    assert json.loads(capsys.readouterr().out)["skipped_entries"][0]["reason"] == "already tracked"
+    assert retro_bytes(vault) == before
+
+
+@pytest.mark.parametrize("stdout, returncode", [
+    ("", 0), ("created\n", 0), ("https://github.com/other/repo/issues/7\n", 0),
+    ("https://github.com/o/r/issues/7/extra\n", 0), ("https://github.com/o/r/issues/0\n", 0),
+    ("https://github.com/o/r/issues/7\n", 1)])
+def test_bad_gh_output_is_a_failure_with_nothing_traced_or_saved(filing, tmp_path, stdout, returncode, monkeypatch):
+    vault, state, base, gh = filing
+    gh2 = FakeGh(stdout=stdout, returncode=returncode)
+    monkeypatch.setattr(retro_rollup, "_run_gh", gh2)
+    lid = _lesson_named(state, 3)
+    f = _file_accept(tmp_path, [{"lesson_id": lid, "file_issue": True, "repo": "o/r"}])
+    before = retro_bytes(vault)
+    assert run(base, "backfill", "--apply", "--accept", str(f)) == 1
+    assert retro_bytes(vault) == before and not state_of(state).get("filed")
+
+
+def test_gh_create_matching_repo_case_insensitively_is_accepted(filing, tmp_path, monkeypatch):
+    vault, state, base, gh = filing
+    monkeypatch.setattr(retro_rollup, "_run_gh",
+                        FakeGh(stdout="https://github.com/O/R/issues/9\n"))
+    lid = _lesson_named(state, 3)
+    f = _file_accept(tmp_path, [{"lesson_id": lid, "file_issue": True, "repo": "o/r"}])
+    assert run(base, "backfill", "--apply", "--accept", str(f)) == 0
+    assert state_of(state)["filed"] == {lid: "o/r#9"}
+
+
+def test_gh_timeout_or_missing_gh_is_a_failure(filing, tmp_path, monkeypatch):
+    import subprocess
+    vault, state, base, gh = filing
+    lid = _lesson_named(state, 3)
+    f = _file_accept(tmp_path, [{"lesson_id": lid, "file_issue": True, "repo": "o/r"}])
+    for exc in (subprocess.TimeoutExpired("gh", 1), FileNotFoundError("gh")):
+        def fail(args, timeout=10, exc=exc):
+            raise exc
+        monkeypatch.setattr(retro_rollup, "_run_gh", fail)
+        assert run(base, "backfill", "--apply", "--accept", str(f)) == 1
+    assert not state_of(state).get("filed")
+
+
+def test_dry_run_lists_planned_filings_and_calls_no_gh(env, monkeypatch, capsys):
+    vault, state, base = env
+    import obsidian_utils
+    monkeypatch.setattr(obsidian_utils, "load_config", lambda: {"project_repos": {"p1": "o/r"}})
+    monkeypatch.setattr(retro_rollup, "_git_origin", lambda path: None)
+    assert run(base, "update") == 0  # the env gh fake fails the test if called
+    before, state_before = retro_bytes(vault), (state / "lessons-state.json").read_bytes()
+    capsys.readouterr()
+    assert run(base, "backfill") == 0
+    result = json.loads(capsys.readouterr().out)
+    assert {(p["repo"], p["title"]) for p in result["planned_filings"]} == {
+        ("o/r", "Follow rule A"), ("o/r", "Follow rule B")}
+    assert all(p["members"] >= 2 and p["lesson"] for p in result["planned_filings"])
+    assert result["filed"] == []
+    assert retro_bytes(vault) == before and (state / "lessons-state.json").read_bytes() == state_before
+
+
+def test_dry_run_planned_filing_without_a_repo_says_so(env, monkeypatch, capsys):
+    vault, state, base = env
+    import obsidian_utils
+    monkeypatch.setattr(obsidian_utils, "load_config", lambda: {})
+    monkeypatch.setattr(retro_rollup, "_git_origin", lambda path: None)
+    assert run(base, "update") == 0
+    capsys.readouterr()
+    assert run(base, "backfill") == 0
+    plans = json.loads(capsys.readouterr().out)["planned_filings"]
+    assert plans and all(p["repo"] is None and p["reason"] == "no repo for project p1" for p in plans)
+
+
+def test_note_edit_between_plan_and_apply_is_refused_not_mistraced(filing, tmp_path, monkeypatch):
+    vault, state, base, gh = filing
+    lid = _lesson_named(state, 3)
+    f = _file_accept(tmp_path, [{"lesson_id": lid, "file_issue": True, "repo": "o/r"}])
+    real = retro_rollup.retro_trace.apply_traces
+    b2 = vault / "claude-insights" / "2026-10-08-retro-b2.md"
+
+    def racing(vault_, path, traces, **k):
+        if str(path).endswith("b2.md"):  # an item lands above the target after the plan was made
+            b2.write_text(b2.read_text().replace(
+                "## Process Improvements\n", "## Process Improvements\n- [ ] Sneaky new first item\n"))
+        return real(vault_, path, traces, **k)
+
+    monkeypatch.setattr(retro_rollup.retro_trace, "apply_traces", racing)
+    assert run(base, "backfill", "--apply", "--accept", str(f)) == 1
+    text = b2.read_text()
+    assert "- [ ] Sneaky new first item\n" in text
+    assert "- [ ] Never chain preflight and commit RULE-A\n" in text  # nothing traced, nothing ticked
+    assert "github.com" not in text and "[x]" not in text
+
+
+def test_state_without_a_filed_key_is_accepted(filing, tmp_path):
+    vault, state, base, gh = filing
+    s = state_of(state)
+    s.pop("filed", None)
+    (state / "lessons-state.json").write_text(json.dumps(s))
+    lid = _lesson_named(state, 3)
+    f = _file_accept(tmp_path, [{"lesson_id": lid, "file_issue": True, "repo": "o/r"}])
+    assert run(base, "backfill", "--apply", "--accept", str(f)) == 0
+    assert state_of(state)["filed"] == {lid: "o/r#7"}
+
+
+@pytest.mark.parametrize("entry", [
+    {"lesson_id": "L1", "file_issue": True, "tracking_ref": "x"},
+    {"lesson_id": "L1", "file_issue": False},
+    {"lesson_id": "L1", "file_issue": "yes"},
+    {"lesson_id": "L1", "file_issue": True, "repo": "no spaces/allowed"},
+    {"lesson_id": "L1", "file_issue": True, "repo": 5},
+    {"lesson_id": "L1", "tracking_ref": "x", "repo": "o/r"},
+])
+def test_bad_accept_entries_exit_2(env, tmp_path, entry):
+    vault, state, base = env
+    f = _file_accept(tmp_path, [entry])
+    assert run(base, "backfill", "--apply", "--accept", str(f)) == 2
+
+
+@pytest.mark.parametrize("url, want", [
+    ("https://github.com/o/r", "o/r"), ("https://github.com/o/r.git", "o/r"),
+    ("https://github.com/o/r/", "o/r"), ("https://user@github.com/o/r.git", "o/r"),
+    ("git@github.com:o/r.git", "o/r"), ("git@github.com:o/r", "o/r"),
+    ("ssh://git@github.com/o/r.git", "o/r"), ("https://github.com/a.b/c_d-e", "a.b/c_d-e"),
+    ("http://github.com/o/r", None), ("https://gitlab.com/o/r", None),
+    ("https://github.com.evil.com/o/r", None), ("https://evil.com/github.com/o/r", None),
+    ("git@github.com:o/r/extra", None), ("https://github.com/o", None),
+    ("file:///tmp/o/r", None), ("/local/path/o/r", None), ("https://github.com/o/r r", None),
+    ("", None), ("git@github.com:o/r;rm", None)])
+def test_repo_from_remote(url, want):
+    assert retro_rollup._repo_from_remote(url) == want
+
+
+def test_git_origin_reads_the_real_remote(tmp_path):
+    import subprocess
+    repo = tmp_path / "proj"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True, stdin=subprocess.DEVNULL)
+    assert retro_rollup._git_origin(str(repo)) is None  # no origin
+    subprocess.run(["git", "-C", str(repo), "remote", "add", "origin", "git@github.com:me/proj.git"],
+                   check=True, stdin=subprocess.DEVNULL)
+    assert retro_rollup._git_origin(str(repo)) == "git@github.com:me/proj.git"
+    assert retro_rollup._git_origin(str(tmp_path / "missing")) is None
+
+
+def test_freshly_filed_lesson_is_quiet_not_raise(filing, tmp_path):
+    # Sessions before the issue existed are not recurrences: the new issue counts as opened today.
+    vault, state, base, gh = filing
+    lid = _lesson_named(state, 3)
+    f = _file_accept(tmp_path, [{"lesson_id": lid, "file_issue": True, "repo": "o/r"}])
+    assert run(base, "backfill", "--apply", "--accept", str(f)) == 0
+    assert run(base, "update") == 0
+    s = state_of(state)
+    c = s["lessons"][lid]["classify"]
+    assert c["bucket"] == "quiet" and c["sessions_after_tracking"] == 0, c
+    info = s["tracking"]["issue:o/r#7"]
+    assert info["state"] == "OPEN" and info["created"] == s["generated"] and info["exists"] is True

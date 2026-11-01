@@ -486,3 +486,29 @@ def test_apply_on_crlf_note_rereads_every_trace(tmp_path):
     rt.apply_traces(str(tmp_path), path.name, TRACES)
     items = rt.parse_items(path.read_bytes().decode())
     assert [i["trace"]["kind"] for i in items] == ["issue", "memory", "path", "skipped"]
+
+
+def test_verify_false_raises_and_leaves_the_note_byte_identical(tmp_path):
+    path = make_note(tmp_path, HEADER + PARTIAL_BODY)
+    before = snapshot(path)
+    seen = []
+
+    def verify(item):
+        seen.append(item["item"])
+        return item["item"] != 3
+
+    with pytest.raises(rt.TraceError):
+        rt.apply_traces(str(tmp_path), path.name, [
+            {"item": 2, "kind": "memory", "stem": "x"},
+            {"item": 3, "kind": "memory", "stem": "y"}], partial=True, verify=verify)
+    assert sorted(seen) == [2, 3]
+    assert snapshot(path) == before
+
+
+def test_verify_true_writes_and_none_skips_the_check(tmp_path):
+    path = make_note(tmp_path, HEADER + PARTIAL_BODY)
+    rt.apply_traces(str(tmp_path), path.name, [{"item": 1, "kind": "memory", "stem": "x"}],
+                    partial=True, verify=lambda item: item["text"].startswith("- [ ] First"))
+    assert b"- [x] First. \xe2\x86\x92 memory `x`" in path.read_bytes()
+    rt.apply_traces(str(tmp_path), path.name, [{"item": 2, "kind": "memory", "stem": "x"}], partial=True)
+    assert b"- [x] Second. \xe2\x86\x92 memory `x`" in path.read_bytes()

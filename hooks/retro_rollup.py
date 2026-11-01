@@ -38,6 +38,13 @@ GH_MAX_WORKERS = 8
 MAX_CONCURRENCY = 16
 _PRIORITY = re.compile(r"^P[0-9]")
 _REF = re.compile(r"^([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#([1-9][0-9]*)$")
+_REPO = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+_REMOTE = re.compile(
+    r"^(?:https://(?:[^@/\s]+@)?github\.com/|ssh://git@github\.com/|git@github\.com:)"
+    r"([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?/?$")
+_CREATED = re.compile(r"^https://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)/issues/([1-9][0-9]*)$")
+GH_CREATE_TIMEOUT_SECONDS = 60
+GIT_TIMEOUT_SECONDS = 10
 
 
 class UsageError(Exception):
@@ -81,6 +88,8 @@ class Ctx:
         self.concurrency = (_bounded_int("concurrency", flag, 1, MAX_CONCURRENCY) if flag is not None else
                             _bounded_int("lessons_concurrency", config.get("lessons_concurrency", 8),
                                          1, MAX_CONCURRENCY))
+        repos = config.get("project_repos")
+        self.project_repos = repos if isinstance(repos, dict) else {}
         self.today = date.today().isoformat()
 
     @property
@@ -114,7 +123,8 @@ class _Lock:
 # --- state -----------------------------------------------------------------
 
 def _empty_state() -> dict:
-    return {"version": 1, "generated": None, "lessons": {}, "tracking": {}, "notes": {}, "totals": {}}
+    return {"version": 1, "generated": None, "lessons": {}, "tracking": {}, "notes": {}, "totals": {},
+            "filed": {}}
 
 
 def load_state(ctx: Ctx) -> dict:
@@ -135,6 +145,8 @@ def load_state(ctx: Ctx) -> dict:
         return _empty_state()
     base = _empty_state()
     base.update(state)
+    if not isinstance(base.get("filed"), dict):
+        base["filed"] = {}
     return base
 
 
@@ -293,9 +305,9 @@ def _report_unreadable(summary: dict) -> bool:
 
 # --- tracking refresh -------------------------------------------------------------
 
-def _run_gh(args: list[str]) -> subprocess.CompletedProcess:
+def _run_gh(args: list[str], timeout: int = GH_TIMEOUT_SECONDS) -> subprocess.CompletedProcess:
     return subprocess.run(["gh", *args], stdin=subprocess.DEVNULL, capture_output=True,
-                          text=True, timeout=GH_TIMEOUT_SECONDS)
+                          text=True, timeout=timeout)
 
 
 def _issue_info(ref: str) -> tuple[dict | None, str | None]:
@@ -391,12 +403,12 @@ def _untraced_report(ctx: Ctx, state: dict, accepted: set[str]) -> dict:
             lid = lesson_of.get(item["key"])
             if lid is None:
                 reason = "one-off" if cache.judged(item["key"]) else "unjudged"
+            elif lid in accepted:
+                reason = "accepted-not-written"
             elif not state["lessons"][lid].get("tracking"):
                 reason = "lesson-untracked"
-            elif lid not in accepted:
-                reason = "not-accepted"
             else:
-                reason = "accepted-not-written"
+                reason = "not-accepted"
             rows.append({"note": item["note"], "item": item["item"], "line": item["line"],
                          "lesson": lid, "reason": reason})
     finally:
@@ -411,29 +423,202 @@ def _read_accept(path: str) -> list[dict]:
         data = json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, UnicodeError, ValueError) as exc:
         raise UsageError(f"cannot read accept file: {exc}")
-    if not isinstance(data, list) or not all(
-            isinstance(e, dict) and isinstance(e.get("lesson_id"), str)
-            and isinstance(e.get("tracking_ref"), str) for e in data):
-        raise UsageError('accept file must be a JSON list of {"lesson_id", "tracking_ref"}')
+    usage = ('accept file must be a JSON list of {"lesson_id", "tracking_ref"} or '
+             '{"lesson_id", "file_issue": true, "repo"?: "owner/repo"}')
+    if not isinstance(data, list):
+        raise UsageError(usage)
+    for e in data:
+        if not isinstance(e, dict) or not isinstance(e.get("lesson_id"), str):
+            raise UsageError(usage)
+        if "file_issue" in e:
+            if e["file_issue"] is not True or "tracking_ref" in e:
+                raise UsageError(usage)
+            if "repo" in e and not _valid_repo(e["repo"]):
+                raise UsageError(f"invalid repo in accept file: {e['repo']!r}")
+        elif not isinstance(e.get("tracking_ref"), str) or "repo" in e:
+            raise UsageError(usage)
     return data
+
+
+# --- filing an issue for an untracked lesson ----------------------------------------
+
+def _valid_repo(value) -> bool:
+    if not isinstance(value, str) or not _REPO.match(value):
+        return False
+    return not any(part in (".", "..") for part in value.split("/"))
+
+
+def _repo_from_remote(url: str) -> str | None:
+    """owner/repo from a github.com https or ssh remote URL; anything else is None."""
+    match = _REMOTE.match(url.strip()) if isinstance(url, str) else None
+    if not match:
+        return None
+    repo = f"{match.group(1)}/{match.group(2)}"
+    return repo if _valid_repo(repo) else None
+
+
+def _git_origin(path: str) -> str | None:
+    try:
+        result = subprocess.run(["git", "-C", path, "remote", "get-url", "origin"],
+                                stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                                timeout=GIT_TIMEOUT_SECONDS)
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    return (result.stdout.strip() or None) if result.returncode == 0 else None
+
+
+def _origin_repo(project: str) -> str | None:
+    """The origin repo of <workspace root>/<project>, or None."""
+    import obsidian_utils
+    if not project or project in (".", "..") or "/" in project or "\\" in project:
+        return None
+    for root in obsidian_utils.get_workspace_roots():
+        candidate = Path(root) / project
+        if candidate.is_dir() and candidate.resolve().parent == Path(root).resolve():
+            repo = _repo_from_remote(_git_origin(str(candidate)) or "")
+            if repo:
+                return repo
+    return None
+
+
+def _lesson_project(rec: dict, by_key: dict) -> str | None:
+    """The project with the most member sessions (retros); ties go to the smaller name."""
+    sessions: dict[str, set] = {}
+    for key in rec["members"]:
+        item = by_key.get(key)
+        if item is not None:
+            sessions.setdefault(item["project"], set()).add(item["note"])
+    return min(sessions, key=lambda p: (-len(sessions[p]), p)) if sessions else None
+
+
+def _resolve_repo(ctx: Ctx, rec: dict, by_key: dict, override: str | None,
+                  cache: dict | None = None) -> tuple[str | None, str | None]:
+    """(repo, None) or (None, reason): accept override, then project_repos, then the origin remote."""
+    project = _lesson_project(rec, by_key)
+    if override is not None:
+        return (override, None) if _valid_repo(override) else (None, "invalid repo")
+    configured = ctx.project_repos.get(project) if project else None
+    if configured is not None:
+        return (configured, None) if _valid_repo(configured) else (None, f"invalid repo for project {project}")
+    if cache is not None and project in cache:
+        repo = cache[project]
+    else:
+        repo = _origin_repo(project) if project else None
+        if cache is not None:
+            cache[project] = repo
+    return (repo, None) if repo else (None, f"no repo for project {project}")
+
+
+def _issue_body(lid: str, rec: dict, by_key: dict) -> str:
+    """Counts, dates, project names and note#item refs only; never retro item text."""
+    members = [by_key[k] for k in rec["members"] if k in by_key]
+    dates = sorted(m["date"] for m in members)
+    lines = [f"Recurring lesson `{lid}` from the retro lessons rollup (#471).", "",
+             f"- Sessions: {len({m['note'] for m in members})}",
+             f"- Projects: {', '.join(sorted({m['project'] for m in members}))}",
+             f"- First seen: {dates[0] if dates else 'unknown'}",
+             f"- Last seen: {dates[-1] if dates else 'unknown'}",
+             "- Retro items (note#item):"]
+    lines += [f"  - {m['note']}#{m['item']}" for m in sorted(members, key=lambda m: (m["date"], m["note"], m["item"]))]
+    return "\n".join(lines) + "\n"
+
+
+def _create_issue(ctx: Ctx, repo: str, title: str, body: str) -> tuple[str | None, str | None]:
+    """File one issue; return ("owner/repo#N", None) or (None, error)."""
+    _ensure_state_dir(ctx)
+    fd, tmp = tempfile.mkstemp(dir=ctx.state_dir, prefix=".gh-body-", suffix=".md")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(body)
+        os.chmod(tmp, 0o600)
+        try:
+            result = _run_gh(["issue", "create", "--repo", repo, "--title", title, "--body-file", tmp],
+                             timeout=GH_CREATE_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            return None, "gh timed out; the issue may exist, check before rerunning"
+        except OSError as exc:
+            return None, str(exc)[:200]
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+    if result.returncode:
+        return None, f"gh exited with code {result.returncode}"
+    last = (result.stdout or "").rstrip().splitlines()[-1:] or [""]
+    match = _CREATED.match(last[0].strip())
+    if not match or f"{match.group(1)}/{match.group(2)}".casefold() != repo.casefold():
+        return None, "gh did not print the new issue URL"
+    return f"{repo}#{match.group(3)}", None
+
+
+def _planned_filings(ctx: Ctx, state: dict, by_key: dict) -> list[dict]:
+    plans, cache = [], {}
+    for lid, rec in sorted(state["lessons"].items()):
+        if rec.get("tracking") or lid in state["filed"]:
+            continue
+        untraced = sum(1 for k in rec["members"] if k in by_key and by_key[k]["trace"] is None)
+        if not untraced:
+            continue
+        repo, reason = _resolve_repo(ctx, rec, by_key, None, cache)
+        plan = {"lesson": lid, "repo": repo, "title": rec["name"], "members": untraced}
+        if reason:
+            plan["reason"] = reason
+        plans.append(plan)
+    return plans
 
 
 def backfill(ctx: Ctx, state: dict, accept: list[dict] | None) -> tuple[dict, bool]:
     """Dry run when accept is None; else trace accepted lessons. Returns (result, ok)."""
     items, by_key, _ = _load(ctx)
-    plan, skipped_entries = [], []
+    plan, skipped_entries, filed = [], [], []
     accepted = {}
+    ok = True
     for entry in accept or []:
-        rec = state["lessons"].get(entry["lesson_id"])
+        lid = entry["lesson_id"]
+        rec = state["lessons"].get(lid)
         if rec is None:
             skipped_entries.append({**entry, "reason": "unknown lesson"})
+        elif entry.get("file_issue"):
+            ref = state["filed"].get(lid)
+            if ref is not None and not _REF.match(str(ref)):
+                ref = None
+            if ref is None:
+                if rec.get("tracking"):
+                    skipped_entries.append({**entry, "reason": "already tracked"})
+                    continue
+                if not any(k in by_key and by_key[k]["trace"] is None for k in rec["members"]):
+                    skipped_entries.append({**entry, "reason": "nothing to trace"})
+                    continue
+                repo, reason = _resolve_repo(ctx, rec, by_key, entry.get("repo"))
+                if repo is None:
+                    skipped_entries.append({**entry, "reason": reason})
+                    ok = False
+                    continue
+                title = " ".join(str(rec["name"]).split())[:200] or lid
+                ref, error = _create_issue(ctx, repo, title, _issue_body(lid, rec, by_key))
+                if ref is None:
+                    skipped_entries.append({**entry, "reason": f"filing failed: {error}"})
+                    ok = False
+                    continue
+                state["filed"][lid] = ref  # saved before any trace, so a crash never files twice
+                # Known facts about the new issue, as refresh-tracking would record them, so the
+                # sessions from before it existed do not count as recurrences.
+                state["tracking"][f"issue:{ref}"] = {"exists": True, "state": "OPEN", "milestone": None,
+                                                     "priority": None, "created": ctx.today, "closed": None}
+                save_state(ctx, state)
+                filed.append({"lesson": lid, "repo": repo, "issue": int(ref.rsplit("#", 1)[1])})
+            elif rec.get("tracking") and rec["tracking"]["ref"] != ref:
+                skipped_entries.append({**entry, "reason": "already tracked"})
+                continue
+            accepted[lid] = {**rec, "tracking": {"kind": "issue", "ref": ref}}
         elif not rec.get("tracking") or rec["tracking"]["ref"] != entry["tracking_ref"]:
             skipped_entries.append({**entry, "reason": "tracking changed"})
         elif ((state["tracking"].get(_tracking_key(rec["tracking"])) or {}).get("exists") is False
               or (rec.get("classify") or {}).get("tracking_gone")):
             skipped_entries.append({**entry, "reason": "tracking gone"})
         else:
-            accepted[entry["lesson_id"]] = rec
+            accepted[lid] = rec
     lessons = accepted if accept is not None else {
         lid: rec for lid, rec in state["lessons"].items() if rec.get("tracking")}
     by_note: dict[str, list[tuple[str, dict]]] = {}
@@ -445,7 +630,6 @@ def backfill(ctx: Ctx, state: dict, accept: list[dict] | None) -> tuple[dict, bo
             by_note.setdefault(item["path"], []).append((key, rec["tracking"]))
             plan.append({"lesson": lid, "note": item["note"], "item": item["item"],
                          "trace": _trace_for(rec["tracking"], item["item"])})
-    ok = True
     written = 0
     if accept is not None:
         for path, wanted in sorted(by_note.items()):
@@ -460,15 +644,22 @@ def backfill(ctx: Ctx, state: dict, accept: list[dict] | None) -> tuple[dict, bo
             current = {}
             for it in retro_trace.parse_items(text):
                 current.setdefault(lessons_corpus.item_key(stem, it["text"]), it)  # first copy, like _load
-            traces = []
+            traces, expected = [], {}
             for key, tracking in wanted:
                 it = current.get(key)
                 if it is not None and it["trace"] is None:
                     traces.append(_trace_for(tracking, it["item"]))
+                    expected[it["item"]] = key
             if not traces:
                 continue
+
+            def still_the_same(item, stem=stem, expected=expected):
+                # Re-checked under the note lock: an edit since the read above must not shift a trace.
+                return lessons_corpus.item_key(stem, item["text"]) == expected.get(item["item"])
+
             try:
-                result = retro_trace.apply_traces(ctx.vault, path, traces, partial=True)
+                result = retro_trace.apply_traces(ctx.vault, path, traces, partial=True,
+                                                  verify=still_the_same)
                 written += int(result["written"])
             except (retro_trace.TraceError, OSError) as exc:
                 print(f"retro_rollup: {path}: {exc}", file=sys.stderr)
@@ -476,7 +667,9 @@ def backfill(ctx: Ctx, state: dict, accept: list[dict] | None) -> tuple[dict, bo
     report = _untraced_report(ctx, state, set(accepted))
     return {"mode": "apply" if accept is not None else "dry-run", "planned": len(plan),
             "notes_written": written, "skipped_entries": skipped_entries,
-            "plan": plan if accept is None else [], **report}, ok
+            "plan": plan if accept is None else [], "filed": filed,
+            "planned_filings": _planned_filings(ctx, state, by_key) if accept is None else [],
+            **report}, ok
 
 
 # --- output -----------------------------------------------------------------

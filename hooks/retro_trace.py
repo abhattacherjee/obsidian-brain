@@ -315,8 +315,12 @@ def _merge_field(fm: list[str], refs: list[str], eol: str) -> list[str]:
 
 
 def apply_traces(vault_path: str, note_path: str, traces: list[dict],
-                 partial: bool = False) -> dict:
-    """Validate outcomes under the writer lock; partial allows untraced items."""
+                 partial: bool = False, verify=None) -> dict:
+    """Validate outcomes under the writer lock; partial allows untraced items.
+
+    verify(item) -> bool runs under the lock for each item to trace (the parsed
+    item dict from parse_items); False raises TraceError with nothing written.
+    """
     if not isinstance(traces, list):
         raise TraceError("traces must be a list")
     path = Path(note_path)
@@ -349,6 +353,8 @@ def apply_traces(vault_path: str, note_path: str, traces: list[dict],
                 raise TraceError(f"item {number} is already traced")
             if number in validated:
                 raise TraceError(f"duplicate item: {number}")
+            if verify is not None and not verify(by_number[number]):
+                raise TraceError(f"item {number} changed since it was read; nothing written")
             validated[number] = (entry, _render(entry))
         untraced = {item["item"] for item in items if item["trace"] is None}
         if not partial and set(validated) != untraced:
