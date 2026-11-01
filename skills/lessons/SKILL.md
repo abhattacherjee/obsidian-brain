@@ -199,7 +199,7 @@ Exit 2: the file is invalid (the message names the field). Fix the entry and wri
 - `skipped_entries`: each entry and its reason.
 - `plan`: the number of traces per lesson.
 
-Ask once: "Apply: N issues to file, P pending reconcile (may file), M lessons to trace?" with **Yes** and **No**. N is the number of `planned_filings` without a `reason`; P is the number with reason `pending reconcile`; M is the number of lessons in `plan` plus N.
+Ask once: "Apply: N issues to file, P pending reconcile (may file), M lessons to trace?" with **Yes** and **No**. N is the number of `planned_filings` without a `reason`; P is the number with reason `pending reconcile`; M is the number of lessons in `plan`, plus N, plus the number of lessons whose `planned_filings` reason starts with `adopts existing issue` (they have no `plan` rows in the preview, but apply traces them).
 
 - **No** — delete the accept file (`rm -f '<ACCEPT path>'`). Nothing changes.
 - **Yes** — run the apply, then delete the accept file whatever the result:

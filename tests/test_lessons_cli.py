@@ -637,3 +637,39 @@ def test_c010_live_tracking_is_still_refused(filing, tmp_path, capsys):
         assert run(base, *args) == 0
         assert json.loads(capsys.readouterr().out)["skipped_entries"][0]["reason"] == "already tracked"
     assert gh.calls == []
+
+
+def test_c006_cli_rejects_abbreviated_options(filing, tmp_path, capsys):
+    vault, state, base, gh = filing
+    f = _file_accept(tmp_path, [entry_for(state)])
+    before = retro_bytes(vault), (state / "lessons-state.json").read_bytes()
+    for args in (("backfill", "--accept", str(f), "--appl"), ("backfill", "--acc", str(f))):
+        capsys.readouterr()
+        try:
+            code = run(base, *args)
+        except SystemExit as exc:
+            code = exc.code
+        assert code == 2, args
+    assert gh.calls == gh.list_calls == []
+    assert (retro_bytes(vault), (state / "lessons-state.json").read_bytes()) == before
+
+
+def test_x011_gone_own_ref_does_not_hide_a_live_merged_in_ref(filing, tmp_path, capsys):
+    vault, state, base, gh = filing
+    entry = entry_for(state)
+    lid = entry["lesson_id"]
+    _retire_into(vault, "old-lesson", lid)
+
+    def mutate(s):
+        s["filed"].update({lid: "o/r#3", "old-lesson": "o/r#7"})
+        s["tracking"]["issue:o/r#3"] = {"exists": False}
+    _set_state(state, mutate)
+    f = _file_accept(tmp_path, [entry])
+    capsys.readouterr()
+    assert run(base, "backfill", "--accept", str(f)) == 0
+    rows = json.loads(capsys.readouterr().out)["planned_filings"]
+    assert rows[0]["reason"] == "adopts existing issue o/r#7"
+    capsys.readouterr()
+    assert run(base, "backfill", "--apply", "--accept", str(f)) == 0
+    assert gh.calls == []
+    assert state_of(state)["lessons"][lid]["tracking"]["ref"] == "o/r#7"

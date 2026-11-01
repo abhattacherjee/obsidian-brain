@@ -233,11 +233,12 @@ def _filing_sources(lid: str, lesson: dict, retired: dict) -> list[str]:
     return olds
 
 
-def _inherited_filing(state: dict, lid: str, lesson: dict, retired: dict):
-    """The issue ref a lesson was filed under (see _filing_sources)."""
+def _inherited_filing(state: dict, lid: str, lesson: dict, retired: dict, live_only: bool = False):
+    """The issue ref a lesson was filed under (see _filing_sources). live_only skips refs whose
+    issue is gone and keeps looking."""
     for old_id in _filing_sources(lid, lesson, retired):
         ref = state["filed"].get(old_id)
-        if isinstance(ref, str) and _REF.match(ref):
+        if isinstance(ref, str) and _REF.match(ref) and not (live_only and _ref_gone(state, ref)):
             return ref, old_id
     return None, None
 
@@ -1055,8 +1056,8 @@ def _adopt_decision(state: dict, lid: str, rec: dict, retired: dict):
     filed = state["filed"].get(lid)
     if _is_pending(filed) or _live_filed(state, lid):
         return None, None, None
-    ref, source = _inherited_filing(state, lid, rec, retired)
-    if ref is not None and not _ref_gone(state, ref):
+    ref, source = _inherited_filing(state, lid, rec, retired, live_only=True)
+    if ref is not None:
         return "adopt", ref, source
     if _inherited_pending(state, lid, rec, retired) is not None:
         return "pending", None, None
@@ -1432,29 +1433,29 @@ def show(ctx: Ctx, state: dict, lid: str, as_json: bool) -> int:
 
 
 def _parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="retro_rollup.py")
-    common = argparse.ArgumentParser(add_help=False)
+    p = argparse.ArgumentParser(prog="retro_rollup.py", allow_abbrev=False)
+    common = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
     common.add_argument("--vault")
     common.add_argument("--insights-folder")
     common.add_argument("--state-dir")
     sub = p.add_subparsers(dest="cmd", required=True)
-    u = sub.add_parser("update", parents=[common])
+    u = sub.add_parser("update", parents=[common], allow_abbrev=False)
     u.add_argument("--note")
     u.add_argument("--concurrency", type=int)
-    sub.add_parser("rebuild", parents=[common])
-    sub.add_parser("refresh-tracking", parents=[common])
-    m = sub.add_parser("match", parents=[common])
+    sub.add_parser("rebuild", parents=[common], allow_abbrev=False)
+    sub.add_parser("refresh-tracking", parents=[common], allow_abbrev=False)
+    m = sub.add_parser("match", parents=[common], allow_abbrev=False)
     m.add_argument("--concurrency", type=int)
     m.add_argument("--all", action="store_true", help="check every untracked lesson again")
-    r = sub.add_parser("report", parents=[common])
+    r = sub.add_parser("report", parents=[common], allow_abbrev=False)
     r.add_argument("--json", action="store_true")
-    b = sub.add_parser("backfill", parents=[common])
+    b = sub.add_parser("backfill", parents=[common], allow_abbrev=False)
     b.add_argument("--apply", action="store_true")
     b.add_argument("--accept")
-    s = sub.add_parser("snooze", parents=[common])
+    s = sub.add_parser("snooze", parents=[common], allow_abbrev=False)
     s.add_argument("lesson_id")
     s.add_argument("when")
-    s = sub.add_parser("show", parents=[common])
+    s = sub.add_parser("show", parents=[common], allow_abbrev=False)
     s.add_argument("lesson_id")
     s.add_argument("--json", action="store_true")
     return p

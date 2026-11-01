@@ -8,6 +8,7 @@ confirm question, and stdin closed on every `gh` and `python3` call.
 from __future__ import annotations
 
 import re
+import shlex
 import subprocess
 from pathlib import Path
 
@@ -71,7 +72,7 @@ def logical_lines(text: str):
 
 
 READ_ONLY_GH = {("issue", "list"), ("issue", "view"), ("label", "list"), ("repo", "view")}
-GH_WRITE_FLAG = re.compile(r"(?:^|\s)(?:-X|--method|-f|-F|--field|--raw-field|--input)")
+GH_WRITE_TOKEN = re.compile(r"(?:-X|--method|-f|-F|--field|--raw-field|--input)")
 # a `gh` word that starts a command: line start, or after whitespace, `;`, `&`, `|`, `(` or `$(`
 GH_CALL = re.compile(r"(?:^|[\s;&|(])gh\s+(\S+)(?:\s+(\S+))?(.*)$")
 
@@ -94,14 +95,21 @@ def raise_span(text: str):
 
 
 def gh_violations(text: str) -> list[str]:
-    """Every gh call that is not read-only, allowing `gh issue edit` only inside the Raise step."""
+    """Every gh call that is not read-only, allowing `gh issue edit` only inside the Raise step.
+
+    The rest of each call is split with shlex, so quoted, attached and `=` forms of the method and
+    field flags are all seen. A line shlex cannot split counts as a violation.
+    """
     low, high = raise_span(text)
     bad = []
     for offset, pair, rest in gh_calls(text):
-        if pair == ("api", rest.split()[0] if rest.split() else ""):
-            pair = ("api", "")
+        try:
+            tokens = shlex.split(pair[0] + " " + rest, comments=False)
+        except ValueError as exc:
+            bad.append(f"cannot parse gh call ({exc}): {rest.strip()}")
+            continue
         if pair[0] == "api":
-            if GH_WRITE_FLAG.search(" " + rest):
+            if any(GH_WRITE_TOKEN.match(t) for t in tokens[1:]):
                 bad.append(f"gh api with a write flag: {rest.strip()}")
         elif pair == ("issue", "edit"):
             if not low <= offset < high:
@@ -118,10 +126,15 @@ def branch(text: str, label: str) -> tuple[int, int]:
     return m.start(), m.end()
 
 
+def is_apply(line: str) -> bool:
+    """A backfill call is an apply when any token is --apply or an abbreviation of it (--ap...)."""
+    return any(t.startswith("--ap") for t in re.split(r"[\s=]+", line))
+
+
 def apply_violations(text: str) -> list[str]:
     """backfill calls: exactly one with --apply, after a dry run and the confirm, inside the Yes bullet."""
     runs = [(o, l) for o, l in logical_lines(text) if re.search(r"retro_rollup\.py\"?\s+backfill\b", l)]
-    applies = [(o, l) for o, l in runs if re.search(r"(?<!\S)--apply(?!\S)", l)]
+    applies = [(o, l) for o, l in runs if is_apply(l)]
     dry = [(o, l) for o, l in runs if (o, l) not in applies and "--accept" in l]
     bad = []
     if len(applies) != 1:
@@ -186,6 +199,9 @@ WRITE_FORMS = [
     "gh api repos/o/r/issues --raw-field title=x < /dev/null",
     "gh api repos/o/r/issues --input body.json < /dev/null",
     "gh api \\\n  -X DELETE repos/o/r/issues/1 < /dev/null",
+    "gh api 'repos/o/r/issues' '-XPOST' '-ftitle=Unapproved' < /dev/null",
+    'gh api "repos/o/r/issues" "-XPOST" "-ftitle=Unapproved" < /dev/null',
+    "gh api repos/o/r/issues '--method=PUT' < /dev/null",
     "gh issue create --title x < /dev/null",
     "gh issue new --title x < /dev/null",
     "gh issue close 1 < /dev/null",
@@ -226,7 +242,7 @@ def test_every_gh_issue_edit_sits_under_the_raise_step():
 
 def test_apply_only_after_dry_run_and_confirm():
     assert apply_violations(TEXT) == []
-    assert any(re.search(r"(?<!\S)--apply(?!\S)", l) for _, l in logical_lines(TEXT))  # positive control
+    assert any(is_apply(l) for _, l in logical_lines(TEXT))  # positive control
 
 
 def _dry_run_line():
@@ -238,6 +254,8 @@ def test_apply_guard_catches_a_second_apply_in_any_form():
     dry = _dry_run_line()
     reordered = TEXT.replace(dry, dry.replace(" < /dev/null", " --apply < /dev/null"), 1)
     assert apply_violations(reordered)  # dry run turned into an apply, flags in another order
+    abbreviated = TEXT.replace(dry, dry.replace(" < /dev/null", " --appl < /dev/null"), 1)
+    assert apply_violations(abbreviated)  # argparse used to accept --appl as --apply
     extra = TEXT.replace("### Step 5", "```bash\n    python3 \"$HOOKS/retro_rollup.py\" backfill --accept X --apply < /dev/null\n```\n\n### Step 5", 1)
     assert apply_violations(extra)
 
@@ -332,6 +350,11 @@ def test_confirm_counts_pending_filings_separately():
     step6 = section("Step 6")
     assert "P pending reconcile (may file)" in step6
     assert "reason `pending reconcile`" in step6 or "`pending reconcile`" in step6
+
+
+def test_confirm_counts_adopted_lessons_in_m():
+    step6 = section("Step 6")
+    assert "starts with `adopts existing issue`" in step6
 
 
 def test_empty_walk_still_reaches_the_batch_confirm():
