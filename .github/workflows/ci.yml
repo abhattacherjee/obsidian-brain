@@ -57,18 +57,33 @@ jobs:
           fi
 
   # ── Python tests — runs on all PRs ───────────────────────────
+  # The suite runs in three kinds of job at once (GH #485):
+  # - python-tests and python-tests-py39 run everything except TIMED_TESTS
+  #   under pytest-xdist (`-n auto`, one worker per runner core). Most tests
+  #   start a process or a git repo, so this splits well.
+  # - timed-tests runs TIMED_TESTS alone, on its own runner, on both Pythons.
+  #   They assert wall-clock budgets, and next to busy workers a 2,000 ms
+  #   backstop measured 2,042 ms. They take 3-5 min serially, so running them
+  #   after the parallel step would make each job the sum of the two.
+  # The 90% coverage gate is applied without TIMED_TESTS (94.7% without
+  # them, measured 2026-11-01).
+  # A renamed TIMED_TESTS id fails timed-tests (pytest exits 4 on a missing
+  # node id), so the split cannot silently drop them. --durations lists the
+  # slowest tests in each log, for the next time CI gets slow.
   python-tests:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    env:
+      TIMED_TESTS: tests/test_security.py::TestDecisionTimeIsBounded
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
-      - name: Install pytest and coverage
-        run: pip install pytest pytest-cov
+      - name: Install pytest, coverage and xdist
+        run: pip install pytest pytest-cov pytest-xdist
       - name: Run tests with coverage
-        run: pytest tests/ -v --tb=short --cov=hooks --cov-report=term-missing --cov-fail-under=90
+        run: pytest tests/ -n auto -v --tb=short --deselect "$TIMED_TESTS" --durations=30 --cov=hooks --cov-report=term-missing --cov-fail-under=90
 
   # ── Python 3.9 floor — macOS system python3 is 3.9 (GH #371) ─
   # hooks.json and the skill snippets run bare `python3`, so the plugin must
@@ -77,15 +92,37 @@ jobs:
   python-tests-py39:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    env:
+      TIMED_TESTS: tests/test_security.py::TestDecisionTimeIsBounded
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
         with:
           python-version: '3.9'
+      - name: Install pytest and xdist
+        run: pip install pytest pytest-xdist
+      - name: Run tests on Python 3.9
+        run: pytest tests/ -n auto -q --tb=short --deselect "$TIMED_TESTS" --durations=30
+
+  # ── Wall-clock budget tests — alone on their own runner (GH #485) ─
+  timed-tests:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.12', '3.9']
+    env:
+      TIMED_TESTS: tests/test_security.py::TestDecisionTimeIsBounded
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
       - name: Install pytest
         run: pip install pytest
-      - name: Run tests on Python 3.9
-        run: pytest tests/ -q --tb=short
+      - name: Run timed tests serially
+        run: pytest "$TIMED_TESTS" -q --tb=short --durations=15
 
   # ── DB-pollution guard — blocks bare ensure_index() in tests (GH #46) ─
   no-default-db-check:
