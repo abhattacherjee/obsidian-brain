@@ -42,7 +42,7 @@ def test_render_frontmatter_parses_with_hostile_text(sample):
     assert frontmatter(content) == {
         "type": "claude-lesson", "lesson_id": lesson["id"], "name": lesson["name"],
         **{k: c[k] for k in ("sessions", "recent_sessions", "projects", "first_seen", "last_seen")},
-        "tracking": "issue", "tracking_ref": tracking["ref"],
+        "tracking": "issue", "tracking_ref": tracking["ref"], "tracking_source": "trace",
         "tracking_since": info["created"], "issue_state": "open",
         "issue_milestone": info["milestone"], "issue_priority": "P1",
         "sessions_after_tracking": 1, "bucket": "raise", "dormant": False,
@@ -120,7 +120,8 @@ def test_report_has_no_item_text(sample):
         "id": "L123", "name": sample[0]["name"],
         **{k: sample[1][k] for k in ("bucket", "dormant", "sessions", "recent_sessions",
                                     "projects", "first_seen", "last_seen", "sessions_after_tracking")},
-        "tracking": "issue", "tracking_ref": "org/repo#471", "issue_state": "open",
+        "tracking": "issue", "tracking_ref": "org/repo#471", "tracking_source": "trace",
+        "issue_state": "open",
         "issue_milestone": sample[3]["milestone"], "issue_priority": "P1",
         "snoozed_until": None,
         "members": [{"note": "b", "item_key": "b:2"}, {"note": "a", "item_key": "a:1"},
@@ -159,6 +160,25 @@ def test_tracking_fields_match_report(sample, tracking, info, gone, kind, since)
     assert "split_from" not in fm
     for key in ("tracking_ref", "issue_state", "issue_milestone", "issue_priority"):
         assert fm[key] == entry[key]
+
+
+@pytest.mark.parametrize(("source", "expected"), [
+    ("match", "match"), ("filed", "filed"), ("trace", "trace"), (None, "trace")])
+def test_tracking_source_in_note_and_report(sample, source, expected):
+    lesson, c, tracking, info, items = sample
+    tracking = {**tracking, **({"source": source} if source else {})}
+    fm = frontmatter(notes.render_note(lesson, c, tracking, info, items, None))
+    state = make_state(sample)
+    state["lessons"][lesson["id"]].update(tracking=tracking)
+    assert fm["tracking_source"] == notes.report(state)["lessons"][0]["tracking_source"] == expected
+
+
+def test_tracking_source_is_none_without_tracking(sample):
+    lesson, c, _, _, items = sample
+    fm = frontmatter(notes.render_note(lesson, c, None, None, items, None))
+    state = make_state(sample)
+    state["lessons"][lesson["id"]].update(tracking=None, info=None)
+    assert fm["tracking_source"] == notes.report(state)["lessons"][0]["tracking_source"] == "none"
 
 
 @pytest.mark.parametrize("content", [

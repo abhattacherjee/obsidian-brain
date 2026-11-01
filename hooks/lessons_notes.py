@@ -25,6 +25,8 @@ def _tracking_fields(c: dict, tracking: dict | None, info: dict | None) -> dict:
             "rule" if kind == "path" else kind
         ),
         "tracking_ref": tracking["ref"] if tracking else None,
+        # trace | filed | match; a record from before #473 has no source and came from a trace or a filing
+        "tracking_source": tracking.get("source", "trace") if tracking else "none",
         "tracking_since": issue_info.get("created") or (
             tracking["since"] if tracking else None
         ),
