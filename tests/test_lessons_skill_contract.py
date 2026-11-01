@@ -137,9 +137,19 @@ def is_apply(line: str) -> bool:
     return any(t.startswith("--ap") for token in tokens for t in token.split("="))
 
 
+def is_backfill_call(line: str) -> bool:
+    """A line runs `retro_rollup.py backfill`, quoted or not. Split with shlex, so `"backfill"` and
+    `'backfill'` count. A line shlex cannot split counts when it names retro_rollup at all."""
+    try:
+        tokens = shlex.split(line)
+    except ValueError:
+        return "retro_rollup" in line
+    return any(t.endswith("retro_rollup.py") and nxt == "backfill" for t, nxt in zip(tokens, tokens[1:]))
+
+
 def apply_violations(text: str) -> list[str]:
     """backfill calls: exactly one with --apply, after a dry run and the confirm, inside the Yes bullet."""
-    runs = [(o, l) for o, l in logical_lines(text) if re.search(r"retro_rollup\.py\"?\s+backfill\b", l)]
+    runs = [(o, l) for o, l in logical_lines(text) if is_backfill_call(l)]
     applies = [(o, l) for o, l in runs if is_apply(l)]
     dry = [(o, l) for o, l in runs if (o, l) not in applies and "--accept" in l]
     bad = []
@@ -259,7 +269,7 @@ def test_apply_only_after_dry_run_and_confirm():
 
 def _dry_run_line():
     return next(l for _, l in logical_lines(TEXT)
-                if re.search(r"retro_rollup\.py\"?\s+backfill\b", l) and "--apply" not in l)
+                if is_backfill_call(l) and "--apply" not in l)
 
 
 def test_apply_guard_catches_a_second_apply_in_any_form():
@@ -275,6 +285,9 @@ def test_apply_guard_catches_a_second_apply_in_any_form():
         assert apply_violations(extra_q), quoted  # argparse used to accept --appl as --apply
     extra = TEXT.replace("### Step 5", "```bash\n    python3 \"$HOOKS/retro_rollup.py\" backfill --accept X --apply < /dev/null\n```\n\n### Step 5", 1)
     assert apply_violations(extra)
+    for sub in ('"backfill"', "'backfill'"):  # a quoted subcommand is still a backfill call
+        quoted_sub = TEXT.replace("### Step 5", f"```bash\npython3 \"$HOOKS/retro_rollup.py\" {sub} --accept X --apply < /dev/null\n```\n\n### Step 5", 1)
+        assert apply_violations(quoted_sub), sub
 
 
 def test_apply_guard_catches_apply_in_the_no_branch():
