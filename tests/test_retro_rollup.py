@@ -1973,6 +1973,19 @@ def test_accepted_local_match_clears_a_stale_gone_marker(menv):
     assert a["classify"]["tracking_gone"] is False and a["classify"]["bucket"] != "file"
 
 
+def test_unchanged_local_match_clears_a_stale_gone_marker(menv):
+    menv.memory("feedback_preflight", PREFLIGHT_DOC)
+    assert run(menv.base, "update") == 0 and run(menv.base, "match") == 0
+    edit_state(menv.state, lambda s: s["tracking"].update({"memory:feedback_preflight": {"exists": False}}))
+    calls = len(menv.gate)
+    assert run(menv.base, "match") == 0
+    assert len(menv.gate) == calls  # candidate unchanged: no Haiku call
+    s = state_of(menv.state)
+    _, a = lesson_of(menv.state, "Follow rule A")
+    assert s["tracking"]["memory:feedback_preflight"] == {"exists": True}
+    assert a["classify"]["tracking_gone"] is False and a["classify"]["bucket"] != "file"
+
+
 def test_a_matched_issues_facts_are_recorded_by_match_itself(menv):
     menv.issues["o/r"] = [{**ISSUE_7, "state": "CLOSED", "closedAt": "2026-10-09T09:00:00Z",
                            "milestone": {"title": "v3.10"}, "labels": [{"name": "P2-medium"}]}]

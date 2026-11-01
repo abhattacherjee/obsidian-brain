@@ -703,6 +703,13 @@ def match_lessons(ctx: Ctx, state: dict, *, recheck: bool = False) -> dict:
         prev = rec.get("match")
         if isinstance(prev, dict) and prev.get("candidate") == chash and not recheck:
             summary["unchanged"] += 1
+            if (doc and doc["source"] != "issue" and prev.get("kind") == _MATCH_KIND[doc["source"]]
+                    and prev.get("ref") == doc["ref"]):
+                # The file was read just now: drop a stale "gone" left by an earlier refresh-tracking.
+                key = f"{prev['kind']}:{doc['ref']}"
+                if state["tracking"].get(key) != {"exists": True}:
+                    state["tracking"][key] = {"exists": True}
+                    changed = True
             continue
         if doc is None:
             rec["match"] = {"none": True, "candidate": None}
