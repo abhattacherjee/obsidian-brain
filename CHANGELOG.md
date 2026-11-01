@@ -8,7 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
-- CI runs `python-tests` (3.12, 90% coverage gate) and `python-tests-py39` with `pytest-xdist` (`-n auto`), the way `scripts/commit-preflight.sh` already does (#485). The wall-clock budget tests (`tests/test_security.py::TestDecisionTimeIsBounded`, 5–7 min serially on CI, and `tests/test_lessons_corpus.py::test_top_candidates_speed_4000_items`, which took 20.8 s of its 30 s CI budget under xdist) move to a new `timed-tests` job that runs them alone on its own runner for 3.12 and 3.9, so they run alongside the parallel jobs instead of after them. Every test job prints its slowest tests (`--durations`). Before this change the jobs ran serially and took 8–14 min (3.12) and 17–26 min (3.9).
+- CI runs `python-tests` (3.12, 90% coverage gate) and `python-tests-py39` with `pytest-xdist` (`-n auto`), the way `scripts/commit-preflight.sh` already does (#485). The wall-clock budget tests (`tests/test_security.py::TestDecisionTimeIsBounded`, 5–7 min serially on CI, and `tests/test_lessons_corpus.py::test_top_candidates_speed_4000_items`, which took 20.8 s of its 30 s CI budget under xdist) move to a new `timed-tests` job that runs them serially in two shards per Python (3.12 and 3.9), each on its own runner, so they run alongside the parallel jobs instead of after them. Each shard collects the node ids and runs every other one; a missing id, an empty `TIMED_TESTS` or an empty shard fails the job. Every test job prints its slowest tests (`--durations`). Before this change the jobs ran serially and took 8–14 min (3.12) and 17–26 min (3.9).
+
+### Fixed
+- On macOS's system Python (`/usr/bin/python3` 3.9.6, which runs the hooks), DB backups no longer leave `-wal`/`-shm` files beside them (#485). Apple's SQLite keeps those files after the last connection closes. `vault_index._backup_db` now writes the backup in rollback-journal mode, and the purge and backlog backups are verified through the new `vault_index.connect_read_only`. A purge backup that fails is removed together with its side files.
+- `scripts/retrieval_eval.py`, `scripts/selection_replay.py` and `scripts/capture_provisional_relocate.py` read their DB copy through `vault_index.connect_read_only`, which opens it with `immutable=1` when there is no WAL to read (#485). Apple's SQLite could not open a WAL-mode copy read-only without its `-shm` file ("unable to open database file").
 
 ## [3.10.0] - 2026-11-01
 

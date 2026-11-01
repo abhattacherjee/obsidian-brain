@@ -71,10 +71,12 @@ jobs:
   # - python-tests and python-tests-py39 run everything except TIMED_TESTS
   #   under pytest-xdist (`-n auto`, one worker per runner core). Most tests
   #   start a process or a git repo, so this splits well.
-  # - timed-tests runs TIMED_TESTS alone, on its own runner, on both Pythons.
-  #   They assert wall-clock budgets, and next to busy workers a 2,000 ms
-  #   backstop measured 2,042 ms. They take 5-7 min serially on CI, so
-  #   running them after the parallel step would make each job the sum.
+  # - timed-tests runs TIMED_TESTS serially, in two shards per Python, each
+  #   on its own runner. They assert wall-clock budgets, and next to busy
+  #   workers a 2,000 ms backstop measured 2,042 ms. They take 5-7 min
+  #   serially on CI, so after the parallel step each job would be the sum,
+  #   and in one job per Python the 3.9 leg alone came within a minute of
+  #   the 8-minute target.
   # The 90% coverage gate is applied without TIMED_TESTS (94.7% without
   # them, measured 2026-11-01).
   # TIMED_TESTS is set once at the top, so the deselect and the run use the
@@ -117,6 +119,9 @@ jobs:
           pytest tests/ -n auto -q --tb=short "${timed[@]/#/--deselect=}" --durations=30
 
   # ── Wall-clock budget tests — alone on their own runner (GH #485) ─
+  # Each shard collects the TIMED_TESTS node ids and runs every other one
+  # (odd lines for shard 1, even for shard 2), so the two shards together
+  # run each collected test exactly once.
   timed-tests:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
@@ -124,6 +129,7 @@ jobs:
       fail-fast: false
       matrix:
         python-version: ['3.12', '3.9']
+        shard: [1, 2]
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
@@ -131,10 +137,23 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - name: Install pytest
         run: pip install pytest
-      - name: Run timed tests serially
+      - name: Run timed tests serially (shard ${{ matrix.shard }} of 2)
         run: |
           read -ra timed <<< "$TIMED_TESTS"
-          pytest "${timed[@]}" -q --tb=short --durations=15
+          # With no ids, --collect-only would list the whole suite.
+          [ "${#timed[@]}" -gt 0 ] || { echo "::error::TIMED_TESTS is empty"; exit 1; }
+          ids="$RUNNER_TEMP/timed-ids.txt"
+          shard_ids="$RUNNER_TEMP/timed-shard-ids.txt"
+          # A missing id exits 4 here, before anything runs. -qq because
+          # setup.cfg's addopts -v would turn a single -q into the tree view.
+          pytest --collect-only -qq "${timed[@]}" > "$ids"
+          grep '::' "$ids" | awk -v shard="$SHARD" 'NR % 2 == shard % 2' > "$shard_ids"
+          # An empty @file makes pytest collect the whole suite, so stop.
+          test -s "$shard_ids"
+          echo "shard $SHARD: $(wc -l < "$shard_ids") of $(grep -c '::' "$ids") tests"
+          pytest "@$shard_ids" -q --tb=short --durations=15
+        env:
+          SHARD: ${{ matrix.shard }}
 
   # ── DB-pollution guard — blocks bare ensure_index() in tests (GH #46) ─
   no-default-db-check:
