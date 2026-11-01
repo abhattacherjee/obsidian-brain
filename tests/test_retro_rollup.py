@@ -982,16 +982,27 @@ def test_gh_create_matching_repo_case_insensitively_is_accepted(filing, tmp_path
     assert state_of(state)["filed"] == {lid: "o/r#9"}
 
 
-def test_gh_timeout_or_missing_gh_is_a_failure(filing, tmp_path, monkeypatch):
-    import subprocess
+@pytest.mark.parametrize("exc", [subprocess.TimeoutExpired("gh", 1), FileNotFoundError("gh"),
+                                 PermissionError("gh")], ids=["timeout", "no-gh", "other-oserror"])
+def test_gh_timeout_or_missing_gh_is_a_failure(filing, tmp_path, monkeypatch, capsys, exc):
+    # Fresh vault and state per case, so each one reaches `issue create`.
     vault, state, base, gh = filing
     lid = _lesson_named(state, 3)
     f = _file_accept(tmp_path, [{"lesson_id": lid, "file_issue": True, "repo": "o/r"}])
-    for exc in (subprocess.TimeoutExpired("gh", 1), FileNotFoundError("gh")):
-        def fail(args, timeout=10, exc=exc):
+    creates = []
+
+    def fail(args, timeout=10):
+        if args[:2] == ["issue", "create"]:
+            creates.append(args)
             raise exc
-        monkeypatch.setattr(retro_rollup, "_run_gh", fail)
-        assert run(base, "backfill", "--apply", "--accept", str(f)) == 1
+        return gh(args, timeout)
+
+    monkeypatch.setattr(retro_rollup, "_run_gh", fail)
+    capsys.readouterr()
+    assert run(base, "backfill", "--apply", "--accept", str(f)) == 1
+    assert len(creates) == 1
+    entries = json.loads(capsys.readouterr().out)["skipped_entries"]
+    assert len(entries) == 1 and entries[0]["reason"].startswith("filing failed")
     assert state_of(state)["filed"] == {lid: _pending(lid, "o/r")}
 
 
@@ -1161,7 +1172,7 @@ def test_save_fails_after_gh_created_the_issue_then_rerun_adopts_it(filing, tmp_
     assert _issue_trace("o/r", 7) in (vault / "claude-insights" / "2026-10-08-retro-b2.md").read_text()
     listing = gh.list_calls[0]
     assert listing == ["issue", "list", "--repo", "o/r", "--state", "all", "--author", "@me",
-                       "--json", "number,body", "--limit", "50"]
+                       "--json", "number,body,state,createdAt,closedAt,milestone", "--limit", "1000"]
 
 
 def test_gh_create_timeout_after_the_issue_exists_is_adopted_not_refiled(filing, tmp_path, monkeypatch):
@@ -1188,9 +1199,9 @@ def test_pending_record_with_no_matching_issue_files_exactly_once(filing, tmp_pa
     assert state_of(state)["filed"] == {lid: "o/r#7"}
 
 
-@pytest.mark.parametrize("fail, pad", [("rc", 0), ("timeout", 0), ("json", 0), ("shape", 0), (None, 50)])
+@pytest.mark.parametrize("fail, pad", [("rc", 0), ("timeout", 0), ("json", 0), ("shape", 0), (None, 1000)])
 def test_pending_record_with_a_failed_search_never_files_blind(filing, tmp_path, monkeypatch, capsys, fail, pad):
-    # pad=50: a full newest page, then a full search page, with no match may hide the issue.
+    # pad=1000: a full page with no match may hide the issue.
     vault, state, base, gh = filing
     lid = _lesson_named(state, 3)
     broken = FakeGh(list_fail=fail, list_pad=pad)
@@ -1291,22 +1302,109 @@ def test_newest_page_not_full_and_no_match_files_without_a_search(filing, tmp_pa
     assert len(gh.list_calls) == 1 and "--search" not in gh.list_calls[0] and len(gh.calls) == 1
 
 
-def test_full_newest_page_falls_back_to_the_body_search(filing, tmp_path):
+def test_full_page_with_no_match_refuses_and_never_files_or_searches(filing, tmp_path, capsys):
     vault, state, base, gh = filing
     lid = _lesson_named(state, 3)
-    gh.list_pad = 50
-    gh.issues.append({"number": 41, "body": f"<!-- retro-lesson:{lid} -->\nbody"})
-    real = gh._list
-    calls = []
+    gh.list_pad = 1000
+    _set_filed(state, lid, _pending(lid, "o/r"))
+    capsys.readouterr()
+    assert run(base, "backfill", "--apply", "--accept", str(_accept_file_issue(tmp_path, lid))) == 1
+    captured = capsys.readouterr()
+    assert "more than 1000 of my issues in o/r; cannot rule out an earlier filing" in captured.err
+    assert json.loads(captured.out)["skipped_entries"][0]["reason"] == "cannot check for an earlier filing"
+    assert gh.calls == [] and len(gh.list_calls) == 1 and "--search" not in gh.list_calls[0]
+    assert state_of(state)["filed"] == {lid: _pending(lid, "o/r")}
 
-    def listing(args):
-        calls.append(args)
-        if "--author" in args:  # the newest page is full of other issues
-            return type("R", (), {"returncode": 0, "stdout": json.dumps(
-                [{"number": 900 + i, "body": "unrelated"} for i in range(50)]), "stderr": ""})()
-        return real(args)
-    gh._list = listing
+
+def test_full_page_that_holds_the_marker_is_adopted(filing, tmp_path):
+    vault, state, base, gh = filing
+    lid = _lesson_named(state, 3)
+    gh.list_pad = 999
+    gh.issues.append({"number": 41, "body": f"<!-- retro-lesson:{lid} -->\nbody"})
     _set_filed(state, lid, _pending(lid, "o/r"))
     assert run(base, "backfill", "--apply", "--accept", str(_accept_file_issue(tmp_path, lid))) == 0
-    assert [("--search" in c) for c in calls] == [False, True] and gh.calls == []
-    assert state_of(state)["filed"] == {lid: "o/r#41"}
+    assert gh.calls == [] and state_of(state)["filed"] == {lid: "o/r#41"}
+
+
+def test_adopted_issue_records_its_real_state_and_dates(filing, tmp_path):
+    vault, state, base, gh = filing
+    lid = _lesson_named(state, 3)
+    gh.issues.append({"number": 41, "body": f"<!-- retro-lesson:{lid} -->\nbody", "state": "CLOSED",
+                      "createdAt": "2026-09-01T10:00:00Z", "closedAt": "2026-09-20T08:00:00Z",
+                      "milestone": {"title": "v1"}})
+    _set_filed(state, lid, _pending(lid, "o/r"))
+    assert run(base, "backfill", "--apply", "--accept", str(_accept_file_issue(tmp_path, lid))) == 0
+    assert gh.calls == []
+    s = state_of(state)
+    assert s["tracking"]["issue:o/r#41"] == {"exists": True, "state": "CLOSED", "milestone": "v1",
+                                             "priority": None, "created": "2026-09-01",
+                                             "closed": "2026-09-20"}
+    assert s["lessons"][lid]["tracking"] == {"kind": "issue", "ref": "o/r#41", "since": "2026-09-01"}
+
+
+def _drop_tracking(state, lid):
+    s = state_of(state)
+    s["lessons"][lid]["tracking"] = None  # filed, saved with no tracking
+    (state / "lessons-state.json").write_text(json.dumps(s))
+
+
+def test_filed_lesson_with_no_saved_tracking_keeps_its_issue_after_update(filing, tmp_path, capsys):
+    vault, state, base, gh = filing
+    lid = _lesson_named(state, 3)
+    _set_filed(state, lid, "o/r#5")
+    _drop_tracking(state, lid)
+    assert run(base, "update") == 0
+    s = state_of(state)
+    assert s["lessons"][lid]["tracking"]["ref"] == "o/r#5" and s["filed"][lid] == "o/r#5"
+    capsys.readouterr()
+    assert run(base, "backfill") == 0
+    dry = json.loads(capsys.readouterr().out)
+    assert all(p["lesson"] != lid for p in dry["planned_filings"])
+    traced = [p for p in dry["plan"] if p["lesson"] == lid]
+    assert len(traced) == 3 and all(p["trace"]["ref"] == "o/r#5" for p in traced)
+
+
+def _bridge_lessons(vault, state, base, monkeypatch):
+    monkeypatch.setattr(retro_rollup, "_run_gh", lambda *a, **k: pytest.fail("gh called"))
+    monkeypatch.setattr(retro_rollup, "_git_origin", lambda path: None)
+    import obsidian_utils
+    monkeypatch.setattr(obsidian_utils, "load_config", lambda: {})
+
+
+def test_filing_survives_a_merge_into_another_id(grouped, monkeypatch, capsys):
+    vault, state, base = grouped
+    _bridge_lessons(vault, state, base, monkeypatch)
+    _notes_with_tags(vault, {1: "G1", 2: "G1", 4: "G2", 5: "G2"})
+    assert run(base, "update") == 0
+    survivor, retiring = sorted(state_of(state)["lessons"])
+    s = state_of(state)
+    s["filed"] = {retiring: "o/r#5"}
+    (state / "lessons-state.json").write_text(json.dumps(s))
+    _notes_with_tags(vault, {3: "G1 G2"})  # the bridge arrives: retiring merges into survivor
+    assert run(base, "update") == 0
+    s = state_of(state)
+    assert list(s["lessons"]) == [survivor]
+    assert s["lessons"][survivor]["tracking"]["ref"] == "o/r#5"
+    assert s["filed"][survivor] == "o/r#5" and s["filed"][retiring] == "o/r#5"
+    capsys.readouterr()
+    assert run(base, "backfill") == 0
+    assert json.loads(capsys.readouterr().out)["planned_filings"] == []
+
+
+def test_filing_survives_a_split_into_two_children(grouped, monkeypatch):
+    vault, state, base = grouped
+    _bridge_lessons(vault, state, base, monkeypatch)
+    _notes_with_tags(vault, {1: "G1", 2: "G1", 3: "G1 G2", 4: "G2", 5: "G2"})
+    assert run(base, "update") == 0
+    (old_id,) = state_of(state)["lessons"]
+    s = state_of(state)
+    s["filed"] = {old_id: "o/r#5"}
+    (state / "lessons-state.json").write_text(json.dumps(s))
+    (vault / "claude-insights" / "2026-10-03-retro-n3.md").unlink()  # the bridge goes
+    assert run(base, "update") == 0
+    s = state_of(state)
+    assert len(s["lessons"]) == 2
+    child = next(l for l in s["lessons"] if l != old_id)
+    assert s["lessons"][child]["split_from"] == old_id
+    for lid in (old_id, child):
+        assert s["lessons"][lid]["tracking"]["ref"] == "o/r#5" and s["filed"][lid] == "o/r#5"

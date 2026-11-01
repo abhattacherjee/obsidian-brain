@@ -44,8 +44,7 @@ _REMOTE = re.compile(
     r"([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?/?$")
 _CREATED = re.compile(r"^https://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)/issues/([1-9][0-9]*)$")
 GH_CREATE_TIMEOUT_SECONDS = 60
-SEARCH_LIMIT = 20
-RECENT_LIMIT = 50  # newest own issues listed before falling back to a body search
+RECENT_LIMIT = 1000  # my issues listed in one `gh issue list` (gh paginates); a full page proves nothing
 GIT_TIMEOUT_SECONDS = 10
 
 
@@ -206,6 +205,19 @@ def _load(ctx: Ctx):
     return items, by_key, skipped
 
 
+def _inherited_filing(state: dict, lid: str, lesson: dict, retired: dict):
+    """The issue ref a lesson was filed under: its own id, its split parent, then merged-in ids."""
+    olds = [lid]
+    if lesson.get("split_from"):
+        olds.append(lesson["split_from"])
+    olds += sorted(o for o, r in retired.items() if isinstance(r, dict) and r.get("merged_into") == lid)
+    for old_id in olds:
+        ref = state["filed"].get(old_id)
+        if isinstance(ref, str) and _REF.match(ref):
+            return ref, old_id
+    return None, None
+
+
 def regroup(ctx: Ctx, state: dict, *, judge: bool, note: str | None = None, cache=None) -> dict:
     """Judge (optionally), re-form lessons, write changed notes; return a summary."""
     items, by_key, skipped = _load(ctx)
@@ -263,10 +275,16 @@ def regroup(ctx: Ctx, state: dict, *, judge: bool, note: str | None = None, cach
         # `since` is sticky for the id's own record; a split child with a new id inherits its parent's.
         prev_rec = state["lessons"].get(lid) or state["lessons"].get(lesson.get("split_from")) or {}
         tracking = lessons_group.lesson_tracking(lesson["members"], by_key, prev_rec.get("tracking"))
-        filed_ref = state["filed"].get(lid)
-        if (tracking is None and isinstance(filed_ref, str) and state["lessons"].get(lid, {}).get("tracking")
-                and state["lessons"][lid]["tracking"].get("ref") == filed_ref):
-            tracking = state["lessons"][lid]["tracking"]  # filed, no trace landed yet: keep the issue
+        if tracking is None:
+            # Filed, no trace landed yet: keep the issue, also across a merge or a split.
+            filed_ref, source = _inherited_filing(state, lid, lesson, retired)
+            if filed_ref:
+                since = (state["tracking"].get(f"issue:{filed_ref}") or {}).get("created")
+                if not since:
+                    old_tracking = (state["lessons"].get(source) or {}).get("tracking") or {}
+                    since = old_tracking.get("since") if old_tracking.get("ref") == filed_ref else None
+                tracking = {"kind": "issue", "ref": filed_ref, "since": since or ctx.today}
+                state["filed"][lid] = filed_ref  # a later file_issue accept on this id finds it
         info = state["tracking"].get(_tracking_key(tracking)) if tracking else None
         c = lessons_group.classify(lesson, by_key, tracking, info, ctx.today, ctx.recent_days)
         snooze = snoozes.get(lid)
@@ -574,47 +592,55 @@ def _create_issue(ctx: Ctx, repo: str, title: str, body: str) -> tuple[str | Non
     return f"{repo}#{match.group(3)}", None
 
 
-def _scan_issues(repo: str, filters: list[str], limit: int, marker: str):
-    """One `gh issue list`: (found ref or None, page full, error or None)."""
+def _find_filed_issue(repo: str, lid: str):
+    """Look for an earlier issue carrying this lesson's marker.
+
+    Returns (ref, meta, error): ("owner/repo#N", issue metadata, None) when found, (None, None, None)
+    when there is none, or (None, None, error) when the check cannot say. One plain listing of my
+    issues (no search index, so a just-created issue is there at once). A full page with no match
+    cannot rule out an earlier filing, so it is an error.
+    """
+    marker = _marker(lid)
     try:
-        result = _run_gh(["issue", "list", "--repo", repo, "--state", "all", *filters,
-                          "--json", "number,body", "--limit", str(limit)])
+        result = _run_gh(["issue", "list", "--repo", repo, "--state", "all", "--author", "@me",
+                          "--json", "number,body,state,createdAt,closedAt,milestone",
+                          "--limit", str(RECENT_LIMIT)])
     except subprocess.TimeoutExpired:
-        return None, False, "gh timed out"
+        return None, None, "gh timed out"
     except OSError as exc:
-        return None, False, str(exc)[:200]
+        return None, None, str(exc)[:200]
     if result.returncode:
-        return None, False, f"gh exited with code {result.returncode}"
+        return None, None, f"gh exited with code {result.returncode}"
     try:
         data = json.loads(result.stdout)
     except ValueError:
-        return None, False, "gh returned invalid JSON"
+        return None, None, "gh returned invalid JSON"
     if not isinstance(data, list) or not all(isinstance(i, dict) for i in data):
-        return None, False, "gh JSON is not a list of issues"
-    found = sorted(i["number"] for i in data
-                   if isinstance(i.get("number"), int) and not isinstance(i["number"], bool)
-                   and i["number"] > 0 and isinstance(i.get("body"), str)
-                   and marker in (line.strip() for line in i["body"].splitlines()))
-    return (f"{repo}#{found[0]}" if found else None), len(data) >= limit, None
+        return None, None, "gh JSON is not a list of issues"
+    found = sorted((i for i in data
+                    if isinstance(i.get("number"), int) and not isinstance(i["number"], bool)
+                    and i["number"] > 0 and isinstance(i.get("body"), str)
+                    and marker in (line.strip() for line in i["body"].splitlines())),
+                   key=lambda i: i["number"])
+    if found:
+        return f"{repo}#{found[0]['number']}", found[0], None
+    if len(data) >= RECENT_LIMIT:
+        return None, None, (f"more than {RECENT_LIMIT} of my issues in {repo}; "
+                            f"cannot rule out an earlier filing")
+    return None, None, None
 
 
-def _find_filed_issue(repo: str, lid: str) -> tuple[str | None, str | None]:
-    """Look for an earlier issue carrying this lesson's marker: ("owner/repo#N", None), (None, None)
-    when there is none, or (None, error) when the check cannot say.
+def _adopted_info(issue: dict, today: str) -> dict:
+    """Tracking facts for an adopted issue, as refresh-tracking would record them."""
+    def day(value):
+        return value[:10] if isinstance(value, str) and len(value) >= 10 else None
 
-    First my newest issues in the repo (a plain listing, so a just-created issue is there at once;
-    GitHub's search index can lag). Only a full page with no match falls back to a body search.
-    """
-    marker = _marker(lid)
-    ref, full, error = _scan_issues(repo, ["--author", "@me"], RECENT_LIMIT, marker)
-    if error or ref or not full:
-        return ref, error
-    ref, full, error = _scan_issues(repo, ["--search", f"{lid} in:body"], SEARCH_LIMIT, marker)
-    if error or ref:
-        return ref, error
-    if full:
-        return None, "search result page is full and has no match; the issue may be further down"
-    return None, None
+    milestone = issue.get("milestone")
+    title = milestone.get("title") if isinstance(milestone, dict) else None
+    state = issue.get("state")
+    return {"exists": True, "state": state if isinstance(state, str) and state else "OPEN",
+            "milestone": title if isinstance(title, str) and title else None, "priority": None,
+            "created": day(issue.get("createdAt")) or today, "closed": day(issue.get("closedAt"))}
 
 
 def _planned_filings(ctx: Ctx, state: dict, by_key: dict) -> list[dict]:
@@ -660,10 +686,10 @@ def backfill(ctx: Ctx, state: dict, accept: list[dict] | None) -> tuple[dict, bo
                 if not any(k in by_key and by_key[k]["trace"] is None for k in rec["members"]):
                     skipped_entries.append({**entry, "reason": "nothing to trace"})
                     continue
-                adopted_ref = None
+                adopted_ref, adopted_meta = None, None
                 if pending is not None:
                     # An earlier run may have created the issue: look for its marker before filing.
-                    adopted_ref, error = _find_filed_issue(pending["repo"], lid)
+                    adopted_ref, adopted_meta, error = _find_filed_issue(pending["repo"], lid)
                     if error:
                         print(f"retro_rollup: {lid}: cannot check {pending['repo']} for an earlier "
                               f"filing: {error}", file=sys.stderr)
@@ -701,11 +727,14 @@ def backfill(ctx: Ctx, state: dict, accept: list[dict] | None) -> tuple[dict, bo
                 # Phase 2, in one save: the issue ref, and the tracking the new issue gives the lesson,
                 # so a dry run, the report and the untraced list see it even if every trace write fails.
                 state["filed"][lid] = ref
-                rec["tracking"] = {"kind": "issue", "ref": ref, "since": ctx.today}
-                # Known facts about the new issue, as refresh-tracking would record them, so the
-                # sessions from before it existed do not count as recurrences.
-                state["tracking"][f"issue:{ref}"] = {"exists": True, "state": "OPEN", "milestone": None,
-                                                     "priority": None, "created": ctx.today, "closed": None}
+                # Known facts about the issue, as refresh-tracking would record them, so the sessions
+                # from before it existed do not count as recurrences. An adopted issue keeps its own
+                # state and dates; a new one is open and created today.
+                info = (_adopted_info(adopted_meta, ctx.today) if adopted_meta is not None else
+                        {"exists": True, "state": "OPEN", "milestone": None, "priority": None,
+                         "created": ctx.today, "closed": None})
+                rec["tracking"] = {"kind": "issue", "ref": ref, "since": info["created"]}
+                state["tracking"][f"issue:{ref}"] = info
                 number = int(ref.rsplit("#", 1)[1])
                 try:
                     save_state(ctx, state)
