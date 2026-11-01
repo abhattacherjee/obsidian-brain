@@ -47,6 +47,10 @@ class LockHeld(Exception):
     pass
 
 
+class Refused(Exception):
+    """The run would drop every lesson because no retro item was found (exit 1)."""
+
+
 # --- context ---------------------------------------------------------------
 
 class Ctx:
@@ -60,6 +64,8 @@ class Ctx:
         insights = Path(self.vault, self.insights).resolve()
         if not insights.is_relative_to(Path(self.vault).resolve()):
             raise UsageError(f"insights folder escapes the vault: {self.insights!r}")
+        if not insights.is_dir():
+            raise UsageError(f"insights folder not found: {self.insights!r}")
         self.lessons_folder = f"{self.insights}/{LESSONS_SUBFOLDER}"
         self.state_dir = Path(args.state_dir or Path.home() / ".claude" / "obsidian-brain")
         self.recent_days = int(config.get("lessons_recent_days", 90))
@@ -162,6 +168,10 @@ def _load(ctx: Ctx):
 def regroup(ctx: Ctx, state: dict, *, judge: bool, note: str | None = None, cache=None) -> dict:
     """Judge (optionally), re-form lessons, write changed notes; return a summary."""
     items, by_key, skipped = _load(ctx)
+    if not by_key and state["lessons"]:
+        # Retro notes missing mid-sync or all unreadable: keep notes and state as they are.
+        raise Refused(f"no retro items found in {ctx.insights!r} ({len(skipped)} unreadable); "
+                      f"refusing to drop {len(state['lessons'])} lessons")
     texts = {k: v["text"] for k, v in by_key.items()}
     note_of = {k: v["note"] for k, v in by_key.items()}
     _ensure_state_dir(ctx)
@@ -477,7 +487,10 @@ def main(argv=None) -> int:
             raise UsageError("--apply and --accept FILE go together")
         ctx = Ctx(args)
         if args.cmd == "report":
-            rep = lessons_notes.report(load_state(ctx))
+            state = load_state(ctx)
+            snoozes = {lid: lessons_notes.read_snooze(ctx.lessons_dir / fn)
+                       for lid, fn in state.get("notes", {}).items()}
+            rep = lessons_notes.report(state, snoozes)
             if args.json:
                 print(json.dumps(rep, indent=1))
             else:
@@ -508,7 +521,7 @@ def main(argv=None) -> int:
         result, ok = backfill(ctx, state, accept)
         print(json.dumps(result, indent=1))
         return 0 if ok else 1
-    except OSError as exc:
+    except (OSError, Refused) as exc:
         print(f"retro_rollup: {exc}", file=sys.stderr)
         return 1
     finally:

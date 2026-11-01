@@ -196,7 +196,7 @@ Every `/retro` ends with `## Process Improvements` items. The same lesson often 
 - **Buckets:** raise priority (an open issue, and the lesson still comes back), file an issue (nothing tracks it), fix didn't hold (closed issue, then it came back), rule not followed, tracked and quiet. A lesson with no session in the last 90 days is dormant.
 - **Notes:** one note per lesson in `claude-insights/lessons/`, rewritten only when it changes. The Retro Lessons dashboard reads them. The vault index skips them, so `/vault-ask` and `/recall` never cite them. Add `snoozed_until: YYYY-MM-DD` to a note to hide it until then.
 - **Commands:** `python3 hooks/retro_rollup.py update` (judge new items, regroup, write notes), `rebuild` (regroup from the cache; no verdict calls, only a Haiku name for each new lesson), `refresh-tracking`, `report [--json]`, and `backfill [--apply --accept FILE]`. The dry run lists the traces it would write; `--apply` traces only the lessons in the accept file (`[{"lesson_id", "tracking_ref"}]`). Nothing is ticked without an accept.
-- **Cost:** the first `update` on a vault with about 3,900 open items makes one Haiku call per item, about 65 minutes at the default concurrency of 8. After that, only new items are judged.
+- **Cost:** the first `update` on a vault with about 3,900 open items makes one Haiku call per item: 3,881 items took 3,611 s (about 60 minutes) at the default concurrency of 8. After that, only new items are judged.
 - **Coming next:** the weekly prompts (`/lessons`, #474) and the `/retro`, `/standup` and `/emerge` wiring (#475).
 
 ## Vault Structure

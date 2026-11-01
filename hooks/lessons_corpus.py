@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict
+import datetime
 import hashlib
 import heapq
 import math
@@ -26,6 +27,17 @@ def item_key(note_stem: str, text: str) -> str:
     """Identify an item independently of its checkbox, trace, case and spacing."""
     norm = _item_text(text).lower()
     return f"{note_stem}:{hashlib.sha1(norm.encode('utf-8')).hexdigest()[:16]}"
+
+
+def _iso_date(value: str) -> bool:
+    """True for a real YYYY-MM-DD date; ranking compares dates as strings."""
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+        return False
+    try:
+        datetime.date.fromisoformat(value)
+    except ValueError:
+        return False
+    return True
 
 
 def load_items(vault_path: str, insights_folder: str) -> tuple[list[dict], list[dict]]:
@@ -57,7 +69,10 @@ def load_items(vault_path: str, insights_folder: str) -> tuple[list[dict], list[
                     value = value[1:-1]
                 metadata[match[1]] = value.strip()
         project = metadata.get("project", "unknown")
-        date = metadata.get("date", path.name[:10])[:10]
+        date = next((d for d in (metadata.get("date", "")[:10], path.name[:10]) if _iso_date(d)), None)
+        if date is None:
+            skipped.append({"path": str(path), "reason": "no valid date"})
+            continue
         for item in retro_trace.parse_items(text):
             items.append({
                 "key": item_key(path.stem, item["text"]),

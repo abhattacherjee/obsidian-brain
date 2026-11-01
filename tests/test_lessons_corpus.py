@@ -190,3 +190,29 @@ def test_top_candidates_speed_4000_items():
     assert len(result) == 4000
     assert all(len(candidates) == 10 for candidates in result.values())
     assert elapsed < 10, f"candidate search took {elapsed:.2f}s"
+
+
+@pytest.mark.parametrize("header", [
+    'type: claude-retro\ndate: ""\nproject: demo\n',
+    "type: claude-retro\ndate: sometime last week\nproject: demo\n",
+    "type: claude-retro\ndate: 2026-13-45\nproject: demo\n",
+    "type: claude-retro\nproject: demo\n",
+])
+def test_load_items_bad_date_falls_back_to_file_name(tmp_path, header):
+    # Dates are compared as strings and split into ints for ranking: only ISO dates may pass.
+    write_note(tmp_path / "insights", "2026-10-05-retro-x1.md", "- [ ] A\n", metadata=header)
+    items, skipped = load_items(str(tmp_path), "insights")
+    assert [i["date"] for i in items] == ["2026-10-05"] and skipped == []
+
+
+def test_load_items_bad_date_and_bad_file_name_is_unreadable(tmp_path):
+    path = write_note(tmp_path / "insights", "x-retro-x1.md", "- [ ] A\n",
+                      metadata="type: claude-retro\ndate: soon\nproject: demo\n")
+    items, skipped = load_items(str(tmp_path), "insights")
+    assert items == [] and skipped == [{"path": str(path), "reason": "no valid date"}]
+
+
+def test_load_items_keeps_a_valid_frontmatter_date(tmp_path):
+    write_note(tmp_path / "insights", "2026-10-05-retro-x1.md", "- [ ] A\n",
+               metadata="type: claude-retro\ndate: 2026-10-07T09:00\nproject: demo\n")
+    assert [i["date"] for i in load_items(str(tmp_path), "insights")[0]] == ["2026-10-07"]

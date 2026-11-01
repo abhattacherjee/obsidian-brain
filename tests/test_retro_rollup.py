@@ -286,7 +286,7 @@ def test_report_json_contract_fields(env, capsys):
     assert set(rep["lessons"][0]) == {
         "id", "name", "bucket", "dormant", "sessions", "recent_sessions", "projects", "first_seen",
         "last_seen", "tracking", "tracking_ref", "issue_state", "issue_milestone", "issue_priority",
-        "sessions_after_tracking", "members"}
+        "sessions_after_tracking", "snoozed_until", "members"}
     assert "RULE" not in json.dumps(rep["lessons"][0]["members"])
 
 
@@ -344,3 +344,61 @@ def test_no_live_paths_touched(env):
     assert not (default / "lessons-verdicts.db").exists()
     assert not (default / "lessons-state.json").exists()
     assert (state / "lessons-verdicts.db").exists() and (state / "lessons-state.json").exists()
+
+
+@pytest.mark.parametrize("cmd", ["update", "rebuild", "refresh-tracking"])
+def test_no_retro_items_with_lessons_refuses_and_keeps_notes(env, cmd, capsys):
+    # Retro notes gone mid-sync (or all unreadable) must not delete every lesson note.
+    vault, state, base = env
+    assert run(base, "update") == 0
+    notes, before = lesson_notes(vault), state_of(state)
+    for p in (vault / "claude-insights").glob("*-retro-*.md"):
+        p.unlink()
+    capsys.readouterr()
+    assert run(base, cmd) == 1
+    assert "refusing" in capsys.readouterr().err
+    assert lesson_notes(vault) == notes
+    assert state_of(state) == before
+
+
+def test_missing_insights_folder_exits_2(env, capsys):
+    vault, state, base = env
+    base = [a if a != "claude-insights" else "no-such-folder" for a in base]
+    assert run(base, "rebuild") == 2
+    assert "insights folder not found" in capsys.readouterr().err
+    assert not (state / "lessons-state.json").exists()
+
+
+def test_no_retro_items_and_no_lessons_is_fine(tmp_path, monkeypatch):
+    # A fresh vault with no retros yet is not an error.
+    monkeypatch.setattr(lessons_verify, "run_haiku", lambda p, timeouts=(120, 240): pytest.fail("haiku called"))
+    (tmp_path / "vault" / "claude-insights").mkdir(parents=True)
+    base = ["--vault", str(tmp_path / "vault"), "--insights-folder", "claude-insights",
+            "--state-dir", str(tmp_path / "state")]
+    assert run(base, "update") == 0
+
+
+@pytest.mark.parametrize("written", ["2026-12-01", '"2026-12-01"', "'2026-12-01'"])
+def test_snooze_as_obsidian_writes_it_survives_update(env, written):
+    # Obsidian's date property editor writes the date unquoted; it must not be wiped to null.
+    vault, state, base = env
+    assert run(base, "update") == 0
+    lid, fn = next(iter(state_of(state)["notes"].items()))
+    p = vault / "claude-insights" / "lessons" / fn
+    p.write_text(p.read_text().replace("snoozed_until: null", f"snoozed_until: {written}"))
+    note(vault, "2026-10-22-retro-d4.md", "2026-10-22", "p3", ["Preflight runs by itself RULE-A"])
+    assert run(base, "update") == 0
+    assert 'snoozed_until: "2026-12-01"' in p.read_text()
+
+
+def test_report_json_reads_snooze_live_from_the_note(env, capsys):
+    vault, state, base = env
+    assert run(base, "update") == 0
+    lid, fn = next(iter(state_of(state)["notes"].items()))
+    p = vault / "claude-insights" / "lessons" / fn
+    p.write_text(p.read_text().replace("snoozed_until: null", "snoozed_until: 2026-12-01"))
+    capsys.readouterr()
+    assert run(base, "report", "--json") == 0
+    rep = {l["id"]: l for l in json.loads(capsys.readouterr().out)["lessons"]}
+    assert rep[lid]["snoozed_until"] == "2026-12-01"
+    assert all(l["snoozed_until"] is None for k, l in rep.items() if k != lid)

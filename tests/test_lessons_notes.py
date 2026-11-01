@@ -122,6 +122,7 @@ def test_report_has_no_item_text(sample):
                                     "projects", "first_seen", "last_seen", "sessions_after_tracking")},
         "tracking": "issue", "tracking_ref": "org/repo#471", "issue_state": "open",
         "issue_milestone": sample[3]["milestone"], "issue_priority": "P1",
+        "snoozed_until": None,
         "members": [{"note": "b", "item_key": "b:2"}, {"note": "a", "item_key": "a:1"},
                     {"note": "a", "item_key": "a:0"}],
     }

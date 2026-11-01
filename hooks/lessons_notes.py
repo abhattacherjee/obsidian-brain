@@ -85,11 +85,16 @@ def read_snooze(path) -> str | None:
     for line in lines[1:end]:
         key, separator, value = line.partition(":")
         if separator and key == "snoozed_until":
+            value = value.strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                value = value[1:-1]  # rendered notes quote it; Obsidian's date editor does not
+            if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+                return None
             try:
-                decoded = json.loads(value)
+                date.fromisoformat(value)
             except ValueError:
                 return None
-            return decoded if isinstance(decoded, str) else None
+            return value
     return None
 
 
@@ -109,8 +114,12 @@ def write_if_changed(vault_path: str, folder: str, filename: str, content: str) 
     return True
 
 
-def report(state: dict) -> dict:
-    """Project state into a ranked report without exposing item text."""
+def report(state: dict, snoozes: dict[str, str | None] | None = None) -> dict:
+    """Project state into a ranked report without exposing item text.
+
+    ``snoozes`` maps lesson id to the ``snoozed_until`` read live from its note.
+    """
+    snoozes = snoozes or {}
     entries = []
     for lesson_id, lesson in state["lessons"].items():
         c = lesson["classify"]
@@ -125,6 +134,7 @@ def report(state: dict) -> dict:
             )},
             **tracking_fields,
             "sessions_after_tracking": c["sessions_after_tracking"],
+            "snoozed_until": snoozes.get(lesson_id),
             "members": [{"note": key.split(":")[0], "item_key": key}
                         for key in lesson["members"]],
         })
