@@ -32,6 +32,12 @@ def test_skill_uses_canonical_project_name(skill):
     assert 'basename "$(pwd)"' not in text
 
 
+def test_check_items_uses_canonical_project_name():
+    text = (REPO / "skills" / "check-items" / "SKILL.md").read_text(encoding="utf-8")
+    assert "os.path.basename(res.stdout" not in text
+    assert text.count("canonical_project_name()") == 3
+
+
 @pytest.fixture
 def worktree_dir(tmp_path):
     main_repo = tmp_path / "main-repo"
