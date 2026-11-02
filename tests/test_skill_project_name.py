@@ -183,8 +183,16 @@ def _check_items_blocks(text):
     return blocks
 
 
+_CHECK_ITEMS_DERIVATIONS = (
+    "cwd_proj = canonical_project_name()\n",
+    "project = canonical_project_name() if res.returncode == 0 else None\n",
+    'scope_name = canonical_project_name() if res.returncode == 0 and res.stdout.strip() else "unknown"\n',
+)
+
+
 def _check_items_problems(text):
     problems = []
+    pinned = []
     found = 0
     for src in _check_items_blocks(text):
         tree = ast.parse(src)
@@ -200,8 +208,18 @@ def _check_items_problems(text):
             problems.append(f"block {found}: no canonical_project_name() call")
         if "os.path.basename(res.stdout" in src:
             problems.append(f"block {found}: still uses os.path.basename(res.stdout")
+        # Pin the whole derivation line, condition included: an AST "calls it"
+        # check also accepts `if res.returncode != 0`, which would hand back
+        # None / "unknown" on every successful git lookup (#492 X-011).
+        hits = [line for line in _CHECK_ITEMS_DERIVATIONS if line in src]
+        if len(hits) != 1:
+            problems.append(f"block {found}: expected one pinned derivation line, found {hits}")
+        else:
+            pinned.append(hits[0])
     if found != 3:
         problems.append(f"expected 3 project-deriving blocks, found {found}")
+    if sorted(pinned) != sorted(_CHECK_ITEMS_DERIVATIONS):
+        problems.append(f"pinned derivation lines do not match: {pinned}")
     return problems
 
 
@@ -230,6 +248,18 @@ def test_check_items_guard_rejects_basename_with_comment():
         "  # canonical_project_name()",
     )
     assert _check_items_problems(mutated)
+
+
+@pytest.mark.parametrize("old, new", [
+    ("project = canonical_project_name() if res.returncode == 0 else None",
+     "project = canonical_project_name() if res.returncode != 0 else None"),
+    ('scope_name = canonical_project_name() if res.returncode == 0 and res.stdout.strip() else "unknown"',
+     'scope_name = canonical_project_name() if res.returncode != 0 and res.stdout.strip() else "unknown"'),
+])
+def test_check_items_guard_rejects_inverted_condition(old, new):
+    text = _skill_text("check-items")
+    assert text.count(old) == 1
+    assert _check_items_problems(text.replace(old, new))
 
 
 @pytest.fixture
