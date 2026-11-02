@@ -194,7 +194,7 @@ Where:
   Parse the output to get `SESSION_ID`, `HASH`, `PROJECT`, `SESSION_NOTE`, and `RESOLVED_NOTE`.
 
   **Important:** If `SESSION_ID` is `unknown`, use `unknown` for `source_session` and omit `source_session_note` entirely. Otherwise, use `RESOLVED_NOTE` (**not** `SESSION_NOTE`) for the `source_session_note` wikilink — `RESOLVED_NOTE` is the note name in the normal case (target absent yet, a forward reference, or present and agreeing) and `""` ONLY when the target note exists, parses, and its own `session_id` frontmatter CONTRADICTS `SESSION_ID` (#330). When `RESOLVED_NOTE` is empty, omit `source_session_note` entirely even though `SESSION_ID` is known (omit the line — do not write `source_session_note: ""`).
-- `<project-name>` is the `PROJECT` value from `get_session_context()` (lowercased, hyphenated basename of cwd)
+- `<project-name>` is the `PROJECT` value from `get_session_context()` (the canonical project name: the main repo's name, also inside a git worktree)
 - `<Error Title>` is a short, descriptive title for the error (e.g. "BrokenPipeError when piping subprocess output to head")
 - The `source_session_note` field creates an Obsidian backlink to the source session note
 

@@ -43,12 +43,12 @@ def _ob_hooks():
     _c = [_d for _d in glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")) if re.fullmatch("[0-9]+([.][0-9]+)*", _d.split("/")[-2])]
     return max(_c, key=lambda _p: ([int(_n) for _n in _p.split("/")[-2].split(".")], _p), default="hooks")
 sys.path.insert(0, _ob_hooks())
-from obsidian_utils import load_config, indexed_folders
+from obsidian_utils import load_config, indexed_folders, canonical_project_name
 c = load_config()
 if not c.get("vault_path"):
     print("ERROR: vault_path not configured", file=sys.stderr)
     sys.exit(1)
-project = os.path.basename(os.getcwd()).lower().replace(" ", "-")
+project = canonical_project_name()
 # WIKI comes from the validated folder list, never the raw config key.
 try:
     folders = indexed_folders(c, strict=True)

@@ -100,7 +100,7 @@ Wait for user input.
   Only toggle after explicit confirmation.
 - **String settings** (`vault_path`, `sessions_folder`, `insights_folder`, `wiki_folder`): Show current value, ask for new value.
 - **Number settings** (`min_turns`, `min_duration_minutes`, `lessons_recent_days`, `lessons_concurrency`): Show current value, ask for new value. Validate it's a positive integer. `lessons_concurrency` must be 1 to 16.
-- **Map setting** (`project_repos`): show each `project -> owner/repo` entry and ask whether to add, edit or remove one. The project name is the lowercased folder name the session notes use (`project:` in their frontmatter); the repo must match `^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$`. Build the whole new map, write it as JSON with the Write tool to `~/.claude/obsidian-brain/config-value-<8 random hex>.json` (run `mkdir -m 700 -p ~/.claude/obsidian-brain` first), and pass `-` as `$JSON_VALUE` with that file on stdin in Step 5. Delete the file afterwards. Never put the map in a shell argument.
+- **Map setting** (`project_repos`): show each `project -> owner/repo` entry and ask whether to add, edit or remove one. The project name is the one the session notes use (`project:` in their frontmatter): the main repo's name, also inside a git worktree; the repo must match `^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$`. Build the whole new map, write it as JSON with the Write tool to `~/.claude/obsidian-brain/config-value-<8 random hex>.json` (run `mkdir -m 700 -p ~/.claude/obsidian-brain` first), and pass `-` as `$JSON_VALUE` with that file on stdin in Step 5. Delete the file afterwards. Never put the map in a shell argument.
 
 ### Step 5 — Write updated config
 

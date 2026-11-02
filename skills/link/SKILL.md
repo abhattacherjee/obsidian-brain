@@ -41,7 +41,7 @@ def _ob_hooks():
     _c = [_d for _d in glob.glob(os.path.expanduser("~/.claude/plugins/cache/*/obsidian-brain/*/hooks")) if re.fullmatch("[0-9]+([.][0-9]+)*", _d.split("/")[-2])]
     return max(_c, key=lambda _p: ([int(_n) for _n in _p.split("/")[-2].split(".")], _p), default="hooks")
 sys.path.insert(0, _ob_hooks())
-from obsidian_utils import load_config
+from obsidian_utils import load_config, canonical_project_name
 c = load_config()
 if not c.get("vault_path"):
     print("ERROR: vault_path not configured", file=sys.stderr)
@@ -49,6 +49,7 @@ if not c.get("vault_path"):
 print("VAULT=" + c["vault_path"])
 print("SESS=" + c.get("sessions_folder", "claude-sessions"))
 print("INS=" + c.get("insights_folder", "claude-insights"))
+print("PROJECT=" + canonical_project_name())
 '
 ```
 
@@ -85,11 +86,7 @@ Check if the user provided an argument after `/link`.
 
 **4A.1 — Derive project name:**
 
-```bash
-basename "$(pwd)"
-```
-
-Store as `PROJECT`. Normalize: lowercase, hyphens for spaces.
+Use the `PROJECT` value from Step 1 (the canonical project name; in a git worktree it is the main repo's name).
 
 **4A.2 — Find most recent session note for this project:**
 
@@ -176,7 +173,7 @@ Wait for the user's response. If `none`, stop. For each selected candidate, go t
 
 **4B.1 — Identify source note:**
 
-If the user's description contains "this session", "current session", or similar: derive the project name from `basename "$(pwd)"` and find the most recent session note for that project (same as Step 4A.2).
+If the user's description contains "this session", "current session", or similar: use the `PROJECT` value from Step 1 and find the most recent session note for that project (same as Step 4A.2).
 
 Otherwise, use the user's description to search for a source note:
 
