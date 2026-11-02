@@ -358,7 +358,7 @@ Where:
   ```
   Example: `2026-04-24T18:42:11+00:00`
 - `<current-session-id>` and `<session-note-filename>` are derived from Step 5
-- `<project-name>` is derived from the current working directory name (basename of the git repo root or cwd)
+- `<project-name>` is the `PROJECT` value from Step 5 (the canonical project name: the main repo's name, also inside a git worktree)
 - The `source_session_note` field creates an Obsidian backlink from the retro to its source session
 
 Ask the user:

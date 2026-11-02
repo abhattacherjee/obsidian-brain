@@ -163,7 +163,7 @@ if scope['mode'] == 'vault':
 elif scope['mode'] == 'project' and scope['project']:
     projects = [scope['project']]
 else:
-    # current: derive project name from cwd git repo name
+    # current: derive the canonical project name (the main repo's name, also in a worktree)
     import subprocess
     from obsidian_utils import canonical_project_name
     res = subprocess.run(
