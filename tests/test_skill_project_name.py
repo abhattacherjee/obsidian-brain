@@ -183,10 +183,12 @@ def _check_items_blocks(text):
     return blocks
 
 
+# In ast.unparse form, so only executable code counts: a commented-out
+# correct line next to a live wrong one does not match (#492 X-012).
 _CHECK_ITEMS_DERIVATIONS = (
-    "cwd_proj = canonical_project_name()\n",
-    "project = canonical_project_name() if res.returncode == 0 else None\n",
-    'scope_name = canonical_project_name() if res.returncode == 0 and res.stdout.strip() else "unknown"\n',
+    "cwd_proj = canonical_project_name()",
+    "project = canonical_project_name() if res.returncode == 0 else None",
+    "scope_name = canonical_project_name() if res.returncode == 0 and res.stdout.strip() else 'unknown'",
 )
 
 
@@ -211,8 +213,13 @@ def _check_items_problems(text):
         # Pin the whole derivation line, condition included: an AST "calls it"
         # check also accepts `if res.returncode != 0`, which would hand back
         # None / "unknown" on every successful git lookup (#492 X-011).
-        hits = [line for line in _CHECK_ITEMS_DERIVATIONS if line in src]
-        if len(hits) != 1:
+        # Every executable assignment that calls the helper must be a pinned
+        # line, and exactly one may appear per block.
+        hits = [
+            ast.unparse(n) for n in ast.walk(tree)
+            if isinstance(n, ast.Assign) and "canonical_project_name(" in ast.unparse(n)
+        ]
+        if len(hits) != 1 or hits[0] not in _CHECK_ITEMS_DERIVATIONS:
             problems.append(f"block {found}: expected one pinned derivation line, found {hits}")
         else:
             pinned.append(hits[0])
@@ -260,6 +267,21 @@ def test_check_items_guard_rejects_inverted_condition(old, new):
     text = _skill_text("check-items")
     assert text.count(old) == 1
     assert _check_items_problems(text.replace(old, new))
+
+
+@pytest.mark.parametrize("old, new", [
+    ("project = canonical_project_name() if res.returncode == 0 else None",
+     "project = canonical_project_name() if res.returncode != 0 else None"),
+    ('scope_name = canonical_project_name() if res.returncode == 0 and res.stdout.strip() else "unknown"',
+     'scope_name = canonical_project_name() if res.returncode != 0 and res.stdout.strip() else "unknown"'),
+])
+def test_check_items_guard_ignores_commented_out_correct_line(old, new):
+    """#492 X-012: the right line as a comment must not hide a live wrong one."""
+    text = _skill_text("check-items")
+    line_start = text.rindex("\n", 0, text.index(old)) + 1
+    indent = text[line_start:text.index(old)]
+    mutated = text.replace(old, "# " + old + "\n" + indent + new, 1)
+    assert _check_items_problems(mutated)
 
 
 @pytest.fixture
