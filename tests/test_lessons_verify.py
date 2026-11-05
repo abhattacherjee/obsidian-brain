@@ -2,7 +2,9 @@
 
 import hashlib
 import json
+import math
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -22,6 +24,13 @@ def cache(tmp_path):
     db.close()
 
 
+def answer_groups(prompt):
+    groups = re.findall(r"^=== GROUP (\d+) ===$", prompt, re.M)
+    if not groups:
+        return '{"1": "same"}'
+    return json.dumps({g: {"1": "same"} for g in groups})
+
+
 def test_rubric_is_byte_exact():
     assert len(lv.RUBRIC) == 876
     assert hashlib.sha1(lv.RUBRIC.encode("utf-8")).hexdigest() == (
@@ -33,6 +42,173 @@ def test_build_prompt_shape():
     assert lv.build_prompt("A", ["x", "y"]) == (
         lv.RUBRIC + "\n\nANCHOR: A\n\nCANDIDATE 1: x\nCANDIDATE 2: y"
     )
+
+
+def test_batch_prompt_is_byte_exact():
+    assert lv.BATCH == 10
+    prompt = lv.build_batch_prompt([
+        ("anchor one", ["cand a", "cand b"]), ("anchor two", ["cand c"]),
+    ])
+    assert len(prompt) == 1320
+    assert hashlib.sha1(prompt.encode()).hexdigest() == "8799fca59a8d26e6a3ca95bf33a2629c5d2c09e9"
+
+
+@pytest.mark.parametrize("reply", ["garbage", "{invalid}", "[]", "null"])
+def test_parse_batch_needs_object(reply):
+    assert lv.parse_batch(reply, [1, 1]) is None
+
+
+@pytest.mark.parametrize("sub", [None, "same", [], {}, {"1": "maybe"}, {"1": True}])
+def test_parse_batch_rejects_invalid_group_independently(sub):
+    reply = json.dumps({"1": {"1": " SAME ", "2": "Different"}, "2": sub})
+    assert lv.parse_batch(reply, [2, 1]) == [[True, False], None]
+
+
+def test_parse_batch_missing_and_incomplete_groups():
+    assert lv.parse_batch('{"1": {"1": "same"}}', [1, 1]) == [[True], None]
+    assert lv.parse_batch('{"1": {"1": "same"}}', [2]) == [None]
+    assert lv.parse_batch('```json\n{"1": {"1": "different"}}\n```', [1]) == [[False]]
+
+
+@pytest.mark.parametrize("count", [1, 10, 11, 25])
+def test_verify_batches_distinct_notes(cache, count):
+    texts = {str(i): str(i) for i in range(count)} | {"c": "candidate"}
+    cands = {str(i): ["c"] for i in range(count)}
+    calls = []
+
+    def runner(prompt):
+        calls.append(prompt)
+        return answer_groups(prompt)
+
+    result = lv.verify_anchors(texts, cands, cache, runner=runner,
+                               note_of={a: f"note-{a}" for a in cands})
+    assert result == {"judged": count, "failed": 0, "unparseable": 0,
+                      "parked": 0, "cache_hits": 0, "calls": math.ceil(count / 10),
+                      "anchors": count, "skipped": 0}
+    assert len(calls) == result["calls"]
+    assert all(cache.judged(a) for a in cands)
+    assert cache.edges() == {tuple(sorted((a, "c"))) for a in cands}
+
+
+def test_batch_sizes_follow_each_anchors_candidate_count(cache):
+    """Mixed candidate counts: only the last candidate of each anchor is 'same'."""
+    cands = {"a": ["a1", "a2"], "b": ["b1", "b2", "b3"], "c": ["c1"]}
+    texts = {k: k for k in cands} | {c: c for cs in cands.values() for c in cs}
+    calls = []
+
+    def runner(prompt):
+        calls.append(prompt)
+        reply = {}
+        parts = re.split(r"^=== GROUP (\d+) ===$", prompt, flags=re.M)
+        for g, body in zip(parts[1::2], parts[2::2]):
+            n = len(re.findall(r"^CANDIDATE \d+: ", body, re.M))
+            reply[g] = {str(i): "same" if i == n else "different" for i in range(1, n + 1)}
+        return json.dumps(reply)
+
+    result = lv.verify_anchors(texts, cands, cache, runner=runner,
+                               note_of={a: f"note-{a}" for a in cands}, batch=10)
+    assert len(calls) == 1
+    assert result["judged"] == 3 and result["failed"] == 0 and result["unparseable"] == 0
+    assert all(cache.judged(a) for a in cands)
+    assert cache.edges() == {("a", "a2"), ("b", "b3"), ("c", "c1")}
+
+
+def test_same_note_anchors_use_separate_singleton_prompts(cache):
+    texts = {"a": "anchor a", "b": "anchor b", "c": "candidate"}
+    cands = {"a": ["c"], "b": ["c"]}
+    calls = []
+
+    def runner(prompt):
+        calls.append(prompt)
+        return '{"1": "same"}'
+
+    result = lv.verify_anchors(texts, cands, cache, runner=runner,
+                               note_of={"a": "n1", "b": "n1"})
+    assert result["calls"] == result["anchors"] == result["judged"] == 2
+    assert sorted(calls) == sorted(lv.build_prompt(texts[a], [texts["c"]]) for a in cands)
+
+
+@pytest.mark.parametrize("note_of", [None, {}, {"other": "note"}])
+def test_missing_notes_are_each_their_own_note(cache, note_of):
+    result = lv.verify_anchors({"a": "A", "b": "B", "c": "C"},
+                               {"a": ["c"], "b": ["c"]}, cache,
+                               runner=answer_groups, note_of=note_of)
+    assert result["calls"] == 1
+    assert result["anchors"] == result["judged"] == 2
+
+
+def test_group_is_deterministic_and_separates_notes():
+    anchors = [f"key-{(i * 17) % 40}" for i in range(40)]
+    note_of = {f"key-{i}": f"note-{i % 5}" for i in range(40)}
+    groups = lv._group(anchors, note_of, 10)
+    assert groups == lv._group(list(reversed(anchors)), note_of, 10)
+    assert sorted(a for group in groups for a in group) == sorted(anchors)
+    for group in groups:
+        assert len(group) <= 5
+        assert len({note_of[a] for a in group}) == len(group)
+    # With no note constraints, first-fit follows the prescribed hash order.
+    ordered = sorted(anchors, key=lambda a: (hashlib.sha1(a.encode()).hexdigest(), a))
+    assert lv._group(anchors, None, 10) == [ordered[i:i+10] for i in range(0, 40, 10)]
+
+
+@pytest.mark.parametrize("batch", [0, -3, 1])
+def test_group_clamps_small_batch(batch):
+    assert all(len(group) == 1 for group in lv._group(["a", "b"], None, batch))
+
+
+def test_singleton_batch_uses_original_prompt(cache):
+    texts = {"a": "anchor", "b": "candidate one", "c": "candidate two"}
+    calls = []
+
+    def runner(prompt):
+        calls.append(prompt)
+        return '{"1": "same", "2": "different"}'
+
+    result = lv.verify_anchors(texts, {"a": ["b", "c"]}, cache, runner=runner, batch=10)
+    assert calls == [lv.build_prompt(texts["a"], [texts["b"], texts["c"]])]
+    assert result["judged"] == result["anchors"] == result["calls"] == 1
+
+
+@pytest.mark.parametrize("reply", [
+    '{"1": {"1": "same"}}',
+    '{"1": {"1": "same"}, "2": {"1": "maybe"}}',
+])
+def test_partial_batch_records_valid_group_and_parks_other(cache, reply):
+    cands = {"a": ["c"], "b": ["c"]}
+    first, second = lv._group(list(cands), None, 10)[0]
+    result = lv.verify_anchors({a: a for a in "abc"}, cands, cache, runner=lambda _: reply)
+    assert result == {"judged": 1, "failed": 1, "unparseable": 1,
+                      "parked": 0, "cache_hits": 0, "calls": 1, "anchors": 2, "skipped": 0}
+    assert cache.judged(first) and not cache.parked(first, ["c"])
+    assert not cache.judged(second) and cache.parked(second, ["c"])
+    assert cache.edges() == {tuple(sorted((first, "c")))}
+
+
+@pytest.mark.parametrize("reply", ["not JSON", "{}", "{invalid}"])
+def test_invalid_batch_parks_every_anchor(cache, reply):
+    result = lv.verify_anchors({a: a for a in "abc"}, {"a": ["c"], "b": ["c"]},
+                               cache, runner=lambda _: reply)
+    assert result["failed"] == result["unparseable"] == 2
+    assert result["judged"] == 0
+    assert all(cache.parked(a, ["c"]) and not cache.judged(a) for a in "ab")
+    assert cache.edges() == set()
+
+
+@pytest.mark.parametrize("reply", [None, "", "  "])
+def test_empty_batch_failure_retries_without_parking(cache, reply):
+    calls = []
+
+    def runner(prompt):
+        calls.append(prompt)
+        return reply
+
+    for _ in range(2):
+        result = lv.verify_anchors({a: a for a in "abc"}, {"a": ["c"], "b": ["c"]},
+                                   cache, runner=runner)
+        assert result == {"judged": 0, "failed": 2, "unparseable": 0,
+                          "parked": 0, "cache_hits": 0, "calls": 1, "anchors": 2, "skipped": 0}
+        assert all(not cache.parked(a, ["c"]) and not cache.judged(a) for a in "ab")
+    assert len(calls) == 2
 
 
 def test_parse_verdicts_maps_same_and_rejects_garbage():
@@ -55,7 +231,7 @@ def test_verify_anchors_incomplete_reply_is_failed_and_not_cached(cache):
     result = lv.verify_anchors({"a": "a", "b": "b", "c": "c"}, {"a": ["b", "c"]}, cache,
                                runner=lambda _: '{"1": "maybe"}')
     assert result == {"judged": 0, "failed": 1, "unparseable": 1,
-                      "parked": 0, "cache_hits": 0, "calls": 1, "skipped": 0}
+                      "parked": 0, "cache_hits": 0, "calls": 1, "anchors": 1, "skipped": 0}
     assert not cache.judged("a")
     assert cache.edges() == set()
     assert cache._conn.execute("SELECT COUNT(*) FROM pairs").fetchone()[0] == 0
@@ -335,9 +511,10 @@ def test_verify_anchors_skips_judged_and_counts_failures(cache, monkeypatch):
         return '{"1": "same"}'
 
     monkeypatch.setattr(lv, "run_haiku", runner)
-    assert lv.verify_anchors(texts, cands, cache, progress=lambda *p: progress.append(p)) == {
+    assert lv.verify_anchors(texts, cands, cache, batch=1,
+                             progress=lambda *p: progress.append(p)) == {
         "judged": 1, "failed": 2, "unparseable": 1,
-        "parked": 0, "cache_hits": 1, "calls": 3, "skipped": 2,
+        "parked": 0, "cache_hits": 1, "calls": 3, "anchors": 3, "skipped": 2,
     }
     assert len(calls) == 3
     assert progress == [(3, 3, 2)]
@@ -354,14 +531,14 @@ def test_second_verify_makes_no_calls_when_all_cached(cache):
         calls.append(prompt)
         return '{"1": "same", "2": "different"}'
 
-    first = lv.verify_anchors(texts, cands, cache, runner=runner)
+    first = lv.verify_anchors(texts, cands, cache, runner=runner, batch=1)
     assert first["judged"] == first["calls"] == len(calls) == 2
     assert cache.edges() == {("a", "b")}
     calls.clear()
-    second = lv.verify_anchors(texts, cands, cache, runner=runner)
+    second = lv.verify_anchors(texts, cands, cache, runner=runner, batch=1)
     assert calls == []
     assert second == {"judged": 0, "failed": 0, "unparseable": 0,
-                      "parked": 0, "cache_hits": 2, "calls": 0, "skipped": 3}
+                      "parked": 0, "cache_hits": 2, "calls": 0, "anchors": 0, "skipped": 3}
 
 
 def test_unparseable_reply_parks_anchor_and_next_run_skips_it(cache):
@@ -379,7 +556,7 @@ def test_unparseable_reply_parks_anchor_and_next_run_skips_it(cache):
                                progress=lambda *p: progress.append(p))
     assert calls == []
     assert second == {"judged": 0, "failed": 0, "unparseable": 0,
-                      "parked": 1, "cache_hits": 0, "calls": 0, "skipped": 1}
+                      "parked": 1, "cache_hits": 0, "calls": 0, "anchors": 0, "skipped": 1}
     assert progress == [(0, 0, 0)]
     assert not cache.judged("a")
 
@@ -415,7 +592,7 @@ def test_runner_none_is_not_parked(cache):
     for _ in range(2):
         result = lv.verify_anchors(texts, cands, cache, runner=runner)
         assert result == {"judged": 0, "failed": 1, "unparseable": 0,
-                          "parked": 0, "cache_hits": 0, "calls": 1, "skipped": 0}
+                          "parked": 0, "cache_hits": 0, "calls": 1, "anchors": 1, "skipped": 0}
         assert not cache.parked("a", ["b"])
     assert len(calls) == 2
 
@@ -434,9 +611,11 @@ def test_parked_row_expires_after_park_days(cache, monkeypatch):
     now = [1_000_000.0]
     monkeypatch.setattr(lv, "_now", lambda: now[0])
     cache.park("a", ["b"])
-    now[0] += (lv.PARK_DAYS - 1) * 86400
+    now[0] += lv.PARK_DAYS * 86400 - 1
     assert cache.parked("a", ["b"])
-    now[0] += 2 * 86400
+    now[0] += 1  # the exact expiry boundary is already eligible for retry
+    assert not cache.parked("a", ["b"])
+    now[0] += 1
     assert not cache.parked("a", ["b"])
     cache.park("a", ["b"])  # re-parking refreshes the clock
     assert cache.parked("a", ["b"])
@@ -470,7 +649,7 @@ def test_verify_anchors_resumes_after_interrupt(tmp_path, monkeypatch):
 
     monkeypatch.setattr(cache, "record", interrupt_after_commit)
     with pytest.raises(KeyboardInterrupt):
-        lv.verify_anchors(texts, cands, cache, runner=lambda _: '{"1": "same"}')
+        lv.verify_anchors(texts, cands, cache, runner=lambda _: '{"1": "same"}', batch=1)
     committed = {a for a in cands if cache.judged(a)}
     assert len(committed) == 1
     cache.close()
@@ -481,9 +660,9 @@ def test_verify_anchors_resumes_after_interrupt(tmp_path, monkeypatch):
             calls.append(prompt)
             return '{"1": "same"}'
 
-        assert lv.verify_anchors(texts, cands, cache, runner=runner) == {
+        assert lv.verify_anchors(texts, cands, cache, runner=runner, batch=1) == {
             "judged": 1, "failed": 0, "unparseable": 0,
-            "parked": 0, "cache_hits": 1, "calls": 1, "skipped": 1,
+            "parked": 0, "cache_hits": 1, "calls": 1, "anchors": 1, "skipped": 1,
         }
         assert len(calls) == 1
         assert all(f"ANCHOR: {a}\n" not in calls[0] for a in committed)
@@ -495,14 +674,38 @@ def test_verify_anchors_progress_every_100_and_at_end(cache):
     texts = {str(i): str(i) for i in range(201)}
     cands = {str(i): ["200"] for i in range(200)}
     progress = []
-    result = lv.verify_anchors(texts, cands, cache, runner=lambda _: '{"1": "same"}',
+    result = lv.verify_anchors(texts, cands, cache, runner=answer_groups,
                                progress=lambda *p: progress.append(p))
     assert result == {"judged": 200, "failed": 0, "unparseable": 0,
-                      "parked": 0, "cache_hits": 0, "calls": 200, "skipped": 0}
+                      "parked": 0, "cache_hits": 0, "calls": 20, "anchors": 200, "skipped": 0}
     assert progress == [(100, 200, 0), (200, 200, 0)]
     progress.clear()
     lv.verify_anchors(texts, cands, cache, runner=lambda _: pytest.fail("already judged"),
                       progress=lambda *p: progress.append(p))
+    assert progress == [(0, 0, 0)]
+
+
+def test_progress_when_group_crosses_100(cache):
+    texts = {str(i): str(i) for i in range(120)} | {"c": "candidate"}
+    cands = {str(i): ["c"] for i in range(120)}
+    progress = []
+    # Size 6 crosses 100 at 102; concurrency=1 makes completion order immaterial.
+    result = lv.verify_anchors(texts, cands, cache, runner=lambda _: None,
+                               batch=6, concurrency=1,
+                               progress=lambda *p: progress.append(p))
+    assert result["anchors"] == result["failed"] == 120
+    assert result["calls"] == 20
+    assert progress == [(102, 120, 102), (120, 120, 120)]
+
+
+@pytest.mark.parametrize("cands", [{}, {"a": []}])
+def test_no_pending_anchors_makes_no_calls(cache, cands):
+    progress = []
+    result = lv.verify_anchors({}, cands, cache, runner=lambda _: pytest.fail("no candidates"),
+                               progress=lambda *p: progress.append(p))
+    assert result == {"judged": 0, "failed": 0, "unparseable": 0,
+                      "parked": 0, "cache_hits": 0, "calls": 0, "anchors": 0,
+                      "skipped": len(cands)}
     assert progress == [(0, 0, 0)]
 
 

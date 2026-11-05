@@ -1170,7 +1170,7 @@
           "files": [
             "hooks/lessons_verify.py"
           ],
-          "purpose": "Round 2 RUBRIC (RUBRIC_VERSION r2-2026-10-31), build_prompt / parse_verdicts, run_haiku (claude -p --model haiku, stdin closed, timeout, run from obsidian_utils.worker_cwd(), the stripped cwd shared with capture_worker; spawn_count() counts attempts), verify_anchors (per anchor, bounded concurrency), name_lessons, and VerdictCache: SQLite keyed by pair + rubric version + model (WAL, 0600 incl. -wal/-shm)."
+          "purpose": "Round 2 RUBRIC (RUBRIC_VERSION r2-2026-10-31), build_prompt / parse_verdicts, run_haiku (claude -p --model haiku, stdin closed, timeout, run from obsidian_utils.worker_cwd(), the stripped cwd shared with capture_worker; spawn_count() counts attempts), verify_anchors (up to BATCH=10 anchors per call, never two from one retro note; a lone anchor keeps the one-anchor prompt; bounded concurrency; a partial batch reply records the answered anchors and parks the rest), name_lessons, and VerdictCache: SQLite keyed by pair + rubric version + model (WAL, 0600 incl. -wal/-shm)."
         },
         {
           "id": "lessons-group",
@@ -1289,7 +1289,7 @@
           "name": "Hook telemetry log",
           "kind": "datastore",
           "files": [],
-          "purpose": "The hook telemetry log (0600, rotates at 100 KB). One key=value line per SessionEnd/SessionStart/Reaper/LessonsRollup event; the primary diagnostic for sessions that produced no note. Completed rollup update, rebuild, match and refresh-tracking commands log actual Claude process attempts (including timeout retries), cache hits, parked anchors, failed judgments or lookups, and exit status (#487)."
+          "purpose": "The hook telemetry log (0600, rotates at 100 KB). One key=value line per SessionEnd/SessionStart/Reaper/LessonsRollup event; the primary diagnostic for sessions that produced no note. Completed rollup update, rebuild, match and refresh-tracking commands log actual Claude process attempts (including timeout retries), anchors sent to the verifier (update, rebuild; #501), cache hits, parked anchors, failed judgments or lookups, and exit status (#487)."
         },
         {
           "id": "db-summarizer-metrics",
@@ -2576,7 +2576,7 @@
         {
           "from": "retro-rollup-cli",
           "to": "telemetry-log",
-          "label": "LessonsRollup: Claude process attempts, cache hits, parked, failed, rc"
+          "label": "LessonsRollup: Claude process attempts, anchors, cache hits, parked, failed, rc"
         }
       ]
     },

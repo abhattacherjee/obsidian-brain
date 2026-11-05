@@ -268,7 +268,7 @@ def regroup(ctx: Ctx, state: dict, *, judge: bool, note: str | None = None, cach
     cache = cache or lessons_verify.VerdictCache(ctx.state_dir / CACHE_NAME)
     try:
         verify = {"judged": 0, "failed": 0, "unparseable": 0, "parked": 0,
-                  "cache_hits": 0, "calls": 0, "skipped": 0}
+                  "cache_hits": 0, "calls": 0, "anchors": 0, "skipped": 0}
         if judge:
             only = None
             if note is not None:
@@ -279,8 +279,9 @@ def regroup(ctx: Ctx, state: dict, *, judge: bool, note: str | None = None, cach
             def progress(done, total, failed):
                 print(f"judged {done}/{total} failed={failed}", file=sys.stderr, flush=True)
 
+            # note_of keeps two anchors from one retro out of the same call (#501).
             verify = lessons_verify.verify_anchors(texts, cands, cache, concurrency=ctx.concurrency,
-                                                   progress=progress)
+                                                   progress=progress, note_of=note_of)
         elif not unreadable:
             cache.prune(set(by_key))
         live = set(by_key)
@@ -383,7 +384,7 @@ def regroup(ctx: Ctx, state: dict, *, judge: bool, note: str | None = None, cach
     return {"lessons": len(out_lessons), "new": len(new), "items_in_lessons": in_lessons,
             "unjudged": unjudged, "failed": verify["failed"], "notes_written": written,
             "cache_hits": verify["cache_hits"], "parked": verify["parked"],
-            "unparseable": verify["unparseable"],
+            "unparseable": verify["unparseable"], "anchors": verify["anchors"],
             "notes_removed": removed, "unreadable": len(skipped)}
 
 
@@ -1481,6 +1482,8 @@ def main(argv=None) -> int:
 
         def log_rollup(rc: int) -> int:
             fields = {"cmd": args.cmd, "claude_calls": lessons_verify.spawn_count() - start}
+            if "anchors" in stats:
+                fields["anchors"] = stats.pop("anchors")  # beside claude_calls: calls per anchor
             fields.update(stats)
             fields["rc"] = rc
             obsidian_utils.append_event_log("LessonsRollup", fields)
@@ -1525,9 +1528,10 @@ def main(argv=None) -> int:
                   f"failed: {summary['failed']}, notes written: {summary['notes_written']}, "
                   f"removed: {summary['notes_removed']}, unreadable notes: {summary['unreadable']}, "
                   f"claude calls: {lessons_verify.spawn_count() - start}, "
+                  f"anchors sent: {summary['anchors']}, "
                   f"cache hits: {summary['cache_hits']}, parked: {summary['parked']}")
             stats.update(cache_hits=summary["cache_hits"], parked=summary["parked"],
-                         failed=summary["failed"])
+                         failed=summary["failed"], anchors=summary["anchors"])
             if summary["parked"]:
                 print(f"retro_rollup: {summary['parked']} anchor(s) parked after an unparseable "
                       "Haiku reply; they stay unjudged until their candidates, rubric or model "

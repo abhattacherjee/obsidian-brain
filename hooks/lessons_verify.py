@@ -24,6 +24,9 @@ Reply with ONLY a JSON object mapping each candidate number to "same" or "differ
 RUBRIC_VERSION = "r2-2026-10-31"
 MODEL = "haiku"
 PARK_DAYS = 30
+BATCH = 10
+BATCH_HEAD = """You will judge several ANCHOR groups. Apply the rules below to each group on its own; candidates are compared only with their own group's anchor."""
+BATCH_TAIL = """Reply with ONLY one JSON object mapping each group number to that group's object, e.g. {"1": {"1": "same", "2": "different"}, "2": {"1": "different"}}. No prose."""
 _spawn_count = 0
 _spawn_lock = threading.Lock()
 
@@ -45,6 +48,14 @@ def build_prompt(anchor: str, candidates: list[str]) -> str:
     )
 
 
+def build_batch_prompt(groups: list[tuple[str, list[str]]]) -> str:
+    lines = [BATCH_HEAD, "", RUBRIC, "", BATCH_TAIL]
+    for g, (anchor, cands) in enumerate(groups, 1):
+        lines += ["", f"=== GROUP {g} ===", "ANCHOR: " + anchor, ""]
+        lines += [f"CANDIDATE {i+1}: {c}" for i, c in enumerate(cands)]
+    return "\n".join(lines)
+
+
 def _parse_object(stdout: str) -> dict | None:
     match = re.search(r"\{.*\}", stdout, re.S)
     if match is None:
@@ -60,6 +71,10 @@ def parse_verdicts(stdout: str, n: int) -> list[bool] | None:
     obj = _parse_object(stdout)
     if obj is None:
         return None
+    return _verdicts_from(obj, n)
+
+
+def _verdicts_from(obj: dict, n: int) -> list[bool] | None:
     verdicts = []
     for i in range(n):
         value = obj.get(str(i + 1))
@@ -68,6 +83,34 @@ def parse_verdicts(stdout: str, n: int) -> list[bool] | None:
             return None  # a missing or odd answer must not cache as "different"
         verdicts.append(word == "same")
     return verdicts
+
+
+def parse_batch(stdout: str, sizes: list[int]) -> list[list[bool] | None] | None:
+    obj = _parse_object(stdout)
+    if obj is None:
+        return None
+    return [
+        _verdicts_from(sub, n) if isinstance(sub := obj.get(str(g)), dict) else None
+        for g, n in enumerate(sizes, 1)
+    ]
+
+
+def _group(anchors: list[str], note_of: dict[str, str] | None,
+           batch: int) -> list[list[str]]:
+    batch = max(1, batch)
+    groups = []
+    notes = []
+    for key in sorted(anchors, key=lambda key: (hashlib.sha1(key.encode()).hexdigest(), key)):
+        note = note_of.get(key, key) if note_of is not None else key
+        for group, seen in zip(groups, notes):
+            if len(group) < batch and note not in seen:
+                group.append(key)
+                seen.add(note)
+                break
+        else:
+            groups.append([key])
+            notes.append({note})
+    return groups
 
 
 def run_haiku(prompt: str, timeouts: tuple[int, int] = (120, 240)) -> str | None:
@@ -210,7 +253,8 @@ class VerdictCache:
 
 def verify_anchors(texts: dict[str, str], cands: dict[str, list[str]],
                    cache: VerdictCache, runner=None, concurrency: int = 8,
-                   progress=None) -> dict:
+                   progress=None, note_of: dict[str, str] | None = None,
+                   batch: int = BATCH) -> dict:
     if runner is None:
         runner = run_haiku
     anchors = []
@@ -225,35 +269,46 @@ def verify_anchors(texts: dict[str, str], cands: dict[str, list[str]],
         else:
             anchors.append(anchor)
     total = len(anchors)
+    groups = _group(anchors, note_of, batch)
     judged = failed = unparseable = 0
 
-    def verify(anchor):
-        out = runner(build_prompt(texts[anchor], [texts[c] for c in cands[anchor]]))
+    def verify(group):
+        inputs = [(texts[a], [texts[c] for c in cands[a]]) for a in group]
+        prompt = build_prompt(*inputs[0]) if len(group) == 1 else build_batch_prompt(inputs)
+        out = runner(prompt)
         # An empty reply is a runner failure, not an unparseable answer: retry it.
-        if out is not None and not out.strip():
-            out = None
-        verdicts = parse_verdicts(out, len(cands[anchor])) if out is not None else None
-        return verdicts, out is not None and verdicts is None
+        if out is None or not out.strip():
+            return [None] * len(group), False
+        sizes = [len(cands[a]) for a in group]
+        if len(group) == 1:
+            verdicts = [parse_verdicts(out, sizes[0])]
+        else:
+            verdicts = parse_batch(out, sizes)
+        return verdicts if verdicts is not None else [None] * len(group), True
 
     with ThreadPoolExecutor(max_workers=concurrency) as pool:
-        futures = {pool.submit(verify, a): a for a in anchors}
-        for done, future in enumerate(as_completed(futures), 1):
-            verdicts, invalid = future.result()
-            anchor = futures[future]
-            if verdicts is None:
-                failed += 1
-                if invalid:
-                    cache.park(anchor, cands[anchor])
-                    unparseable += 1
-            else:
-                cache.record(anchor, cands[anchor], verdicts)
-                judged += 1
-            if progress is not None and done % 100 == 0 and done != total:
+        futures = {pool.submit(verify, group): group for group in groups}
+        done = 0
+        for future in as_completed(futures):
+            verdicts, has_reply = future.result()
+            group = futures[future]
+            for anchor, verdict in zip(group, verdicts):
+                if verdict is None:
+                    failed += 1
+                    if has_reply:
+                        cache.park(anchor, cands[anchor])
+                        unparseable += 1
+                else:
+                    cache.record(anchor, cands[anchor], verdict)
+                    judged += 1
+            prev = done
+            done += len(group)
+            if progress is not None and prev // 100 != done // 100 and done != total:
                 progress(done, total, failed)
     if progress is not None:
         progress(total, total, failed)
     return {"judged": judged, "failed": failed, "unparseable": unparseable,
-            "parked": parked, "cache_hits": cache_hits, "calls": total,
+            "parked": parked, "cache_hits": cache_hits, "calls": len(groups), "anchors": total,
             "skipped": len(cands) - total}
 
 

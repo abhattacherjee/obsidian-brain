@@ -25,13 +25,29 @@ def fake_haiku(prompt: str):
     if prompt.startswith("Give each lesson"):
         blocks = re.findall(r"LESSON (\d+):\n(.*)", prompt)
         return json.dumps({n: f"Follow rule {TAG.search(t).group(1)}" for n, t in blocks if TAG.search(t)})
+    return json.dumps(per_group(prompt, _judge_one))
+
+
+def per_group(prompt: str, judge) -> dict:
+    """Answer a one-anchor prompt, or each group of a batched prompt (#501)."""
+    if "=== GROUP 1 ===" not in prompt:
+        return judge(prompt)
+    groups = re.split(r"^=== GROUP \d+ ===$", prompt, flags=re.M)[1:]
+    return {str(g): judge(part) for g, part in enumerate(groups, 1)}
+
+
+def is_verifier(prompt: str) -> bool:
+    return prompt.startswith(("You decide", "You will judge"))
+
+
+def _judge_one(prompt: str) -> dict:
     anchor = re.search(r"^ANCHOR: (.*)$", prompt, re.M).group(1)
     a = TAG.search(anchor)
     out = {}
     for n, text in re.findall(r"^CANDIDATE (\d+): (.*)$", prompt, re.M):
         c = TAG.search(text)
         out[n] = "same" if a and c and a.group(1) == c.group(1) else "different"
-    return json.dumps(out)
+    return out
 
 
 def note(vault: Path, name: str, date: str, project: str, items: list[str], eol="\n") -> Path:
@@ -118,7 +134,36 @@ def test_second_update_starts_no_claude_process(env, monkeypatch, capsys):
     log = log_path.read_text().splitlines()
     assert "LessonsRollup cmd=update claude_calls=0" in log[-1]
     assert "rc=0" in log[-1]
-    assert "claude calls: 0, cache hits: " in capsys.readouterr().out
+    assert "claude calls: 0, anchors sent: 0, cache hits: " in capsys.readouterr().out
+
+
+def test_update_never_batches_two_anchors_from_one_note(env, monkeypatch, capsys):
+    vault, _, base = env
+    note_of = {}
+    for path in (vault / "claude-insights").glob("*-retro-*.md"):
+        for line in path.read_text().splitlines():
+            if line.startswith("- [ ] "):
+                note_of[line[6:]] = path.stem
+    prompts = []
+
+    def runner(prompt, timeouts=(120, 240)):
+        if not prompt.startswith("Give each lesson"):
+            prompts.append(prompt)
+        return fake_haiku(prompt)
+
+    monkeypatch.setattr(lessons_verify, "run_haiku", runner)
+    assert run(base, "update") == 0
+    # 7 anchors over 3 notes, one note holding 3: three calls, never one call for all 7.
+    assert len(prompts) == 3
+    for prompt in prompts:
+        anchors = re.findall(r"^ANCHOR: (.*)$", prompt, re.M)
+        notes = [note_of[a] for a in anchors]
+        assert len(notes) == len(set(notes)), notes
+    assert sorted(len(re.findall(r"^ANCHOR: ", p, re.M)) for p in prompts) == [1, 3, 3]
+    out = capsys.readouterr().out
+    assert "claude calls: " in out and "anchors sent: 7," in out
+    line = (Path.home() / ".claude" / "obsidian-brain-hook.log").read_text().splitlines()[-1]
+    assert "LessonsRollup cmd=update " in line and "claude_calls=0 anchors=7 " in line
 
 
 def test_refused_update_logs_rc_1(env, capsys):
@@ -151,7 +196,7 @@ def test_unparseable_reply_exits_1_then_parked_exits_0(env, monkeypatch, capsys)
     _, _, base = env
 
     def invalid_verifier(prompt):
-        return "not json" if prompt.startswith("You decide") else fake_haiku(prompt)
+        return "not json" if is_verifier(prompt) else fake_haiku(prompt)
 
     monkeypatch.setattr(lessons_verify, "run_haiku", invalid_verifier)
     assert run(base, "update") == 1
@@ -161,7 +206,7 @@ def test_unparseable_reply_exits_1_then_parked_exits_0(env, monkeypatch, capsys)
     capsys.readouterr()
 
     def no_verifier(prompt):
-        if prompt.startswith("You decide"):
+        if is_verifier(prompt):
             pytest.fail("parked verifier called")
         return fake_haiku(prompt)
 
@@ -214,11 +259,14 @@ def test_update_haiku_failure_is_unjudged_and_exit_1(env, monkeypatch, capsys):
 def test_update_note_only_judges_that_notes_items(env):
     vault, state, base = env
     seen = []
+    per_prompt = []
     orig = lessons_verify.run_haiku
 
     def spy(p, timeouts=(120, 240)):
-        if p.startswith("You decide"):
-            seen.append(re.search(r"^ANCHOR: (.*)$", p, re.M).group(1))
+        if is_verifier(p):
+            anchors = re.findall(r"^ANCHOR: (.*)$", p, re.M)
+            per_prompt.append(len(anchors))
+            seen.extend(anchors)
         return orig(p)
 
     lessons_verify.run_haiku = spy
@@ -227,6 +275,8 @@ def test_update_note_only_judges_that_notes_items(env):
     finally:
         lessons_verify.run_haiku = orig
     assert seen and all("RULE-A" in a or "walrus" in a for a in seen)
+    # One call per anchor: a one-note run never batches (#501). The note has 2 items.
+    assert per_prompt == [1] * 2
 
 
 def test_lock_held_exits_1_and_leaves_state(env, capsys):
@@ -439,7 +489,7 @@ def test_rebuild_makes_no_verdict_calls(env, monkeypatch):
     calls = []
     monkeypatch.setattr(lessons_verify, "run_haiku", lambda p, timeouts=(120, 240): calls.append(p) or None)
     assert run(base, "rebuild") == 0
-    assert not [c for c in calls if c.startswith("You decide")]
+    assert not [c for c in calls if is_verifier(c)]
     assert state_of(state)["totals"]["unjudged"] == 1
 
 
@@ -714,9 +764,11 @@ def group_haiku(prompt: str):
     """Same lesson iff anchor and candidate share a G<n> tag; an item can carry two."""
     if prompt.startswith("Give each lesson"):
         return json.dumps({n: f"Rule {n}" for n in re.findall(r"^LESSON (\d+):", prompt, re.M)})
-    anchor = set(GROUP.findall(re.search(r"^ANCHOR: (.*)$", prompt, re.M).group(1)))
-    return json.dumps({n: "same" if anchor & set(GROUP.findall(t)) else "different"
-                       for n, t in re.findall(r"^CANDIDATE (\d+): (.*)$", prompt, re.M)})
+    def judge(part):
+        anchor = set(GROUP.findall(re.search(r"^ANCHOR: (.*)$", part, re.M).group(1)))
+        return {n: "same" if anchor & set(GROUP.findall(t)) else "different"
+                for n, t in re.findall(r"^CANDIDATE (\d+): (.*)$", part, re.M)}
+    return json.dumps(per_group(prompt, judge))
 
 
 @pytest.fixture
