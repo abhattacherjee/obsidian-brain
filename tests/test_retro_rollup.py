@@ -259,11 +259,14 @@ def test_update_haiku_failure_is_unjudged_and_exit_1(env, monkeypatch, capsys):
 def test_update_note_only_judges_that_notes_items(env):
     vault, state, base = env
     seen = []
+    per_prompt = []
     orig = lessons_verify.run_haiku
 
     def spy(p, timeouts=(120, 240)):
         if is_verifier(p):
-            seen.extend(re.findall(r"^ANCHOR: (.*)$", p, re.M))
+            anchors = re.findall(r"^ANCHOR: (.*)$", p, re.M)
+            per_prompt.append(len(anchors))
+            seen.extend(anchors)
         return orig(p)
 
     lessons_verify.run_haiku = spy
@@ -272,6 +275,8 @@ def test_update_note_only_judges_that_notes_items(env):
     finally:
         lessons_verify.run_haiku = orig
     assert seen and all("RULE-A" in a or "walrus" in a for a in seen)
+    # One call per anchor: a one-note run never batches (#501). The note has 2 items.
+    assert per_prompt == [1] * 2
 
 
 def test_lock_held_exits_1_and_leaves_state(env, capsys):

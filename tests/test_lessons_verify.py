@@ -90,6 +90,29 @@ def test_verify_batches_distinct_notes(cache, count):
     assert cache.edges() == {tuple(sorted((a, "c"))) for a in cands}
 
 
+def test_batch_sizes_follow_each_anchors_candidate_count(cache):
+    """Mixed candidate counts: only the last candidate of each anchor is 'same'."""
+    cands = {"a": ["a1", "a2"], "b": ["b1", "b2", "b3"], "c": ["c1"]}
+    texts = {k: k for k in cands} | {c: c for cs in cands.values() for c in cs}
+    calls = []
+
+    def runner(prompt):
+        calls.append(prompt)
+        reply = {}
+        parts = re.split(r"^=== GROUP (\d+) ===$", prompt, flags=re.M)
+        for g, body in zip(parts[1::2], parts[2::2]):
+            n = len(re.findall(r"^CANDIDATE \d+: ", body, re.M))
+            reply[g] = {str(i): "same" if i == n else "different" for i in range(1, n + 1)}
+        return json.dumps(reply)
+
+    result = lv.verify_anchors(texts, cands, cache, runner=runner,
+                               note_of={a: f"note-{a}" for a in cands}, batch=10)
+    assert len(calls) == 1
+    assert result["judged"] == 3 and result["failed"] == 0 and result["unparseable"] == 0
+    assert all(cache.judged(a) for a in cands)
+    assert cache.edges() == {("a", "a2"), ("b", "b3"), ("c", "c1")}
+
+
 def test_same_note_anchors_use_separate_singleton_prompts(cache):
     texts = {"a": "anchor a", "b": "anchor b", "c": "candidate"}
     cands = {"a": ["c"], "b": ["c"]}
