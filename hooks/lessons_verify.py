@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -80,6 +81,10 @@ def default_cache_path() -> Path:
     return Path.home() / ".claude" / "obsidian-brain" / "lessons-verdicts.db"
 
 
+def _cands_key(cand_keys: list[str]) -> str:
+    return hashlib.sha1("\n".join(cand_keys).encode()).hexdigest()
+
+
 class VerdictCache:
     """Store unordered pairs; a positive judgment is sticky in either direction."""
 
@@ -99,6 +104,11 @@ class VerdictCache:
                 "anchor TEXT, rubric TEXT, model TEXT, "
                 "PRIMARY KEY(anchor,rubric,model))"
             )
+            self._conn.execute(
+                "CREATE TABLE IF NOT EXISTS failures ("
+                "anchor TEXT, cands TEXT, rubric TEXT, model TEXT, "
+                "PRIMARY KEY(anchor,cands,rubric,model))"
+            )
         # WAL mode keeps recent rows in side files; they hold the same data.
         for side in (path.with_name(path.name + "-wal"), path.with_name(path.name + "-shm")):
             if side.exists():
@@ -108,6 +118,19 @@ class VerdictCache:
         return self._conn.execute(
             "SELECT 1 FROM anchors WHERE anchor=? AND rubric=? AND model=?",
             (anchor_key, RUBRIC_VERSION, MODEL),
+        ).fetchone() is not None
+
+    def park(self, anchor_key: str, cand_keys: list[str]) -> None:
+        with self._conn:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO failures VALUES (?, ?, ?, ?)",
+                (anchor_key, _cands_key(cand_keys), RUBRIC_VERSION, MODEL),
+            )
+
+    def parked(self, anchor_key: str, cand_keys: list[str]) -> bool:
+        return self._conn.execute(
+            "SELECT 1 FROM failures WHERE anchor=? AND cands=? AND rubric=? AND model=?",
+            (anchor_key, _cands_key(cand_keys), RUBRIC_VERSION, MODEL),
         ).fetchone() is not None
 
     def record(self, anchor_key: str, cand_keys: list[str], verdicts: list[bool]) -> None:
@@ -141,6 +164,9 @@ class VerdictCache:
             dead_anchors = [tuple(row) for row in self._conn.execute(
                 "SELECT anchor, rubric, model FROM anchors"
             ) if row[0] not in live_keys]
+            dead_failures = [tuple(row) for row in self._conn.execute(
+                "SELECT anchor, cands, rubric, model FROM failures"
+            ) if row[0] not in live_keys]
             self._conn.executemany(
                 "DELETE FROM pairs WHERE a=? AND b=? AND rubric=? AND model=?",
                 dead_pairs,
@@ -148,6 +174,10 @@ class VerdictCache:
             self._conn.executemany(
                 "DELETE FROM anchors WHERE anchor=? AND rubric=? AND model=?",
                 dead_anchors,
+            )
+            self._conn.executemany(
+                "DELETE FROM failures WHERE anchor=? AND cands=? AND rubric=? AND model=?",
+                dead_failures,
             )
             return self._conn.total_changes - before
 
@@ -160,29 +190,45 @@ def verify_anchors(texts: dict[str, str], cands: dict[str, list[str]],
                    progress=None) -> dict:
     if runner is None:
         runner = run_haiku
-    anchors = [a for a, keys in cands.items() if keys and not cache.judged(a)]
+    anchors = []
+    cache_hits = parked = 0
+    for anchor, keys in cands.items():
+        if not keys:
+            continue
+        if cache.judged(anchor):
+            cache_hits += 1
+        elif cache.parked(anchor, keys):
+            parked += 1
+        else:
+            anchors.append(anchor)
     total = len(anchors)
-    judged = failed = 0
+    judged = failed = unparseable = 0
 
     def verify(anchor):
         out = runner(build_prompt(texts[anchor], [texts[c] for c in cands[anchor]]))
-        return parse_verdicts(out, len(cands[anchor])) if out is not None else None
+        verdicts = parse_verdicts(out, len(cands[anchor])) if out is not None else None
+        return verdicts, out is not None and verdicts is None
 
     with ThreadPoolExecutor(max_workers=concurrency) as pool:
         futures = {pool.submit(verify, a): a for a in anchors}
         for done, future in enumerate(as_completed(futures), 1):
-            verdicts = future.result()
+            verdicts, invalid = future.result()
+            anchor = futures[future]
             if verdicts is None:
                 failed += 1
+                if invalid:
+                    cache.park(anchor, cands[anchor])
+                    unparseable += 1
             else:
-                anchor = futures[future]
                 cache.record(anchor, cands[anchor], verdicts)
                 judged += 1
             if progress is not None and done % 100 == 0 and done != total:
                 progress(done, total, failed)
     if progress is not None:
         progress(total, total, failed)
-    return {"judged": judged, "failed": failed, "skipped": len(cands) - total}
+    return {"judged": judged, "failed": failed, "unparseable": unparseable,
+            "parked": parked, "cache_hits": cache_hits, "calls": total,
+            "skipped": len(cands) - total}
 
 
 def name_lessons(lessons: list[dict], texts: dict[str, str], runner=None) -> dict[str, str]:
