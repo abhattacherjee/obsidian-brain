@@ -1161,6 +1161,31 @@ def _sanitize_log_field(value: str, default: str = "") -> str:
     return s.replace("\n", " ").replace("\r", " ").replace("\t", " ")
 
 
+def _append_hook_log_line(line: str, label: str) -> None:
+    """Append one line to the shared hook log: rotate at the cap, chmod 0o600.
+
+    Best-effort: any exception prints "[obsidian-brain] <label> log append
+    failed: <exc>" to stderr and returns.
+    """
+    try:
+        log_dir = str(Path.home() / ".claude")
+        log_path = os.path.join(log_dir, _HOOK_LOG_NAME)
+        os.makedirs(log_dir, mode=0o700, exist_ok=True)
+        try:
+            if os.path.getsize(log_path) > _HOOK_LOG_MAX_BYTES:
+                os.replace(log_path, log_path + ".1")
+        except FileNotFoundError:
+            pass  # no existing log; nothing to rotate
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(line)
+        try:
+            os.chmod(log_path, 0o600)
+        except OSError:
+            pass  # best-effort; chmod failure is not fatal for telemetry
+    except Exception as exc:
+        print(f"[obsidian-brain] {label} log append failed: {exc}", file=sys.stderr)
+
+
 def _append_sessionend_log(
     project: str,
     session_id: str,
@@ -1178,16 +1203,7 @@ def _append_sessionend_log(
     from bad input types, etc.) and prints a stderr warning. Failure to log
     must not block the SessionEnd hook contract — the hook always exits 0.
     """
-    log_dir = os.path.join(os.path.expanduser("~"), ".claude")
-    log_path = os.path.join(log_dir, _HOOK_LOG_NAME)
     try:
-        os.makedirs(log_dir, exist_ok=True)
-        try:
-            if os.path.getsize(log_path) > _HOOK_LOG_MAX_BYTES:
-                os.replace(log_path, log_path + ".1")
-        except FileNotFoundError:
-            pass  # no existing log; nothing to rotate
-        # Other errors (permission, etc.) propagate to outer except → stderr warning
         timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
         # Sanitize all fields — \n, \r, or \t in any field would corrupt the
         # one-line-per-event format.
@@ -1200,14 +1216,26 @@ def _append_sessionend_log(
             f"outcome={safe_outcome} msgs={int(msgs)} dur={float(dur_min):.1f} "
             f"detail={safe_detail}\n"
         )
-        with open(log_path, "a", encoding="utf-8") as f:
-            f.write(line)
-        try:
-            os.chmod(log_path, 0o600)
-        except OSError:
-            pass  # best-effort; chmod failure is not fatal for telemetry
     except Exception as exc:
         print(f"[obsidian-brain] sessionend log append failed: {exc}", file=sys.stderr)
+        return
+    _append_hook_log_line(line, "sessionend")
+
+
+def append_event_log(event: str, fields: dict) -> None:
+    """Append a sanitized event to the shared hook log, best effort."""
+    try:
+        timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+        parts = [timestamp, _sanitize_log_field(event).replace(" ", "_")]
+        for key, value in fields.items():
+            safe_key = _sanitize_log_field(str(key)).replace(" ", "_")
+            safe_value = _sanitize_log_field(str(value)).replace(" ", "_")
+            parts.append(f"{safe_key}={safe_value}")
+        line = " ".join(parts) + "\n"
+    except Exception as exc:
+        print(f"[obsidian-brain] event log append failed: {exc}", file=sys.stderr)
+        return
+    _append_hook_log_line(line, "event")
 
 
 def _append_reaper_log(project: str, sid: Optional[str], event: str, detail: str = "") -> None:
@@ -1220,18 +1248,6 @@ def _append_reaper_log(project: str, sid: Optional[str], event: str, detail: str
     to stderr so the reaper itself is never interrupted by a log write error.
     """
     try:
-        log_dir = Path.home() / ".claude"
-        log_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        log_path = log_dir / _HOOK_LOG_NAME
-
-        # Rotate at 100 KB (mirrors _append_sessionend_log)
-        try:
-            if log_path.exists() and log_path.stat().st_size >= _HOOK_LOG_MAX_BYTES:
-                rotated = log_dir / (_HOOK_LOG_NAME + ".1")
-                os.replace(log_path, rotated)
-        except OSError:
-            pass
-
         iso = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
         safe_project = _sanitize_log_field(project, "unknown").replace(" ", "_")
         parts = [iso, "Reaper", f"project={safe_project}"]
@@ -1244,14 +1260,10 @@ def _append_reaper_log(project: str, sid: Optional[str], event: str, detail: str
             safe_detail = _sanitize_log_field(detail)
             parts.append(f"detail={safe_detail}")
         line = " ".join(parts) + "\n"
-        try:
-            with open(log_path, "a", encoding="utf-8") as f:
-                f.write(line)
-            os.chmod(log_path, 0o600)
-        except OSError:
-            pass  # best-effort
     except Exception as exc:
         print(f"[obsidian-brain] reaper log append failed: {exc}", file=sys.stderr)
+        return
+    _append_hook_log_line(line, "reaper")
 
 
 def _safe_mtime(path: str) -> float:
@@ -2418,6 +2430,20 @@ def worker_env() -> dict:
     env = dict(os.environ)
     env[WORKER_ENV_VAR] = "1"
     return env
+
+
+def worker_cwd() -> str:
+    """Keep headless workers from loading repo instructions, memory, and git status."""
+    # makedirs(mode=) only applies to the leaf, so create each level on its own.
+    os.makedirs(os.path.dirname(_SECURE_DIR) or ".", exist_ok=True)
+    path = _SECURE_DIR
+    for part in ("", "capture", "worker-cwd"):
+        path = os.path.join(path, part) if part else path
+        try:
+            os.mkdir(path, 0o700)
+        except FileExistsError:
+            pass  # existing dirs keep their mode
+    return path
 
 
 # ---------------------------------------------------------------------------

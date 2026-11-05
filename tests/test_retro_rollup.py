@@ -6,15 +6,18 @@ import subprocess
 import os
 import re
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 import lessons_match
 import lessons_verify
+import obsidian_utils
 import retro_rollup
 import retro_trace
 
 TAG = re.compile(r"RULE-([A-Z])")
+REAL_RUN_HAIKU = lessons_verify.run_haiku
 
 
 def fake_haiku(prompt: str):
@@ -89,6 +92,114 @@ def test_update_groups_and_writes_notes_then_rerun_writes_nothing(env, capsys):
     assert "notes written: 0" in capsys.readouterr().out
     assert {p: p.stat().st_mtime_ns for p in mtimes} == mtimes
     assert (state / "lessons-verdicts.db").stat().st_mode & 0o777 == 0o600
+
+
+def test_second_update_starts_no_claude_process(env, monkeypatch, capsys):
+    _, _, base = env
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+        return SimpleNamespace(returncode=0, stdout=fake_haiku(kwargs["input"]))
+
+    monkeypatch.setattr(lessons_verify, "run_haiku", REAL_RUN_HAIKU)
+    monkeypatch.setattr(lessons_verify.subprocess, "run", fake_run)
+    assert run(base, "update") == 0
+    n = len(calls)
+    assert n > 0
+    first_out = capsys.readouterr().out
+    assert f"claude calls: {n}," in first_out
+    log_path = Path.home() / ".claude" / "obsidian-brain-hook.log"
+    first_line = log_path.read_text().splitlines()[-1]
+    assert f"LessonsRollup cmd=update claude_calls={n} " in first_line
+    calls.clear()
+    assert run(base, "update") == 0
+    assert calls == []
+    log = log_path.read_text().splitlines()
+    assert "LessonsRollup cmd=update claude_calls=0" in log[-1]
+    assert "rc=0" in log[-1]
+    assert "claude calls: 0, cache hits: " in capsys.readouterr().out
+
+
+def test_refused_update_logs_rc_1(env, capsys):
+    vault, _, base = env
+    assert run(base, "update") == 0
+    for f in (vault / "claude-insights").glob("*-retro-*.md"):
+        f.unlink()
+    capsys.readouterr()
+    assert run(base, "update") == 1
+    assert "no retro items found" in capsys.readouterr().err
+    line = (Path.home() / ".claude" / "obsidian-brain-hook.log").read_text().splitlines()[-1]
+    assert "LessonsRollup cmd=update " in line and line.endswith("rc=1")
+
+
+def test_rebuild_logs_cmd_rebuild(env):
+    _, _, base = env
+    assert run(base, "rebuild") == 0
+    line = (Path.home() / ".claude" / "obsidian-brain-hook.log").read_text().splitlines()[-1]
+    assert "LessonsRollup cmd=rebuild " in line and line.endswith("rc=0")
+
+
+def test_rollup_log_failure_does_not_change_rc(env, capsys):
+    _, _, base = env
+    (Path.home() / ".claude" / "obsidian-brain-hook.log").mkdir(parents=True)
+    assert run(base, "update") == 0
+    assert "[obsidian-brain] event log append failed:" in capsys.readouterr().err
+
+
+def test_unparseable_reply_exits_1_then_parked_exits_0(env, monkeypatch, capsys):
+    _, _, base = env
+
+    def invalid_verifier(prompt):
+        return "not json" if prompt.startswith("You decide") else fake_haiku(prompt)
+
+    monkeypatch.setattr(lessons_verify, "run_haiku", invalid_verifier)
+    assert run(base, "update") == 1
+    log_path = Path.home() / ".claude" / "obsidian-brain-hook.log"
+    first = log_path.read_text().splitlines()[-1]
+    assert "rc=1" in first and re.search(r"failed=[1-9]\d*", first)
+    capsys.readouterr()
+
+    def no_verifier(prompt):
+        if prompt.startswith("You decide"):
+            pytest.fail("parked verifier called")
+        return fake_haiku(prompt)
+
+    monkeypatch.setattr(lessons_verify, "run_haiku", no_verifier)
+    assert run(base, "update") == 0
+    captured = capsys.readouterr()
+    assert re.search(r"parked: [1-9]\d*", captured.out)
+    assert re.search(r"retro_rollup: [1-9]\d* anchor\(s\) parked after an unparseable Haiku reply; "
+                     r"they stay unjudged until their candidates, rubric or model change, "
+                     r"or 30 days pass", captured.err)
+    last = log_path.read_text().splitlines()[-1]
+    assert "failed=0 rc=0" in last and re.search(r"parked=[1-9]\d*", last)
+
+
+def test_event_log_sanitizes_fields_rotates_and_is_private(monkeypatch):
+    monkeypatch.setattr(obsidian_utils, "_HOOK_LOG_MAX_BYTES", 1)
+    path = Path.home() / ".claude" / "obsidian-brain-hook.log"
+    obsidian_utils.append_event_log("old", {})
+    before = path.read_text()
+    obsidian_utils.append_event_log("New\nevent", {"a\tb": "two words\rnext", "count": 0})
+    assert path.with_name(path.name + ".1").read_text() == before
+    line = path.read_text()
+    assert re.fullmatch(r"\S+\+00:00 New_event a_b=two_words_next count=0\n", line)
+    assert path.stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.parametrize("cmd", ["match", "refresh-tracking"])
+@pytest.mark.parametrize("errors", [[], ["failed lookup"]])
+def test_match_commands_log_unchanged_and_errors(env, monkeypatch, cmd, errors):
+    _, _, base = env
+    assert run(base, "update") == 0
+    monkeypatch.setattr(retro_rollup, "match_lessons", lambda *a, **kw: {
+        "unchanged": 3, "errors": list(errors)})
+    monkeypatch.setattr(retro_rollup, "refresh_tracking", lambda *a: [])
+    rc = int(bool(errors))
+    assert run(base, cmd) == rc
+    line = (Path.home() / ".claude" / "obsidian-brain-hook.log").read_text().splitlines()[-1]
+    assert f"LessonsRollup cmd={cmd} claude_calls=0 unchanged=3 parked=0 failed={len(errors)} rc={rc}" in line
 
 
 def test_update_haiku_failure_is_unjudged_and_exit_1(env, monkeypatch, capsys):

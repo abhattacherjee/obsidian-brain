@@ -256,9 +256,7 @@ def parse_candidates(stdout: str, earlier_ids=()) -> list[dict]:
 
 
 def _worker_cwd() -> Path:
-    d = capture_state.capture_dir() / "worker-cwd"
-    d.mkdir(exist_ok=True, mode=0o700)
-    return d
+    return Path(obsidian_utils.worker_cwd())
 
 
 def _ask_worker(text: str, project: str, sid: str) -> list[dict]:
