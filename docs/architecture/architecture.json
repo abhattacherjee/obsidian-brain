@@ -1170,7 +1170,7 @@
           "files": [
             "hooks/lessons_verify.py"
           ],
-          "purpose": "Round 2 RUBRIC (RUBRIC_VERSION r2-2026-10-31), build_prompt / parse_verdicts, run_haiku (claude -p --model haiku, stdin closed, timeout), verify_anchors (per anchor, bounded concurrency), name_lessons, and VerdictCache: SQLite keyed by pair + rubric version + model (WAL, 0600 incl. -wal/-shm)."
+          "purpose": "Round 2 RUBRIC (RUBRIC_VERSION r2-2026-10-31), build_prompt / parse_verdicts, run_haiku (claude -p --model haiku, stdin closed, timeout, run from obsidian_utils.worker_cwd(), the stripped cwd shared with capture_worker; spawn_count() counts attempts), verify_anchors (per anchor, bounded concurrency), name_lessons, and VerdictCache: SQLite keyed by pair + rubric version + model (WAL, 0600 incl. -wal/-shm)."
         },
         {
           "id": "lessons-group",
@@ -1314,7 +1314,7 @@
           "files": [
             "hooks/lessons_verify.py"
           ],
-          "purpose": "<secure dir>/lessons-verdicts.db: SQLite cache of Haiku same-lesson verdicts, one row per (anchor, candidate, rubric version, model); judged anchors are never re-sent. Rebuildable but costly (about 3,900 Haiku calls for a full vault)."
+          "purpose": "<secure dir>/lessons-verdicts.db: SQLite cache of Haiku same-lesson verdicts, one row per (anchor, candidate, rubric version, model); judged anchors are never re-sent. A failures table parks anchors whose Haiku reply did not parse (keyed by anchor, candidate-set hash, rubric version and model, with parked_at); a parked row expires after 30 days. Rebuildable but costly (about 3,900 Haiku calls for a full vault)."
         },
         {
           "id": "db-lessons-state",

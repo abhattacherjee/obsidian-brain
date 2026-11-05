@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 import subprocess
 import threading
+import time
 
 import obsidian_utils
 import vault_index
@@ -22,8 +23,13 @@ Examples:
 Reply with ONLY a JSON object mapping each candidate number to "same" or "different", e.g. {"1": "same", "2": "different"}. No prose."""
 RUBRIC_VERSION = "r2-2026-10-31"
 MODEL = "haiku"
+PARK_DAYS = 30
 _spawn_count = 0
 _spawn_lock = threading.Lock()
+
+
+def _now() -> float:
+    return time.time()
 
 
 def spawn_count() -> int:
@@ -118,9 +124,12 @@ class VerdictCache:
             )
             self._conn.execute(
                 "CREATE TABLE IF NOT EXISTS failures ("
-                "anchor TEXT, cands TEXT, rubric TEXT, model TEXT, "
+                "anchor TEXT, cands TEXT, rubric TEXT, model TEXT, parked_at REAL, "
                 "PRIMARY KEY(anchor,cands,rubric,model))"
             )
+            columns = {row[1] for row in self._conn.execute("PRAGMA table_info(failures)")}
+            if "parked_at" not in columns:
+                self._conn.execute("ALTER TABLE failures ADD COLUMN parked_at REAL")
         # WAL mode keeps recent rows in side files; they hold the same data.
         for side in (path.with_name(path.name + "-wal"), path.with_name(path.name + "-shm")):
             if side.exists():
@@ -135,14 +144,16 @@ class VerdictCache:
     def park(self, anchor_key: str, cand_keys: list[str]) -> None:
         with self._conn:
             self._conn.execute(
-                "INSERT OR IGNORE INTO failures VALUES (?, ?, ?, ?)",
-                (anchor_key, _cands_key(cand_keys), RUBRIC_VERSION, MODEL),
+                "INSERT OR REPLACE INTO failures VALUES (?, ?, ?, ?, ?)",
+                (anchor_key, _cands_key(cand_keys), RUBRIC_VERSION, MODEL, _now()),
             )
 
     def parked(self, anchor_key: str, cand_keys: list[str]) -> bool:
         return self._conn.execute(
-            "SELECT 1 FROM failures WHERE anchor=? AND cands=? AND rubric=? AND model=?",
-            (anchor_key, _cands_key(cand_keys), RUBRIC_VERSION, MODEL),
+            "SELECT 1 FROM failures WHERE anchor=? AND cands=? AND rubric=? AND model=? "
+            "AND parked_at > ?",
+            (anchor_key, _cands_key(cand_keys), RUBRIC_VERSION, MODEL,
+             _now() - PARK_DAYS * 86400),
         ).fetchone() is not None
 
     def record(self, anchor_key: str, cand_keys: list[str], verdicts: list[bool]) -> None:
@@ -218,6 +229,9 @@ def verify_anchors(texts: dict[str, str], cands: dict[str, list[str]],
 
     def verify(anchor):
         out = runner(build_prompt(texts[anchor], [texts[c] for c in cands[anchor]]))
+        # An empty reply is a runner failure, not an unparseable answer: retry it.
+        if out is not None and not out.strip():
+            out = None
         verdicts = parse_verdicts(out, len(cands[anchor])) if out is not None else None
         return verdicts, out is not None and verdicts is None
 

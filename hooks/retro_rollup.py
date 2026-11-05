@@ -1477,12 +1477,16 @@ def main(argv=None) -> int:
         ctx = Ctx(args)
         start = lessons_verify.spawn_count()
 
-        def log_rollup(rc: int, cache_hits: int = 0, parked: int = 0, failed: int = 0) -> int:
-            obsidian_utils.append_event_log("LessonsRollup", {
-                "cmd": args.cmd, "claude_calls": lessons_verify.spawn_count() - start,
-                "cache_hits": cache_hits, "parked": parked, "failed": failed, "rc": rc,
-            })
+        stats = {"cache_hits": 0, "parked": 0, "failed": 0}
+
+        def log_rollup(rc: int) -> int:
+            fields = {"cmd": args.cmd, "claude_calls": lessons_verify.spawn_count() - start}
+            fields.update(stats)
+            fields["rc"] = rc
+            obsidian_utils.append_event_log("LessonsRollup", fields)
             return rc
+
+        logged = args.cmd in ("update", "rebuild", "match", "refresh-tracking")
 
         if args.cmd == "update" and args.note and ctx.lessons_enabled is False:
             print("lessons: disabled (lessons_enabled is false)")
@@ -1508,6 +1512,7 @@ def main(argv=None) -> int:
     except (LockHeld, OSError) as exc:
         print(f"retro_rollup: {exc}", file=sys.stderr)
         return 1
+    rc = None
     try:
         state = load_state(ctx)
         if args.cmd == "snooze":
@@ -1521,33 +1526,47 @@ def main(argv=None) -> int:
                   f"removed: {summary['notes_removed']}, unreadable notes: {summary['unreadable']}, "
                   f"claude calls: {lessons_verify.spawn_count() - start}, "
                   f"cache hits: {summary['cache_hits']}, parked: {summary['parked']}")
+            stats.update(cache_hits=summary["cache_hits"], parked=summary["parked"],
+                         failed=summary["failed"])
+            if summary["parked"]:
+                print(f"retro_rollup: {summary['parked']} anchor(s) parked after an unparseable "
+                      "Haiku reply; they stay unjudged until their candidates, rubric or model "
+                      "change, or 30 days pass", file=sys.stderr)
             rc = 1 if _report_unreadable(summary) or summary["failed"] else 0
-            return log_rollup(rc, summary["cache_hits"], summary["parked"], summary["failed"])
+            return rc
         if args.cmd == "match":
             found = match_lessons(ctx, state, recheck=args.all)
             summary = regroup(ctx, state, judge=False)
             print(json.dumps({**found, "notes_written": summary["notes_written"]}))
             rc = 1 if _report_unreadable(summary) or found["errors"] else 0
-            return log_rollup(rc, found["unchanged"], 0, len(found["errors"]))
+            stats.clear()
+            stats.update(unchanged=found["unchanged"], parked=0, failed=len(found["errors"]))
+            return rc
         if args.cmd == "refresh-tracking":
             found = match_lessons(ctx, state)  # a lesson's match is looked up before tracking is re-read
             errors = found.pop("errors") + refresh_tracking(ctx, state)
             summary = regroup(ctx, state, judge=False)
             print(json.dumps({"errors": errors, "match": found, "notes_written": summary["notes_written"]}))
             rc = 1 if _report_unreadable(summary) or errors else 0
-            return log_rollup(rc, found["unchanged"], 0, len(errors))
+            stats.clear()
+            stats.update(unchanged=found["unchanged"], parked=0, failed=len(errors))
+            return rc
         result, ok = backfill(ctx, state, entries if args.apply else None,
                               preview=entries if not args.apply else None)
         print(json.dumps(result, indent=1))
         return 0 if ok else 1
     except UsageError as exc:
         print(f"retro_rollup: {exc}", file=sys.stderr)
-        return 2
+        rc = 2
+        return rc
     except (OSError, Refused) as exc:
         print(f"retro_rollup: {exc}", file=sys.stderr)
-        return 1
+        rc = 1
+        return rc
     finally:
         lock.release()
+        if logged and rc is not None:
+            log_rollup(rc)
 
 
 if __name__ == "__main__":

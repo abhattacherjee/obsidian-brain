@@ -420,6 +420,43 @@ def test_runner_none_is_not_parked(cache):
     assert len(calls) == 2
 
 
+@pytest.mark.parametrize("reply", ["", "   \n\t "])
+def test_empty_reply_is_not_parked(cache, reply):
+    texts, cands = {"a": "a", "b": "b"}, {"a": ["b"]}
+    for _ in range(2):
+        result = lv.verify_anchors(texts, cands, cache, runner=lambda p: reply)
+        assert result["failed"] == 1 and result["unparseable"] == 0
+        assert result["parked"] == 0 and result["calls"] == 1
+        assert not cache.parked("a", ["b"])
+
+
+def test_parked_row_expires_after_park_days(cache, monkeypatch):
+    now = [1_000_000.0]
+    monkeypatch.setattr(lv, "_now", lambda: now[0])
+    cache.park("a", ["b"])
+    now[0] += (lv.PARK_DAYS - 1) * 86400
+    assert cache.parked("a", ["b"])
+    now[0] += 2 * 86400
+    assert not cache.parked("a", ["b"])
+    cache.park("a", ["b"])  # re-parking refreshes the clock
+    assert cache.parked("a", ["b"])
+
+
+def test_old_failures_table_without_parked_at_gains_column(tmp_path):
+    path = tmp_path / "verdicts.db"
+    conn = vault_index._connect(str(path))
+    with conn:
+        conn.execute("CREATE TABLE failures (anchor TEXT, cands TEXT, rubric TEXT, model TEXT, "
+                     "PRIMARY KEY(anchor,cands,rubric,model))")
+    conn.close()
+    cache = lv.VerdictCache(path)
+    try:
+        cache.park("a", ["b"])
+        assert cache.parked("a", ["b"])
+    finally:
+        cache.close()
+
+
 def test_verify_anchors_resumes_after_interrupt(tmp_path, monkeypatch):
     path = tmp_path / "verdicts.db"
     cache = lv.VerdictCache(path)
