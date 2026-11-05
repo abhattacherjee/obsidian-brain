@@ -33,6 +33,7 @@ import lessons_match
 import lessons_notes
 import lessons_verify
 import memory_sources
+import obsidian_utils
 import retro_trace
 
 STATE_NAME = "lessons-state.json"
@@ -266,7 +267,8 @@ def regroup(ctx: Ctx, state: dict, *, judge: bool, note: str | None = None, cach
     own_cache = cache is None
     cache = cache or lessons_verify.VerdictCache(ctx.state_dir / CACHE_NAME)
     try:
-        verify = {"judged": 0, "failed": 0, "skipped": 0}
+        verify = {"judged": 0, "failed": 0, "unparseable": 0, "parked": 0,
+                  "cache_hits": 0, "calls": 0, "skipped": 0}
         if judge:
             only = None
             if note is not None:
@@ -380,6 +382,8 @@ def regroup(ctx: Ctx, state: dict, *, judge: bool, note: str | None = None, cach
     save_state(ctx, state)
     return {"lessons": len(out_lessons), "new": len(new), "items_in_lessons": in_lessons,
             "unjudged": unjudged, "failed": verify["failed"], "notes_written": written,
+            "cache_hits": verify["cache_hits"], "parked": verify["parked"],
+            "unparseable": verify["unparseable"],
             "notes_removed": removed, "unreadable": len(skipped)}
 
 
@@ -1471,9 +1475,18 @@ def main(argv=None) -> int:
         if args.cmd == "backfill" and args.apply and not args.accept:
             raise UsageError("--apply and --accept FILE go together")
         ctx = Ctx(args)
+        start = lessons_verify.spawn_count()
+
+        def log_rollup(rc: int, cache_hits: int = 0, parked: int = 0, failed: int = 0) -> int:
+            obsidian_utils.append_event_log("LessonsRollup", {
+                "cmd": args.cmd, "claude_calls": lessons_verify.spawn_count() - start,
+                "cache_hits": cache_hits, "parked": parked, "failed": failed, "rc": rc,
+            })
+            return rc
+
         if args.cmd == "update" and args.note and ctx.lessons_enabled is False:
             print("lessons: disabled (lessons_enabled is false)")
-            return 0
+            return log_rollup(0)
         if args.cmd == "show":
             return show(ctx, load_state(ctx), args.lesson_id, args.json)
         if args.cmd == "report":
@@ -1505,19 +1518,24 @@ def main(argv=None) -> int:
             print(f"lessons: {summary['lessons']} (+{summary['new']} new), items in lessons: "
                   f"{summary['items_in_lessons']}, unjudged: {summary['unjudged']}, "
                   f"failed: {summary['failed']}, notes written: {summary['notes_written']}, "
-                  f"removed: {summary['notes_removed']}, unreadable notes: {summary['unreadable']}")
-            return 1 if _report_unreadable(summary) or summary["failed"] else 0
+                  f"removed: {summary['notes_removed']}, unreadable notes: {summary['unreadable']}, "
+                  f"claude calls: {lessons_verify.spawn_count() - start}, "
+                  f"cache hits: {summary['cache_hits']}, parked: {summary['parked']}")
+            rc = 1 if _report_unreadable(summary) or summary["failed"] else 0
+            return log_rollup(rc, summary["cache_hits"], summary["parked"], summary["failed"])
         if args.cmd == "match":
             found = match_lessons(ctx, state, recheck=args.all)
             summary = regroup(ctx, state, judge=False)
             print(json.dumps({**found, "notes_written": summary["notes_written"]}))
-            return 1 if _report_unreadable(summary) or found["errors"] else 0
+            rc = 1 if _report_unreadable(summary) or found["errors"] else 0
+            return log_rollup(rc, found["unchanged"], 0, len(found["errors"]))
         if args.cmd == "refresh-tracking":
             found = match_lessons(ctx, state)  # a lesson's match is looked up before tracking is re-read
             errors = found.pop("errors") + refresh_tracking(ctx, state)
             summary = regroup(ctx, state, judge=False)
             print(json.dumps({"errors": errors, "match": found, "notes_written": summary["notes_written"]}))
-            return 1 if _report_unreadable(summary) or errors else 0
+            rc = 1 if _report_unreadable(summary) or errors else 0
+            return log_rollup(rc, found["unchanged"], 0, len(errors))
         result, ok = backfill(ctx, state, entries if args.apply else None,
                               preview=entries if not args.apply else None)
         print(json.dumps(result, indent=1))

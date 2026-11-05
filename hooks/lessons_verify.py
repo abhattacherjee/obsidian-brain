@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import re
 import subprocess
+import threading
 
 import obsidian_utils
 import vault_index
@@ -21,6 +22,14 @@ Examples:
 Reply with ONLY a JSON object mapping each candidate number to "same" or "different", e.g. {"1": "same", "2": "different"}. No prose."""
 RUBRIC_VERSION = "r2-2026-10-31"
 MODEL = "haiku"
+_spawn_count = 0
+_spawn_lock = threading.Lock()
+
+
+def spawn_count() -> int:
+    """Return the number of Claude subprocess attempts in this process."""
+    with _spawn_lock:
+        return _spawn_count
 
 
 def build_prompt(anchor: str, candidates: list[str]) -> str:
@@ -56,10 +65,13 @@ def parse_verdicts(stdout: str, n: int) -> list[bool] | None:
 
 
 def run_haiku(prompt: str, timeouts: tuple[int, int] = (120, 240)) -> str | None:
+    global _spawn_count
     for t in timeouts:
         try:
             # A stripped cwd avoids loading repo CLAUDE.md, memory, and git status.
             cwd = obsidian_utils.worker_cwd()
+            with _spawn_lock:
+                _spawn_count += 1
             result = subprocess.run(
                 # No tools and no MCP: retro text must not reach a tool-capable session.
                 ["claude", "-p", "--model", MODEL, "--setting-sources", "project",

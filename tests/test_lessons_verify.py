@@ -61,6 +61,33 @@ def test_verify_anchors_incomplete_reply_is_failed_and_not_cached(cache):
     assert cache._conn.execute("SELECT COUNT(*) FROM pairs").fetchone()[0] == 0
 
 
+def test_spawn_count_counts_each_attempt(monkeypatch):
+    attempts = iter([subprocess.TimeoutExpired("claude", 120),
+                     SimpleNamespace(returncode=0, stdout="ok")])
+
+    def fake_run(*args, **kwargs):
+        result = next(attempts)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    monkeypatch.setattr(lv.subprocess, "run", fake_run)
+    start = lv.spawn_count()
+    assert lv.run_haiku("prompt") == "ok"
+    assert lv.spawn_count() - start == 2
+
+
+def test_spawn_count_not_raised_when_cwd_fails(monkeypatch):
+    def failing_cwd():
+        raise OSError("cannot create worker cwd")
+
+    monkeypatch.setattr(obsidian_utils, "worker_cwd", failing_cwd)
+    monkeypatch.setattr(lv.subprocess, "run", lambda *a, **kw: pytest.fail("spawned"))
+    start = lv.spawn_count()
+    assert lv.run_haiku("prompt") is None
+    assert lv.spawn_count() == start
+
+
 def test_run_haiku_uses_worker_env(monkeypatch):
     calls = []
 

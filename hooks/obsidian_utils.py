@@ -1210,6 +1210,30 @@ def _append_sessionend_log(
         print(f"[obsidian-brain] sessionend log append failed: {exc}", file=sys.stderr)
 
 
+def append_event_log(event: str, fields: dict) -> None:
+    """Append a sanitized event to the shared hook log, best effort."""
+    try:
+        log_dir = os.path.join(os.path.expanduser("~"), ".claude")
+        log_path = os.path.join(log_dir, _HOOK_LOG_NAME)
+        os.makedirs(log_dir, exist_ok=True)
+        try:
+            if os.path.getsize(log_path) > _HOOK_LOG_MAX_BYTES:
+                os.replace(log_path, log_path + ".1")
+        except FileNotFoundError:
+            pass
+        timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+        parts = [timestamp, _sanitize_log_field(event).replace(" ", "_")]
+        for key, value in fields.items():
+            safe_key = _sanitize_log_field(str(key)).replace(" ", "_")
+            safe_value = _sanitize_log_field(str(value)).replace(" ", "_")
+            parts.append(f"{safe_key}={safe_value}")
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(" ".join(parts) + "\n")
+        os.chmod(log_path, 0o600)
+    except Exception as exc:
+        print(f"[obsidian-brain] event log append failed: {exc}", file=sys.stderr)
+
+
 def _append_reaper_log(project: str, sid: Optional[str], event: str, detail: str = "") -> None:
     """Reaper-specific telemetry. Same log file + rotation as SessionEnd
     telemetry, but uses event= keyword to keep enum spaces distinct.
