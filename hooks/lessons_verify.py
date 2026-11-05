@@ -57,6 +57,8 @@ def parse_verdicts(stdout: str, n: int) -> list[bool] | None:
 def run_haiku(prompt: str, timeouts: tuple[int, int] = (120, 240)) -> str | None:
     for t in timeouts:
         try:
+            # A stripped cwd avoids loading repo CLAUDE.md, memory, and git status.
+            cwd = obsidian_utils.worker_cwd()
             result = subprocess.run(
                 # No tools and no MCP: retro text must not reach a tool-capable session.
                 ["claude", "-p", "--model", MODEL, "--setting-sources", "project",
@@ -64,6 +66,7 @@ def run_haiku(prompt: str, timeouts: tuple[int, int] = (120, 240)) -> str | None
                 input=prompt,
                 capture_output=True, text=True, timeout=t,
                 env=obsidian_utils.worker_env(),
+                cwd=cwd,
             )
         except subprocess.TimeoutExpired:
             continue

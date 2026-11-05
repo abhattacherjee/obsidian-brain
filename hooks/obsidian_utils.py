@@ -2420,6 +2420,13 @@ def worker_env() -> dict:
     return env
 
 
+def worker_cwd() -> str:
+    """Keep headless workers from loading repo instructions, memory, and git status."""
+    path = os.path.join(_SECURE_DIR, "capture", "worker-cwd")
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    return path
+
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------

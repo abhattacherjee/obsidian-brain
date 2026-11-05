@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import pytest
 
 import lessons_verify as lv
+import obsidian_utils
 
 
 @pytest.fixture
@@ -77,6 +78,39 @@ def test_run_haiku_uses_worker_env(monkeypatch):
     assert kwargs["text"] is True
     assert kwargs["timeout"] == 120
     assert "stdin" not in kwargs
+
+
+def test_run_haiku_runs_from_worker_cwd(monkeypatch):
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(returncode=0, stdout="result")
+
+    monkeypatch.setattr(lv.subprocess, "run", fake_run)
+    assert lv.run_haiku("prompt") == "result"
+    cwd = calls[0]["cwd"]
+    assert cwd == obsidian_utils.worker_cwd()
+    assert os.path.isdir(cwd)
+    assert cwd != os.getcwd()
+    assert not os.path.exists(os.path.join(cwd, "CLAUDE.md"))
+    assert not os.path.exists(os.path.join(cwd, ".git"))
+
+
+def test_run_haiku_cwd_error_returns_none_without_spawning(monkeypatch):
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(returncode=0, stdout="result")
+
+    def failing_cwd():
+        raise OSError("cannot create worker cwd")
+
+    monkeypatch.setattr(lv.subprocess, "run", fake_run)
+    monkeypatch.setattr(obsidian_utils, "worker_cwd", failing_cwd)
+    assert lv.run_haiku("prompt") is None
+    assert calls == []
 
 
 def test_run_haiku_retries_once_on_timeout_then_none(monkeypatch):
