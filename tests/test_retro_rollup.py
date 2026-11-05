@@ -134,7 +134,7 @@ def test_second_update_starts_no_claude_process(env, monkeypatch, capsys):
     log = log_path.read_text().splitlines()
     assert "LessonsRollup cmd=update claude_calls=0" in log[-1]
     assert "rc=0" in log[-1]
-    assert "claude calls: 0, anchors judged: 0, cache hits: " in capsys.readouterr().out
+    assert "claude calls: 0, anchors sent: 0, cache hits: " in capsys.readouterr().out
 
 
 def test_update_never_batches_two_anchors_from_one_note(env, monkeypatch, capsys):
@@ -161,7 +161,7 @@ def test_update_never_batches_two_anchors_from_one_note(env, monkeypatch, capsys
         assert len(notes) == len(set(notes)), notes
     assert sorted(len(re.findall(r"^ANCHOR: ", p, re.M)) for p in prompts) == [1, 3, 3]
     out = capsys.readouterr().out
-    assert "claude calls: " in out and "anchors judged: 7," in out
+    assert "claude calls: " in out and "anchors sent: 7," in out
     line = (Path.home() / ".claude" / "obsidian-brain-hook.log").read_text().splitlines()[-1]
     assert "LessonsRollup cmd=update " in line and "claude_calls=0 anchors=7 " in line
 

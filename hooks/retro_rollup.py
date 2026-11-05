@@ -1528,7 +1528,7 @@ def main(argv=None) -> int:
                   f"failed: {summary['failed']}, notes written: {summary['notes_written']}, "
                   f"removed: {summary['notes_removed']}, unreadable notes: {summary['unreadable']}, "
                   f"claude calls: {lessons_verify.spawn_count() - start}, "
-                  f"anchors judged: {summary['anchors']}, "
+                  f"anchors sent: {summary['anchors']}, "
                   f"cache hits: {summary['cache_hits']}, parked: {summary['parked']}")
             stats.update(cache_hits=summary["cache_hits"], parked=summary["parked"],
                          failed=summary["failed"], anchors=summary["anchors"])

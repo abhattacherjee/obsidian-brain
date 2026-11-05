@@ -1289,7 +1289,7 @@
           "name": "Hook telemetry log",
           "kind": "datastore",
           "files": [],
-          "purpose": "The hook telemetry log (0600, rotates at 100 KB). One key=value line per SessionEnd/SessionStart/Reaper/LessonsRollup event; the primary diagnostic for sessions that produced no note. Completed rollup update, rebuild, match and refresh-tracking commands log actual Claude process attempts (including timeout retries), anchors judged (update, rebuild; #501), cache hits, parked anchors, failed judgments or lookups, and exit status (#487)."
+          "purpose": "The hook telemetry log (0600, rotates at 100 KB). One key=value line per SessionEnd/SessionStart/Reaper/LessonsRollup event; the primary diagnostic for sessions that produced no note. Completed rollup update, rebuild, match and refresh-tracking commands log actual Claude process attempts (including timeout retries), anchors sent to the verifier (update, rebuild; #501), cache hits, parked anchors, failed judgments or lookups, and exit status (#487)."
         },
         {
           "id": "db-summarizer-metrics",
