@@ -63,8 +63,8 @@ All frontmatter tags use the `claude/` prefix: `claude/session`, `claude/insight
 **Whenever a change adds, removes, or renames a hook, skill, vault-doctor check, CLI/support module, datastore, env var, or alters a data flow, update the architecture artifacts in the same PR:**
 
 - Edit `docs/architecture/architecture.json` (layers / components / flows / types / environment), keeping `lastUpdated` set to the change date and `version` in sync with `plugin.json`. Every `flows[].steps[].from`/`to` must reference a real `layers[].components[].id`, and every component `files[]` path must exist on disk.
-- Re-render the viewer: `~/.claude/skills/architecture-page/scripts/render-html.sh --json docs/architecture/architecture.json --output docs/architecture/architecture.html`
-- Validate before committing: `~/.claude/skills/architecture-page/scripts/smoke-test.sh --json docs/architecture/architecture.json` — both `[main]` and `[sparse]` must pass.
+- Re-render the viewer: `~/.claude/skills-archive/architecture-page/scripts/render-html.sh --json docs/architecture/architecture.json --output docs/architecture/architecture.html`
+- Validate before committing: `~/.claude/skills-archive/architecture-page/scripts/smoke-test.sh --json docs/architecture/architecture.json` — both `[main]` and `[sparse]` must pass.
 - For a large or structural change, regenerate from scratch via the `architecture-page` skill rather than hand-editing.
 - Ground every claim in live source (run `wc -l`, read the actual file) — never copy a number or path from prose/docs that may be stale.
 
