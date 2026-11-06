@@ -163,8 +163,9 @@ if scope['mode'] == 'vault':
 elif scope['mode'] == 'project' and scope['project']:
     projects = [scope['project']]
 else:
-    # current: derive project name from cwd git repo name
+    # current: derive the canonical project name (the main repo's name, also in a worktree)
     import subprocess
+    from obsidian_utils import canonical_project_name
     res = subprocess.run(
         ['git', 'rev-parse', '--show-toplevel'],
         capture_output=True, text=True
@@ -173,7 +174,7 @@ else:
         print('ERROR: /check-items current-project mode requires running inside a git repo.\n'
               'Use /check-items all (vault-wide) or /check-items <project>.', file=sys.stderr)
         sys.exit(1)
-    cwd_proj = os.path.basename(res.stdout.strip()) if res.returncode == 0 else None
+    cwd_proj = canonical_project_name()
     projects = [cwd_proj] if cwd_proj else None
 
 raw_items = []
@@ -267,6 +268,7 @@ def _ob_hooks():
     return max(_c, key=lambda _p: ([int(_n) for _n in _p.split("/")[-2].split(".")], _p), default="hooks")
 sys.path.insert(0, _ob_hooks())
 from retro_trace import closed_candidates
+from obsidian_utils import canonical_project_name
 
 scope_path = os.environ["SCOPE_PATH"]
 scope = json.load(open(scope_path))
@@ -279,7 +281,7 @@ elif scope["mode"] == "project" and scope["project"]:
     project = scope["project"]
 else:
     res = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True)
-    project = os.path.basename(res.stdout.strip()) if res.returncode == 0 else None
+    project = canonical_project_name() if res.returncode == 0 else None
     if project is None:
         print("ERROR: current-project mode needs a git repo; closed-issue lookup skipped", file=sys.stderr)
 result = {"candidates": [], "errors": []}
@@ -1101,6 +1103,7 @@ def _ob_hooks():
 sys.path.insert(0, _ob_hooks())
 from open_item_dedup import merge_records_from_groups
 from check_items_report import write_check_items_dashboard
+from obsidian_utils import canonical_project_name
 
 scope_path = os.environ["SCOPE_PATH"]
 raw_path = os.environ["RAW_PATH"]
@@ -1130,7 +1133,7 @@ elif scope["mode"] == "project" and scope["project"]:
     scope_name = scope["project"]
 else:
     res = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True)
-    scope_name = os.path.basename(res.stdout.strip()) if res.returncode == 0 and res.stdout.strip() else "unknown"
+    scope_name = canonical_project_name() if res.returncode == 0 and res.stdout.strip() else "unknown"
 
 date_str = datetime.date.today().isoformat()
 window_days = scope.get("window_days", 14)

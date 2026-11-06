@@ -5065,3 +5065,16 @@ def test_resolve_source_session_note_blocks_path_traversal(tmp_path):
         "a traversing session_note_name resolved to a file outside the "
         "vault and was vouched for as a session note"
     )
+
+
+def test_worker_cwd_creates_every_directory_0700(tmp_path, monkeypatch):
+    secure = tmp_path / "ob"
+    monkeypatch.setattr(obsidian_utils, "_SECURE_DIR", str(secure))
+    old = os.umask(0o022)
+    try:
+        path = obsidian_utils.worker_cwd()
+    finally:
+        os.umask(old)
+    assert path == str(secure / "capture" / "worker-cwd")
+    for d in (secure, secure / "capture", secure / "capture" / "worker-cwd"):
+        assert (d.stat().st_mode & 0o777) == 0o700, d

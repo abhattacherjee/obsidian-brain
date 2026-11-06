@@ -193,6 +193,23 @@ def test_positive_min_results_unsupported_is_usage_error(index, monkeypatch, cap
     assert "does not support" in captured.err
 
 
+def test_wal_copy_without_side_files_is_read(index, capsys):
+    with closing(sqlite3.connect(str(index))) as conn:  # noqa: vault-db-connect -- WAL-mode fixture in tmp_path only
+        assert conn.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+    side_files = [Path(str(index) + suffix) for suffix in ("-wal", "-shm")]
+    for path in side_files:
+        path.unlink(missing_ok=True)
+    assert index.read_bytes()[18:20] == b"\x02\x02"
+    assert all(not path.exists() for path in side_files)
+
+    assert retrieval_eval.main(["--db", str(index), "--json"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["cases"][0]["include_provisional"]["rank"] == 1
+    # No side-file check after the run: search_vault keeps its normal WAL
+    # connection (see the module docstring), and macOS SQLite keeps the
+    # -wal/-shm files that connection makes.
+
+
 def test_uri_metacharacters_select_exact_copy(index, capsys):
     special = index.with_name("copy?#.db")
     # A closed/checkpointed index is a standalone copy.

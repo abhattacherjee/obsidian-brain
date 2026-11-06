@@ -46,7 +46,7 @@ python3 hooks/obsidian_context_snapshot.py
 
 Sessions are logged with a **write-first pattern**: the raw note (with conversation excerpts, tool usage, metadata) is always saved to the vault immediately. AI summarization is deferred entirely: notes are written in raw form and upgraded by `/recall` on demand.
 
-Structured outcome telemetry is appended to `~/.claude/obsidian-brain-hook.log` for every SessionEnd exit path (success, all skip reasons, write failure, exception) and every SessionStart bootstrap event. The log uses one line per event with grep-friendly `key=value` fields, rotates at 100 KB to `obsidian-brain-hook.log.1`, and is the primary diagnostic surface for sessions that did not produce a vault note. Inspect with `awk '/SessionEnd/ {print $5}' ~/.claude/obsidian-brain-hook.log | sort | uniq -c` for a SessionEnd outcome distribution.
+Structured outcome telemetry is appended to `~/.claude/obsidian-brain-hook.log` for every SessionEnd exit path (success, all skip reasons, write failure, exception) and every SessionStart bootstrap event; `retro_rollup.py` also appends one `LessonsRollup` line per `update`, `rebuild`, `match` and `refresh-tracking` run. The log uses one line per event with grep-friendly `key=value` fields, rotates at 100 KB to `obsidian-brain-hook.log.1`, and is the primary diagnostic surface for sessions that did not produce a vault note. Inspect with `awk '/SessionEnd/ {print $5}' ~/.claude/obsidian-brain-hook.log | sort | uniq -c` for a SessionEnd outcome distribution.
 
 ### Configuration
 
@@ -63,8 +63,8 @@ All frontmatter tags use the `claude/` prefix: `claude/session`, `claude/insight
 **Whenever a change adds, removes, or renames a hook, skill, vault-doctor check, CLI/support module, datastore, env var, or alters a data flow, update the architecture artifacts in the same PR:**
 
 - Edit `docs/architecture/architecture.json` (layers / components / flows / types / environment), keeping `lastUpdated` set to the change date and `version` in sync with `plugin.json`. Every `flows[].steps[].from`/`to` must reference a real `layers[].components[].id`, and every component `files[]` path must exist on disk.
-- Re-render the viewer: `~/.claude/skills/architecture-page/scripts/render-html.sh --json docs/architecture/architecture.json --output docs/architecture/architecture.html`
-- Validate before committing: `~/.claude/skills/architecture-page/scripts/smoke-test.sh --json docs/architecture/architecture.json` — both `[main]` and `[sparse]` must pass.
+- Re-render the viewer: `~/.claude/skills-archive/architecture-page/scripts/render-html.sh --json docs/architecture/architecture.json --output docs/architecture/architecture.html`
+- Validate before committing: `~/.claude/skills-archive/architecture-page/scripts/smoke-test.sh --json docs/architecture/architecture.json` — both `[main]` and `[sparse]` must pass.
 - For a large or structural change, regenerate from scratch via the `architecture-page` skill rather than hand-editing.
 - Ground every claim in live source (run `wc -l`, read the actual file) — never copy a number or path from prose/docs that may be stale.
 
@@ -100,7 +100,7 @@ When writing new hooks, skills, or scripts, follow these rules:
 - Hotfixes branch from `main`, merge to both `main` and `develop`
 - Run `./scripts/commit-preflight.sh` before every commit
 - Stage first, then commit in a separate Bash call. The preflight token binds the staged tree, so the hooks refuse a commit that could stage files in the same call (`git add … && git commit …`, `git commit -a`, `-m "$(…)"`).
-- The five `.claude/hooks/*.py` gates are vendored unchanged from harden-repo (v1.3.0, `892d0f5`). Fix them upstream, never by hand. `tests/test_vendored_hooks.py::test_hook_bytes_match_harden_repo_v130` pins their sha256; `scripts/commit-preflight.sh` is upstream's template plus repo parts and is not pinned.
+- The five `.claude/hooks/*.py` gates are vendored unchanged from harden-repo (v1.3.1, release commit `f2574b5`; `commit-preflight.sh` is still the v1.3.0 template, unchanged in v1.3.1). Fix them upstream, never by hand. `tests/test_vendored_hooks.py::test_hook_bytes_match_harden_repo_v131` pins their sha256; `scripts/commit-preflight.sh` is upstream's template plus repo parts and is not pinned.
 
 ## Distribution & Release
 

@@ -359,7 +359,7 @@ def backup_db(db: str, backup_dir: Path | None = None) -> str:
         finally:
             src.close()
         os.chmod(dest, 0o600)
-        check = vault_index._connect(dest)
+        check = vault_index.connect_read_only(dest)
         try:
             got = check.execute("SELECT (SELECT COUNT(*) FROM notes), (SELECT COUNT(*) FROM access_log)").fetchone()
         finally:

@@ -21,7 +21,6 @@ sys.dont_write_bytecode = True
 import argparse
 import copy
 import json
-import sqlite3
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -68,20 +67,12 @@ def _using_ledger(path: Path):
 def _read_db(db: str):
     """Read without _connect's WAL conversion or new -wal/-shm files.
 
-    SQLite mode=ro alone creates sidecars even for a checkpointed WAL DB.
-    immutable avoids that when there is no WAL to read. With a live WAL,
-    use its existing shared-memory index, so committed WAL rows count too.
-    A WAL copy without its index must be checkpointed before inspection;
-    silently ignoring that WAL would give incorrect counts.
+    vault_index.connect_read_only avoids sidecars for checkpointed WAL DBs
+    and requires an existing shared-memory index to read committed WAL rows
+    rather than silently ignoring them.
     """
-    wal, shm = Path(db + "-wal"), Path(db + "-shm")
-    has_wal = wal.is_file() and wal.stat().st_size > 0
-    if has_wal and not shm.is_file():
-        raise ValueError("DB has a WAL without its shared-memory index; checkpoint the copy first")
-    options = "mode=ro" if has_wal else "mode=ro&immutable=1"
-    conn = sqlite3.connect(Path(db).as_uri() + "?" + options, uri=True, timeout=5.0)  # noqa: vault-db-connect -- read-only dry run; _connect would write WAL
+    conn = vault_index.connect_read_only(db)
     try:
-        conn.execute("PRAGMA query_only=ON")
         conn.execute("BEGIN")
         yield conn
     finally:

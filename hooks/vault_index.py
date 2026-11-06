@@ -205,6 +205,25 @@ def _connect(db_path: str) -> sqlite3.Connection:
     return conn
 
 
+def connect_read_only(db_path: str) -> sqlite3.Connection:
+    """Open an explicit DB file for reading without creating it.
+
+    When there is no WAL to read, immutable mode avoids creating side files.
+    A WAL without its shared-memory index is refused: immutable mode would
+    ignore the WAL and return wrong data. A missing file raises
+    sqlite3.OperationalError instead of being created.
+    """
+    wal, shm = Path(db_path + "-wal"), Path(db_path + "-shm")
+    has_wal = wal.is_file() and wal.stat().st_size > 0
+    if has_wal and not shm.is_file():
+        raise ValueError("DB has a WAL without its shared-memory index; checkpoint the copy first")
+    options = "mode=ro" if has_wal else "mode=ro&immutable=1"
+    uri = Path(os.path.abspath(db_path)).as_uri() + "?" + options
+    conn = sqlite3.connect(uri, uri=True, timeout=5.0)  # noqa: vault-db-connect -- read-only open of an explicit DB file; never creates it and never converts it to WAL
+    conn.execute("PRAGMA query_only=ON")
+    return conn
+
+
 def _init_schema(conn: sqlite3.Connection) -> None:
     """Create tables if they don't exist."""
     # Split and execute each statement (can't use executescript with IF NOT EXISTS
@@ -1303,12 +1322,22 @@ def _access_log_count(conn: sqlite3.Connection) -> int:
 
 def _backup_db(src: sqlite3.Connection, dest_path: str) -> None:
     """Copy the open DB to *dest_path* with SQLite's online backup API,
-    which reads a consistent snapshot even while WAL writers are active."""
+    which reads a consistent snapshot even while WAL writers are active.
+    The backup is a single self-contained file in rollback-journal mode.
+    """
     dest = _connect(dest_path)
     try:
         src.backup(dest)
+        mode = dest.execute("PRAGMA journal_mode=DELETE").fetchone()[0]
+        if mode.lower() != "delete":
+            raise sqlite3.OperationalError(f"backup {dest_path} stayed in {mode} mode")
     finally:
         dest.close()
+    for suffix in ("-wal", "-shm"):
+        try:
+            os.unlink(dest_path + suffix)
+        except FileNotFoundError:
+            pass
 
 
 def purge_access_log(
@@ -1375,15 +1404,16 @@ def purge_access_log(
         ).fetchone()[0]
         def _drop_backup() -> None:
             # Nothing was deleted, so a failed backup holds no unique data.
-            try:
-                os.unlink(backup_path)
-            except OSError:
-                pass
+            for p in (backup_path, backup_path + "-wal", backup_path + "-shm", backup_path + "-journal"):
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
 
         try:
             _backup_db(conn, backup_path)
             os.chmod(backup_path, 0o600)
-            check = _connect(backup_path)
+            check = connect_read_only(backup_path)
             try:
                 backed_up = _access_log_count(check)
                 max_id = check.execute(

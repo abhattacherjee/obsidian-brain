@@ -1,9 +1,9 @@
 {
   "name": "obsidian-brain",
   "displayName": "Obsidian Brain",
-  "version": "3.10.0",
+  "version": "3.11.0",
   "tagline": "A Claude Code plugin that turns an Obsidian vault into a persistent brain across sessions — auto-logging, curated knowledge capture, snapshot-on-compact, and fast cross-project recall, all via direct filesystem writes.",
-  "lastUpdated": "2026-11-01",
+  "lastUpdated": "2026-11-05",
   "repository": "https://github.com/abhattacherjee/obsidian-brain",
   "defaultBranch": "main",
   "techStack": {
@@ -1170,7 +1170,7 @@
           "files": [
             "hooks/lessons_verify.py"
           ],
-          "purpose": "Round 2 RUBRIC (RUBRIC_VERSION r2-2026-10-31), build_prompt / parse_verdicts, run_haiku (claude -p --model haiku, stdin closed, timeout), verify_anchors (per anchor, bounded concurrency), name_lessons, and VerdictCache: SQLite keyed by pair + rubric version + model (WAL, 0600 incl. -wal/-shm)."
+          "purpose": "Round 2 RUBRIC (RUBRIC_VERSION r2-2026-10-31), build_prompt / parse_verdicts, run_haiku (claude -p --model haiku, stdin closed, timeout, run from obsidian_utils.worker_cwd(), the stripped cwd shared with capture_worker; spawn_count() counts attempts), verify_anchors (up to BATCH=10 anchors per call, never two from one retro note; a lone anchor keeps the one-anchor prompt; bounded concurrency; a partial batch reply records the answered anchors and parks the rest), name_lessons, and VerdictCache: SQLite keyed by pair + rubric version + model (WAL, 0600 incl. -wal/-shm)."
         },
         {
           "id": "lessons-group",
@@ -1289,7 +1289,7 @@
           "name": "Hook telemetry log",
           "kind": "datastore",
           "files": [],
-          "purpose": "The hook telemetry log (0600, rotates at 100 KB). One key=value line per SessionEnd/SessionStart/Reaper event; the primary diagnostic for sessions that produced no note."
+          "purpose": "The hook telemetry log (0600, rotates at 100 KB). One key=value line per SessionEnd/SessionStart/Reaper/LessonsRollup event; the primary diagnostic for sessions that produced no note. Completed rollup update, rebuild, match and refresh-tracking commands log actual Claude process attempts (including timeout retries), anchors sent to the verifier (update, rebuild; #501), cache hits, parked anchors, failed judgments or lookups, and exit status (#487)."
         },
         {
           "id": "db-summarizer-metrics",
@@ -1314,7 +1314,7 @@
           "files": [
             "hooks/lessons_verify.py"
           ],
-          "purpose": "<secure dir>/lessons-verdicts.db: SQLite cache of Haiku same-lesson verdicts, one row per (anchor, candidate, rubric version, model); judged anchors are never re-sent. Rebuildable but costly (about 3,900 Haiku calls for a full vault)."
+          "purpose": "<secure dir>/lessons-verdicts.db: SQLite cache of Haiku same-lesson verdicts, one row per (anchor, candidate, rubric version, model); judged anchors are never re-sent. A failures table parks anchors whose Haiku reply did not parse (keyed by anchor, candidate-set hash, rubric version and model, with parked_at); a parked row expires after 30 days. Rebuildable but costly (about 3,900 Haiku calls for a full vault)."
         },
         {
           "id": "db-lessons-state",
@@ -1358,7 +1358,7 @@
           "files": [
             ".github/workflows/ci.yml"
           ],
-          "purpose": "Adaptive cost-optimized CI: secret-scan, changelog-check (PRs to main), python-tests (3.12, cov>=90), python-tests-py39 (whole suite on 3.9, the macOS system python3; no coverage gate, #371), no-default-db AST guard, security-tests, and an advisory detect-release-merge check."
+          "purpose": "Adaptive cost-optimized CI: secret-scan, changelog-check (PRs to main), python-tests (3.12, cov>=90), python-tests-py39 (suite on 3.9 minus the timed tests, the macOS system python3; no coverage gate, #371), both on pytest-xdist, plus timed-tests (the wall-clock budget tests run serially in two shards per Python, each on its own runner, for 3.12 and 3.9, #485), no-default-db AST guard, security-tests, and an advisory detect-release-merge check."
         },
         {
           "id": "ops-no-default-db",
@@ -2536,7 +2536,7 @@
     {
       "id": "lessons-update",
       "name": "Retro lessons update",
-      "description": "retro_rollup.py update judges new items, regroups and rewrites changed lesson notes.",
+      "description": "retro_rollup.py update judges new items, regroups and rewrites changed lesson notes. update/rebuild stdout includes Claude process attempts, cache hits and parked anchors (#487); a lock-protected lessons_verify.spawn_count tracks subprocess attempts across verifier, naming and matching calls, excluding worker cwd failures.",
       "steps": [
         {
           "from": "retro-rollup-cli",
@@ -2572,6 +2572,11 @@
           "from": "lessons-notes",
           "to": "db-vault",
           "label": "write changed notes to claude-insights/lessons/"
+        },
+        {
+          "from": "retro-rollup-cli",
+          "to": "telemetry-log",
+          "label": "LessonsRollup: Claude process attempts, anchors, cache hits, parked, failed, rc"
         }
       ]
     },

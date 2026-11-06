@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import hashlib
 import json
 from pathlib import Path
 import re
 import subprocess
+import threading
+import time
 
 import obsidian_utils
 import vault_index
@@ -20,6 +23,22 @@ Examples:
 Reply with ONLY a JSON object mapping each candidate number to "same" or "different", e.g. {"1": "same", "2": "different"}. No prose."""
 RUBRIC_VERSION = "r2-2026-10-31"
 MODEL = "haiku"
+PARK_DAYS = 30
+BATCH = 10
+BATCH_HEAD = """You will judge several ANCHOR groups. Apply the rules below to each group on its own; candidates are compared only with their own group's anchor."""
+BATCH_TAIL = """Reply with ONLY one JSON object mapping each group number to that group's object, e.g. {"1": {"1": "same", "2": "different"}, "2": {"1": "different"}}. No prose."""
+_spawn_count = 0
+_spawn_lock = threading.Lock()
+
+
+def _now() -> float:
+    return time.time()
+
+
+def spawn_count() -> int:
+    """Return the number of Claude subprocess attempts in this process."""
+    with _spawn_lock:
+        return _spawn_count
 
 
 def build_prompt(anchor: str, candidates: list[str]) -> str:
@@ -27,6 +46,14 @@ def build_prompt(anchor: str, candidates: list[str]) -> str:
         [RUBRIC, "", "ANCHOR: " + anchor, ""]
         + [f"CANDIDATE {i+1}: {c}" for i, c in enumerate(candidates)]
     )
+
+
+def build_batch_prompt(groups: list[tuple[str, list[str]]]) -> str:
+    lines = [BATCH_HEAD, "", RUBRIC, "", BATCH_TAIL]
+    for g, (anchor, cands) in enumerate(groups, 1):
+        lines += ["", f"=== GROUP {g} ===", "ANCHOR: " + anchor, ""]
+        lines += [f"CANDIDATE {i+1}: {c}" for i, c in enumerate(cands)]
+    return "\n".join(lines)
 
 
 def _parse_object(stdout: str) -> dict | None:
@@ -44,6 +71,10 @@ def parse_verdicts(stdout: str, n: int) -> list[bool] | None:
     obj = _parse_object(stdout)
     if obj is None:
         return None
+    return _verdicts_from(obj, n)
+
+
+def _verdicts_from(obj: dict, n: int) -> list[bool] | None:
     verdicts = []
     for i in range(n):
         value = obj.get(str(i + 1))
@@ -54,9 +85,42 @@ def parse_verdicts(stdout: str, n: int) -> list[bool] | None:
     return verdicts
 
 
+def parse_batch(stdout: str, sizes: list[int]) -> list[list[bool] | None] | None:
+    obj = _parse_object(stdout)
+    if obj is None:
+        return None
+    return [
+        _verdicts_from(sub, n) if isinstance(sub := obj.get(str(g)), dict) else None
+        for g, n in enumerate(sizes, 1)
+    ]
+
+
+def _group(anchors: list[str], note_of: dict[str, str] | None,
+           batch: int) -> list[list[str]]:
+    batch = max(1, batch)
+    groups = []
+    notes = []
+    for key in sorted(anchors, key=lambda key: (hashlib.sha1(key.encode()).hexdigest(), key)):
+        note = note_of.get(key, key) if note_of is not None else key
+        for group, seen in zip(groups, notes):
+            if len(group) < batch and note not in seen:
+                group.append(key)
+                seen.add(note)
+                break
+        else:
+            groups.append([key])
+            notes.append({note})
+    return groups
+
+
 def run_haiku(prompt: str, timeouts: tuple[int, int] = (120, 240)) -> str | None:
+    global _spawn_count
     for t in timeouts:
         try:
+            # A stripped cwd avoids loading repo CLAUDE.md, memory, and git status.
+            cwd = obsidian_utils.worker_cwd()
+            with _spawn_lock:
+                _spawn_count += 1
             result = subprocess.run(
                 # No tools and no MCP: retro text must not reach a tool-capable session.
                 ["claude", "-p", "--model", MODEL, "--setting-sources", "project",
@@ -64,6 +128,7 @@ def run_haiku(prompt: str, timeouts: tuple[int, int] = (120, 240)) -> str | None
                 input=prompt,
                 capture_output=True, text=True, timeout=t,
                 env=obsidian_utils.worker_env(),
+                cwd=cwd,
             )
         except subprocess.TimeoutExpired:
             continue
@@ -75,6 +140,10 @@ def run_haiku(prompt: str, timeouts: tuple[int, int] = (120, 240)) -> str | None
 
 def default_cache_path() -> Path:
     return Path.home() / ".claude" / "obsidian-brain" / "lessons-verdicts.db"
+
+
+def _cands_key(cand_keys: list[str]) -> str:
+    return hashlib.sha1("\n".join(cand_keys).encode()).hexdigest()
 
 
 class VerdictCache:
@@ -96,6 +165,14 @@ class VerdictCache:
                 "anchor TEXT, rubric TEXT, model TEXT, "
                 "PRIMARY KEY(anchor,rubric,model))"
             )
+            self._conn.execute(
+                "CREATE TABLE IF NOT EXISTS failures ("
+                "anchor TEXT, cands TEXT, rubric TEXT, model TEXT, parked_at REAL, "
+                "PRIMARY KEY(anchor,cands,rubric,model))"
+            )
+            columns = {row[1] for row in self._conn.execute("PRAGMA table_info(failures)")}
+            if "parked_at" not in columns:
+                self._conn.execute("ALTER TABLE failures ADD COLUMN parked_at REAL")
         # WAL mode keeps recent rows in side files; they hold the same data.
         for side in (path.with_name(path.name + "-wal"), path.with_name(path.name + "-shm")):
             if side.exists():
@@ -105,6 +182,21 @@ class VerdictCache:
         return self._conn.execute(
             "SELECT 1 FROM anchors WHERE anchor=? AND rubric=? AND model=?",
             (anchor_key, RUBRIC_VERSION, MODEL),
+        ).fetchone() is not None
+
+    def park(self, anchor_key: str, cand_keys: list[str]) -> None:
+        with self._conn:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO failures VALUES (?, ?, ?, ?, ?)",
+                (anchor_key, _cands_key(cand_keys), RUBRIC_VERSION, MODEL, _now()),
+            )
+
+    def parked(self, anchor_key: str, cand_keys: list[str]) -> bool:
+        return self._conn.execute(
+            "SELECT 1 FROM failures WHERE anchor=? AND cands=? AND rubric=? AND model=? "
+            "AND parked_at > ?",
+            (anchor_key, _cands_key(cand_keys), RUBRIC_VERSION, MODEL,
+             _now() - PARK_DAYS * 86400),
         ).fetchone() is not None
 
     def record(self, anchor_key: str, cand_keys: list[str], verdicts: list[bool]) -> None:
@@ -138,6 +230,9 @@ class VerdictCache:
             dead_anchors = [tuple(row) for row in self._conn.execute(
                 "SELECT anchor, rubric, model FROM anchors"
             ) if row[0] not in live_keys]
+            dead_failures = [tuple(row) for row in self._conn.execute(
+                "SELECT anchor, cands, rubric, model FROM failures"
+            ) if row[0] not in live_keys]
             self._conn.executemany(
                 "DELETE FROM pairs WHERE a=? AND b=? AND rubric=? AND model=?",
                 dead_pairs,
@@ -145,6 +240,10 @@ class VerdictCache:
             self._conn.executemany(
                 "DELETE FROM anchors WHERE anchor=? AND rubric=? AND model=?",
                 dead_anchors,
+            )
+            self._conn.executemany(
+                "DELETE FROM failures WHERE anchor=? AND cands=? AND rubric=? AND model=?",
+                dead_failures,
             )
             return self._conn.total_changes - before
 
@@ -154,32 +253,63 @@ class VerdictCache:
 
 def verify_anchors(texts: dict[str, str], cands: dict[str, list[str]],
                    cache: VerdictCache, runner=None, concurrency: int = 8,
-                   progress=None) -> dict:
+                   progress=None, note_of: dict[str, str] | None = None,
+                   batch: int = BATCH) -> dict:
     if runner is None:
         runner = run_haiku
-    anchors = [a for a, keys in cands.items() if keys and not cache.judged(a)]
+    anchors = []
+    cache_hits = parked = 0
+    for anchor, keys in cands.items():
+        if not keys:
+            continue
+        if cache.judged(anchor):
+            cache_hits += 1
+        elif cache.parked(anchor, keys):
+            parked += 1
+        else:
+            anchors.append(anchor)
     total = len(anchors)
-    judged = failed = 0
+    groups = _group(anchors, note_of, batch)
+    judged = failed = unparseable = 0
 
-    def verify(anchor):
-        out = runner(build_prompt(texts[anchor], [texts[c] for c in cands[anchor]]))
-        return parse_verdicts(out, len(cands[anchor])) if out is not None else None
+    def verify(group):
+        inputs = [(texts[a], [texts[c] for c in cands[a]]) for a in group]
+        prompt = build_prompt(*inputs[0]) if len(group) == 1 else build_batch_prompt(inputs)
+        out = runner(prompt)
+        # An empty reply is a runner failure, not an unparseable answer: retry it.
+        if out is None or not out.strip():
+            return [None] * len(group), False
+        sizes = [len(cands[a]) for a in group]
+        if len(group) == 1:
+            verdicts = [parse_verdicts(out, sizes[0])]
+        else:
+            verdicts = parse_batch(out, sizes)
+        return verdicts if verdicts is not None else [None] * len(group), True
 
     with ThreadPoolExecutor(max_workers=concurrency) as pool:
-        futures = {pool.submit(verify, a): a for a in anchors}
-        for done, future in enumerate(as_completed(futures), 1):
-            verdicts = future.result()
-            if verdicts is None:
-                failed += 1
-            else:
-                anchor = futures[future]
-                cache.record(anchor, cands[anchor], verdicts)
-                judged += 1
-            if progress is not None and done % 100 == 0 and done != total:
+        futures = {pool.submit(verify, group): group for group in groups}
+        done = 0
+        for future in as_completed(futures):
+            verdicts, has_reply = future.result()
+            group = futures[future]
+            for anchor, verdict in zip(group, verdicts):
+                if verdict is None:
+                    failed += 1
+                    if has_reply:
+                        cache.park(anchor, cands[anchor])
+                        unparseable += 1
+                else:
+                    cache.record(anchor, cands[anchor], verdict)
+                    judged += 1
+            prev = done
+            done += len(group)
+            if progress is not None and prev // 100 != done // 100 and done != total:
                 progress(done, total, failed)
     if progress is not None:
         progress(total, total, failed)
-    return {"judged": judged, "failed": failed, "skipped": len(cands) - total}
+    return {"judged": judged, "failed": failed, "unparseable": unparseable,
+            "parked": parked, "cache_hits": cache_hits, "calls": len(groups), "anchors": total,
+            "skipped": len(cands) - total}
 
 
 def name_lessons(lessons: list[dict], texts: dict[str, str], runner=None) -> dict[str, str]:

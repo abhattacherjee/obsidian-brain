@@ -4087,6 +4087,21 @@ def _statement_global_opts(argv, words):
     return argv[start + 1:end - (len(words) - 1)]
 
 
+def _has_nul(path):
+    """Whether *path* is a string holding a NUL byte (#176).
+
+    No real path holds one: git and the kernel cut the string at the first
+    NUL. So a NUL-bearing target names no directory this reader can follow,
+    and every resolver checks for it on the RAW string, first, and fails
+    closed. Do not lean on os.path.realpath raising instead. 3.10+ raises
+    ValueError, but macOS's /usr/bin/python3 (3.9.6), which runs these hooks,
+    does not: there realpath('/tmp/<NUL>/..') is '/private/tmp', because the
+    `..` pops the NUL part. `git -C <elsewhere>/<NUL>/.. commit` then read as
+    aimed at <elsewhere>, while git ran HERE.
+    """
+    return isinstance(path, str) and "\x00" in path
+
+
 def _normalised_cd_target(target):
     """An absolute path, normalised as bash's logical `cd` would, or None.
 
@@ -4104,6 +4119,8 @@ def _normalised_cd_target(target):
     would also invent a resolution for a path that does not exist -- both are
     answers about a directory the command may never reach.
     """
+    if _has_nul(target):
+        return None
     try:
         expanded = os.path.expandvars(os.path.expanduser(target))
     except (AttributeError, TypeError, ValueError):
@@ -5225,6 +5242,8 @@ def _anchor(path, base):
     *base* -- the absolute directory the shell stands in -- and is None
     without one: a bare relative string compared against a project path
     means whatever this hook process's cwd happens to be."""
+    if _has_nul(path) or _has_nul(base):
+        return None
     absolute = _normalised_cd_target(path)
     if absolute is not None:
         return absolute
@@ -5242,6 +5261,8 @@ def _physical_path(path, base):
     normpath here was a bypass: `env -C link2/.. git push origin HEAD`,
     with link2 -> <main>/sub, folded to the current directory while git ran
     in the main checkout on develop."""
+    if _has_nul(path) or _has_nul(base):
+        return None
     try:
         expanded = os.path.expandvars(os.path.expanduser(path))
     except (AttributeError, TypeError, ValueError):
@@ -5323,6 +5344,8 @@ def _command_scope_uncached(cmd, verb=None, base=None):
     """_command_scope_raw, with a relative answer (from a GIT_DIR or
     `env -C`) anchored to *base*."""
     scope = _command_scope_raw(cmd, verb, base)
+    if _has_nul(scope):
+        return _SCOPE_UNKNOWN  # see _has_nul: no directory to follow
     if (isinstance(scope, str) and base is not None and
             _normalised_cd_target(scope) is None):
         anchored = _anchor(scope, base)
@@ -5421,7 +5444,8 @@ def _command_scope_raw(cmd, verb=None, base=None):
 def _scope_key(answer):
     """*answer* canonicalised for comparison only: an absolute path through
     realpath (after a logical fold for a plain `cd`); anything else as is."""
-    if not isinstance(answer, str) or not answer.startswith("/"):
+    if (not isinstance(answer, str) or not answer.startswith("/") or
+            _has_nul(answer)):
         return answer
     try:
         return os.path.realpath(os.path.normpath(answer))
@@ -5958,6 +5982,8 @@ def _effective_cwd(cmd, default, verb=None, base=None):
         return default
     if not target:
         return default
+    if _has_nul(target) or _has_nul(base):
+        return default  # see _has_nul: cannot tell, so read HERE
     target = os.path.expandvars(os.path.expanduser(target))
     if base and not target.startswith("/"):
         # normpath, not realpath, first: bash's `cd` is logical, so `..`
@@ -6045,6 +6071,10 @@ def _targets_this_project(cmd: str, base=None) -> bool:
             # else": run the guard, the same fail-closed reading an
             # unresolvable `cd` already gets below.
             return True
+        if _has_nul(target):
+            # Checked here, not left to the except below: 3.9's realpath
+            # does not raise for a NUL (see _has_nul).
+            return True
         target = os.path.expanduser(target)
         target = os.path.expandvars(target)
         try:
@@ -6052,7 +6082,7 @@ def _targets_this_project(cmd: str, base=None) -> bool:
             # realpath'd already (see _effective_cwd).
             target = os.path.realpath(os.path.normpath(target))
         except (OSError, ValueError):
-            return True  # e.g. a NUL byte -> be safe, run the guard
+            return True  # unresolvable -> be safe, run the guard
         # Same repository -> run the guard, even when the target is a
         # SIBLING worktree rather than a subdirectory. Containment alone
         # answered "no" there and skipped the guard entirely.
@@ -6512,8 +6542,10 @@ _GH_SAFE = frozenset({"create", "view", "edit", "comment", "list"})
 # could still be waiting after its claim lapsed.
 _PLAIN_SAFE = frozenset({"echo", "true"})
 # `git push` with only these options and plain words: no --receive-pack,
-# --exec or other option that runs a program.
-_PUSH_SAFE_OPTIONS = frozenset({"-u", "--set-upstream"})
+# --exec or other option that runs a program. `-q`/`-v` and their long forms
+# only change how much git prints (#163). Exact match, so `-qu` is not read.
+_PUSH_SAFE_OPTIONS = frozenset({"-u", "--set-upstream", "-q", "--quiet",
+                                "-v", "--verbose"})
 
 
 def _lex(command):
@@ -6578,16 +6610,28 @@ def _safe_commit_args(command):
     options such as ``-C``); exactly one of them is a commit; and there is no
     ``<`` or ``>`` (a redirection can write into .git/hooks, and its target
     is not an argument the command sees)."""
+    return _keep_reader(command)[0]
+
+
+def _keep_reader(command):
+    """``(args, None)`` when _safe_commit_args would keep the token for
+    *command*, where *args* are the words after ``commit``. Otherwise
+    ``(None, why)``: *why* names the first thing that stops the keep, and
+    fits after "this one has" in the spend note (#163)."""
     items = _lex(command)
     if items is None:
-        return None
+        return (None,
+                "a character it does not read exactly (`$`, a backtick, "
+                "a backslash, a glob, a brace, `~`, `!`, a lone `&` "
+                "or a carriage return), an unclosed quote, or over "
+                "100,000 characters")
     segments, cur = [], []
     for kind, text in items:
         if kind == "op" and text in _SEPARATORS:
             segments.append(cur)
             cur = []
         elif kind == "op":
-            return None  # < or >
+            return None, "a `<` or `>` redirection"
         else:
             cur.append(text)
     segments.append(cur)
@@ -6613,8 +6657,15 @@ def _safe_commit_args(command):
         elif head in _PLAIN_SAFE:
             pass
         else:
-            return None
-    return commits[0] if len(commits) == 1 else None
+            segment = " ".join(words)
+            if len(segment) > 60:
+                segment = segment[:60] + "…"
+            return None, f"`{segment}`"
+    if not commits:
+        return None, "no plain `git commit`"
+    if len(commits) > 1:
+        return None, "more than one `git commit`"
+    return commits[0], None
 
 
 # --- the token file ---
@@ -6746,7 +6797,8 @@ def _index_lock_held(cwd):
 def _check_bound_token(token, command, input_data):
     """Allow or deny a commit against a token that records ``head``,
     ``tree`` and ``worktree``; keep the token only for a command read
-    exactly (_safe_commit_args). Runs under the token lock."""
+    exactly (_keep_reader). Return a note when approval spends the
+    token, else None. Runs under the token lock."""
     # A missing field reads as None, which _bound_fields_ok refuses.
     if not _bound_fields_ok(token):
         _spend_token()
@@ -6813,12 +6865,13 @@ The token covered a different set of staged changes. Run preflight again:
 
 Then retry your commit.""")
 
-    commit_args = _safe_commit_args(command)
+    commit_args, why = _keep_reader(command)
     if token["head"] == "":
         # An unborn branch: there is no HEAD to watch move, so the token is
         # spent on its first commit.
         _spend_token()
-        return
+        return ("The token was spent on approval: the first commit on a "
+                "branch with no commits always spends it.")
     is_amend = commit_args is not None and _has_amend(commit_args)
     state = _token_state(token["head"], is_amend, cwd)
     if state == "git-error":
@@ -6839,7 +6892,12 @@ Then retry your commit.""")
         # Not read exactly: this call may commit where this hook cannot see
         # HEAD move, so the token is spent on approval, as before.
         _spend_token()
-        return
+        return ("The token was spent on approval: this hook keeps it "
+                "only for a command it reads exactly, and this one has "
+                + why + ". If another hook denies this call, "
+                "nothing is committed and you must run "
+                "./scripts/commit-preflight.sh again. Run a plain "
+                "`git commit` as its own call to keep the token.")
     _claim_token(token)
 
 
@@ -7050,14 +7108,18 @@ Then retry your commit.""")
         # This is not forgery protection; see the module docstring.
         _spend_token()
         block(_OLD_FORMAT_TOKEN_REASON)
-    _check_bound_token(token_data, command, input_data)
+    note = _check_bound_token(token_data, command, input_data)
 
     # Token valid - allow commit
     # Output verification status for audit trail
+    context = (
+        f"✅ Preflight verified: {checks_run} | {staged_count} files")
+    if note is not None:
+        context += "\n\n" + note
     _emit({
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
-            "additionalContext": f"✅ Preflight verified: {checks_run} | {staged_count} files"
+            "additionalContext": context
         }
     })
     sys.exit(0)
