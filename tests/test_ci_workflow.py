@@ -71,6 +71,10 @@ def test_aggregator_needs_every_pr_test_job():
     needs = jobs[AGGREGATOR]["needs"]
     assert isinstance(needs, list), needs
     assert set(needs) == test_jobs
+    # A needed job with continue-on-error reports `success` when it fails,
+    # so the aggregator would stay green.
+    for name in test_jobs:
+        assert "continue-on-error" not in jobs[name], name
 
 
 @_REQUIRES_YAML
@@ -103,6 +107,9 @@ def test_aggregator_cannot_pass_without_running_its_check():
     assert "continue-on-error" not in step, step
     assert "if" not in step, step
     assert step.get("shell", "bash") == "bash", step
+    # A `defaults: run: shell:` at job or workflow level would replace bash.
+    assert "defaults" not in agg, agg.get("defaults")
+    assert "defaults" not in _workflow(), _workflow().get("defaults")
 
 
 @_REQUIRES_YAML

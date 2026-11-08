@@ -73,7 +73,7 @@ All frontmatter tags use the `claude/` prefix: `claude/session`, `claude/insight
 ## Conventions
 
 - **Commits:** Use conventional commit format — `feat(obsidian-brain):`, `fix:`, `chore:`, `docs:`
-- **Python:** stdlib only, no pip dependencies. All hooks must be deterministic and safe to run at session boundaries.
+- **Python:** stdlib only, no pip dependencies. Test-only exception: CI's pytest jobs `pip install` pytest, pytest-cov, pytest-xdist and PyYAML (`tests/test_ci_workflow.py` reads `ci.yml` with PyYAML, #505). Never import them from `hooks/` or `scripts/`. All hooks must be deterministic and safe to run at session boundaries.
 - **Atomic writes:** All vault writes must use temp file + rename pattern (see `write_vault_note()` in `obsidian_utils.py`).
 - **Version:** Bump `plugin.json` and `.claude-plugin/marketplace.json` in lockstep (use `scripts/bump-version.sh`), and update `CHANGELOG.md` for releases.
 - **Branching:** Never commit directly to develop/main — use feature branches.
