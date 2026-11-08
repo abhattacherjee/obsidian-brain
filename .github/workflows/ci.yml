@@ -92,8 +92,8 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
-      - name: Install pytest, coverage and xdist
-        run: pip install pytest pytest-cov pytest-xdist
+      - name: Install pytest, coverage, xdist and PyYAML
+        run: pip install pytest pytest-cov pytest-xdist pyyaml
       - name: Run tests with coverage
         run: |
           read -ra timed <<< "$TIMED_TESTS"
@@ -111,8 +111,8 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: '3.9'
-      - name: Install pytest and xdist
-        run: pip install pytest pytest-xdist
+      - name: Install pytest, xdist and PyYAML
+        run: pip install pytest pytest-xdist pyyaml
       - name: Run tests on Python 3.9
         run: |
           read -ra timed <<< "$TIMED_TESTS"
@@ -181,6 +181,34 @@ jobs:
         env:
           OB_HOOKS_DIR: hooks
         run: bash scripts/test-security.sh
+
+  # ── Test gate — the one check develop requires for the tests (GH #505) ─
+  # Branch protection requires this job, not each test job, so the matrix
+  # names (`timed-tests (3.12, 1)` and so on) never sit in branch
+  # protection. `always()` matters: without it GitHub skips this job when a
+  # need fails, and a skipped required check counts as passing. Only
+  # `success` passes; failure, cancelled and skipped all fail.
+  # tests/test_ci_workflow.py checks that `needs` lists every PR test job.
+  tests-passed:
+    if: always() && github.event_name == 'pull_request'
+    needs: [python-tests, python-tests-py39, timed-tests, no-default-db-check, security-tests]
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Fail unless every test job succeeded
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          set -euo pipefail
+          read -ra results <<< "${RESULTS:-}"
+          [ "${#results[@]}" -gt 0 ] || { echo "::error::no test job results"; exit 1; }
+          for r in "${results[@]}"; do
+            if [ "$r" != success ]; then
+              echo "::error::a test job ended '$r'; every test job must succeed (results: $RESULTS)"
+              exit 1
+            fi
+          done
+          echo "all ${#results[@]} test jobs succeeded"
 
   # ── Post-merge: release verification (main only, advisory) ─
   detect-release-merge:

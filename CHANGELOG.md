@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- CI gains a `tests-passed` job that needs the five test jobs (`python-tests`, `python-tests-py39`, `timed-tests`, `no-default-db-check` and `security-tests`) and passes only when every one succeeded (#505). It runs with `always()`, because GitHub skips a job whose need failed, and a skipped required check counts as passing. `develop` now requires `secret-scan`, `python-tests` and `tests-passed`, so a red suite blocks a merge. Branch protection names the one aggregator, not the four `timed-tests (<python>, <shard>)` matrix checks, so a matrix change does not break it. `tests/test_ci_workflow.py` checks that `needs` lists every job not named as a non-test job, that the `if:` is exactly `always() && github.event_name == 'pull_request'`, that the job has one step whose env is exactly the `RESULTS` join of every need's result, with no `RESULTS` at workflow or job level, that the step has no `if:`, no `continue-on-error` and no non-bash `shell:` (and no `defaults` at job or workflow level), that no needed test job has `continue-on-error`, that `pull_request` has no `paths` filter, and that the script fails on a failed, skipped or cancelled job or on no results. The test reads `ci.yml` with PyYAML, a test-only dependency that CI installs.
+
 ## [3.11.0] - 2026-11-05
 
 ### Changed
