@@ -90,17 +90,20 @@ def test_aggregator_runs_always_on_pull_requests():
 
 @_REQUIRES_BASH
 @pytest.mark.parametrize(
-    "results, code",
+    "results, code, message",
     [
-        ("success success success success success", 0),
-        ("success", 0),
-        ("success failure success success success", 1),
-        ("success skipped success success success", 1),
-        ("cancelled success success success success", 1),
-        ("", 1),
+        ("success success success success success", 0, "all 5 test jobs succeeded"),
+        ("success", 0, "all 1 test jobs succeeded"),
+        ("success failure success success success", 1, "a test job ended 'failure'"),
+        ("success skipped success success success", 1, "a test job ended 'skipped'"),
+        ("cancelled success success success success", 1, "a test job ended 'cancelled'"),
+        # The message matters, not just the exit code: macOS bash 3.2 exits 1
+        # on an empty array under `set -u` even without the guard, while
+        # bash 5 on the CI runner would exit 0.
+        ("", 1, "no test job results"),
     ],
 )
-def test_aggregator_script_passes_only_when_every_need_succeeded(results, code):
+def test_aggregator_script_passes_only_when_every_need_succeeded(results, code, message):
     script = _run_script(_jobs()[AGGREGATOR])
     proc = subprocess.run(
         ["bash", "-c", script],
@@ -111,3 +114,4 @@ def test_aggregator_script_passes_only_when_every_need_succeeded(results, code):
         stdin=subprocess.DEVNULL,
     )
     assert proc.returncode == code, proc.stdout + proc.stderr
+    assert message in proc.stdout, proc.stdout + proc.stderr
