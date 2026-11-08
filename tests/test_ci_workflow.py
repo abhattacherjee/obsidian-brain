@@ -35,7 +35,7 @@ def _jobs():
     start = lines.index("jobs:") + 1
     jobs, name = {}, None
     for line in lines[start:]:
-        m = re.match(r"^  ([A-Za-z0-9_-]+):\s*$", line)
+        m = re.match(r"^  ([A-Za-z0-9_-]+):\s*(#.*)?$", line)
         if m:
             name = m.group(1)
             jobs[name] = []
@@ -88,7 +88,14 @@ def test_aggregator_runs_always_on_pull_requests():
 
 def test_aggregator_collects_every_need_result():
     expected = "RESULTS: ${{ join(needs.*.result, ' ') }}"
-    assert expected in [line.strip() for line in _jobs()[AGGREGATOR]]
+    job = _jobs()[AGGREGATOR]
+    # One RESULTS line only: a job-level `env:` copy plus a step override
+    # (`RESULTS: success`) must not pass.
+    results = [line.strip() for line in job if line.strip().startswith("RESULTS:")]
+    assert results == [expected], results
+    # One run step only, so a second step cannot replace the gate.
+    runs = [line for line in job if re.match(r"^\s+(- )?run:", line)]
+    assert len(runs) == 1, runs
 
 
 @_REQUIRES_BASH
