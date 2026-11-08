@@ -22,8 +22,9 @@ import pytest
 
 CI_YML = Path(__file__).resolve().parent.parent / ".github" / "workflows" / "ci.yml"
 AGGREGATOR = "tests-passed"
-# PR jobs that are not test jobs, so the aggregator does not need them.
-NOT_TEST_JOBS = {"secret-scan", "changelog-check", AGGREGATOR}
+# Every job in ci.yml is a test job unless named here, so a new job (with or
+# without an `if:`) must be added to the aggregator's `needs:` or to this set.
+NOT_TEST_JOBS = {"secret-scan", "changelog-check", "detect-release-merge", AGGREGATOR}
 
 _REQUIRES_BASH = pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
 
@@ -73,19 +74,21 @@ def _run_script(job_lines):
 
 def test_aggregator_needs_every_pr_test_job():
     jobs = _jobs()
-    pr_jobs = {
-        name
-        for name, body in jobs.items()
-        if "github.event_name == 'pull_request'" in (_field(body, "if") or "")
-    }
-    assert _needs(jobs[AGGREGATOR]) == pr_jobs - NOT_TEST_JOBS
+    # A renamed or deleted entry must fail here, not silently shrink the set.
+    assert NOT_TEST_JOBS <= set(jobs), NOT_TEST_JOBS - set(jobs)
+    test_jobs = set(jobs) - NOT_TEST_JOBS
+    assert test_jobs, "no test jobs found"
+    assert _needs(jobs[AGGREGATOR]) == test_jobs
 
 
 def test_aggregator_runs_always_on_pull_requests():
     cond = _field(_jobs()[AGGREGATOR], "if")
-    assert cond is not None
-    assert "always()" in cond
-    assert "github.event_name == 'pull_request'" in cond
+    assert cond == "always() && github.event_name == 'pull_request'"
+
+
+def test_aggregator_collects_every_need_result():
+    expected = "RESULTS: ${{ join(needs.*.result, ' ') }}"
+    assert expected in [line.strip() for line in _jobs()[AGGREGATOR]]
 
 
 @_REQUIRES_BASH
