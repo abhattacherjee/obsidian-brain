@@ -57,7 +57,8 @@ def _claude_p_calls(path: Path):
         if node.func.attr != "run" or getattr(node.func.value, "id", None) != "subprocess":
             continue
         first = ast.get_source_segment(source, node.args[0]) if node.args else ""
-        if '"claude"' in first or first == "cmd":
+        # summarizer_argv(model) builds the stripped summarizer argv (#510).
+        if '"claude"' in first or first == "cmd" or first.startswith("summarizer_argv("):
             yield node.lineno, any(k.arg == "env" for k in node.keywords)
 
 

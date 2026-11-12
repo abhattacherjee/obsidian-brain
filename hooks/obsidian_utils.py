@@ -2446,6 +2446,22 @@ def worker_cwd() -> str:
     return path
 
 
+def summarizer_argv(model: str) -> list[str]:
+    """No tools, no MCP, project settings only (#510)."""
+    return [
+        "claude", "-p", "--model", model, "--setting-sources", "project",
+        "--strict-mcp-config", "--tools", "", "--no-session-persistence",
+    ]
+
+
+def _summarizer_cwd() -> str | None:
+    """Use the stripped worker cwd when available; keep summarizing on failure."""
+    try:
+        return worker_cwd()
+    except OSError:
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -4613,7 +4629,8 @@ def generate_snapshot_summary(
     for i, attempt_timeout in enumerate(attempts):
         try:
             result = subprocess.run(
-                ["claude", "-p", "--model", model, "--no-session-persistence"],
+                summarizer_argv(model),
+                cwd=_summarizer_cwd(),
                 input=prompt, capture_output=True, text=True, timeout=attempt_timeout,
                 env=worker_env(),
             )
@@ -4679,7 +4696,8 @@ def generate_theme_names(
     for idx, attempt_timeout in enumerate(attempts):
         try:
             result = subprocess.run(
-                ["claude", "-p", "--model", model, "--no-session-persistence"],
+                summarizer_argv(model),
+                cwd=_summarizer_cwd(),
                 input=prompt, capture_output=True, text=True, timeout=attempt_timeout,
                 env=worker_env(),
             )
@@ -4830,7 +4848,8 @@ Rate this session 1-10. 1-3: trivial (config, interrupted). 4-6: standard work. 
     for i, attempt_timeout in enumerate(attempts):
         try:
             result = subprocess.run(
-                ["claude", "-p", "--model", model, "--no-session-persistence"],
+                summarizer_argv(model),
+                cwd=_summarizer_cwd(),
                 input=prompt,
                 capture_output=True,
                 text=True,
@@ -7297,7 +7316,8 @@ def generate_summaries_batch(
     for i, attempt_timeout in enumerate(attempts):
         try:
             result = subprocess.run(
-                ["claude", "-p", "--model", model, "--no-session-persistence"],
+                summarizer_argv(model),
+                cwd=_summarizer_cwd(),
                 input=prompt,
                 capture_output=True,
                 text=True,
