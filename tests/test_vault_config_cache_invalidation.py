@@ -90,11 +90,11 @@ def test_snapshot_on_clear_toggle_is_seen_by_the_redisplay_read(home_cfg):
 
 def test_step5_returns_to_step1_before_redisplay():
     text = (_REPO_ROOT / "skills" / "vault-config" / "SKILL.md").read_text(encoding="utf-8")
-    assert "go back to Step 1 to re-read the config" in text
-    assert "go back to Step 2 to redisplay" not in text
+    assert "go back to Step 1" in text
+    assert "go back to Step 2" not in text
 
 
 def test_folder_hint_no_longer_blames_the_config_cache():
     text = (_REPO_ROOT / "skills" / "vault-config" / "SKILL.md").read_text(encoding="utf-8")
-    assert "read a cached copy of the config" not in text
+    assert "cached copy" not in text
     assert "/vault-reindex" in text

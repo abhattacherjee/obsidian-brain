@@ -4,6 +4,11 @@ Repro: a session cached its config with pre-3.8.0 code, whose _DEFAULTS had no
 `wiki_folder`. After the plugin updated mid-session, load_config() kept
 returning that dict, so /vault-ask's `c.get("wiki_folder")` read None and the
 wiki was silently turned off for the rest of the session.
+
+#59: the cache also keeps the config file's (st_ino, st_mtime_ns, st_size),
+taken before the read, and trusts the cached config only while the file still
+matches. The config and both signatures are one cache value, "config_entry",
+so two processes cannot leave an old dict beside a new file's signature.
 """
 import builtins
 import json
@@ -26,13 +31,63 @@ def cfg(tmp_path, monkeypatch):
     return path
 
 
+def _entry(config, **over):
+    entry = {
+        "config": config,
+        "defaults_sig": obsidian_utils._defaults_signature(),
+        "file_sig": obsidian_utils._config_file_sig(),
+    }
+    entry.update(over)
+    return entry
+
+
 def test_cache_written_by_older_code_is_not_trusted(cfg):
     # The literal repro: old code cached "config" with no signature key, and
-    # its dict lacked the wiki_folder default added in 3.8.0.
-    stale = {k: v for k, v in obsidian_utils._DEFAULTS.items() if k != "wiki_folder"}
-    stale["vault_path"] = "/vault"
-    obsidian_utils.cache_set(SID, "config", stale)
-    assert obsidian_utils.load_config().get("wiki_folder") == "claude-wiki"
+    # its dict lacked the wiki_folder default added in 3.8.0. The old keys
+    # are ignored, even a "config" that looks current.
+    obsidian_utils.cache_set(SID, "config", dict(obsidian_utils._DEFAULTS, vault_path="/stale"))
+    obsidian_utils.cache_set(SID, "config_defaults_sig", obsidian_utils._defaults_signature())
+    loaded = obsidian_utils.load_config()
+    assert loaded.get("wiki_folder") == "claude-wiki"
+    assert loaded["vault_path"] == "/vault"
+
+
+def test_entry_with_wrong_defaults_sig_is_not_trusted(cfg):
+    obsidian_utils.cache_set(SID, "config_entry", _entry(
+        dict(obsidian_utils._DEFAULTS, vault_path="/stale"), defaults_sig="not-the-sig"))
+    assert obsidian_utils.load_config()["vault_path"] == "/vault"
+
+
+def test_entry_missing_a_default_key_is_not_trusted(cfg):
+    short = {k: v for k, v in obsidian_utils._DEFAULTS.items() if k != "wiki_folder"}
+    short["vault_path"] = "/stale"
+    obsidian_utils.cache_set(SID, "config_entry", _entry(short))
+    loaded = obsidian_utils.load_config()
+    assert loaded["vault_path"] == "/vault"
+    assert loaded["wiki_folder"] == "claude-wiki"
+
+
+def test_config_and_signatures_are_one_cache_value(cfg, monkeypatch):
+    keys = []
+    real_set = obsidian_utils.cache_set
+
+    def record(sid, key, value):
+        keys.append(key)
+        return real_set(sid, key, value)
+
+    monkeypatch.setattr(obsidian_utils, "cache_set", record)
+    obsidian_utils.load_config()
+    assert keys == ["config_entry"]
+
+
+def test_stale_entry_under_old_file_sig_is_rejected(cfg):
+    obsidian_utils.load_config()
+    old_sig = obsidian_utils._config_file_sig()
+    cfg.write_text(json.dumps({"vault_path": "/new-value-longer"}))
+    assert obsidian_utils._config_file_sig() != old_sig
+    obsidian_utils.cache_set(SID, "config_entry", _entry(
+        dict(obsidian_utils._DEFAULTS, vault_path="/stale"), file_sig=old_sig))
+    assert obsidian_utils.load_config()["vault_path"] == "/new-value-longer"
 
 
 def test_defaults_change_mid_session_is_picked_up(cfg, monkeypatch):
@@ -48,29 +103,31 @@ def test_rewritten_config_is_read_in_the_same_session(cfg):
     assert obsidian_utils.load_config(fresh=True)["vault_path"] == "/elsewhere"
 
 
-def test_invalidating_config_key_still_forces_a_reread(cfg):
+def test_invalidating_config_entry_still_forces_a_reread(cfg):
     obsidian_utils.load_config()
     cfg.write_text(json.dumps({"vault_path": "/elsewhere"}))
-    obsidian_utils.cache_invalidate(SID, "config")
+    obsidian_utils.cache_invalidate(SID, "config_entry")
     assert obsidian_utils.load_config()["vault_path"] == "/elsewhere"
 
 
 def test_signature_is_not_a_config_key(cfg):
-    # The signature lives beside the config in the cache, never inside it,
-    # so /vault-config never shows it as a setting.
-    assert "config_defaults_sig" not in obsidian_utils.load_config()
-    assert "config_defaults_sig" not in obsidian_utils.load_config()
+    # The signature lives beside the config in the cache entry, never inside
+    # it, so /vault-config never shows it as a setting.
+    assert "defaults_sig" not in obsidian_utils.load_config()
+    assert "defaults_sig" not in obsidian_utils.load_config()
 
 
 def test_old_code_rewriting_config_under_a_new_signature_is_not_trusted(cfg):
     # Review finding on PR #411. Old hooks keep running the pre-update install
     # for the whole session; an old load_config re-caches "config" without
-    # touching "config_defaults_sig", so the signature alone would bless it.
+    # touching anything else. The new code reads only "config_entry", so that
+    # old dict is never served.
     assert obsidian_utils.load_config()["wiki_folder"] == "claude-wiki"  # 1
-    obsidian_utils.cache_invalidate(SID, "config")                       # 2
+    obsidian_utils.cache_invalidate(SID, "config_entry")                 # 2
     old = {k: v for k, v in obsidian_utils._DEFAULTS.items() if k != "wiki_folder"}
     old["vault_path"] = "/vault"
     obsidian_utils.cache_set(SID, "config", old)                         # 3
+    obsidian_utils.cache_set(SID, "config_defaults_sig", obsidian_utils._defaults_signature())
     assert obsidian_utils.load_config().get("wiki_folder") == "claude-wiki"  # 4
 
 
@@ -121,11 +178,13 @@ def test_missing_file_cached_then_created_file_is_read(tmp_path, monkeypatch):
     assert obsidian_utils.load_config()["vault_path"] == "/created"
 
 
-def test_cache_from_older_code_without_file_sig_is_not_trusted(tmp_path, monkeypatch):
+def test_entry_without_file_sig_is_not_trusted(tmp_path, monkeypatch):
     monkeypatch.setattr(obsidian_utils, "_CONFIG_PATH", str(tmp_path / "missing-config.json"))
     monkeypatch.setattr(obsidian_utils, "_get_session_id_fast", lambda *a, **k: SID)
-    obsidian_utils.cache_set(SID, "config_defaults_sig", obsidian_utils._defaults_signature())
-    obsidian_utils.cache_set(SID, "config", dict(obsidian_utils._DEFAULTS, vault_path="/stale"))
+    obsidian_utils.cache_set(SID, "config_entry", {
+        "config": dict(obsidian_utils._DEFAULTS, vault_path="/stale"),
+        "defaults_sig": obsidian_utils._defaults_signature(),
+    })
     assert obsidian_utils.load_config()["vault_path"] != "/stale"
 
 
@@ -151,4 +210,28 @@ def test_sig_taken_before_read(cfg, monkeypatch):
 
 
 def test_file_sig_is_not_a_config_key(cfg):
-    assert "config_file_sig" not in obsidian_utils.load_config()
+    assert "file_sig" not in obsidian_utils.load_config()
+
+
+def test_same_length_in_place_edit_with_new_mtime_is_seen(cfg):
+    assert obsidian_utils.load_config()["vault_path"] == "/vault"
+    before = cfg.stat()
+    cfg.write_text(json.dumps({"vault_path": "/vaulY"}))
+    os.utime(cfg, ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000))
+    after = cfg.stat()
+    assert after.st_ino == before.st_ino
+    assert after.st_size == before.st_size
+    assert after.st_mtime_ns != before.st_mtime_ns
+    assert obsidian_utils.load_config()["vault_path"] == "/vaulY"
+
+
+def test_different_length_edit_with_old_mtime_is_seen(cfg):
+    assert obsidian_utils.load_config()["vault_path"] == "/vault"
+    before = cfg.stat()
+    cfg.write_text(json.dumps({"vault_path": "/vault-much-longer"}))
+    os.utime(cfg, ns=(before.st_atime_ns, before.st_mtime_ns))
+    after = cfg.stat()
+    assert after.st_ino == before.st_ino
+    assert after.st_mtime_ns == before.st_mtime_ns
+    assert after.st_size != before.st_size
+    assert obsidian_utils.load_config()["vault_path"] == "/vault-much-longer"
