@@ -67,7 +67,7 @@ class TestConfigDefaults:
         monkeypatch.setattr(
             obsidian_utils, "_get_session_id_fast", lambda: "test-session-id",
         )
-        obsidian_utils.cache_set("test-session-id", "config", None)
+        obsidian_utils.cache_invalidate("test-session-id", "config_entry")
 
         loaded = obsidian_utils.load_config()
         assert loaded["optional_deps_prompted"] is False
@@ -90,13 +90,13 @@ class TestConfigDefaults:
         monkeypatch.setattr(
             obsidian_utils, "_get_session_id_fast", lambda: "leak-test-session",
         )
-        obsidian_utils.cache_set("leak-test-session", "config", None)
+        obsidian_utils.cache_invalidate("leak-test-session", "config_entry")
 
         first = obsidian_utils.load_config()
         first["optional_deps_declined"].append("poisoned-entry")
 
         # Bust the cache so the second call rebuilds from _DEFAULTS + disk.
-        obsidian_utils.cache_set("leak-test-session", "config", None)
+        obsidian_utils.cache_invalidate("leak-test-session", "config_entry")
         second = obsidian_utils.load_config()
 
         assert second["optional_deps_declined"] == [], (

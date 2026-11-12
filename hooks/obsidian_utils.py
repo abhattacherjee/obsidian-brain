@@ -2470,31 +2470,42 @@ def _summarizer_cwd() -> str | None:
 def load_config(fresh: bool = False) -> dict:
     """Read ~/.claude/obsidian-brain-config.json, returning defaults for missing keys.
 
-    Session-scoped caching: first call loads from disk and writes to cache;
-    subsequent calls within the same session hit the cache. ``fresh=True``
-    skips the cache read and refreshes the cache from disk: callers that
-    prune the index by folder (``/vault-reindex``, ``/obsidian-setup``) use
-    it so a config written earlier in the session is not ignored (#393).
+    The result is cached per session as one ``config_entry`` value:
+    ``{"config": ..., "defaults_sig": ..., "file_sig": ...}``. A later call
+    returns the cached config only while the entry still matches the current
+    ``_DEFAULTS`` and the current config file. Otherwise it re-reads the file.
+    ``fresh=True`` skips the cache read and rewrites the entry (#393):
+    ``/vault-reindex`` and ``/obsidian-setup`` use it so a config written
+    earlier in the session is not ignored.
 
-    The cache is valid only for the ``_DEFAULTS`` that wrote it (#409). A
-    plugin update mid-session changes ``_DEFAULTS``; without this check the
-    old cached dict lacks every new default key (``wiki_folder`` after
-    3.8.0), and a raw ``config.get(key)`` reads None until the session ends.
+    The entry is one value, written by one ``cache_set`` (#59). The config
+    and both signatures used to be three keys, and two processes could
+    interleave their writes. An old dict then sat beside the new file's
+    signature and was trusted until the next config edit.
 
-    The signature alone is not enough: hooks registered at session start
-    keep running the old install, and an old ``load_config`` rewrites
-    ``config`` without touching ``config_defaults_sig``. So a cached dict
-    must also carry every current default key.
+    ``defaults_sig`` is a hash of ``_DEFAULTS`` (#409). A plugin update
+    mid-session changes ``_DEFAULTS``; the old cached dict lacks the new
+    default keys (``wiki_folder`` after 3.8.0). The entry must also carry
+    every current default key, because hooks registered at session start
+    keep running the old install, and old code may still write the
+    separate ``config`` and ``config_defaults_sig`` keys. This code ignores
+    those keys.
+
+    ``file_sig`` is ``(st_ino, st_mtime_ns, st_size)`` of the config file,
+    taken before the read (#59). A /vault-config write, a hand edit or
+    another session's write is seen on the next call.
     """
+    file_sig = _config_file_sig()
     sid = _get_session_id_fast()
     sig = _defaults_signature()
-    cached = None
-    if not fresh and cache_get(sid, "config_defaults_sig") == sig:
-        cached = cache_get(sid, "config")
-        if not (isinstance(cached, dict) and _DEFAULTS.keys() <= cached.keys()):
-            cached = None
-    if cached is not None:
-        return cached
+    if not fresh:
+        entry = cache_get(sid, "config_entry")
+        if (isinstance(entry, dict)
+                and entry.get("defaults_sig") == sig
+                and entry.get("file_sig") == file_sig
+                and isinstance(entry.get("config"), dict)
+                and _DEFAULTS.keys() <= entry["config"].keys()):
+            return entry["config"]
 
     # dict(_DEFAULTS) is a shallow copy — any list/dict values in _DEFAULTS
     # would be shared across calls, so an in-place mutation on
@@ -2531,8 +2542,8 @@ def load_config(fresh: bool = False) -> dict:
             except OSError as exc:
                 print(f"[obsidian-brain] WARNING: config is world-readable and chmod failed: {exc}", file=sys.stderr)
 
-    cache_set(sid, "config", config)
-    cache_set(sid, "config_defaults_sig", sig)
+    cache_set(sid, "config_entry",
+              {"config": config, "defaults_sig": sig, "file_sig": file_sig})
     return config
 
 
@@ -2540,6 +2551,17 @@ def _defaults_signature() -> str:
     """Short hash of ``_DEFAULTS``: names the code that wrote a cached config."""
     blob = json.dumps(_DEFAULTS, sort_keys=True, default=str)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
+
+
+def _config_file_sig() -> "list | str":
+    """Identify the config file for session cache validation (#59)."""
+    try:
+        st = os.stat(_CONFIG_PATH)
+    except OSError:
+        return "absent"
+    # A list, not a tuple: the cache round-trips through JSON, and a tuple
+    # would never compare equal to the list it comes back as.
+    return [st.st_ino, st.st_mtime_ns, st.st_size]
 
 
 def indexed_folders(config: dict, strict: bool = False) -> list:

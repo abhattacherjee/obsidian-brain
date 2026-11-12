@@ -558,7 +558,7 @@ def test_config_deepcopy() -> None:
         c1.setdefault("optional_deps_declined", []).append("poisoned")
         # Bust cache
         sid = obsidian_utils._get_session_id_fast()
-        obsidian_utils.cache_set(sid, "config", None)
+        obsidian_utils.cache_invalidate(sid, "config_entry")
         c2 = obsidian_utils.load_config()
         if "poisoned" not in c2.get("optional_deps_declined", []):
             pass_("mutation did not leak across load_config calls")

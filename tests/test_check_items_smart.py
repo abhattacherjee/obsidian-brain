@@ -2505,7 +2505,7 @@ def _reset_load_config_cache():
     """
     import obsidian_utils
     sid = obsidian_utils._get_session_id_fast()
-    obsidian_utils.cache_invalidate(sid, "config")
+    obsidian_utils.cache_invalidate(sid, "config_entry")
 
 
 def test_check_items_report_default_folder_is_claude_check_items(tmp_path, monkeypatch):
