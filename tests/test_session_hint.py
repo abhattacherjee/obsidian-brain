@@ -41,14 +41,15 @@ _RAW_SUMMARY = (
 @pytest.fixture
 def _note(tmp_vault):
     def _note(name, *, type_="claude-session", sid="s-old",
-              summary="Built the frobulator.", status="summarized"):
+              summary="Built the frobulator.", status="summarized",
+              project="test-project", filler=""):
         note_path = tmp_vault / "claude-sessions" / name
         type_line = f"type: {type_}\n" if type_ is not None else ""
         summary_section = f"## Summary\n{summary}\n\n" if summary is not None else ""
         note_path.write_text(
             f"---\n{type_line}date: 2026-11-12\nsession_id: {sid}\n"
-            f"project: test-project\nstatus: {status}\n---\n\n"
-            f"{summary_section}## Open Questions / Next Steps\n"
+            f"project: {project}\nstatus: {status}\n---\n\n"
+            f"{summary_section}{filler}## Open Questions / Next Steps\n"
             "- [ ] Add integration tests.\n",
             encoding="utf-8",
         )
@@ -89,6 +90,30 @@ def test_hint_skips_newest_raw_note(tmp_vault, _note):
     _note("2026-11-11-test-project.md")
     result = find_latest_session(str(tmp_vault), "claude-sessions", "test-project")
     assert result["summary"] == "Built the frobulator."
+
+
+def test_hint_accepts_summary_mentioning_unavailable_phrase(tmp_vault, _note):
+    _note("2026-11-12-test-project.md", status="summarized",
+          summary="Fixed SessionStart hints that printed AI summary unavailable.")
+    result = find_latest_session(str(tmp_vault), "claude-sessions", "test-project")
+    assert result["summary"] == "Fixed SessionStart hints that printed AI summary unavailable."
+
+
+def test_hint_cap_counts_only_project_notes(tmp_vault, _note):
+    for i in range(60):
+        _note(f"2026-11-12-other-{i:04d}.md", project="other-project", sid=f"o{i}")
+    _note("2026-11-01-test-project.md")
+    result = find_latest_session(str(tmp_vault), "claude-sessions", "test-project")
+    assert result["summary"] == "Built the frobulator."
+
+
+def test_hint_reads_next_steps_past_16kb_head(tmp_vault, _note):
+    filler = "## Details\n" + ("x" * 20000) + "\n\n"
+    _note("2026-11-12-test-project.md", filler=filler)
+    assert len(filler) > 16384
+    result = find_latest_session(str(tmp_vault), "claude-sessions", "test-project")
+    assert result["summary"] == "Built the frobulator."
+    assert "Add integration tests." in result["next_steps"]
 
 
 def test_hint_only_raw_and_snapshot_notes(tmp_vault, _note):

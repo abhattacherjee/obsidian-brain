@@ -73,6 +73,7 @@ def test_summarizer_subprocess_argv_and_cwd(
     assert argv[argv.index("--tools") + 1] == ""
     assert "--no-session-persistence" in argv
     assert kwargs["cwd"] == str(tmp_path)
+    assert kwargs["env"][obsidian_utils.WORKER_ENV_VAR] == "1"
 
 
 def test_summarizer_cwd_none_on_oserror(monkeypatch):

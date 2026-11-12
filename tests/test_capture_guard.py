@@ -70,6 +70,11 @@ def test_every_claude_p_call_passes_worker_env(name):
     assert missing == [], f"{name}: claude -p calls without env= at lines {missing}"
 
 
+def test_summarizer_argv_sites_are_scanned():
+    # Positive control: the 4 summarizer sites build argv via summarizer_argv(...).
+    assert len(list(_claude_p_calls(HOOKS / "obsidian_utils.py"))) >= 4
+
+
 class _CountingStdin(io.StringIO):
     reads = 0
 

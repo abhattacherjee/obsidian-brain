@@ -5043,6 +5043,10 @@ def flip_note_status(path: str, old_status: str, new_status: str) -> bool:
 
 _HINT_MAX_PROJECT_NOTES = 50
 
+# Exact boilerplate the raw fallback writer emits when AI summarization is
+# unavailable. Match this, not the loose phrase, so real prose may mention it.
+RAW_SUMMARY_MARKER = "AI summary unavailable \u2014 raw extraction below."
+
 
 def find_latest_session(
     vault_path: str, sessions_folder: str, project: str, exclude_session_id: str = ""
@@ -5110,7 +5114,7 @@ def find_latest_session(
         )
         if summary_match:
             summary = summary_match.group(1).strip()
-        if not summary or "AI summary unavailable" in summary:
+        if not summary or RAW_SUMMARY_MARKER in summary:
             continue
 
         # Extract next steps section
@@ -5308,7 +5312,7 @@ def find_unsummarized_notes(
 
         # Defense-in-depth: check if already has a real summary
         has_summary = bool(re.search(r'^## Summary', content, re.MULTILINE))
-        has_unavailable = 'AI summary unavailable' in content
+        has_unavailable = RAW_SUMMARY_MARKER in content
 
         if has_summary and not has_unavailable:
             # Already summarized by legacy code path — fix status on disk
@@ -6353,7 +6357,7 @@ def build_raw_fallback(
     sections.append("## Summary")
     sections.append(
         f"Session in **{project}** ({duration} min). "
-        "AI summary unavailable \u2014 raw extraction below.\n"
+        f"{RAW_SUMMARY_MARKER}\n"
     )
 
     sections.append("## Key Decisions")
