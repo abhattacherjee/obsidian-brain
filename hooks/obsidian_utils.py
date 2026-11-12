@@ -2485,11 +2485,18 @@ def load_config(fresh: bool = False) -> dict:
     keep running the old install, and an old ``load_config`` rewrites
     ``config`` without touching ``config_defaults_sig``. So a cached dict
     must also carry every current default key.
+
+    The cache is also valid only for the config file it was read from,
+    keyed on (st_ino, st_mtime_ns, st_size) taken before the read (#59).
+    A /vault-config write, a hand edit or another session's write is seen
+    on the next call.
     """
+    file_sig = _config_file_sig()
     sid = _get_session_id_fast()
     sig = _defaults_signature()
     cached = None
-    if not fresh and cache_get(sid, "config_defaults_sig") == sig:
+    if (not fresh and cache_get(sid, "config_defaults_sig") == sig
+            and cache_get(sid, "config_file_sig") == file_sig):
         cached = cache_get(sid, "config")
         if not (isinstance(cached, dict) and _DEFAULTS.keys() <= cached.keys()):
             cached = None
@@ -2533,6 +2540,7 @@ def load_config(fresh: bool = False) -> dict:
 
     cache_set(sid, "config", config)
     cache_set(sid, "config_defaults_sig", sig)
+    cache_set(sid, "config_file_sig", file_sig)
     return config
 
 
@@ -2540,6 +2548,15 @@ def _defaults_signature() -> str:
     """Short hash of ``_DEFAULTS``: names the code that wrote a cached config."""
     blob = json.dumps(_DEFAULTS, sort_keys=True, default=str)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
+
+
+def _config_file_sig():
+    """Identify the config file for session cache validation (#59)."""
+    try:
+        st = os.stat(_CONFIG_PATH)
+    except OSError:
+        return "absent"
+    return [st.st_ino, st.st_mtime_ns, st.st_size]
 
 
 def indexed_folders(config: dict, strict: bool = False) -> list:

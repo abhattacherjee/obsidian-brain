@@ -209,11 +209,13 @@ def test_load_config_fresh_bypasses_session_cache(tmp_path, monkeypatch):
     monkeypatch.setattr(obsidian_utils, "_CONFIG_PATH", cfg)
     # The fake cache serves the current defaults signature and a dict with
     # every default key (#409), or the cached config counts as written by
-    # other code and is never returned.
+    # other code and is never returned. It also serves the config file's
+    # current signature (#59), or the cache counts as read from another file.
     sig = obsidian_utils._defaults_signature()
+    file_sig = obsidian_utils._config_file_sig()
     cached = dict(obsidian_utils._DEFAULTS, vault_path="/v", wiki_folder="old")
-    monkeypatch.setattr(obsidian_utils, "cache_get", lambda sid, key: sig if key == "config_defaults_sig"
-                        else cached)
+    fake = {"config_defaults_sig": sig, "config_file_sig": file_sig}
+    monkeypatch.setattr(obsidian_utils, "cache_get", lambda sid, key: fake.get(key, cached))
     monkeypatch.setattr(obsidian_utils, "cache_set", lambda sid, key, val: None)
     assert obsidian_utils.load_config()["wiki_folder"] == "old"
     assert obsidian_utils.load_config(fresh=True)["wiki_folder"] == "new-wiki"
