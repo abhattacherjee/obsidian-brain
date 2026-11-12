@@ -74,6 +74,16 @@ def test_hint_skips_newest_snapshot(tmp_vault, _note):
     assert result["summary"] == "Built the frobulator."
 
 
+@pytest.mark.parametrize("type_", ["claude-snapshot", "claude-insight"])
+def test_hint_skips_non_session_type_with_summary(tmp_vault, _note, type_):
+    # A summarized snapshot has a real ## Summary; only the type check skips it.
+    _note("2026-11-12-test-project-aaaa-snapshot-092042.md",
+          type_=type_, summary="Snapshot of the current work.")
+    _note("2026-11-11-test-project.md")
+    result = find_latest_session(str(tmp_vault), "claude-sessions", "test-project")
+    assert result["summary"] == "Built the frobulator."
+
+
 def test_hint_skips_newest_raw_note(tmp_vault, _note):
     _note("2026-11-12-test-project.md", summary=_RAW_SUMMARY, status="auto-logged")
     _note("2026-11-11-test-project.md")
