@@ -211,9 +211,18 @@ def _run() -> None:
             # Reaper is best-effort; never break SessionStart
             print(f"[obsidian-brain] reaper failed: {exc}", file=sys.stderr)
 
+    if hook_input.get("source") == "compact":
+        print("[obsidian-brain] hint skipped: compact (the compaction summary covers this session)", file=sys.stderr)
+        return
+    if os.environ.get("CLAUDE_CODE_ENTRYPOINT", "").startswith("sdk"):
+        print("[obsidian-brain] hint skipped: headless sdk entrypoint", file=sys.stderr)
+        return
+
     # 4. Find latest session note for this project
-    latest = find_latest_session(vault_path, sessions_folder, project)
-    if not latest:
+    latest = find_latest_session(
+        vault_path, sessions_folder, project, exclude_session_id=session_id
+    )
+    if not latest or not latest["summary"].strip():
         print(f"[obsidian-brain] no previous sessions found for {project}", file=sys.stderr)
         return
 

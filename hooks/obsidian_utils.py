@@ -5041,13 +5041,19 @@ def flip_note_status(path: str, old_status: str, new_status: str) -> bool:
     return True
 
 
-def find_latest_session(
-    vault_path: str, sessions_folder: str, project: str
-) -> dict | None:
-    """Find the most recent session note for a project.
+_HINT_MAX_PROJECT_NOTES = 50
 
-    Searches YAML frontmatter for ``project: <project>``.
-    Returns ``{date, summary, next_steps}`` or None.
+
+def find_latest_session(
+    vault_path: str, sessions_folder: str, project: str, exclude_session_id: str = ""
+) -> dict | None:
+    """Find the most recent usable summarized session note for a project (#510).
+
+    Skip non-session types (but accept legacy notes without a type), the
+    excluded session, and empty or unavailable summaries to avoid useless hints.
+    Read only a frontmatter prefix until project/type/session checks pass, and
+    inspect at most 50 project-matching notes to bound SessionStart work.
+    Return ``{date, summary, next_steps}`` or None.
     """
     sessions_dir = Path(vault_path) / sessions_folder
     if not sessions_dir.exists():
@@ -5057,9 +5063,13 @@ def find_latest_session(
     # Collect candidate files sorted by name descending (newest date first)
     candidates = sorted(sessions_dir.glob("*.md"), reverse=True)
 
+    inspected = 0
     for note_path in candidates:
+        if inspected >= _HINT_MAX_PROJECT_NOTES:
+            return None
         try:
-            text = note_path.read_text(encoding="utf-8", errors="replace")
+            with open(note_path, "r", encoding="utf-8", errors="replace") as f:
+                text = f.read(16384)
         except OSError:
             continue
 
@@ -5077,6 +5087,19 @@ def find_latest_session(
         if fm_project.lower() != project.lower() and slugify(fm_project) != slug:
             continue
 
+        inspected += 1
+        note_type = parse_frontmatter_field(frontmatter, "type")
+        if note_type is not None and note_type != "claude-session":
+            continue
+        note_session_id = parse_frontmatter_field(frontmatter, "session_id")
+        if exclude_session_id and note_session_id == exclude_session_id:
+            continue
+
+        try:
+            text = note_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+
         # Extract date from frontmatter
         date_str = parse_frontmatter_field(frontmatter, "date") or ""
 
@@ -5087,6 +5110,8 @@ def find_latest_session(
         )
         if summary_match:
             summary = summary_match.group(1).strip()
+        if not summary or "AI summary unavailable" in summary:
+            continue
 
         # Extract next steps section
         next_steps = ""
