@@ -57,7 +57,8 @@ def _claude_p_calls(path: Path):
         if node.func.attr != "run" or getattr(node.func.value, "id", None) != "subprocess":
             continue
         first = ast.get_source_segment(source, node.args[0]) if node.args else ""
-        if '"claude"' in first or first == "cmd":
+        # summarizer_argv(model) builds the stripped summarizer argv (#510).
+        if '"claude"' in first or first == "cmd" or first.startswith("summarizer_argv("):
             yield node.lineno, any(k.arg == "env" for k in node.keywords)
 
 
@@ -67,6 +68,11 @@ def test_every_claude_p_call_passes_worker_env(name):
     assert calls, f"expected claude -p calls in {name}"
     missing = [line for line, has_env in calls if not has_env]
     assert missing == [], f"{name}: claude -p calls without env= at lines {missing}"
+
+
+def test_summarizer_argv_sites_are_scanned():
+    # Positive control: the 4 summarizer sites build argv via summarizer_argv(...).
+    assert len(list(_claude_p_calls(HOOKS / "obsidian_utils.py"))) >= 4
 
 
 class _CountingStdin(io.StringIO):

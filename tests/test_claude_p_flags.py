@@ -31,7 +31,7 @@ def claude_p_sites():
 
 
 def test_found_enough_claude_p_sites():
-    assert len(claude_p_sites()) >= 8
+    assert len(claude_p_sites()) >= 5
 
 
 def test_every_claude_p_argv_disables_session_persistence():

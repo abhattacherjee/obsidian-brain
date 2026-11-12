@@ -2446,6 +2446,22 @@ def worker_cwd() -> str:
     return path
 
 
+def summarizer_argv(model: str) -> list[str]:
+    """No tools, no MCP, project settings only (#510)."""
+    return [
+        "claude", "-p", "--model", model, "--setting-sources", "project",
+        "--strict-mcp-config", "--tools", "", "--no-session-persistence",
+    ]
+
+
+def _summarizer_cwd() -> str | None:
+    """Use the stripped worker cwd when available; keep summarizing on failure."""
+    try:
+        return worker_cwd()
+    except OSError:
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -4613,7 +4629,8 @@ def generate_snapshot_summary(
     for i, attempt_timeout in enumerate(attempts):
         try:
             result = subprocess.run(
-                ["claude", "-p", "--model", model, "--no-session-persistence"],
+                summarizer_argv(model),
+                cwd=_summarizer_cwd(),
                 input=prompt, capture_output=True, text=True, timeout=attempt_timeout,
                 env=worker_env(),
             )
@@ -4679,7 +4696,8 @@ def generate_theme_names(
     for idx, attempt_timeout in enumerate(attempts):
         try:
             result = subprocess.run(
-                ["claude", "-p", "--model", model, "--no-session-persistence"],
+                summarizer_argv(model),
+                cwd=_summarizer_cwd(),
                 input=prompt, capture_output=True, text=True, timeout=attempt_timeout,
                 env=worker_env(),
             )
@@ -4830,7 +4848,8 @@ Rate this session 1-10. 1-3: trivial (config, interrupted). 4-6: standard work. 
     for i, attempt_timeout in enumerate(attempts):
         try:
             result = subprocess.run(
-                ["claude", "-p", "--model", model, "--no-session-persistence"],
+                summarizer_argv(model),
+                cwd=_summarizer_cwd(),
                 input=prompt,
                 capture_output=True,
                 text=True,
@@ -5022,13 +5041,23 @@ def flip_note_status(path: str, old_status: str, new_status: str) -> bool:
     return True
 
 
-def find_latest_session(
-    vault_path: str, sessions_folder: str, project: str
-) -> dict | None:
-    """Find the most recent session note for a project.
+_HINT_MAX_PROJECT_NOTES = 50
 
-    Searches YAML frontmatter for ``project: <project>``.
-    Returns ``{date, summary, next_steps}`` or None.
+# Exact boilerplate the raw fallback writer emits when AI summarization is
+# unavailable. Match this, not the loose phrase, so real prose may mention it.
+RAW_SUMMARY_MARKER = "AI summary unavailable \u2014 raw extraction below."
+
+
+def find_latest_session(
+    vault_path: str, sessions_folder: str, project: str, exclude_session_id: str = ""
+) -> dict | None:
+    """Find the most recent usable summarized session note for a project (#510).
+
+    Skip non-session types (but accept legacy notes without a type), the
+    excluded session, and empty or unavailable summaries to avoid useless hints.
+    Read only a frontmatter prefix until project/type/session checks pass, and
+    inspect at most 50 project-matching notes to bound SessionStart work.
+    Return ``{date, summary, next_steps}`` or None.
     """
     sessions_dir = Path(vault_path) / sessions_folder
     if not sessions_dir.exists():
@@ -5038,9 +5067,13 @@ def find_latest_session(
     # Collect candidate files sorted by name descending (newest date first)
     candidates = sorted(sessions_dir.glob("*.md"), reverse=True)
 
+    inspected = 0
     for note_path in candidates:
+        if inspected >= _HINT_MAX_PROJECT_NOTES:
+            return None
         try:
-            text = note_path.read_text(encoding="utf-8", errors="replace")
+            with open(note_path, "r", encoding="utf-8", errors="replace") as f:
+                text = f.read(16384)
         except OSError:
             continue
 
@@ -5058,6 +5091,19 @@ def find_latest_session(
         if fm_project.lower() != project.lower() and slugify(fm_project) != slug:
             continue
 
+        inspected += 1
+        note_type = parse_frontmatter_field(frontmatter, "type")
+        if note_type is not None and note_type != "claude-session":
+            continue
+        note_session_id = parse_frontmatter_field(frontmatter, "session_id")
+        if exclude_session_id and note_session_id == exclude_session_id:
+            continue
+
+        try:
+            text = note_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+
         # Extract date from frontmatter
         date_str = parse_frontmatter_field(frontmatter, "date") or ""
 
@@ -5068,6 +5114,8 @@ def find_latest_session(
         )
         if summary_match:
             summary = summary_match.group(1).strip()
+        if not summary or RAW_SUMMARY_MARKER in summary:
+            continue
 
         # Extract next steps section
         next_steps = ""
@@ -5264,7 +5312,7 @@ def find_unsummarized_notes(
 
         # Defense-in-depth: check if already has a real summary
         has_summary = bool(re.search(r'^## Summary', content, re.MULTILINE))
-        has_unavailable = 'AI summary unavailable' in content
+        has_unavailable = RAW_SUMMARY_MARKER in content
 
         if has_summary and not has_unavailable:
             # Already summarized by legacy code path — fix status on disk
@@ -6309,7 +6357,7 @@ def build_raw_fallback(
     sections.append("## Summary")
     sections.append(
         f"Session in **{project}** ({duration} min). "
-        "AI summary unavailable \u2014 raw extraction below.\n"
+        f"{RAW_SUMMARY_MARKER}\n"
     )
 
     sections.append("## Key Decisions")
@@ -7297,7 +7345,8 @@ def generate_summaries_batch(
     for i, attempt_timeout in enumerate(attempts):
         try:
             result = subprocess.run(
-                ["claude", "-p", "--model", model, "--no-session-persistence"],
+                summarizer_argv(model),
+                cwd=_summarizer_cwd(),
                 input=prompt,
                 capture_output=True,
                 text=True,
