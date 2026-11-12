@@ -126,6 +126,6 @@ print("OK")
 
 Where `$KEY` is the setting name and `$JSON_VALUE` is the new value as a JSON literal (e.g., `"false"`, `"3"`, `'"/path/to/vault"'`).
 
-If the changed key is `sessions_folder`, `insights_folder` or `wiki_folder`: other skills in this session read a cached copy of the config, so tell the user to run `/vault-reindex`, which reads the config fresh and re-indexes the new folders. For `wiki_folder`, first check the value: it must be a relative folder name with no `..`, `~` or dot-prefixed segment (an empty value turns the wiki folder off). `/vault-reindex` refuses an invalid value and names it.
+If the changed key is `sessions_folder`, `insights_folder` or `wiki_folder`: the search index still holds the old folders' notes, so tell the user to run `/vault-reindex`, which re-indexes the new folders. For `wiki_folder`, first check the value: it must be a relative folder name with no `..`, `~` or dot-prefixed segment (an empty value turns the wiki folder off). `/vault-reindex` refuses an invalid value and names it.
 
-Confirm the change, then go back to Step 2 to redisplay the table.
+Confirm the change, then go back to Step 1 to re-read the config, and redisplay the table (Step 2) from that fresh output. Do not redisplay from the dict you parsed before the write: Step 2's ⚠ rows key on the new value (#59).
