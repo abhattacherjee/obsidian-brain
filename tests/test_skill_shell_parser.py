@@ -331,6 +331,7 @@ def test_later_backtick_substitution_still_reports_git():
     assert "git inside a command substitution" in isolation_problems(
         "z=`echo ok # c`; w=`git z`"
     )
+    assert substitution_bodies("z=`echo ok # c`; w=`git z`") == ["echo ok # c", "git z"]
 
 
 def test_comment_in_parenthesis_substitution_ends_at_newline():

@@ -164,16 +164,21 @@ PYEOF
 _STEP_HEADING = re.compile(r"^#{2,3}\s+(?:Step\b|Phase\b|\d)")
 
 
+_ATX_HEADING = re.compile(r" {0,3}#{1,6}(?:\s|$)")
+
+
 def _heading_lines(text: str) -> list[tuple[int, str]]:
-    """(line number, heading) for each Markdown heading outside a fence."""
+    """(line number, heading) for each ATX heading outside a fence. CommonMark
+    allows 0-3 leading spaces; they are removed from the returned line. Known
+    limit: a Setext heading (text over `===` or `---`) is not read."""
     fenced = {
         line
         for fence in fenced_blocks(text, langs=None)
         for line in range(fence.line, fence.line + len(fence.body.splitlines()) + 2)
     }
     return [
-        (number, line) for number, line in enumerate(text.splitlines(), 1)
-        if line.startswith("#") and number not in fenced
+        (number, line.lstrip(" ")) for number, line in enumerate(text.splitlines(), 1)
+        if _ATX_HEADING.match(line) and number not in fenced
     ]
 
 
@@ -241,6 +246,16 @@ def test_a_root_command_before_its_first_use_passes():
 def test_a_root_use_between_the_heading_and_command_is_flagged():
     text = f"{REPO_ROOT_STEP}\n\n{_ROOT_USER_BLOCK}\n{_ROOT_STEP_BODY}"
     assert root_step_problems(text, "fixture") == ["a block runs before the step"]
+
+
+def test_an_indented_heading_ends_the_root_step():
+    """CommonMark allows 0-3 spaces before `#`, so `  ## Step 1` is a heading."""
+    text = f"{REPO_ROOT_STEP}\n\n  ## Step 1\n\n{_ROOT_STEP_BODY}{_ROOT_USER_BLOCK}"
+    problems = root_step_problems(text, "fixture")
+    assert "the root step lacks its command or its pwd fallback" in problems
+    # Four spaces is a code block, not a heading, so the step still holds.
+    code = f"{REPO_ROOT_STEP}\n\n    ## Step 1\n\n{_ROOT_STEP_BODY}{_ROOT_USER_BLOCK}"
+    assert root_step_problems(code, "fixture") == []
 
 
 @pytest.mark.parametrize("heading", [

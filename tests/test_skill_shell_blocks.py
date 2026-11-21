@@ -5,8 +5,8 @@ bash with stub ``python3``, ``git`` and ``gh`` that record their argv (#522),
 not by matching command text: regexes missed ``python3 -X utf8``, a ``\\``
 continuation before ``write`` and tilde fences, and counted a shell comment as
 a call. Execution only sees calls that ran, so a block that stops early or
-sits in an untaken branch records nothing. The pinned ``_CALL_SITES`` set
-names the blocks that record a call today, and the counts (8 ``write``, 1
+sits in an untaken branch records nothing. The pinned ``_CALL_SITES`` dict
+names the blocks that record a call today (with a hash of each body), and the counts (8 ``write``, 1
 ``append-update``) are pinned too. A new call site, or one that stops
 recording, fails the count test; update ``_CALL_SITES`` when a skill adds or
 removes one.
@@ -25,13 +25,16 @@ plugin* looks like.
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import shutil
 import signal
+import socket
 import subprocess
+import sys
+import tempfile
 import time
-import uuid
 from collections import Counter
 from pathlib import Path
 
@@ -96,18 +99,28 @@ _ALL_BLOCKS = [
 ]
 # The blocks that record a note_writer.py call when run under the stubs.
 # Update when a skill adds or removes a call site.
-_CALL_SITES = frozenset({
-    "compress-250",
-    "compress-514",
-    "decide-262",
-    "error-log-252",
-    "retro-412",
-    "standup-325",
-    "standup-582",
-    "vault-import-285",
-    "vault-stats-238",
-})
+# Each id maps to the first 16 hex of sha256(body). Only a block whose body still
+# matches may run without a sandbox, so a block edited without review cannot.
+_CALL_SITES = {
+    "compress-250": "4669e1e4f8ac1760",
+    "compress-514": "ff5167440d6540a7",
+    "decide-262": "e6c3bc8558e8925f",
+    "error-log-252": "73826d66a0ed0992",
+    "retro-412": "0d7838eddb509c3a",
+    "standup-325": "6f7118d056ab2fb9",
+    "standup-582": "ff5167440d6540a7",
+    "vault-import-285": "e5970c453d34ab44",
+    "vault-stats-238": "23f3b08de6fd2ebe",
+}
 _CALL_BLOCKS = [block for block in _ALL_BLOCKS if block[0] in _CALL_SITES]
+
+
+def _body_hash(body: str) -> str:
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()[:16]
+
+
+def _is_pinned(block_id: str, body: str) -> bool:
+    return _CALL_SITES.get(block_id) == _body_hash(body)
 # A call in an untaken branch is not recorded, so a call site must not sit
 # inside one.
 _BRANCH_WORDS = frozenset({"if", "case", "elif", "else", "while", "until"})
@@ -119,7 +132,7 @@ _COMMAND_LEADERS = frozenset({"then", "do", "time", "!"})
 
 
 def _recorded_calls(block_id, block, workdir):
-    result = run_with_stubs(block, workdir, unsandboxed_ok=block_id in _CALL_SITES)
+    result = run_with_stubs(block, workdir, unsandboxed_ok=_is_pinned(block_id, block))
     assert result.returncode == 0, f"{block_id}: {result.stderr}"
     return note_writer_calls(result.calls)
 
@@ -178,13 +191,14 @@ def test_branch_words_are_read_at_every_command_position(block, words):
     assert _branch_words(block) == words
 
 
-def _check_call_sites(blocks, tmp_path, **run_kwargs):
-    """Run ``blocks`` and check the recorded call sites and their counts."""
-    assert {block_id for block_id, _skill, _block in _CALL_BLOCKS} == _CALL_SITES
+def _check_call_sites(blocks, tmp_path, run=run_with_stubs):
+    """Run ``blocks`` through ``run(block, workdir)`` and check the recorded call
+    sites and their counts."""
+    assert {block_id for block_id, _skill, _block in _CALL_BLOCKS} == set(_CALL_SITES)
     recorded = set()
     counts = Counter()
     for block_id, _skill, block in blocks:
-        result = run_with_stubs(block, tmp_path / block_id, **run_kwargs)
+        result = run(block, tmp_path / block_id)
         calls = note_writer_calls(result.calls)
         if not calls:
             continue  # Other blocks may exit non-zero; only call sites are checked.
@@ -197,7 +211,7 @@ def _check_call_sites(blocks, tmp_path, **run_kwargs):
                 _assert_body_file(args, block_id)
         if "<<" in block:
             assert [args[0] for args in calls] == ["append-update"], block_id
-    assert recorded == _CALL_SITES
+    assert recorded == set(_CALL_SITES)
     assert counts == {"write": 8, "append-update": 1}
     for block_id, _skill, block in _CALL_BLOCKS:
         assert _branch_words(block) == set(), block_id
@@ -456,7 +470,8 @@ def test_stub_does_not_record_absolute_python_path(tmp_path):
     """A real python3 called by absolute path bypasses the stub, so it is not recorded."""
     fake = tmp_path / "run" / "abs" / "python3"
     fake.parent.mkdir(parents=True)
-    # `touch` is a recording stub in the run, so the fake marks itself with a builtin.
+    # The fake marks itself with a shell builtin redirect, so the test does not
+    # depend on which tools are stubs.
     fake.write_text(f"#!/bin/sh\necho ran > '{fake.parent}/ran'\n", encoding="utf-8")
     fake.chmod(0o755)
     block = _SCRATCH_SETUP + f"'{fake}' \"$HOOKS/note_writer.py\" write"
@@ -484,6 +499,16 @@ def _pid_is_gone(pid: int) -> bool:
     return False
 
 
+def _wait_gone(pid: int, timeout: float = 3.0) -> bool:
+    """SIGKILL is asynchronous: poll until the process is gone or ``timeout`` ends."""
+    deadline = time.monotonic() + timeout
+    while not _pid_is_gone(pid):
+        if time.monotonic() > deadline:
+            return False
+        time.sleep(0.05)
+    return True
+
+
 def _timeout_leaves_no_child(tmp_path, block):
     """Time out a block that backgrounds `sleep 300` and check the sleep is dead."""
     run_dir = tmp_path / "run"
@@ -499,7 +524,7 @@ def _timeout_leaves_no_child(tmp_path, block):
         with pytest.raises(subprocess.TimeoutExpired):
             run_with_stubs(block, run_dir, timeout=2)
         elapsed = time.monotonic() - started
-        gone = pid_file.exists() and _pid_is_gone(int(pid_file.read_text()))
+        gone = pid_file.exists() and _wait_gone(int(pid_file.read_text()))
     finally:
         signal.alarm(0)
         signal.signal(signal.SIGALRM, old_handler)
@@ -532,7 +557,7 @@ def test_a_surviving_child_cannot_hold_the_run(tmp_path):
     try:
         result = run_with_stubs('sleep 300 & echo $! > "$TMPDIR/pid"; echo out', tmp_path / "run")
         elapsed = time.monotonic() - started
-        gone = _pid_is_gone(int(pid_file.read_text()))
+        gone = _wait_gone(int(pid_file.read_text()))
     finally:
         if pid_file.exists():  # Never leave the sleep running, even on failure.
             try:
@@ -576,6 +601,11 @@ def _escape_block(outside: Path) -> str:
         'ln -s "$O" link; echo x > link/via-symlink\n'
         'ln "$O/f" hard; echo pwned >> hard\n'
         'sed -i.bak s/orig/sed/ "$O/f"\n'
+        'rm -f "$O/f2"\n'
+        'mv "$O/f3" moved\n'
+        'echo x | tee "$O/tee" >/dev/null\n'
+        'dd if=/dev/zero of="$O/dd" bs=1 count=1 2>/dev/null\n'
+        'install t.txt "$O/inst"\n'
         "echo done\n"
     )
 
@@ -590,6 +620,8 @@ def _outside(tmp_path: Path) -> Path:
     outside = tmp_path / "outside"
     outside.mkdir()
     (outside / "f").write_text("orig\n", encoding="utf-8")
+    (outside / "f2").write_text("keep\n", encoding="utf-8")
+    (outside / "f3").write_text("move\n", encoding="utf-8")
     return outside.resolve()
 
 
@@ -599,8 +631,12 @@ def test_no_write_escapes_the_workdir(tmp_path):
     result = run_with_stubs(_escape_block(outside), tmp_path / "run")
     assert result.stdout.endswith("done\n"), result.stderr
     assert _made_temp_files(result.stdout) == [], result.stdout
-    assert sorted(p.name for p in outside.iterdir()) == ["f"]
+    assert sorted(p.name for p in outside.iterdir()) == ["f", "f2", "f3"]
     assert (outside / "f").read_text(encoding="utf-8") == "orig\n"
+    assert (outside / "f2").read_text(encoding="utf-8") == "keep\n"
+    assert (outside / "f3").read_text(encoding="utf-8") == "move\n"
+    # No check on `moved` inside the workdir: under bwrap the rename crosses
+    # mounts, so mv copies the file in and then fails to unlink the original.
     # The writes inside the workdir still happened.
     assert (tmp_path / "run" / "cwd" / "t.txt").read_text(encoding="utf-8") == "a\n"
 
@@ -618,6 +654,8 @@ def test_without_the_sandbox_the_same_block_escapes(tmp_path):
     assert len(made) == 2, result.stdout
     names = {p.name for p in outside.iterdir()}
     assert {"clobber", "sorted", "abs-cp", "via-symlink", "f.bak"} <= names, names
+    assert {"tee", "dd", "inst"} <= names, names
+    assert not {"f2", "f3"} & names, names  # rm deleted f2, mv moved f3.
     assert any(name.startswith("tmp.") for name in names), names
     assert (outside / "f").read_text(encoding="utf-8") == "sed\npwned\n"
 
@@ -641,18 +679,35 @@ def test_the_fallback_records_writers_and_creates_nothing(tmp_path, monkeypatch)
         ["cp", "a", f"{outside}/c"],
         ["rm", "-rf", f"{outside}/f"],
     ]
-    assert sorted(p.name for p in outside.iterdir()) == ["f"]
+    assert sorted(p.name for p in outside.iterdir()) == ["f", "f2", "f3"]
     for name in skill_shell._WRITERS:
         stub = tmp_path.resolve() / "run" / "bin" / name
         assert not stub.is_symlink(), name
 
 
+def test_the_pinned_call_site_blocks_are_unchanged():
+    """The unsandboxed mode trusts a pinned block, so an edit needs a review."""
+    changed = [
+        block_id for block_id, _skill, body in _CALL_BLOCKS if not _is_pinned(block_id, body)
+    ]
+    assert changed == [], (
+        f"{changed}: the block text changed. Review the block (it may run without "
+        "a sandbox), then update its hash in _CALL_SITES."
+    )
+
+
+def _run_with_recording_writers(block, workdir):
+    """The writers are recording stubs; a sandbox still wraps the run where one works."""
+    return skill_shell._run(
+        block, workdir.resolve(), 60, sandbox_prefix(workdir) or [], real_writers=False
+    )
+
+
 @requires_bash
-def test_the_pinned_call_sites_hold_without_a_sandbox(tmp_path, monkeypatch):
-    """The unsandboxed mode runs only the pinned blocks, and they still record
-    their 8 writes and 1 append-update."""
-    monkeypatch.setattr(skill_shell, "_sandbox_tool", lambda: None)
-    _check_call_sites(_CALL_BLOCKS, tmp_path, unsandboxed_ok=True)
+def test_the_pinned_call_sites_hold_with_recording_writers(tmp_path):
+    """With writers recorded instead of run (the unsandboxed mode), the pinned
+    blocks still record their 8 writes and 1 append-update."""
+    _check_call_sites(_CALL_BLOCKS, tmp_path, run=_run_with_recording_writers)
 
 
 def test_the_probe_rejects_a_sandbox_that_denies_nothing(monkeypatch):
@@ -665,6 +720,75 @@ def test_the_probe_rejects_a_sandbox_that_fails_to_start(monkeypatch):
     assert skill_shell._probe(("fake", "/usr/bin/false")) is False
 
 
+def test_the_probe_is_false_when_the_temp_dir_cannot_be_made(monkeypatch):
+    def refuse(*_args, **_kwargs):
+        raise OSError("read-only temp dir")
+
+    monkeypatch.setattr(skill_shell.tempfile, "mkdtemp", refuse)
+    assert skill_shell._probe(("sandbox-exec", "/usr/bin/true")) is False
+
+
+@pytest.mark.skipif(skill_shell._sandbox_tool() is None, reason="no OS sandbox")
+def test_the_probe_passes_paths_as_arguments_not_shell_source(monkeypatch):
+    """A temp dir whose name holds `$`, `"` and a backtick must not break the probe."""
+    real_mkdtemp = tempfile.mkdtemp
+    monkeypatch.setattr(
+        skill_shell.tempfile, "mkdtemp",
+        lambda prefix="": real_mkdtemp(prefix=prefix + '$x"`'),
+    )
+    assert skill_shell._probe(skill_shell._sandbox_tool()) is True
+
+
+_CONNECT_PROBE = (
+    "import socket, sys\n"
+    "try:\n"
+    "    socket.create_connection(('127.0.0.1', int(sys.argv[1])), timeout=2).close()\n"
+    "    print('CONNECTED')\n"
+    "except OSError as exc:\n"
+    "    print('BLOCKED:', exc)\n"
+)
+
+
+def _connect_block(port: int) -> str:
+    return f"'{sys.executable}' -c \"{_CONNECT_PROBE}\" {port}\n"
+
+
+def _accepted(listener: socket.socket) -> bool:
+    listener.settimeout(0.5)
+    try:
+        listener.accept()[0].close()
+    except OSError:  # socket.timeout is an OSError.
+        return False
+    return True
+
+
+@requires_sandbox
+def test_the_sandbox_denies_network(tmp_path):
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        port = listener.getsockname()[1]
+        result = run_with_stubs(_connect_block(port), tmp_path / "run", timeout=20)
+        accepted = _accepted(listener)
+    assert result.stdout.startswith("BLOCKED"), (result.stdout, result.stderr)
+    assert not accepted
+
+
+@requires_bash
+def test_without_the_sandbox_the_same_block_connects(tmp_path):
+    """Mutation check for the test above: with no prefix, the connection works."""
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        port = listener.getsockname()[1]
+        result = skill_shell._run(
+            _connect_block(port), tmp_path / "run", 20, [], real_writers=True
+        )
+        accepted = _accepted(listener)
+    assert result.stdout == "CONNECTED\n", (result.stdout, result.stderr)
+    assert accepted
+
+
 def test_the_probe_rejects_a_missing_sandbox_binary(monkeypatch):
     monkeypatch.setattr(
         skill_shell, "_prefix_for", lambda tool, workdir: ["/nonexistent/sandbox-exec"]
@@ -672,21 +796,28 @@ def test_the_probe_rejects_a_missing_sandbox_binary(monkeypatch):
     assert skill_shell._probe(("fake", "/nonexistent/sandbox-exec")) is False
 
 
-def _broken_listing():
-    raise PermissionError("ps: launch refused")
+def _broken_listing(error=PermissionError("ps: launch refused")):
+    def listing():
+        raise error
+    return listing
 
 
 @requires_sandbox
-def test_a_failed_process_listing_keeps_the_result(tmp_path, monkeypatch):
+@pytest.mark.parametrize("error", [
+    PermissionError("ps: launch refused"),
+    ValueError("invalid literal for int()"),
+    subprocess.SubprocessError("ps failed"),
+], ids=["PermissionError", "ValueError", "SubprocessError"])
+def test_a_failed_process_listing_keeps_the_result(tmp_path, monkeypatch, error):
     """X-025: cleanup must not replace the block's result, and the block's own
     group is still killed. A `set -m` child needs the listing to be found."""
-    monkeypatch.setattr(skill_shell, "_list_pids", _broken_listing)
+    monkeypatch.setattr(skill_shell, "_list_pids", _broken_listing(error))
     pid_file = tmp_path / "run" / "tmp" / "pid"
     try:
         result = run_with_stubs(
             'sleep 300 & echo $! > "$TMPDIR/pid"; echo out; exit 3', tmp_path / "run"
         )
-        gone = _pid_is_gone(int(pid_file.read_text()))
+        gone = _wait_gone(int(pid_file.read_text()))
     finally:
         _kill_pid_file(pid_file)
     assert (result.returncode, result.stdout) == (3, "out\n")
@@ -695,7 +826,7 @@ def test_a_failed_process_listing_keeps_the_result(tmp_path, monkeypatch):
 
 @requires_sandbox
 def test_a_failed_process_listing_keeps_the_timeout(tmp_path, monkeypatch):
-    monkeypatch.setattr(skill_shell, "_list_pids", _broken_listing)
+    monkeypatch.setattr(skill_shell, "_list_pids", _broken_listing())
     with pytest.raises(subprocess.TimeoutExpired):
         run_with_stubs("sleep 30", tmp_path / "run", timeout=1)
 

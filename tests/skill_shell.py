@@ -142,15 +142,19 @@ def _prefix_for(tool: tuple[str, str], workdir: str) -> list[str]:
     kind, path = tool
     if kind == "sandbox-exec":
         profile = (
-            "(version 1)(allow default)"
+            "(version 1)(allow default)(deny network*)"
             f"(deny file-write* (require-not (require-any (subpath {_sbpl_string(workdir)})"
             f" {_SBPL_DEVICES})))"
         )
         return [path, "-p", profile]
     # bwrap: the whole filesystem read-only, the workdir writable, a private
-    # /dev. No --unshare-pid and no --new-session: the block keeps host pids and
-    # the launcher's session, which `_kill_session` and the timeout rely on.
-    return [path, "--ro-bind", "/", "/", "--dev", "/dev", "--bind", workdir, workdir]
+    # /dev, no network. No --unshare-pid and no --new-session: the block keeps
+    # host pids and the launcher's session, which `_kill_session` and the
+    # timeout rely on.
+    return [
+        path, "--unshare-net", "--ro-bind", "/", "/", "--dev", "/dev",
+        "--bind", workdir, workdir,
+    ]
 
 
 def _probe(tool: tuple[str, str]) -> bool:
@@ -158,22 +162,25 @@ def _probe(tool: tuple[str, str]) -> bool:
     one inside it. A tool that is present but refused (nested `sandbox-exec`
     exits 71 inside another sandbox; `bwrap` exits 1 without user namespaces)
     fails here."""
-    base = Path(tempfile.mkdtemp(prefix="ob-sandbox-probe-")).resolve()
+    base = None
     try:
+        base = Path(tempfile.mkdtemp(prefix="ob-sandbox-probe-")).resolve()
         inside, outside = base / "inside", base / "outside"
         inside.mkdir()
         outside.mkdir()
-        script = f'echo ok > "{inside}/ok"; echo bad > "{outside}/bad"; exit 0'
-        try:
-            subprocess.run(
-                [*_prefix_for(tool, str(inside)), "/bin/sh", "-c", script],
-                stdin=subprocess.DEVNULL, capture_output=True, timeout=20,
-            )
-        except (OSError, subprocess.SubprocessError):
-            return False
+        # The paths are arguments, never part of the shell source.
+        script = 'echo ok > "$1/ok"; echo bad > "$2/bad"; exit 0'
+        subprocess.run(
+            [*_prefix_for(tool, str(inside)), "/bin/sh", "-c", script, "sh",
+             str(inside), str(outside)],
+            stdin=subprocess.DEVNULL, capture_output=True, timeout=20,
+        )
         return (inside / "ok").exists() and not (outside / "bad").exists()
+    except (OSError, subprocess.SubprocessError):
+        return False
     finally:
-        shutil.rmtree(base, ignore_errors=True)
+        if base is not None:
+            shutil.rmtree(base, ignore_errors=True)
 
 
 @functools.lru_cache(maxsize=None)
@@ -250,16 +257,21 @@ def run_with_stubs(
     The block runs under an OS sandbox (`sandbox-exec` on macOS, `bwrap` on
     Linux) that denies every file write outside ``workdir``, whatever tool or
     path makes it: a redirect, `sort -o`, `mktemp`, `/bin/cp`, a symlink or a
-    hardlink out of the workdir. ``python3``, ``git``, ``gh`` and ``grep`` are
+    hardlink out of the workdir. The exception is the device files: on macOS,
+    writes to /dev/null, /dev/zero, /dev/stdout, /dev/stderr, /dev/dtracehelper,
+    /dev/fd/* and /dev/tty* are allowed; under `bwrap`, /dev is a private
+    tmpfs with a few device nodes, discarded after the run. The sandbox also
+    denies all network access. ``python3``, ``git``, ``gh`` and ``grep`` are
     stubs that record their argv and do nothing else; file writers and text
     tools are the real ones. Every path variable the blocks read points into
     ``workdir``.
 
     With no working sandbox (inside another sandbox, or Linux without a usable
     `bwrap`) it raises `SandboxUnavailable` before it creates anything, unless
-    ``unsandboxed_ok`` is set. That mode is for the pinned, reviewed call-site
-    blocks only: the writers become recording stubs, but nothing contains a
-    redirect or the real `sed`, `sort`, `awk`, `mktemp` and `env`.
+    ``unsandboxed_ok`` is set. That mode is for the pinned, hash-checked
+    call-site blocks only (`_CALL_SITES` in test_skill_shell_blocks.py): the
+    writers become recording stubs, but nothing contains their redirects or the
+    real `sed`, `sort`, `awk`, `mktemp` and `env` there.
 
     The block runs in its own session with job control off (no ``-i``/``-m``);
     output goes to files, not pipes, so a child that outlives the block cannot

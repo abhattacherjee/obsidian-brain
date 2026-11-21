@@ -19,6 +19,7 @@ hand-written text parser, and reviews kept finding ways round it (flow-style
 A real YAML parser closes that whole class.
 """
 
+import copy
 import os
 import shutil
 import subprocess
@@ -159,18 +160,56 @@ def test_aggregator_script_passes_only_when_every_need_succeeded(results, code, 
 SANDBOX_JOBS = ("python-tests", "python-tests-py39")
 
 
-@_REQUIRES_YAML
-@pytest.mark.parametrize("job", SANDBOX_JOBS)
-def test_harness_jobs_install_and_require_the_sandbox(job):
-    steps = _workflow()["jobs"][job]["steps"]
+def _harness_job_problems(workflow, job):
+    """What is wrong with how ``job`` installs and requires the sandbox."""
+    problems = []
+    spec = workflow["jobs"][job]
+    steps = spec["steps"]
     runs = [str(step.get("run", "")) for step in steps]
     install = next(
         (i for i, run in enumerate(runs) if "apt-get install" in run and "bubblewrap" in run), None
     )
-    assert install is not None, job
-    assert "kernel.apparmor_restrict_unprivileged_userns=0" in runs[install], job
     pytest_steps = [i for i, run in enumerate(runs) if "pytest tests/" in run]
-    assert pytest_steps, job
+    if install is None:
+        return ["no bubblewrap install step"]
+    if "kernel.apparmor_restrict_unprivileged_userns=0" not in runs[install]:
+        problems.append("the install step does not lift the AppArmor limit")
+    if not pytest_steps:
+        problems.append("no pytest step")
     for i in pytest_steps:
-        assert i > install, job
-        assert steps[i].get("env", {}).get("OB_REQUIRE_SANDBOX") == "1", job
+        if i < install:
+            problems.append(f"step {i} runs pytest before the install")
+        if steps[i].get("env", {}).get("OB_REQUIRE_SANDBOX") != "1":
+            problems.append(f"step {i} does not set OB_REQUIRE_SANDBOX=1")
+    # Any value but a literal false could pass the job on a failure (`true`,
+    # `"true"`, an expression).
+    for name, holder in [("job", spec)] + [
+        (f"step {i}", steps[i]) for i in [install, *pytest_steps]
+    ]:
+        if holder.get("continue-on-error", False) is not False:
+            problems.append(f"{name} has continue-on-error")
+    return problems
+
+
+@_REQUIRES_YAML
+@pytest.mark.parametrize("job", SANDBOX_JOBS)
+def test_harness_jobs_install_and_require_the_sandbox(job):
+    assert _harness_job_problems(_workflow(), job) == [], job
+
+
+@_REQUIRES_YAML
+@pytest.mark.parametrize("job", SANDBOX_JOBS)
+@pytest.mark.parametrize("where", ["job", "install", "pytest"])
+def test_continue_on_error_on_a_harness_job_is_caught(job, where):
+    """Fail-first: the same check on an in-memory copy with `continue-on-error: true`."""
+    workflow = copy.deepcopy(_workflow())
+    spec = workflow["jobs"][job]
+    steps = spec["steps"]
+    holder = {
+        "job": spec,
+        "install": next(s for s in steps if "bubblewrap" in str(s.get("run", ""))),
+        "pytest": next(s for s in steps if "pytest tests/" in str(s.get("run", ""))),
+    }[where]
+    assert _harness_job_problems(workflow, job) == []
+    holder["continue-on-error"] = True
+    assert _harness_job_problems(workflow, job) != [], (job, where)
