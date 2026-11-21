@@ -199,6 +199,45 @@ def isolation_problems(block: str, *, heredoc: bool = False) -> list[str]:
     return problems
 
 
+# In a worktree-isolated session on Claude Code 2.1.330 (2026-11-21),
+# heredocs containing one- or two-key dicts (including empty-list values)
+# and f-strings with quoted dict subscripts were refused. Empty dicts, lists,
+# f-strings with `{exc}`, and `{a,b}` in a `cat << 'EOF'` body ran. The same
+# dict also ran under `python3 -c`. The harness cause is a hypothesis: the
+# probes showed refusal when a heredoc line had a quote after `{` before `}`.
+_HEREDOC_OPEN = re.compile(r"<<-?[ \t]*(['\"]?)([A-Za-z_][A-Za-z0-9_<>]*)\1")
+_QUOTED_BRACE = re.compile(r"\{[^}\n]*[\"']")
+
+
+def heredoc_bodies(block: str) -> list[str]:
+    """Read each heredoc body through its delimiter or the end of the block."""
+    bodies = []
+    lines = iter(block.splitlines())
+    for line in lines:
+        for match in _HEREDOC_OPEN.finditer(line):
+            if match.start() and line[match.start() - 1] == "<":
+                continue
+            delimiter = match.group(2)
+            body = []
+            for body_line in lines:
+                if body_line.strip() == delimiter:
+                    break
+                body.append(body_line)
+            bodies.append("\n".join(body))
+            break
+    return bodies
+
+
+def heredoc_brace_problems(block: str) -> list[str]:
+    """Return heredoc lines that contain a quote inside an opening brace."""
+    return [
+        line.strip()
+        for body in heredoc_bodies(block)
+        for line in body.splitlines()
+        if _QUOTED_BRACE.search(line)
+    ]
+
+
 REFUSED_FORMS: dict[str, str] = {
     "plain": 'cd "$(git rev-parse --show-toplevel)"',
     "command": 'x=$(command git rev-parse HEAD)',

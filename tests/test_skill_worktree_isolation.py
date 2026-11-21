@@ -12,12 +12,30 @@ from pathlib import Path
 
 import pytest
 
-from skill_shell import fenced_blocks, isolation_problems
+from skill_shell import fenced_blocks, heredoc_brace_problems, isolation_problems
 
 SKILLS = Path(__file__).resolve().parents[1] / "skills"
 SKILL_FILES = sorted(SKILLS.glob("*/SKILL.md"))
 REPO_ROOT_STEP = "### Repo root — run first"
 OLD_CD = 'cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"'
+
+# Refused in a worktree-isolated session; tracked in #524. Remove an id when its block is fixed.
+HEREDOC_BRACE_KNOWN = frozenset({
+    "check-items-247",
+    "check-items-307",
+    "check-items-423",
+    "check-items-592",
+    "check-items-681",
+    "check-items-811",
+})
+
+
+def heredoc_brace_ids(skill: str, text: str) -> set[str]:
+    return {
+        f"{skill}-{block.line}"
+        for block in fenced_blocks(text)
+        if heredoc_brace_problems(block.body)
+    }
 
 
 def test_the_glob_finds_every_skill():
@@ -29,6 +47,25 @@ def test_no_block_has_a_form_an_isolated_session_refuses(path):
     blocks = fenced_blocks(path.read_text(encoding="utf-8"))
     for block in blocks:
         assert isolation_problems(block.body) == [], f"{path.parent.name}:{block.line}"
+
+
+def test_no_new_heredoc_with_a_quoted_brace():
+    offenders = set()
+    for path in SKILL_FILES:
+        offenders.update(heredoc_brace_ids(path.parent.name, path.read_text(encoding="utf-8")))
+    assert offenders == HEREDOC_BRACE_KNOWN
+
+
+def test_checker_catches_a_heredoc_with_a_quoted_brace_added_to_a_real_skill():
+    text = (SKILLS / "decide" / "SKILL.md").read_text(encoding="utf-8") + "\n\n"
+    appended = text + """```bash
+python3 << 'PYEOF'
+x = {"a": 1}
+PYEOF
+```
+"""
+    new_id = f"decide-{len(text.splitlines()) + 1}"
+    assert heredoc_brace_ids("decide", appended) - HEREDOC_BRACE_KNOWN == {new_id}
 
 
 @pytest.mark.parametrize("path", SKILL_FILES, ids=[p.parent.name for p in SKILL_FILES])

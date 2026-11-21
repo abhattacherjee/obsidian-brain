@@ -4,7 +4,14 @@ from pathlib import Path
 
 import pytest
 
-from skill_shell import Block, REFUSED_FORMS, fenced_blocks, isolation_problems, substitution_bodies
+from skill_shell import (
+    Block,
+    REFUSED_FORMS,
+    fenced_blocks,
+    heredoc_brace_problems,
+    isolation_problems,
+    substitution_bodies,
+)
 
 
 @pytest.mark.parametrize("marker", ["`", "~"])
@@ -87,6 +94,58 @@ def test_bare_group_fails_closed():
 ])
 def test_clean_blocks(block):
     assert isolation_problems(block) == []
+
+
+@pytest.mark.parametrize("body", [
+    'x = {"a": 1}',
+    'x = {"a": 1, "b": 2}',
+    'x = {"a": [], "b": []}',
+    """print(f"{d['r']}: {d['r']}")""",
+])
+def test_heredoc_quoted_braces_are_flagged(body):
+    assert heredoc_brace_problems(f"python3 << 'PYEOF'\n{body}\nPYEOF") == [body]
+
+
+@pytest.mark.parametrize("body", [
+    "x = {}",
+    "x = [1, 2]",
+    'print(f"... {exc}")',
+])
+def test_heredoc_bodies_that_ran_are_allowed(body):
+    assert heredoc_brace_problems(f"python3 << 'PYEOF'\n{body}\nPYEOF") == []
+
+
+def test_heredoc_unquoted_brace_expansion_is_allowed():
+    assert heredoc_brace_problems("cat << 'EOF'\n{a,b}\nEOF") == []
+
+
+@pytest.mark.parametrize("block", [
+    """python3 -c '\nx = {"a": 1}\n'""",
+    'cat << EOF\nhello\nEOF\n{"a": 1}',
+    'cat <<< EOF\n{"a": 1}',
+])
+def test_quoted_braces_outside_heredoc_bodies_are_allowed(block):
+    assert heredoc_brace_problems(block) == []
+
+
+@pytest.mark.parametrize(("opener", "closer"), [
+    ("<<-EOF", "\tEOF"),
+    ('<< "EOF"', "EOF"),
+    ("<< 'OB_NOTE_EOF_<eof4>'", "OB_NOTE_EOF_<eof4>"),
+])
+def test_heredoc_delimiter_forms(opener, closer):
+    block = f'cat {opener}\n\t{{"a": 1}}  \n{closer}\n{{"outside": 2}}'
+    assert heredoc_brace_problems(block) == ['{"a": 1}']
+
+
+def test_heredoc_scan_resumes_after_the_delimiter_and_keeps_an_unclosed_body():
+    block = """cat << FIRST
+{"a": 1}
+FIRST
+{"outside": 2}
+cat << SECOND
+{"b": 3}"""
+    assert heredoc_brace_problems(block) == ['{"a": 1}', '{"b": 3}']
 
 
 def test_real_skill_fences_are_closed():
