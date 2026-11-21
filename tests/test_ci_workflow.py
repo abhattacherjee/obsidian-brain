@@ -177,8 +177,10 @@ def _harness_job_problems(workflow, job):
     if not pytest_steps:
         problems.append("no pytest step")
     for i in pytest_steps:
-        if i < install:
-            problems.append(f"step {i} runs pytest before the install")
+        # Strictly before: an install and pytest in one step has no ordering
+        # the check can see, and a failed install would not stop the pytest.
+        if i <= install:
+            problems.append(f"step {i} does not run pytest in a step after the install")
         if steps[i].get("env", {}).get("OB_REQUIRE_SANDBOX") != "1":
             problems.append(f"step {i} does not set OB_REQUIRE_SANDBOX=1")
     # Any value but a literal false could pass the job on a failure (`true`,
@@ -213,3 +215,19 @@ def test_continue_on_error_on_a_harness_job_is_caught(job, where):
     assert _harness_job_problems(workflow, job) == []
     holder["continue-on-error"] = True
     assert _harness_job_problems(workflow, job) != [], (job, where)
+
+
+@_REQUIRES_YAML
+@pytest.mark.parametrize("job", SANDBOX_JOBS)
+def test_an_install_and_pytest_in_one_step_is_caught(job):
+    """Fail-first: merge the install commands and pytest into one step."""
+    workflow = copy.deepcopy(_workflow())
+    steps = workflow["jobs"][job]["steps"]
+    install = next(s for s in steps if "bubblewrap" in str(s.get("run", "")))
+    pytest_step = next(s for s in steps if "pytest tests/" in str(s.get("run", "")))
+    assert _harness_job_problems(workflow, job) == []
+    install["run"] = install["run"] + "\n" + pytest_step["run"]
+    install["env"] = {"OB_REQUIRE_SANDBOX": "1"}
+    steps.remove(pytest_step)
+    problems = _harness_job_problems(workflow, job)
+    assert any("after the install" in problem for problem in problems), problems

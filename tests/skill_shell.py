@@ -151,8 +151,17 @@ def _prefix_for(tool: tuple[str, str], workdir: str) -> list[str]:
     # /dev, no network. No --unshare-pid and no --new-session: the block keeps
     # host pids and the launcher's session, which `_kill_session` and the
     # timeout rely on.
+    #
+    # `--unshare-net` does not hide pathname Unix sockets: they stay reachable
+    # through the read-only root bind (the Docker socket, a user bus, an agent
+    # socket in /run or /tmp). `--tmpfs /run --tmpfs /tmp` hide those
+    # directories. They come AFTER the root bind and BEFORE the workdir bind: a
+    # later bind mounts on top, so a workdir under /tmp stays reachable. Not
+    # `/var/run`: it is usually a symlink to /run, and a tmpfs there would
+    # replace the link.
     return [
         path, "--unshare-net", "--ro-bind", "/", "/", "--dev", "/dev",
+        "--tmpfs", "/run", "--tmpfs", "/tmp",
         "--bind", workdir, workdir,
     ]
 

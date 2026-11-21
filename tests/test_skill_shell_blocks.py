@@ -25,6 +25,7 @@ plugin* looks like.
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import os
 import re
@@ -121,6 +122,16 @@ def _body_hash(body: str) -> str:
 
 def _is_pinned(block_id: str, body: str) -> bool:
     return _CALL_SITES.get(block_id) == _body_hash(body)
+
+
+def _require_pinned(block_id: str, body: str) -> None:
+    """Fail (never run) when ``body`` no longer matches its pin in `_CALL_SITES`.
+    The one predicate for "this block may run without a sandbox"."""
+    if not _is_pinned(block_id, body):
+        pytest.fail(
+            f"{block_id}: the block text does not match its pin in _CALL_SITES. "
+            "Review the block (it may run without a sandbox), then re-pin its hash."
+        )
 # A call in an untaken branch is not recorded, so a call site must not sit
 # inside one.
 _BRANCH_WORDS = frozenset({"if", "case", "elif", "else", "while", "until"})
@@ -191,14 +202,15 @@ def test_branch_words_are_read_at_every_command_position(block, words):
     assert _branch_words(block) == words
 
 
-def _check_call_sites(blocks, tmp_path, run=run_with_stubs):
-    """Run ``blocks`` through ``run(block, workdir)`` and check the recorded call
+def _check_call_sites(blocks, tmp_path, run=None):
+    """Run ``blocks`` through ``run(block_id, block, workdir)`` (default: `run_with_stubs`) and check the recorded call
     sites and their counts."""
     assert {block_id for block_id, _skill, _block in _CALL_BLOCKS} == set(_CALL_SITES)
     recorded = set()
     counts = Counter()
     for block_id, _skill, block in blocks:
-        result = run(block, tmp_path / block_id)
+        workdir = tmp_path / block_id
+        result = run(block_id, block, workdir) if run else run_with_stubs(block, workdir)
         calls = note_writer_calls(result.calls)
         if not calls:
             continue  # Other blocks may exit non-zero; only call sites are checked.
@@ -358,8 +370,11 @@ def test_skill_heredoc_block_survives_delimiter_in_note_body(
     script_path = tmp_path / "block.sh"
     script_path.write_text(script, encoding="utf-8")
 
+    # The block is editable skill text: contain it wherever a sandbox works.
+    # Everything this test writes (the vault, block.sh, body.md, the marker)
+    # sits under tmp_path.
     result = subprocess.run(
-        [_BASH, str(script_path)],
+        [*(sandbox_prefix(tmp_path) or []), _BASH, str(script_path)],
         cwd=str(tmp_path),
         env=_env(vault, match_path),
         capture_output=True,
@@ -492,11 +507,41 @@ def test_grep_is_a_recording_stub_that_scans_nothing(tmp_path):
 
 
 def _pid_is_gone(pid: int) -> bool:
+    """True when ``pid`` no longer exists. A zombie (killed, not yet reaped by
+    its parent) counts as gone: it runs nothing."""
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
         return True
-    return False
+    try:
+        state = subprocess.run(
+            ["ps", "-o", "stat=", "-p", str(pid)],
+            capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=5,
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return state.startswith("Z")
+
+
+def test_a_zombie_counts_as_gone():
+    """A killed child its parent has not reaped still answers `kill -0`."""
+    child = subprocess.Popen(["sleep", "300"], stdin=subprocess.DEVNULL)
+    try:
+        assert not _pid_is_gone(child.pid)  # Control: a live process is not gone.
+        child.kill()
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:  # Popen.poll() would reap it; read the state.
+            state = subprocess.run(
+                ["ps", "-o", "stat=", "-p", str(child.pid)],
+                capture_output=True, text=True, stdin=subprocess.DEVNULL,
+            ).stdout.strip()
+            if state.startswith("Z"):
+                break
+            time.sleep(0.05)
+        os.kill(child.pid, 0)  # Still answers: it is a zombie, not reaped.
+        assert _pid_is_gone(child.pid)
+    finally:
+        child.wait()
 
 
 def _wait_gone(pid: int, timeout: float = 3.0) -> bool:
@@ -685,6 +730,20 @@ def test_the_fallback_records_writers_and_creates_nothing(tmp_path, monkeypatch)
         assert not stub.is_symlink(), name
 
 
+@requires_bash
+def test_the_recording_runner_refuses_an_edited_block_without_a_sandbox(tmp_path, monkeypatch):
+    """With no sandbox the prefix is empty, so an edited body must fail before it runs."""
+    monkeypatch.setattr(skill_shell, "_sandbox_tool", lambda: None)
+    block_id, _skill, body = _CALL_BLOCKS[0]
+    workdir = tmp_path / "run"
+    with pytest.raises(pytest.fail.Exception, match=rf"{block_id}.*re-pin"):
+        _run_with_recording_writers(block_id, body + "\ntouch /nonexistent/edited\n", workdir)
+    assert not workdir.exists()
+    # Control: the unedited, pinned body still runs.
+    result = _run_with_recording_writers(block_id, body, workdir)
+    assert note_writer_calls(result.calls)
+
+
 def test_the_pinned_call_site_blocks_are_unchanged():
     """The unsandboxed mode trusts a pinned block, so an edit needs a review."""
     changed = [
@@ -696,11 +755,14 @@ def test_the_pinned_call_site_blocks_are_unchanged():
     )
 
 
-def _run_with_recording_writers(block, workdir):
-    """The writers are recording stubs; a sandbox still wraps the run where one works."""
-    return skill_shell._run(
-        block, workdir.resolve(), 60, sandbox_prefix(workdir) or [], real_writers=False
-    )
+def _run_with_recording_writers(block_id, block, workdir):
+    """The writers are recording stubs; a sandbox still wraps the run where one
+    works. With no sandbox the prefix is empty, so the block must match its pin
+    or the run is refused before anything is created."""
+    prefix = sandbox_prefix(workdir) or []
+    if not prefix:
+        _require_pinned(block_id, block)
+    return skill_shell._run(block, workdir.resolve(), 60, prefix, real_writers=False)
 
 
 @requires_bash
@@ -774,7 +836,7 @@ def test_the_sandbox_denies_network(tmp_path):
     assert not accepted
 
 
-@requires_bash
+@requires_sandbox
 def test_without_the_sandbox_the_same_block_connects(tmp_path):
     """Mutation check for the test above: with no prefix, the connection works."""
     with socket.socket() as listener:
@@ -783,6 +845,58 @@ def test_without_the_sandbox_the_same_block_connects(tmp_path):
         port = listener.getsockname()[1]
         result = skill_shell._run(
             _connect_block(port), tmp_path / "run", 20, [], real_writers=True
+        )
+        accepted = _accepted(listener)
+    assert result.stdout == "CONNECTED\n", (result.stdout, result.stderr)
+    assert accepted
+
+
+_UNIX_CONNECT_PROBE = (
+    "import socket, sys\n"
+    "s = socket.socket(socket.AF_UNIX)\n"
+    "s.settimeout(2)\n"
+    "try:\n"
+    "    s.connect(sys.argv[1])\n"
+    "    print('CONNECTED')\n"
+    "except OSError as exc:\n"
+    "    print('BLOCKED:', exc)\n"
+)
+
+
+def _unix_connect_block(path: str) -> str:
+    return f"'{sys.executable}' -c \"{_UNIX_CONNECT_PROBE}\" '{path}'\n"
+
+
+@contextlib.contextmanager
+def _unix_listener():
+    """A listening AF_UNIX socket in a short /tmp directory (macOS limits the
+    path to ~104 bytes). Yields (listener, socket path); cleans up after."""
+    short = tempfile.mkdtemp(prefix="obs", dir="/tmp")
+    try:
+        path = os.path.join(short, "s")
+        with socket.socket(socket.AF_UNIX) as listener:
+            listener.bind(path)
+            listener.listen(1)
+            yield listener, path
+    finally:
+        shutil.rmtree(short, ignore_errors=True)
+
+
+@requires_sandbox
+def test_the_sandbox_denies_unix_sockets(tmp_path):
+    with _unix_listener() as (listener, path):
+        result = run_with_stubs(_unix_connect_block(path), tmp_path / "run", timeout=20)
+        accepted = _accepted(listener)
+    assert result.stdout.startswith("BLOCKED"), (result.stdout, result.stderr)
+    assert not accepted
+
+
+@requires_sandbox
+def test_without_the_sandbox_the_same_block_connects_to_a_unix_socket(tmp_path):
+    """Mutation check for the test above: with no prefix, the connection works."""
+    with _unix_listener() as (listener, path):
+        result = skill_shell._run(
+            _unix_connect_block(path), tmp_path / "run", 20, [], real_writers=True
         )
         accepted = _accepted(listener)
     assert result.stdout == "CONNECTED\n", (result.stdout, result.stderr)
