@@ -9,6 +9,7 @@ from skill_shell import (
     _blank_quotes_and_heredocs,
     REFUSED_FORMS,
     fenced_blocks,
+    heredoc_bodies,
     heredoc_brace_problems,
     isolation_problems,
     substitution_bodies,
@@ -205,3 +206,121 @@ def test_real_skill_fences_are_closed():
         if fenced_blocks(text + "\nend of document", langs=None) != blocks:
             unclosed.add(path.parent.name)
     assert unclosed == set()
+
+
+@pytest.mark.parametrize(("info", "lang"), [
+    ("bash:x", "bash"), ("sh,x", "sh"), ("bash{.x}", "bash"), ("Zsh;y", "zsh"),
+])
+def test_info_string_language_stops_at_the_first_other_character(info, lang):
+    assert fenced_blocks(f"```{info}\ncmd\n```") == [Block(1, lang, "cmd")]
+
+
+@pytest.mark.parametrize("info", ["c++", "shell-session", "{.bash}", "python"])
+def test_info_string_languages_that_are_not_shell_stay_out(info):
+    assert fenced_blocks(f"```{info}\ncmd\n```") == []
+
+
+# Fix 1 (X-017): `<<` in arithmetic is a shift, not a heredoc.
+@pytest.mark.parametrize("block", [
+    "((mask << SHIFT))\nx=$(git rev-parse HEAD)",
+    "x=$((a << 2))\ny=$(git rev-parse HEAD)",
+    "if ((a << 1)); then\n  :\nfi\nx=`git rev-parse HEAD`",
+])
+def test_a_shift_is_not_a_heredoc_opener(block):
+    assert "git inside a command substitution" in isolation_problems(block)
+    assert heredoc_bodies(block) == []
+
+
+def test_a_real_heredoc_after_arithmetic_is_still_read():
+    block = "((a << 1))\ncat <<EOF\nbody\nEOF\nx"
+    assert heredoc_bodies(block) == ["body"]
+
+
+# Fix 2 (X-018): an unquoted heredoc expands `$(...)` and backticks.
+@pytest.mark.parametrize("opener", ["<<EOF", "<<-EOF", "<< EOF"])
+def test_an_unquoted_heredoc_body_is_scanned_for_substitutions(opener):
+    assert "git inside a command substitution" in isolation_problems(
+        f"cat {opener}\n$(git rev-parse HEAD)\nEOF"
+    )
+
+
+def test_an_unquoted_heredoc_body_is_scanned_for_backticks():
+    assert "git inside a command substitution" in isolation_problems(
+        "cat <<EOF\nx `git log` y\nEOF"
+    )
+
+
+@pytest.mark.parametrize("opener", ["<<'EOF'", '<<"EOF"', "<<\\EOF", "<<-'EOF'"])
+def test_a_quoted_heredoc_body_is_inert(opener):
+    assert isolation_problems(f"cat {opener}\n$(git rev-parse HEAD)\n`git`\nEOF") == []
+
+
+def test_an_unquoted_heredoc_body_is_not_scanned_for_brace_groups():
+    assert isolation_problems("cat <<EOF\n{ echo; }\nEOF") == []
+
+
+def test_an_escaped_substitution_in_an_unquoted_heredoc_is_text():
+    assert isolation_problems("cat <<EOF\n\\$(git log)\nEOF") == []
+
+
+def test_heredoc_bodies_after_two_openers_on_one_line():
+    assert heredoc_bodies("cat <<A <<'B'\none\nA\ntwo\nB\n") == ["one", "two"]
+
+
+# Fix 3 (C-005): case-arm parens and backticks.
+@pytest.mark.parametrize("block", [
+    "x=$(case $y in a) echo;; esac; git log)",
+    "x=$(case $y in (a) echo;; esac; git log)",
+    "x=$(case $y in a|b) echo ok;; c) echo no;; esac; git log)",
+    "x=$(case $y in a) case $z in b) echo;; esac;; esac; git log)",
+])
+def test_a_case_arm_paren_does_not_close_a_substitution(block):
+    assert any("git log" in body for body in substitution_bodies(block))
+    assert "git inside a command substitution" in isolation_problems(block)
+
+
+def test_a_case_statement_outside_a_substitution_is_not_one():
+    assert isolation_problems("x=$(case $y in a) echo;; esac)\ncase $y in a) git log;; esac") == []
+
+
+def test_a_case_word_that_is_an_argument_does_not_open_a_case():
+    assert substitution_bodies("x=$(echo case in a); y=$(git x)") == ["echo case in a", "git x"]
+
+
+@pytest.mark.parametrize("block", [
+    "x=`echo \\` ; git log`",
+    "echo `git",
+    "x=`echo a` y=`git log`",
+    'echo "`git log`"',
+])
+def test_backticks_honour_escapes_and_run_to_the_end_when_unmatched(block):
+    assert "git inside a command substitution" in isolation_problems(block)
+
+
+def test_an_escaped_backtick_does_not_end_the_span():
+    assert substitution_bodies("`a \\` b` c") == ["a \\` b"]
+
+
+def test_backticks_in_single_quotes_are_text():
+    assert isolation_problems("echo 'run `git log`'") == []
+
+
+# Fix 4 (X-022): a reserved word is a word only at command position.
+@pytest.mark.parametrize("block", [
+    "echo then {",
+    "printf do {",
+    "echo a else {\n}",
+    "echo elif {",
+])
+def test_a_reserved_word_that_is_an_argument_does_not_start_a_group(block):
+    assert isolation_problems(block) == []
+
+
+@pytest.mark.parametrize("block", [
+    "if x; then { echo; }; fi",
+    "if x\nthen\n{ echo; }\nfi",
+    "for i in 1; do { echo; }; done",
+    "if x; then :; else { echo; }; fi",
+])
+def test_a_reserved_word_at_command_position_still_starts_a_group(block):
+    assert "brace group" in isolation_problems(block)

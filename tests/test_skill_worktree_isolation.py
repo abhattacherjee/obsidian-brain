@@ -67,9 +67,9 @@ REPO_ROOT_SKILLS = frozenset({
     "vault-ask", "vault-config", "vault-import", "vault-search", "vault-stats",
 })
 
-# `fenced_blocks` does not read a fence inside a blockquote or one whose info
-# string starts with `{`. A shell block hidden that way is never checked.
-_QUOTED_FENCE = re.compile(r"^\s*>\s*(`{3,}|~{3,})\s*(\w*)")
+# `fenced_blocks` does not read a fence inside a blockquote (at any depth) or one
+# whose info string starts with `{`. A shell block hidden that way is never checked.
+_QUOTED_FENCE = re.compile(r"^\s*(?:>\s*)+(`{3,}|~{3,})\s*([A-Za-z0-9_+-]*)")
 _BRACE_INFO_FENCE = re.compile(r"^\s*(`{3,}|~{3,})\s*\{")
 # A quoted fence with one of these info strings is a shell example that nothing checks.
 _QUOTED_SHELL_INFO = frozenset({"", "bash", "sh", "shell", "zsh"})
@@ -121,8 +121,13 @@ def test_no_skill_hides_a_shell_fence_the_reader_skips():
 
 
 def test_the_hidden_fence_check_flags_each_hiding_form():
-    for line in ("> ```bash", ">   ~~~", "```{.bash}", "~~~ {.sh}"):
+    for line in (
+        "> ```bash", ">   ~~~", "```{.bash}", "~~~ {.sh}",
+        ">> ```bash", "> > ~~~sh", ">>> ```", "> > ```bash:x", ">> ~~~zsh,x",
+    ):
         assert hidden_fences(line) == [(1, line.strip())], line
+    # A nested quoted example that is not shell stays allowed, closer included.
+    assert hidden_fences("> > ```python\n> > x\n> > ```\n>> ```bash") == [(4, ">> ```bash")]
     # A quoted JSON example is not shell, so it is allowed, closer included.
     assert hidden_fences(">    ```json\n>    {}\n>    ```\n> ```bash") == [(4, "> ```bash")]
 
@@ -153,28 +158,80 @@ PYEOF
     assert heredoc_brace_ids("decide", appended) - HEREDOC_BRACE_KNOWN == {new_id}
 
 
+# A numbered or named step heading of any form the skills use: `### Step 1`,
+# `## Step 1`, `### 1. Read`, `## 1 — Read`, `### Phase 1`, `## Phase 1`.
+_STEP_HEADING = re.compile(r"^#{2,3}\s+(?:Step\b|Phase\b|\d)")
+
+
+def _heading_lines(text: str) -> list[tuple[int, str]]:
+    """(line number, heading) for each Markdown heading outside a fence."""
+    fenced = {
+        line
+        for fence in fenced_blocks(text, langs=None)
+        for line in range(fence.line, fence.line + len(fence.body.splitlines()) + 2)
+    }
+    return [
+        (number, line) for number, line in enumerate(text.splitlines(), 1)
+        if line.startswith("#") and number not in fenced
+    ]
+
+
+def root_step_problems(text: str, skill: str) -> list[str]:
+    """Why the "Repo root - run first" step is missing, malformed or too late."""
+    users = [b for b in fenced_blocks(text) if "'<REPO_ROOT>'" in b.body]
+    if not users:
+        return []
+    headings = _heading_lines(text)
+    # /retro has its own wording of the same step (#518): it opens its Step 1.
+    if skill == "retro":
+        anchor = text.index("```bash\ngit rev-parse --show-toplevel\n```")
+        first_line = text[:anchor].count("\n") + 1
+        return [] if all(b.line > first_line for b in users) else ["a block runs before the step"]
+    if text.count(REPO_ROOT_STEP) != 1:
+        return ["the root step heading is not there exactly once"]
+    problems = []
+    anchor = text.index(REPO_ROOT_STEP)
+    end = text.find("\n### ", anchor + 1)
+    step = text[anchor:end if end >= 0 else len(text)]
+    if "```bash\ngit rev-parse --show-toplevel\n```" not in step or "run `pwd` instead" not in step:
+        problems.append("the root step lacks its command or its pwd fallback")
+    root_line = text[:anchor].count("\n") + 1
+    if any(b.line <= root_line for b in users):
+        problems.append("a block runs before the step")
+    first_step = next((n for n, line in headings if _STEP_HEADING.match(line)), None)
+    if first_step is not None and first_step < root_line:
+        problems.append(f"the step heading at line {first_step} comes before the root step")
+    return problems
+
+
 @pytest.mark.parametrize("path", SKILL_FILES, ids=[p.parent.name for p in SKILL_FILES])
 def test_the_repo_root_step_comes_before_any_block_that_needs_it(path):
     text = path.read_text(encoding="utf-8")
-    users = [b for b in fenced_blocks(text) if "'<REPO_ROOT>'" in b.body]
-    if not users:
-        return
-    # /retro has its own wording of the same step (#518).
-    if path.parent.name == "retro":
-        anchor = text.index("```bash\ngit rev-parse --show-toplevel\n```")
-    else:
-        assert text.count(REPO_ROOT_STEP) == 1, path.parent.name
-        anchor = text.index(REPO_ROOT_STEP)
-        step = text[anchor:text.index("\n### ", anchor + 1)]
-        assert "```bash\ngit rev-parse --show-toplevel\n```" in step
-        assert "run `pwd` instead" in step
-    first_line = text[:anchor].count("\n") + 1
-    assert all(b.line > first_line for b in users), path.parent.name
-    # The step must come before every `### Step` heading, so no entry path skips
-    # it. /retro keeps its #518 layout: the step opens its Step 1.
-    first_step = text.find("\n### Step ")
-    if path.parent.name != "retro":
-        assert first_step == -1 or anchor < first_step + 1, path.parent.name
+    assert root_step_problems(text, path.parent.name) == [], path.parent.name
+
+
+_ROOT_STEP = REPO_ROOT_STEP + "\n\n```bash\ngit rev-parse --show-toplevel\n```\nIf it fails, run `pwd` instead.\n\n"
+
+
+@pytest.mark.parametrize("heading", [
+    "### Step 1 - Read config", "## Step 1 - Read config", "### 1. Read config",
+    "## 1 - Read config", "### Phase 1 - Read config", "## Phase 1",
+])
+def test_a_root_step_below_any_numbered_heading_is_flagged(heading):
+    late = f"{heading}\n\n" + _ROOT_STEP
+    text = f"# Skill\n\n{late}```bash\ncd '<REPO_ROOT>'\n```\n"
+    problems = root_step_problems(text, "fixture")
+    assert any("comes before the root step" in problem for problem in problems), (heading, problems)
+    early = f"# Skill\n\n{_ROOT_STEP}{heading}\n\n```bash\ncd '<REPO_ROOT>'\n```\n"
+    assert root_step_problems(early, "fixture") == [], heading
+
+
+def test_a_heading_inside_a_fence_is_not_a_step():
+    text = (
+        "# Skill\n\n```markdown\n### 1. Read config\n```\n\n" + _ROOT_STEP
+        + "### Step 1\n\n```bash\ncd '<REPO_ROOT>'\n```\n"
+    )
+    assert root_step_problems(text, "fixture") == []
 
 
 def test_the_skills_with_a_repo_root_block_are_the_expected_ones():

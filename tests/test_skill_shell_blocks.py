@@ -28,15 +28,19 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import signal
 import subprocess
 import time
+import uuid
 from collections import Counter
+from pathlib import Path
 
 import pytest
 
 from skill_shell import (
     HOOKS_DIR,
     _blank_quotes_and_heredocs,
+    escaping_redirects,
     fenced_blocks,
     note_writer_calls,
     python_script_call,
@@ -98,7 +102,12 @@ _CALL_SITES = frozenset({
 _CALL_BLOCKS = [block for block in _ALL_BLOCKS if block[0] in _CALL_SITES]
 # A call in an untaken branch is not recorded, so a call site must not sit
 # inside one.
-_BRANCH_WORDS = frozenset({"if", "case", "elif", "else", "while"})
+_BRANCH_WORDS = frozenset({"if", "case", "elif", "else", "while", "until"})
+# The one-line guard every call-site block opens with. It exits when it fails,
+# so it cannot hide a call. Matched on a whole line: a chained `; if ...` after
+# its `fi` is not part of it.
+_GUARD_LINE = re.compile(r"\s*if ! test -f [^;&|]+;\s*then\s+(?:[^;]+;\s*)*exit 1;\s*fi\s*")
+_COMMAND_LEADERS = frozenset({"then", "do", "time", "!"})
 
 
 def _recorded_calls(block_id, block, workdir):
@@ -114,16 +123,29 @@ def _assert_body_file(args, block_id):
 
 
 def _branch_words(block: str) -> set[str]:
-    """Branch keywords that start a command line of the block.
+    """Branch keywords at any command position of the block.
 
-    Heredoc bodies are note text, not shell. The one-line `if ! test -f` guard at
-    the top of each call-site block exits when it fails, so it cannot hide a call.
+    Quotes and heredoc bodies are blanked first (they are text, not shell). The
+    code is split on `;`, `&`, `|` and newlines, and each piece's first word is
+    read after any `$(`, `(`, `{`, `then`, `do`, `!`, `VAR=` prefix and case-arm
+    `pat)` label.
     """
-    first_words = {
-        line.split()[0] for line in _blank_quotes_and_heredocs(block).splitlines()
-        if line.strip() and not line.lstrip().startswith("if ! test -f")
-    }
-    return first_words & _BRANCH_WORDS
+    code = "\n".join(
+        line for line in _blank_quotes_and_heredocs(block).splitlines()
+        if not _GUARD_LINE.fullmatch(line)
+    )
+    found = set()
+    for piece in re.split(r"[;&|)\n]", code.replace("$(", " ")):
+        words = piece.replace("(", " ").replace("{", " ").split()
+        while words and (
+            words[0] in _COMMAND_LEADERS
+            or words[0].endswith(")")
+            or re.fullmatch(r"\w+=\S*", words[0])
+        ):
+            words.pop(0)
+        if words and words[0] in _BRANCH_WORDS:
+            found.add(words[0])
+    return found
 
 
 def test_a_call_inside_a_branch_is_detected():
@@ -131,6 +153,21 @@ def test_a_call_inside_a_branch_is_detected():
     assert _branch_words("case x in\n  a) python3 n.py ;;\nesac") == {"case"}
     assert _branch_words("x\nelse\ny") == {"else"}
     assert _branch_words("if ! test -f f; then exit 1; fi\ncat <<E\nif a\nE") == set()
+
+
+@pytest.mark.parametrize(("block", "words"), [
+    (':; if false; then python3 "$HOOKS/note_writer.py" write x; fi', {"if"}),
+    ("echo a && while x; do y; done", {"while"}),
+    ("echo a | until x; do y; done", {"until"}),
+    ("x=$(if a; then b; fi)", {"if"}),
+    ("echo a; ( if a; then b; fi )", {"if"}),
+    ("case $x in a) if b; then c; fi ;; esac", {"case", "if"}),
+    ('if ! test -f f; then echo "no" >&2; exit 1; fi; if false; then y; fi', {"if"}),
+    ('if ! test -f "$H"; then echo "ERROR: no" >&2; exit 1; fi\necho ok', set()),
+    ("echo 'if a' \"while b\" # if c", set()),
+])
+def test_branch_words_are_read_at_every_command_position(block, words):
+    assert _branch_words(block) == words
 
 
 @requires_bash
@@ -405,7 +442,8 @@ def test_stub_does_not_record_absolute_python_path(tmp_path):
     """A real python3 called by absolute path bypasses the stub, so it is not recorded."""
     fake = tmp_path / "abs" / "python3"
     fake.parent.mkdir(parents=True)
-    fake.write_text(f"#!/bin/sh\ntouch '{fake.parent}/ran'\n", encoding="utf-8")
+    # `touch` is a recording stub in the run, so the fake marks itself with a builtin.
+    fake.write_text(f"#!/bin/sh\necho ran > '{fake.parent}/ran'\n", encoding="utf-8")
     fake.chmod(0o755)
     block = _SCRATCH_SETUP + f"'{fake}' \"$HOOKS/note_writer.py\" write"
     result = run_with_stubs(block, tmp_path / "run")
@@ -424,22 +462,163 @@ def test_grep_is_a_recording_stub_that_scans_nothing(tmp_path):
     assert not (tmp_path / "bin" / "grep").resolve().samefile(shutil.which("grep"))
 
 
+def _pid_is_gone(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    return False
+
+
+def _timeout_leaves_no_child(tmp_path, block):
+    """Time out a block that backgrounds `sleep 300` and check the sleep is dead."""
+    run_dir = tmp_path / "run"
+    pid_file = run_dir / "tmp" / "pid"
+
+    def hung(*_args):
+        raise AssertionError("run_with_stubs did not return: the timeout did not end the run")
+
+    old_handler = signal.signal(signal.SIGALRM, hung)
+    signal.alarm(30)
+    started = time.monotonic()
+    try:
+        with pytest.raises(subprocess.TimeoutExpired):
+            run_with_stubs(block, run_dir, timeout=2)
+        elapsed = time.monotonic() - started
+        gone = pid_file.exists() and _pid_is_gone(int(pid_file.read_text()))
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old_handler)
+        if pid_file.exists():  # Never leave the sleep running, even on failure.
+            try:
+                os.kill(int(pid_file.read_text()), signal.SIGKILL)
+            except (ProcessLookupError, ValueError):
+                pass
+    assert elapsed < 15, elapsed
+    assert pid_file.exists(), "the block never wrote its child's pid"
+    assert gone, "the backgrounded child outlived the timeout"
+
+
 @requires_bash
-def test_a_timeout_kills_the_whole_process_group(tmp_path):
-    pid_file = tmp_path / "pid"
-    block = f"/bin/sleep 300 &\necho $! > '{pid_file}'\nwait"
-    with pytest.raises(subprocess.TimeoutExpired):
-        run_with_stubs(block, tmp_path / "run", timeout=2)
-    pid = int(pid_file.read_text())
-    for _ in range(50):
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            break
-        time.sleep(0.1)
-    else:
-        os.kill(pid, 9)
-        pytest.fail("the backgrounded child outlived the timeout")
+def test_a_timeout_kills_a_backgrounded_child(tmp_path):
+    _timeout_leaves_no_child(tmp_path, 'sleep 300 & echo $! > "$TMPDIR/pid"; wait')
+
+
+@requires_bash
+def test_a_timeout_kills_a_child_in_its_own_process_group(tmp_path):
+    """`set -m` gives each job its own group, so killpg of the block's group misses it."""
+    _timeout_leaves_no_child(tmp_path, 'set -m; sleep 300 & echo $! > "$TMPDIR/pid"; wait')
+
+
+@requires_bash
+def test_a_surviving_child_cannot_hold_the_run(tmp_path):
+    """Output goes to files, so a child that keeps stdout open does not block the run."""
+    pid_file = tmp_path / "run" / "tmp" / "pid"
+    started = time.monotonic()
+    try:
+        result = run_with_stubs('sleep 300 & echo $! > "$TMPDIR/pid"; echo out', tmp_path / "run")
+        elapsed = time.monotonic() - started
+        gone = _pid_is_gone(int(pid_file.read_text()))
+    finally:
+        if pid_file.exists():  # Never leave the sleep running, even on failure.
+            try:
+                os.kill(int(pid_file.read_text()), signal.SIGKILL)
+            except (ProcessLookupError, ValueError):
+                pass
+    assert elapsed < 15
+    assert result.stdout == "out\n"
+    assert gone
+
+
+_WRITERS = "mkdir touch chmod ln tee dd install rm cp mv".split()
+
+
+def _escape_names(tag):
+    return sorted(Path("/tmp").glob(f"ob-escape-{tag}*"))
+
+
+@requires_bash
+def test_every_file_writer_is_a_recording_stub(tmp_path):
+    run_with_stubs(":", tmp_path)
+    for name in _WRITERS:
+        stub = tmp_path.resolve() / "bin" / name
+        assert not stub.is_symlink(), name
+        assert stub.read_text().startswith("#!"), name
+
+
+@requires_bash
+def test_a_writer_stub_records_the_call_and_creates_nothing(tmp_path):
+    tag = uuid.uuid4().hex
+    target = f"/tmp/ob-escape-{tag}"
+    block = f"mkdir -p {target}-dir; touch {target}-file; rm -rf {target}-dir"
+    result = run_with_stubs(block, tmp_path)
+    assert result.calls == [
+        ["mkdir", "-p", f"{target}-dir"],
+        ["touch", f"{target}-file"],
+        ["rm", "-rf", f"{target}-dir"],
+    ]
+    assert _escape_names(tag) == []
+
+
+@requires_bash
+def test_a_redirect_to_an_absolute_path_raises_before_the_block_runs(tmp_path):
+    tag = uuid.uuid4().hex
+    with pytest.raises(ValueError, match="outside the workdir"):
+        run_with_stubs(f"echo x > /tmp/ob-escape-{tag}-$$", tmp_path)
+    assert _escape_names(tag) == []
+    assert not (tmp_path / "bin").exists()  # It raised before any setup.
+
+
+@requires_bash
+def test_the_literal_escape_block_from_the_review_raises(tmp_path):
+    before = _escape_names("")
+    with pytest.raises(ValueError):
+        run_with_stubs("echo x > /tmp/ob-escape-$$", tmp_path)
+    assert _escape_names("") == before
+
+
+@pytest.mark.parametrize(("block", "targets"), [
+    ("echo x > /tmp/f", ["/tmp/f"]),
+    ("echo x >> ../f", ["../f"]),
+    ("echo x &> /etc/f", ["/etc/f"]),
+    ('echo x >"/tmp/f"', ["/tmp/f"]),
+    ("echo x >&/tmp/f", ["/tmp/f"]),
+    ("echo x 1>/tmp/f 2>&1", ["/tmp/f"]),
+    ("x=$(echo y > /tmp/f)", ["/tmp/f"]),
+    ("echo x > /dev/null 2> /dev/stderr >/dev/stdout >&2 2>&1", []),
+    ('echo x > ~/f > "$HOME/f" > "$VAULT_PATH/f" > rel/f > ./f', []),
+    ("python3 -c 'print(1 > /x)' # > /y", []),
+    ("cat <<'E'\n> /x\nE", []),
+    ("diff <(a) >(b)", []),
+])
+def test_escaping_redirects(block, targets):
+    assert escaping_redirects(block) == targets
+
+
+def test_no_skill_block_redirects_outside_the_workdir():
+    """Every block runs under the stubs, so none may be refused for a redirect."""
+    refused = {
+        block_id: targets
+        for block_id, _skill, block in _ALL_BLOCKS
+        if (targets := escaping_redirects(block))
+    }
+    assert refused == {}
+
+
+@requires_bash
+def test_a_guarded_tool_refuses_a_path_outside_the_workdir(tmp_path):
+    tag = uuid.uuid4().hex
+    outside = f"/tmp/ob-escape-{tag}"
+    block = (
+        f"mktemp {outside}-XXXXXX; echo a > t.txt\n"
+        f"sed -i s/a/b/ {outside}-s; sort -o {outside}-o t.txt; env /bin/echo hi\n"
+        'mktemp "$TMPDIR/ok.XXXXXX"; sed s/a/b/ t.txt'
+    )
+    result = run_with_stubs(block, tmp_path)
+    assert result.stderr.count("refused, outside the test workdir") == 4, result.stderr
+    assert _escape_names(tag) == []
+    assert result.stdout.strip().splitlines()[-1] == "b"
+    assert str(tmp_path.resolve() / "tmp" / "ok.") in result.stdout
 
 
 def test_python_script_call():
