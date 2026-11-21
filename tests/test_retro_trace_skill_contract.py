@@ -234,13 +234,16 @@ def _bash_blocks(text: str) -> list[str]:
 
 
 def test_retro_blocks_run_in_a_worktree_isolated_session():
-    """#518: a worktree-isolated session refuses `cd "$(git ...)"`; no block may carry
-    git inside a command substitution, and no block may carry a heredoc."""
+    """#518: a worktree-isolated session refuses `cd "$(git ...)"` and `|| { ...; }`
+    groups; no block may carry either, nor a heredoc."""
     blocks = _bash_blocks(RETRO)
     assert len(blocks) >= 9
     for block in blocks:
         assert not re.search(r"\$\(\s*git\b", block), block[:120]
         assert "<<" not in block, block[:120]
+        # The isolation check also refuses any `|| { ...; }` group (probed on
+        # Claude Code 2.1.330); guards use `if ! test -f ...; then ...; fi`.
+        assert not re.search(r"(\|\||&&)\s*\{", block), block[:120]
     assert sum(b.count("cd '<REPO_ROOT>'") for b in blocks) == 8
     assert "```bash\ngit rev-parse --show-toplevel\n```" in RETRO
 

@@ -431,7 +431,7 @@ def _ob_hooks():
     return max(_c, key=lambda _p: ([int(_n) for _n in _p.split('/')[-2].split('.')], _p), default='hooks')
 print(_ob_hooks())
 ")
-test -f "$HOOKS/note_writer.py" || { echo "ERROR: note_writer.py not found under $HOOKS - resolution checks the marketplace registered install location first, then falls back to the plugin cache; neither path produced a hooks directory containing it. Verify the obsidian-brain install resolved at $HOOKS is complete (git pull for a directory-source checkout, or run /plugin marketplace update for a cache install), then retry." >&2; exit 1; }
+if ! test -f "$HOOKS/note_writer.py"; then echo "ERROR: note_writer.py not found under $HOOKS - resolution checks the marketplace registered install location first, then falls back to the plugin cache; neither path produced a hooks directory containing it. Verify the obsidian-brain install resolved at $HOOKS is complete (git pull for a directory-source checkout, or run /plugin marketplace update for a cache install), then retry." >&2; exit 1; fi
 python3 "$HOOKS/note_writer.py" write "$VAULT_PATH" "$INSIGHTS_FOLDER" "YYYY-MM-DD-retro-<hash>.md" --body-file '<BODY_FILE>'
 ```
 
@@ -500,7 +500,7 @@ def _ob_hooks():
     return max(_c, key=lambda _p: ([int(_n) for _n in _p.split('/')[-2].split('.')], _p), default='hooks')
 print(_ob_hooks())
 ")
-test -f "$HOOKS/retro_trace.py" || { echo "ERROR: retro_trace.py not found under $HOOKS - verify the obsidian-brain install resolved there is complete (git pull for a directory-source checkout, or /plugin marketplace update for a cache install), then retry." >&2; exit 1; }
+if ! test -f "$HOOKS/retro_trace.py"; then echo "ERROR: retro_trace.py not found under $HOOKS - verify the obsidian-brain install resolved there is complete (git pull for a directory-source checkout, or /plugin marketplace update for a cache install), then retry." >&2; exit 1; fi
 python3 "$HOOKS/retro_trace.py" items '<NOTE_PATH>'
 ```
 
@@ -540,7 +540,7 @@ def _ob_hooks():
     return max(_c, key=lambda _p: ([int(_n) for _n in _p.split('/')[-2].split('.')], _p), default='hooks')
 print(_ob_hooks())
 ")
-test -f "$HOOKS/retro_trace.py" || { echo "ERROR: retro_trace.py not found under $HOOKS - verify the obsidian-brain install resolved there is complete (git pull for a directory-source checkout, or /plugin marketplace update for a cache install), then retry." >&2; exit 1; }
+if ! test -f "$HOOKS/retro_trace.py"; then echo "ERROR: retro_trace.py not found under $HOOKS - verify the obsidian-brain install resolved there is complete (git pull for a directory-source checkout, or /plugin marketplace update for a cache install), then retry." >&2; exit 1; fi
 python3 "$HOOKS/retro_trace.py" apply "$VAULT_PATH" '<NOTE_PATH>' --traces-file '<TRACES_FILE>'
 ```
 
@@ -612,7 +612,7 @@ def _ob_hooks():
     return max(_c, key=lambda _p: ([int(_n) for _n in _p.split('/')[-2].split('.')], _p), default='hooks')
 print(_ob_hooks())
 ")
-test -f "$HOOKS/retro_rollup.py" || { echo "lesson update skipped: retro_rollup.py not found under $HOOKS"; exit 0; }
+if ! test -f "$HOOKS/retro_rollup.py"; then echo "lesson update skipped: retro_rollup.py not found under $HOOKS"; exit 0; fi
 mkdir -p -m 700 "$HOME/.claude/obsidian-brain"
 LESSONS=$(python3 -c '
 import json, os
