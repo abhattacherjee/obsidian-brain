@@ -615,3 +615,25 @@ def test_verify_true_writes_and_none_skips_the_check(tmp_path):
     assert b"- [x] First. \xe2\x86\x92 memory `x`" in path.read_bytes()
     rt.apply_traces(str(tmp_path), path.name, [{"item": 2, "kind": "memory", "stem": "x"}], partial=True)
     assert b"- [x] Second. \xe2\x86\x92 memory `x`" in path.read_bytes()
+
+
+@pytest.mark.parametrize("dash", ["vault", "note"])
+def test_cli_apply_refuses_a_dash_leading_vault_or_note(tmp_path, monkeypatch, capsys, dash):
+    """A vault or note positional that starts with `-` is exit 2 with usage, and a
+    real note behind that name is left untouched."""
+    monkeypatch.chdir(tmp_path)
+    traces = tmp_path / "t.json"
+    traces.write_text(json.dumps({"traces": TRACES}), encoding="utf-8")
+    if dash == "vault":
+        vault = tmp_path / "-v"
+        vault.mkdir()
+        path = make_note(vault)
+        argv = ["apply", "-v", path.name, "--traces-file", str(traces)]
+    else:
+        path = tmp_path / "-n.md"
+        path.write_bytes((HEADER + BODY).encode())
+        argv = ["apply", str(tmp_path), "-n.md", "--traces-file", str(traces)]
+    before = snapshot(path)
+    assert rt.main(argv) == 2
+    assert "usage:" in capsys.readouterr().err
+    assert snapshot(path) == before

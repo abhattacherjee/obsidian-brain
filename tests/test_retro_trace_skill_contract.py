@@ -230,12 +230,12 @@ def test_step_75_apply_test_catches_swapped_vault_and_note_arguments(tmp_path):
 
 
 _SHELL_FENCE_RE = re.compile(
-    r"^[ \t]*```(?:bash|sh|shell|zsh)[ \t]*\n(.*?)^[ \t]*```[ \t]*$", re.M | re.S)
+    r"^[ \t]*(```|~~~)(?:bash|sh|shell|zsh)[ \t]*\n(.*?)^[ \t]*\1[ \t]*$", re.M | re.S)
 
 
 def _bash_blocks(text: str) -> list[str]:
-    """Every fenced shell block (bash, sh, shell, zsh), indented or not."""
-    return _SHELL_FENCE_RE.findall(text)
+    """Every fenced shell block (bash, sh, shell, zsh; ``` or ~~~ fences), indented or not."""
+    return [m[1] for m in _SHELL_FENCE_RE.findall(text)]
 
 
 def _substitution_bodies(block: str) -> list[str]:
@@ -301,8 +301,9 @@ def test_isolation_checker_flags_every_refused_form_and_passes_a_clean_block():
 
 def test_shell_block_collector_takes_every_fence_spelling():
     text = ("```bash\na\n```\n```sh\nb\n```\n```shell\nc\n```\n```zsh\nd\n```\n"
-            "   ```bash\n   e\n   ```\n```python\nnot shell\n```\n")
-    assert [b.strip() for b in _bash_blocks(text)] == ["a", "b", "c", "d", "e"]
+            "   ```bash\n   e\n   ```\n```python\nnot shell\n```\n"
+            "~~~bash\nf\n~~~\n  ~~~sh\n  g\n  ~~~\n~~~python\nnot shell\n~~~\n")
+    assert [b.strip() for b in _bash_blocks(text)] == ["a", "b", "c", "d", "e", "f", "g"]
 
 
 def _needs_repo_cd(block: str) -> bool:
@@ -333,7 +334,7 @@ def _step_1_config_block() -> str:
     raise AssertionError("Step 1 config block not found")
 
 
-def _run_step_1(tmp_path, block: str):
+def _run_step_1(tmp_path, block: str, precreate_work: bool = True):
     home = tmp_path / "home"
     (home / ".claude" / "plugins").mkdir(parents=True)
     (home / ".claude" / "plugins" / "known_marketplaces.json").write_text(json.dumps(
@@ -344,8 +345,9 @@ def _run_step_1(tmp_path, block: str):
     (home / ".claude" / "obsidian-brain-config.json").write_text(
         json.dumps({"vault_path": str(vault)}), encoding="utf-8")
     work = home / ".claude" / "obsidian-brain"
-    work.mkdir()
-    work.chmod(0o755)
+    if precreate_work:
+        work.mkdir()
+        work.chmod(0o755)
     script = block.replace("'<REPO_ROOT>'", f"'{REPO_ROOT}'")
     env = {**os.environ, "HOME": str(home)}
     proc = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True,
@@ -358,6 +360,15 @@ def test_step_1_config_block_prints_work_and_makes_it_private(tmp_path):
     assert proc.returncode == 0, proc.stderr
     assert f"WORK={work}" in proc.stdout.splitlines()
     assert f"VAULT={tmp_path / 'vault'}" in proc.stdout.splitlines()
+    assert stat.S_IMODE(work.stat().st_mode) == 0o700
+
+
+def test_step_1_config_block_creates_work_private_when_it_does_not_exist(tmp_path):
+    """Fresh HOME: `~/.claude/obsidian-brain` is absent before the run."""
+    block = _step_1_config_block()
+    proc, home, work = _run_step_1(tmp_path, block, precreate_work=False)
+    assert proc.returncode == 0, proc.stderr
+    assert f"WORK={work}" in proc.stdout.splitlines()
     assert stat.S_IMODE(work.stat().st_mode) == 0o700
 
 

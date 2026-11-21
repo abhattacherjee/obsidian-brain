@@ -1844,7 +1844,7 @@
         {
           "from": "compress-guard",
           "to": "note-writer-cli",
-          "label": "create new (write) OR append Update section + last_updated bump + tag merge (append-update), via CLI (the body comes from a draft file, #269, #517)"
+          "label": "create new (write) OR append Update section + last_updated bump + tag merge (append-update), via CLI (write reads a draft file via --body-file, #269, #517; append-update reads its section from stdin)"
         },
         {
           "from": "note-writer-cli",

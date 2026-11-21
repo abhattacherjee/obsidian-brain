@@ -44,11 +44,13 @@ requires_bash = pytest.mark.skipif(_BASH is None, reason="bash not available")
 # a global non-greedy ```bash…``` regex silently matched a prose span instead
 # of the real block (which then looks like "no heredoc here" — a test that
 # quietly covers nothing).
-# One regex for both the strict collector and the loose cross-check. It allows
-# interpreter flags between `python3` and the script (`python3 -B`, `python3 -I -u`).
-_INVOKE_PREFIX = r"""[ \t]*(?:python3(?:[ \t]+-[A-Za-z]+)*[ \t]+)?["']?[^"'\s]*note_writer\.py["']?\s+"""
-_COLUMN0_INVOCATION_RE = re.compile(
-    r"""^python3(?:[ \t]+-[A-Za-z]+)*[ \t]+"\$HOOKS/note_writer\.py\"""")
+# One pattern for both the strict collector and the loose cross-check. It does not
+# list interpreter flags (`python3 -B`, `-X utf8`, `-W ignore`, ...): any line with
+# `note_writer.py` (optionally quoted) then whitespace then `write` or
+# `append-update` counts, wherever it sits on the line. A backtick before the match
+# marks a prose mention, so it is skipped.
+_INVOKE_PATTERN = r"""[^`\n]*?note_writer\.py["']?[ \t]+(?:write|append-update)\b"""
+_COLUMN0_INVOCATION_RE = re.compile(r"^" + _INVOKE_PATTERN)
 # Matches the opener under EITHER scheme -- with the per-invocation `<eof4>`
 # placeholder or the old fixed form. Deliberately scheme-agnostic so that
 # reverting to a fixed delimiter makes the execution test fail on its real
@@ -114,8 +116,7 @@ _BLOCKS = _collect_blocks()
 # column 0, so a new call site written any other way would be silently
 # uncovered — and a `>= 9` floor would still pass. Cross-checking the strict
 # collector against this loose count makes that failure loud instead.
-_LOOSE_INVOCATION_RE = re.compile(
-    r"^" + _INVOKE_PREFIX + r"(?:write|append-update)\b", re.MULTILINE)
+_LOOSE_INVOCATION_RE = re.compile(r"^" + _INVOKE_PATTERN, re.MULTILINE)
 
 
 def _loose_invocation_count():
@@ -345,12 +346,12 @@ def test_invocation_regexes_accept_interpreter_flags():
     """Positive control: `python3 -B "$HOOKS/note_writer.py" write ...` must be
     matched by both the strict and the loose regex, else a call site written that
     way would be silently uncovered."""
-    for flags in ("", "-B ", "-I -u ", "-Bu "):
+    for flags in ("", "-B ", "-I -u ", "-Bu ", "-X utf8 ", "-W ignore ", "-X utf8 -W ignore "):
         line = f'python3 {flags}"$HOOKS/note_writer.py" write "$VAULT_PATH" "$X" "n.md" --body-file \'<BODY_FILE>\''
         assert _COLUMN0_INVOCATION_RE.match(line), line
         assert _LOOSE_INVOCATION_RE.findall(line), line
         assert _LOOSE_INVOCATION_RE.findall("  " + line), line
-    assert not _COLUMN0_INVOCATION_RE.match('echo python3 "$HOOKS/note_writer.py" write')
+    assert not _COLUMN0_INVOCATION_RE.match('Do not copy `--overwrite` to any other `note_writer.py write` block.')
 
 
 def _body_file_steps():
@@ -384,5 +385,10 @@ def test_every_body_file_step_tells_the_model_to_write_remove_and_keep_the_file(
     assert len(steps) == 8, [s[0] for s in steps]
     for site, prose in steps:
         assert "**Write tool**" in prose, site
-        assert "rm -f '<BODY_FILE>'" in prose, site
+        assert "After an `OK:` line, run `rm -f '<BODY_FILE>'`" in prose, site
+        retro = site.startswith("retro@")
+        draft = ("`<WORK>/retro-note-<draft-id>.md`" if retro
+                 else "`~/.claude/obsidian-brain/<draft-id>-<filename>`")
+        assert draft in prose, site
+        assert "`<draft-id>` is 8 random hex characters you pick once per run" in prose, site
         assert "keep `<BODY_FILE>`" in prose, site
