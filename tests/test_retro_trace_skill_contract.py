@@ -38,10 +38,9 @@ def test_step_75_names_every_trace_kind_the_cli_accepts():
 
 
 def _step_75_payload() -> dict:
-    """The JSON line inside the skill's apply heredoc, parsed."""
-    match = re.search(
-        r"<<'OB_TRACES_EOF_<eof4>'\n(?P<json>.*)\nOB_TRACES_EOF_<eof4>\n", STEP_75)
-    assert match, "apply heredoc not found in Step 7.5"
+    """The example traces-file content the skill shows, parsed."""
+    match = re.search(r"for example `(?P<json>\{\"traces\": .*?\})`", STEP_75)
+    assert match, "example traces file content not found in Step 7.5"
     return json.loads(match["json"])
 
 
@@ -69,9 +68,11 @@ def test_clear_step_reports_blocked_when_items_are_untraced():
     assert 'print(f"blocked: {untraced}' in STEP_75
 
 
-def test_apply_heredoc_terminator_is_per_invocation():
-    assert "<<'OB_TRACES_EOF_<eof4>'" in STEP_75
-    assert "\nOB_TRACES_EOF_<eof4>\n" in STEP_75
+def test_apply_takes_traces_from_a_file_not_a_heredoc():
+    """#518: the traces JSON goes in a file the Write tool made, never in the command."""
+    block = _step_75_apply_block()
+    assert "--traces-file '<TRACES_FILE>'" in block
+    assert "<<" not in block
 
 
 def _first_bash_block(section: str) -> str:
@@ -200,7 +201,10 @@ def _run_step_75_apply(tmp_path, swap: bool):
     note.write_text(
         "---\ntype: claude-retro\nproject: demo\ntags:\n  - claude/retro\n---\n"
         "\n## Process Improvements\n- [ ] One untraced item.\n", encoding="utf-8")
-    block = _step_75_apply_block().replace("<eof4>", "c0de")
+    traces = tmp_path / "traces.json"
+    traces.write_text(json.dumps(_step_75_payload()), encoding="utf-8")
+    block = _step_75_apply_block().replace("'<TRACES_FILE>'", f"'{traces}'")
+    block = block.replace("'<REPO_ROOT>'", f"'{REPO_ROOT}'")
     vault_arg, note_arg = '"$VAULT_PATH"', "'<NOTE_PATH>'"
     assert vault_arg in block and note_arg in block
     if swap:  # scratch copy only; the SKILL file is untouched
@@ -223,3 +227,27 @@ def test_step_75_apply_test_catches_swapped_vault_and_note_arguments(tmp_path):
     proc, note = _run_step_75_apply(tmp_path, swap=True)
     assert proc.returncode != 0
     assert retro_trace.parse_items(note.read_text(encoding="utf-8"))[0]["trace"] is None
+
+
+def _bash_blocks(text: str) -> list[str]:
+    return re.findall(r"^ *```bash\n(.*?)^ *```", text, re.M | re.S)
+
+
+def test_retro_blocks_run_in_a_worktree_isolated_session():
+    """#518: a worktree-isolated session refuses `cd "$(git ...)"`; no block may carry
+    git inside a command substitution, and no block may carry a heredoc."""
+    blocks = _bash_blocks(RETRO)
+    assert len(blocks) >= 9
+    for block in blocks:
+        assert not re.search(r"\$\(\s*git\b", block), block[:120]
+        assert "<<" not in block, block[:120]
+    assert sum(b.count("cd '<REPO_ROOT>'") for b in blocks) == 8
+    assert "```bash\ngit rev-parse --show-toplevel\n```" in RETRO
+
+
+def test_retro_write_takes_the_note_from_a_body_file():
+    """#517: the note body comes from a file the Write tool made, never the command."""
+    writes = [b for b in _bash_blocks(RETRO) if 'note_writer.py" write' in b]
+    assert len(writes) == 1
+    assert "--body-file '<BODY_FILE>'" in writes[0]
+    assert "keep `<BODY_FILE>`" in RETRO

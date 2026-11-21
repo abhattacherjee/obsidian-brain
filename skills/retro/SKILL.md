@@ -17,10 +17,18 @@ Follow these steps exactly. Do not skip steps or reorder them.
 
 ### Step 1 — Read config
 
-Run:
+First find the directory the later steps run from. Run this as a command of its own:
 
 ```bash
-cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+git rev-parse --show-toplevel
+```
+
+If it fails (not a git repo), run `pwd` instead. Keep the printed path; the steps below call it `<REPO_ROOT>`. Every block below starts with `cd '<REPO_ROOT>'`: paste the literal path, in single quotes (write a `'` inside it as `'\''`). Do not put `git` inside `$(...)` on a `cd` line: a worktree-isolated session refuses that form ("names git in a form too complex to verify", #518).
+
+Then run:
+
+```bash
+cd '<REPO_ROOT>'
 python3 -c '
 import sys, os
 import glob, json, os, re, sys
@@ -49,10 +57,14 @@ if not c.get("vault_path"):
 print("VAULT=" + c["vault_path"])
 print("SESS=" + c.get("sessions_folder", "claude-sessions"))
 print("INS=" + c.get("insights_folder", "claude-insights"))
+_w = os.path.expanduser("~/.claude/obsidian-brain")
+os.makedirs(_w, mode=0o700, exist_ok=True)
+os.chmod(_w, 0o700)
+print("WORK=" + _w)
 '
 ```
 
-Parse each output line as KEY=VALUE, splitting on the first `=`.
+Parse each output line as KEY=VALUE, splitting on the first `=`. `WORK` is a private (0o700) directory for the note and traces files that Steps 7 and 7.5 write with the Write tool; the steps below call it `<WORK>`.
 
 If the file does not exist or is invalid JSON, tell the user:
 
@@ -86,7 +98,7 @@ The active conversation buffer only covers the post-compact half of long session
 When a prior id is recovered, pass it as a **shell-quoted positional argument** after the `python3 -c` script below, one argument per id — never interpolated into the Python source itself (repo security rule). The script reads them from `sys.argv[1:]`, so it works whether zero or several are recovered.
 
 ```bash
-cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+cd '<REPO_ROOT>'
 mkdir -p "$HOME/.claude/obsidian-brain" && chmod 700 "$HOME/.claude/obsidian-brain"
 _OB_BUNDLE="$HOME/.claude/obsidian-brain/retro-bundle-$$.json"
 _OB_ERR="$HOME/.claude/obsidian-brain/retro-bundle-$$.err"
@@ -395,10 +407,10 @@ Final filename: `YYYY-MM-DD-retro-<hash>.md`
 
 Example: `2026-04-05-retro-a3f2.md`
 
-Run the note-writer CLI, piping the full note (frontmatter + body) in on stdin. It creates `$INSIGHTS_FOLDER` if needed and writes the file atomically at mode `0o600` — no `mkdir`/`chmod` needed. **Two rules for the heredoc terminator, both load-bearing.** (1) It must stay **quoted** (`<<'OB_NOTE_EOF_<eof4>'`) — do not drop the quotes in a future edit. (2) It must be **unique per invocation**: substitute the same 4 random hex characters for `<eof4>` in BOTH the `<<'OB_NOTE_EOF_<eof4>'` opener and the terminator line, then confirm that **no line of the content you are about to emit is exactly that terminator** — if one is, pick different hex characters and re-check. **Never** replace this with a fixed delimiter. Quoting stops `$`/backtick expansion but does NOT stop early termination: a line equal to the terminator at column 0 ends the heredoc there, silently truncating the content AND handing everything after it to the shell as commands to execute. Notes written by this plugin routinely quote these very blocks, so a fixed terminator is a live hazard, not a theoretical one. **Self-check before you emit the block: if the terminator still contains `<` or `>`, you have not substituted it.** Stop and substitute it — the literal `<eof4>` form appears at column 0 inside these SKILL.md blocks themselves, so a note quoting one of them collides all over again, and nothing on the shell side can catch that. The `HOOKS=` line below checks the marketplace-registered directory-source install location FIRST (#278 — on a local checkout that is what loads, not the released cache), and only falls back to the plugin cache, where it sorts versions **numerically** (a plain `max()` is lexicographic and picks `3.9.0` over `3.10.0`, resolving to a cache with no `note_writer.py`); the `test -f` line turns a stale/incomplete cache into the documented `ERROR:` shape instead of a raw Python `can't open file` message. An unquoted delimiter lets the shell expand `$` variables and backtick commands embedded in the note body, silently corrupting it:
+First write the full note (frontmatter + body) with the **Write tool** to `<WORK>/retro-note-<hash>.md` (the same `<hash>` as the filename; `<WORK>` from Step 1). Call that path `<BODY_FILE>`. Then run the note-writer CLI with `--body-file`. The note text never goes into the Bash command, so a PreToolUse hook that reads command text cannot refuse the save over words the note quotes (#517). `note_writer.py` creates `$INSIGHTS_FOLDER` if needed and writes the note atomically at mode `0o600`; no `mkdir`/`chmod` needed. The `HOOKS=` line below checks the marketplace-registered directory-source install location FIRST (#278 — on a local checkout that is what loads, not the released cache), and only falls back to the plugin cache, where it sorts versions **numerically** (a plain `max()` is lexicographic and picks `3.9.0` over `3.10.0`, resolving to a cache with no `note_writer.py`); the `test -f` line turns a stale/incomplete cache into the documented `ERROR:` shape instead of a raw Python `can't open file` message:
 
 ```bash
-cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+cd '<REPO_ROOT>'
 HOOKS=$(python3 -c "
 import glob, json, os, re
 def _ob_hooks():
@@ -420,25 +432,17 @@ def _ob_hooks():
 print(_ob_hooks())
 ")
 test -f "$HOOKS/note_writer.py" || { echo "ERROR: note_writer.py not found under $HOOKS - resolution checks the marketplace registered install location first, then falls back to the plugin cache; neither path produced a hooks directory containing it. Verify the obsidian-brain install resolved at $HOOKS is complete (git pull for a directory-source checkout, or run /plugin marketplace update for a cache install), then retry." >&2; exit 1; }
-python3 "$HOOKS/note_writer.py" write "$VAULT_PATH" "$INSIGHTS_FOLDER" "YYYY-MM-DD-retro-<hash>.md" <<'OB_NOTE_EOF_<eof4>'
----
-type: claude-retro
-...
----
-
-# Session Retrospective: ...
-...
-OB_NOTE_EOF_<eof4>
+python3 "$HOOKS/note_writer.py" write "$VAULT_PATH" "$INSIGHTS_FOLDER" "YYYY-MM-DD-retro-<hash>.md" --body-file '<BODY_FILE>'
 ```
 
-On success this prints `OK: <absolute path>`. Keep that absolute path exactly as printed; the steps below call it `<NOTE_PATH>`. Shell variables do not survive between Bash calls, so wherever `<NOTE_PATH>` appears, paste the literal path in its place. It always sits inside single quotes, so the shell does not expand a `$` or backtick in it; if the path itself contains a `'`, write each one as `'\''`. Step 8 confirms against it, not against a path rebuilt from config. On failure it prints `ERROR: <reason>` to stderr and exits non-zero; surface that message to the user and stop here (do not proceed to arming the classification gate below on a failed write).
+On success this prints `OK: <absolute path>`. Keep that absolute path exactly as printed; the steps below call it `<NOTE_PATH>`. Shell variables do not survive between Bash calls, so wherever `<NOTE_PATH>` appears, paste the literal path in its place. It always sits inside single quotes, so the shell does not expand a `$` or backtick in it; if the path itself contains a `'`, write each one as `'\''`. Step 8 confirms against it, not against a path rebuilt from config. Then remove the body file with `rm -f '<BODY_FILE>'` (the literal path). On failure it prints `ERROR: <reason>` to stderr and exits non-zero; surface that message to the user, **keep `<BODY_FILE>`** and tell the user its path so the note text is not lost, and stop here (do not proceed to arming the classification gate below on a failed write).
 
 If the error is `note already exists`, the 4-hex filename hash collided with a note written in the same second. Regenerate the hash (Step 7's command), rebuild the filename, and retry the write **once**. If it fails again for any reason, surface the error and stop — do not loop.
 
 **Arm the classification gate.** Immediately after writing the note, mark classification as pending. This arms the `obsidian_retro_gate.py` **Stop** hook, which blocks the turn from ending until Step 7.5 clears the gate — so classification can no longer be silently skipped:
 
 ```bash
-cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+cd '<REPO_ROOT>'
 python3 -c '
 import sys, os, glob
 import glob, json, os, re, sys
@@ -475,7 +479,7 @@ The retro is **not done** when the file is written. The literal next action afte
 1. **Extract** every item from the just-written **Process Improvements** and **Key Learnings** sections. Number the Process Improvements items with the parser the gate uses, so the numbers you trace in step 4 match it:
 
 ```bash
-cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+cd '<REPO_ROOT>'
 HOOKS=$(python3 -c "
 import glob, json, os, re
 def _ob_hooks():
@@ -512,10 +516,10 @@ python3 "$HOOKS/retro_trace.py" items '<NOTE_PATH>'
    - a direct doc or skill edit: `{"item": N, "kind": "path", "path": "<path you edited>"}`;
    - skipped, already covered or declined: `{"item": N, "kind": "skipped", "reason": "<why, citing the artifact>"}`.
 
-   Then pipe `{"traces": [...]}` to `apply`. Substitute 4 random hex characters for `<eof4>` in both the opener and the terminator, as in Step 7:
+   Write `{"traces": [...]}` with the **Write tool** to `<WORK>/retro-traces-<hash>.json` (the `<hash>` from Step 7). Call that path `<TRACES_FILE>`. Then pass it to `apply` with `--traces-file`, so no JSON goes into the Bash command. The file holds one JSON object, for example `{"traces": [{"item": 1, "kind": "skipped", "reason": "<why>"}]}`:
 
 ```bash
-cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+cd '<REPO_ROOT>'
 HOOKS=$(python3 -c "
 import glob, json, os, re
 def _ob_hooks():
@@ -537,18 +541,16 @@ def _ob_hooks():
 print(_ob_hooks())
 ")
 test -f "$HOOKS/retro_trace.py" || { echo "ERROR: retro_trace.py not found under $HOOKS - verify the obsidian-brain install resolved there is complete (git pull for a directory-source checkout, or /plugin marketplace update for a cache install), then retry." >&2; exit 1; }
-python3 "$HOOKS/retro_trace.py" apply "$VAULT_PATH" '<NOTE_PATH>' <<'OB_TRACES_EOF_<eof4>'
-{"traces": [{"item": 1, "kind": "skipped", "reason": "<why>"}]}
-OB_TRACES_EOF_<eof4>
+python3 "$HOOKS/retro_trace.py" apply "$VAULT_PATH" '<NOTE_PATH>' --traces-file '<TRACES_FILE>'
 ```
 
-   `apply` checks every entry before it writes anything. Exit 0 prints `{"written": true, "untraced": 0, "tracked_issues": [...]}`. The note now carries ` → <trace>` on each item, and every item except an issue is ticked `- [x]`. Exit 2 means an entry was refused (a missing or extra item, an item that already has a trace, a bad ref, or a newline, `→` or backtick in a value). The note is unchanged; fix the JSON from the stderr message and run it again. Exit 1 means the note could not be read or written, or was locked or changed on disk. Run it once more. If it fails again, check the note path from Step 7's `OK:` line and stop: treat it as a cancel and write nothing else.
+   `apply` checks every entry before it writes anything. Exit 0 prints `{"written": true, "untraced": 0, "tracked_issues": [...]}`. After exit 0, run `rm -f '<TRACES_FILE>'`. The note now carries ` → <trace>` on each item, and every item except an issue is ticked `- [x]`. Exit 2 means an entry was refused (a missing or extra item, an item that already has a trace, a bad ref, or a newline, `→` or backtick in a value). The note is unchanged; fix the JSON in `<TRACES_FILE>` from the stderr message (Write tool) and run it again. A traces file that is missing or unreadable is also exit 2, with nothing written. Exit 1 means the note could not be read or written, or was locked or changed on disk. Run it once more. If it fails again, check the note path from Step 7's `OK:` line and stop: treat it as a cancel and write nothing else.
 
    **Cancel is not decline.** If the user cancels classification, or `apply` keeps failing, write nothing: the note stays exactly as Step 7 wrote it and the gate stays armed. The Stop hook then blocks once and clears itself on the re-entry. Never invent a trace to get past the gate.
 5. **Clear the gate.** Once every item is filed and traced (step 4) — or there were no Process Improvements items — clear the gate so the turn can end:
 
    ```bash
-   cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+   cd '<REPO_ROOT>'
    python3 -c '
    import sys, os, glob
    import glob, json, os, re, sys
@@ -589,7 +591,7 @@ OB_TRACES_EOF_<eof4>
 Step 7.5 has cleared the gate, so the note is final. Start the lesson update for it in the background. It never asks, never waits and never checks the result: the update judges the new items with Haiku (about 7 seconds each) and rewrites the lesson notes that changed. A held lock makes the background run exit 1 into the log, never block `/retro`. Replace `<NOTE_PATH>` with the path from Step 7:
 
 ```bash
-cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+cd '<REPO_ROOT>'
 HOOKS=$(python3 -c "
 import glob, json, os, re
 def _ob_hooks():

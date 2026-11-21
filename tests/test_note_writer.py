@@ -80,6 +80,87 @@ def _run_argv(*args: str, stdin: str = "") -> subprocess.CompletedProcess:
 # Happy path
 # ---------------------------------------------------------------------------
 
+class TestBodyFile:
+    def test_matches_stdin_bytes(self, tmp_path):
+        content = MINIMAL_FM + "Café\r\nsecond line\n"
+        body = tmp_path / "input note"
+        body.write_bytes(content.encode("utf-8"))
+
+        stdin_result = _run_write(tmp_path, "notes", "stdin.md", content)
+        file_result = _run_argv("write", "--body-file", str(body), str(tmp_path), "notes", "file.md")
+
+        assert stdin_result.returncode == 0, stdin_result.stderr
+        assert file_result.returncode == 0, file_result.stderr
+        assert (tmp_path / "notes/file.md").read_bytes() == (tmp_path / "notes/stdin.md").read_bytes()
+
+    def test_overwrite(self, tmp_path):
+        dest = _make_note(tmp_path, "notes", "note.md", MINIMAL_FM + "original\n")
+        body = tmp_path / "body"
+        body.write_text(MINIMAL_FM + "replacement\n", encoding="utf-8")
+
+        result = _run_argv("write", str(tmp_path), "notes", "--overwrite", "--body-file", str(body), dest.name)
+
+        assert result.returncode == 0, result.stderr
+        assert dest.read_bytes() == body.read_bytes()
+
+    @pytest.mark.parametrize("kind", ["missing", "directory", "unreadable", "invalid-utf8"])
+    def test_cannot_read(self, tmp_path, kind):
+        body = tmp_path / "body"
+        if kind == "directory":
+            body.mkdir()
+        elif kind == "unreadable":
+            if os.geteuid() == 0:
+                pytest.skip("root can read a mode-000 file")
+            body.write_text(MINIMAL_FM + "content\n", encoding="utf-8")
+            body.chmod(0)
+        elif kind == "invalid-utf8":
+            body.write_bytes(MINIMAL_FM.encode("utf-8") + b"\xff")
+
+        result = _run_argv("write", str(tmp_path), "notes", "note.md", "--body-file", str(body))
+
+        assert result.returncode == 1
+        assert result.stderr.startswith(f"ERROR: cannot read --body-file {body}: ")
+        assert not (tmp_path / "notes/note.md").exists()
+
+    def test_oversized(self, tmp_path):
+        body = tmp_path / "body"
+        body.write_text(MINIMAL_FM + "a" * (STDIN_CAP_CHARS + 1 - len(MINIMAL_FM)), encoding="utf-8")
+
+        result = _run_argv("write", str(tmp_path), "notes", "note.md", "--body-file", str(body))
+
+        assert result.returncode == 1
+        assert result.stderr.startswith("ERROR: --body-file exceeds")
+        assert not (tmp_path / "notes/note.md").exists()
+
+    @pytest.mark.parametrize(("flags", "error"), [
+        (["--body-file"], "--body-file needs a path"),
+        (["--body-file", "one", "--body-file", "two"], "--body-file given more than once"),
+    ])
+    def test_invalid_flags(self, tmp_path, flags, error):
+        result = _run_argv("write", str(tmp_path), "notes", "note.md", *flags)
+
+        assert result.returncode == 2
+        assert result.stderr.strip() == f"ERROR: {error}"
+        assert not (tmp_path / "notes/note.md").exists()
+
+    def test_ignores_stdin(self, tmp_path):
+        body = tmp_path / "body"
+        body.write_text(MINIMAL_FM + "from file\n", encoding="utf-8")
+        result = _run_argv("write", str(tmp_path), "notes", "note.md", "--body-file", str(body),
+                           stdin=MINIMAL_FM + "from stdin\n")
+
+        assert result.returncode == 0, result.stderr
+        assert (tmp_path / "notes/note.md").read_bytes() == body.read_bytes()
+
+    def test_empty(self, tmp_path):
+        body = tmp_path / "body"
+        body.touch()
+        result = _run_argv("write", str(tmp_path), "notes", "note.md", "--body-file", str(body))
+
+        assert result.returncode == 1
+        assert not (tmp_path / "notes/note.md").exists()
+
+
 def test_write_creates_file_with_verbatim_content(tmp_path):
     vault = tmp_path / "vault"
     vault.mkdir()

@@ -14,6 +14,7 @@ from note_writer import (
     _acquire_lock,
     _atomic_rewrite,
     _detect_line_ending,
+    STDIN_CAP_CHARS,
     _read_stdin_capped,
     _release_lock,
     _resolve_note_path,
@@ -390,22 +391,51 @@ def apply_traces(vault_path: str, note_path: str, traces: list[dict],
         _release_lock(lock)
 
 
+def _usage() -> int:
+    print("usage: retro_trace.py apply <vault> <note> [--partial] [--traces-file PATH]"
+          " | untraced <note> | items <note>"
+          " | closed-candidates <vault> <insights_folder> [--project P]", file=sys.stderr)
+    return 2
+
+
 def main(argv=None) -> int:
     """CLI for retro traces; JSON input is read only for apply."""
     args = list(sys.argv[1:] if argv is None else argv)
     if not args or not (
-        (args[0] == "apply" and (
-            len(args) == 3 or (len(args) == 4 and args[3] == "--partial")))
+        (args[0] == "apply" and len(args) >= 3
+         and not any(arg.startswith("-") for arg in args[1:3]))
         or (args[0] in ("untraced", "items") and len(args) == 2)
         or (args[0] == "closed-candidates" and (
             len(args) == 3 or (len(args) == 5 and args[3] == "--project")))
     ):
-        print("usage: retro_trace.py apply <vault> <note> [--partial] | untraced <note> | items <note>"
-              " | closed-candidates <vault> <insights_folder> [--project P]", file=sys.stderr)
-        return 2
+        return _usage()
     try:
         if args[0] == "apply":
-            raw, oversized = _read_stdin_capped()
+            partial = False
+            traces_file = None
+            options = iter(args[3:])
+            for option in options:
+                if option == "--partial" and not partial:
+                    partial = True
+                elif option == "--traces-file" and traces_file is None:
+                    traces_file = next(options, None)
+                    if traces_file is None or traces_file.startswith("-"):
+                        return _usage()
+                else:
+                    return _usage()
+            if traces_file is None:
+                raw, oversized = _read_stdin_capped()
+            else:
+                try:
+                    if not os.path.isfile(traces_file):
+                        raise OSError("not a regular file")
+                    with open(traces_file, encoding="utf-8", newline="") as fh:
+                        raw = fh.read(STDIN_CAP_CHARS + 1)
+                except (OSError, UnicodeError) as exc:
+                    print(f"apply: cannot read --traces-file {traces_file}: {exc}; nothing written",
+                          file=sys.stderr)
+                    return 2
+                oversized = len(raw) > STDIN_CAP_CHARS
             if oversized:
                 print("apply: input over the stdin cap; nothing written", file=sys.stderr)
                 return 2
@@ -413,7 +443,7 @@ def main(argv=None) -> int:
             if not isinstance(payload, dict) or "traces" not in payload:
                 raise TraceError('expected JSON object with "traces" list')
             print(json.dumps(apply_traces(
-                args[1], args[2], payload["traces"], partial=len(args) == 4)))
+                args[1], args[2], payload["traces"], partial=partial)))
         elif args[0] == "closed-candidates":
             try:
                 result = closed_candidates(

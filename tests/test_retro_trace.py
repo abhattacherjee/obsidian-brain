@@ -103,14 +103,71 @@ def test_cli_apply_partial_flag(tmp_path, monkeypatch, capsys):
     assert json.loads(capsys.readouterr().out)["untraced"] == 2
 
 
-@pytest.mark.parametrize("extra", [["--bogus"], ["extra"], ["--partial", "--bogus"],
-                                   ["--partial", "--partial"]])
+def test_cli_apply_file_matches_stdin(tmp_path, monkeypatch):
+    stdin_note = make_note(tmp_path).rename(tmp_path / "stdin.md")
+    file_note = make_note(tmp_path)
+    payload = json.dumps({"traces": TRACES})
+    traces_file = tmp_path / "traces.json"
+    traces_file.write_text(payload, encoding="utf-8")
+    monkeypatch.setattr("sys.stdin", io.StringIO(payload))
+    assert rt.main(["apply", str(tmp_path), stdin_note.name]) == 0
+
+    class UnusedInput:
+        def read(self, *args):
+            raise AssertionError("unexpected read from stdin")
+
+    monkeypatch.setattr("sys.stdin", UnusedInput())
+    assert rt.main(["apply", str(tmp_path), file_note.name, "--traces-file", str(traces_file)]) == 0
+    assert file_note.read_bytes() == stdin_note.read_bytes()
+
+
+@pytest.mark.parametrize("partial_first", [True, False])
+def test_cli_apply_partial_file(tmp_path, partial_first, capsys):
+    path = make_note(tmp_path)
+    traces_file = tmp_path / "traces.json"
+    traces_file.write_text(json.dumps({"traces": TRACES[:1]}), encoding="utf-8")
+    file_args = ["--traces-file", str(traces_file)]
+    flags = ["--partial", *file_args] if partial_first else [*file_args, "--partial"]
+    assert rt.main(["apply", str(tmp_path), path.name, *flags]) == 0
+    assert json.loads(capsys.readouterr().out)["untraced"] == 3
+    assert rt.untraced_count(path) == 3
+
+
+@pytest.mark.parametrize("case", ["missing", "directory", "invalid-utf8"])
+def test_cli_apply_file_read_error(tmp_path, case, capsys):
+    path = make_note(tmp_path)
+    before = snapshot(path)
+    traces_file = tmp_path / "traces.json"
+    if case == "directory":
+        traces_file.mkdir()
+    elif case == "invalid-utf8":
+        traces_file.write_bytes(b'{"traces": [], "extra": "\xff"}')
+    assert rt.main(["apply", str(tmp_path), path.name, "--traces-file", str(traces_file)]) == 2
+    assert f"cannot read --traces-file {traces_file}:" in capsys.readouterr().err
+    assert snapshot(path) == before
+
+
+def test_cli_apply_oversized_file(tmp_path, capsys):
+    path = make_note(tmp_path)
+    before = snapshot(path)
+    traces_file = tmp_path / "traces.json"
+    payload = json.dumps({"traces": TRACES}).ljust(rt.STDIN_CAP_CHARS + 1)
+    traces_file.write_text(payload, encoding="utf-8")
+    assert rt.main(["apply", str(tmp_path), path.name, "--traces-file", str(traces_file)]) == 2
+    assert capsys.readouterr().err.strip() == "apply: input over the stdin cap; nothing written"
+    assert snapshot(path) == before
+
+
+@pytest.mark.parametrize("extra", [["--nope"], ["extra"], ["--partial", "--bogus"],
+                                   ["--partial", "--partial"], ["--traces-file"],
+                                   ["--traces-file", "--partial"],
+                                   ["--traces-file", "one", "--traces-file", "two"]])
 def test_cli_apply_unknown_flag_is_usage_error(tmp_path, capsys, extra):
     path = make_note(tmp_path, HEADER + PARTIAL_BODY)
     before = snapshot(path)
     assert rt.main(["apply", str(tmp_path), path.name, *extra]) == 2
     output = capsys.readouterr()
-    assert "usage:" in output.err and "[--partial]" in output.err
+    assert "usage:" in output.err and "apply <vault> <note> [--partial] [--traces-file PATH]" in output.err
     assert not output.out
     assert snapshot(path) == before
 
