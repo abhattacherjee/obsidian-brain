@@ -11,6 +11,8 @@ import sys
 
 import pytest
 
+from skill_shell import fenced_blocks
+
 
 REPO = Path(__file__).resolve().parent.parent
 needs_git = pytest.mark.skipif(shutil.which("git") is None, reason="git required")
@@ -169,7 +171,9 @@ def test_step_one_guard_rejects_develop_recall():
 
 # --- /check-items: three blocks derive the project ---
 
-_DQ_BLOCK_RE = re.compile(r'python3 -c "\n(.*?)\n"[^\n]*\)', re.DOTALL)
+# The closing quote ends its line: `")` inside a `$(...)`, or `" "$scope_path"`
+# at top level (#521 took check-items' git-naming blocks out of `$(...)`).
+_DQ_BLOCK_RE = re.compile(r'python3 -c "\n(.*?)\n"[^\n]*$', re.DOTALL | re.MULTILINE)
 _HEREDOC_BLOCK_RE = re.compile(r"python3\s+<<\s*'(\w+)'\n(.*?)\n\1\n", re.DOTALL)
 
 
@@ -239,9 +243,9 @@ def test_check_items_guard_rejects_deleted_import():
     marker = "from obsidian_utils import canonical_project_name\n"
     # Delete the import from the Step 2b heredoc only; prose and the other
     # two import sites are untouched, so the old count check stayed green.
-    head, _, tail = text.partition("closed_path=$(SCOPE_PATH")
+    head, _, tail = text.partition("## Step 2b")
     assert marker in tail
-    mutated = head + "closed_path=$(SCOPE_PATH" + tail.replace(marker, "", 1)
+    mutated = head + "## Step 2b" + tail.replace(marker, "", 1)
     assert _check_items_problems(mutated)
 
 
@@ -358,9 +362,9 @@ def test_worktree_fixture_discriminates(worktree_dir):
 def test_check_items_step2_current_project_is_canonical(worktree_dir, snippet_env, tmp_path):
     """Run the real Step 2 block from a worktree: it must read main-repo's notes."""
     text = _skill_text("check-items")
-    start = text.index('raw_path=$(python3 -c "')
-    end = text.index('" "$scope_path")', start) + len('" "$scope_path")')
-    script = text[start:end] + '\nprintf "%s" "$raw_path"\n'
+    step2 = text.index("## Step 2 —")
+    block = next(b for b in fenced_blocks(text[step2:]) if "raw_items.json" in b.body)
+    script = block.body
 
     config = json.loads(
         (Path(snippet_env["HOME"]) / ".claude" / "obsidian-brain-config.json").read_text()
@@ -382,6 +386,8 @@ def test_check_items_step2_current_project_is_canonical(worktree_dir, snippet_en
         capture_output=True, text=True, timeout=60,
     )
     assert result.returncode == 0, result.stderr
-    items = json.loads(Path(result.stdout.strip()).read_text(encoding="utf-8"))
+    last = result.stdout.strip().splitlines()[-1]
+    assert last.startswith("raw_path="), result.stdout
+    items = json.loads(Path(last[len("raw_path="):]).read_text(encoding="utf-8"))
     assert [i["project"] for i in items] == ["main-repo"]
     assert [i["text"] for i in items] == ["item for main-repo"]

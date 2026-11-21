@@ -1108,7 +1108,7 @@
           "files": [
             "skills/dev-test/SKILL.md"
           ],
-          "purpose": "MAINTENANCE. Install/restore/status the dev plugin into the cache for local testing. The SKILL.md blocks locate the checkout in this order: git rev-parse --show-toplevel when that toplevel carries the scripts/test-dev-skill.sh sentinel (so a worktree or second clone installs itself, not the registered tree), then a dedicated _ob_repo() resolver reading the registered directory-source install from known_marketplaces.json, else a loud failure naming both attempted routes (#287); the plugin cache is deliberately not a fallback here, unlike every other resolver in this repo (D3). The resolved tree is echoed ('Source checkout: ...') and passed as an absolute path to scripts/test-dev-skill.sh, which independently re-derives and validates its own root."
+          "purpose": "MAINTENANCE. Install/restore/status the dev plugin into the cache for local testing. The SKILL.md blocks locate the checkout in this order: the repo root the model pastes from a separate git rev-parse --show-toplevel step (#521), when that root carries the scripts/test-dev-skill.sh sentinel (so a worktree or second clone installs itself, not the registered tree), then a dedicated _ob_repo() resolver reading the registered directory-source install from known_marketplaces.json, else a loud failure naming both attempted routes (#287); the plugin cache is deliberately not a fallback here, unlike every other resolver in this repo (D3). The resolved tree is echoed ('Source checkout: ...') and passed as an absolute path to scripts/test-dev-skill.sh, which independently re-derives and validates its own root."
         },
         {
           "id": "sk-check-items",

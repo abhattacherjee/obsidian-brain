@@ -145,8 +145,8 @@ def _validate_vault_path(vault_path: str):
     so a write is trivially "contained" in whatever directory the process
     happens to be running in.
 
-    Every skill call site is preceded by `cd "$(git rev-parse
-    --show-toplevel ...)"`, so if a skill block runs with `$VAULT_PATH`
+    Every skill call site is preceded by `cd '<REPO_ROOT>'` (the repo
+    root, #521), so if a skill block runs with `$VAULT_PATH`
     left unsubstituted (e.g. an unset variable in a fresh shell), an
     unvalidated empty vault_path silently writes session content into the
     user's git working tree -- exit 0, an `OK:` line, no filesystem error

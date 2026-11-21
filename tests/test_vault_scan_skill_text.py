@@ -181,9 +181,11 @@ def test_vault_scan_blocks_resolve_hooks_and_check_the_script(skill):
     scan_blocks = [b for b in blocks if "vault_scan.py" in b]
     assert len(scan_blocks) >= 2, skill
     for b in scan_blocks:
-        assert b.startswith('cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"\n')
+        # #521: a worktree-isolated session refuses git inside $(...) and
+        # brace groups, so the block cds to a pasted root and guards with if/then.
+        assert b.startswith("cd '<REPO_ROOT>'\n")
         assert '\nHOOKS=$(python3 -c "\n' in b
-        assert 'test -f "$HOOKS/vault_scan.py" ||' in b
+        assert 'if ! test -f "$HOOKS/vault_scan.py"; then ' in b
 
 
 @pytest.mark.parametrize("skill", sorted(SKILLS))

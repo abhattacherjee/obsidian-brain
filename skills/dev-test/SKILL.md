@@ -15,6 +15,16 @@ Swaps the installed plugin cache with the current repo working copy for local te
 
 ## Procedure
 
+### Repo root — run first
+
+Run this as a command of its own:
+
+```bash
+git rev-parse --show-toplevel
+```
+
+If it fails (not a git repo), run `pwd` instead. Keep the printed path; the steps below call it `<REPO_ROOT>`. Paste that literal path wherever a block below names `'<REPO_ROOT>'`, in single quotes (write a `'` inside it as `'\''`). Do not put `git` inside `$(...)`: a worktree-isolated session refuses any command substitution whose text contains `git` (#521).
+
 ### Step 1 — Parse argument
 
 Check the argument passed to `/dev-test`:
@@ -42,7 +52,10 @@ This works from any directory — it locates the obsidian-brain checkout itself,
 # regresses. Pinned by
 # test_shell_uses_the_registry_when_the_cwd_toplevel_lacks_the_sentinel.
 REPO=""
-_T="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+_T='<REPO_ROOT>'
+# An unfilled placeholder would fail the sentinel check and fall through to
+# layer 2 without a word, which is the #287 bug. Refuse it instead.
+if [ "${_T#<}" != "$_T" ]; then echo "ERROR: paste the repo root path from the first step in place of the placeholder, then retry." >&2; exit 1; fi
 if [ -n "$_T" ] && [ -f "$_T/scripts/test-dev-skill.sh" ]; then
     REPO="$_T"
 fi
@@ -115,7 +128,10 @@ This works from any directory — it locates the obsidian-brain checkout itself,
 # regresses. Pinned by
 # test_shell_uses_the_registry_when_the_cwd_toplevel_lacks_the_sentinel.
 REPO=""
-_T="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+_T='<REPO_ROOT>'
+# An unfilled placeholder would fail the sentinel check and fall through to
+# layer 2 without a word, which is the #287 bug. Refuse it instead.
+if [ "${_T#<}" != "$_T" ]; then echo "ERROR: paste the repo root path from the first step in place of the placeholder, then retry." >&2; exit 1; fi
 if [ -n "$_T" ] && [ -f "$_T/scripts/test-dev-skill.sh" ]; then
     REPO="$_T"
 fi
@@ -184,7 +200,10 @@ This works from any directory — it locates the obsidian-brain checkout itself,
 # regresses. Pinned by
 # test_shell_uses_the_registry_when_the_cwd_toplevel_lacks_the_sentinel.
 REPO=""
-_T="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+_T='<REPO_ROOT>'
+# An unfilled placeholder would fail the sentinel check and fall through to
+# layer 2 without a word, which is the #287 bug. Refuse it instead.
+if [ "${_T#<}" != "$_T" ]; then echo "ERROR: paste the repo root path from the first step in place of the placeholder, then retry." >&2; exit 1; fi
 if [ -n "$_T" ] && [ -f "$_T/scripts/test-dev-skill.sh" ]; then
     REPO="$_T"
 fi

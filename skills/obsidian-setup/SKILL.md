@@ -15,6 +15,16 @@ Configure the obsidian-brain plugin for first use. This skill validates prerequi
 
 Follow these steps exactly. Do not skip steps or reorder them.
 
+### Repo root — run first
+
+Run this as a command of its own:
+
+```bash
+git rev-parse --show-toplevel
+```
+
+If it fails (not a git repo), run `pwd` instead. Keep the printed path; the steps below call it `<REPO_ROOT>`. Paste that literal path wherever a block below names `'<REPO_ROOT>'`, in single quotes (write a `'` inside it as `'\''`). Do not put `git` inside `$(...)`: a worktree-isolated session refuses any command substitution whose text contains `git` (#521).
+
 ### Step 1 — Check for existing installation
 
 **Argument handling:** If the user ran `/obsidian-setup --deps`, skip the existing-config detection and jump directly to Step 8.7 (Performance Dependencies). `--deps` re-triggers the dependency prompt regardless of the `optional_deps_prompted` flag in config. After Step 8.7 completes, skip to Step 10 (success message).
@@ -22,7 +32,7 @@ Follow these steps exactly. Do not skip steps or reorder them.
 Check for existing config:
 
 ```bash
-cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+cd '<REPO_ROOT>'
 python3 -c '
 import sys, os
 import glob, json, os, re, sys
@@ -686,7 +696,7 @@ Phase 2 theme clustering can use `numpy` (vectorized TF-IDF) and `scipy` (agglom
 **Idempotent detection.** Load the current config + installed status:
 
 ```bash
-cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+cd '<REPO_ROOT>'
 python3 -c '
 import sys, os, json
 import glob, json, os, re, sys
@@ -743,7 +753,7 @@ Parse each line as `KEY=VALUE`.
 - **Install:** run `python3 -m pip install --user` for every missing package. Report success/failure for each. After install, update config:
 
 ```bash
-cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+cd '<REPO_ROOT>'
 python3 -c '
 import sys, os, json, tempfile
 import glob, json, os, re, sys
@@ -803,7 +813,7 @@ If pip itself is missing or the install fails (restricted environments, e.g. Hom
 - **Skip:** write both flags with every missing package added to `optional_deps_declined`:
 
 ```bash
-cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+cd '<REPO_ROOT>'
 python3 - <<'PY'
 import json, os, tempfile
 from pathlib import Path

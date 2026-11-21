@@ -15,12 +15,22 @@ Searches the Obsidian vault for session notes and insights matching the current 
 
 Follow these steps exactly. Do not skip steps or reorder them.
 
+### Repo root — run first
+
+Run this as a command of its own:
+
+```bash
+git rev-parse --show-toplevel
+```
+
+If it fails (not a git repo), run `pwd` instead. Keep the printed path; the steps below call it `<REPO_ROOT>`. Paste that literal path wherever a block below names `'<REPO_ROOT>'`, in single quotes (write a `'` inside it as `'\''`). Do not put `git` inside `$(...)`: a worktree-isolated session refuses any command substitution whose text contains `git` (#521).
+
 ### Step 1 — Load config and derive project
 
 Run a single call that loads config and derives the project name (saves one parent round):
 
 ```bash
-cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+cd '<REPO_ROOT>'
 python3 -c '
 import sys, os
 import glob, json, os, re, sys
@@ -86,7 +96,7 @@ Track the returned task IDs — you will update them as each step completes. Imm
 Find unsummarized notes for this project in a single Python call (replaces multiple Grep rounds):
 
 ```bash
-cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+cd '<REPO_ROOT>'
 python3 -c '
 import sys, os
 import glob, json, os, re, sys
@@ -151,7 +161,7 @@ If N <= 5, create a sub-task for each note (subject `"Upgrade: <basename>"`, act
 **Single Bash tool call** — `upgrade_batch()` fans out N Haiku invocations in parallel inside one Python process via `concurrent.futures.ThreadPoolExecutor`. This sidesteps the Claude Code harness's serialization of parallel Bash tool calls for subprocess-blocking work:
 
 ```bash
-cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+cd '<REPO_ROOT>'
 printf '%s' "$UNSUMMARIZED_PATHS_JSON" | python3 -c '
 import sys, os, json
 from collections import Counter
@@ -226,7 +236,7 @@ When sub-agents return, for each:
 2. If EXISTS, apply it via Python:
 
    ```bash
-   cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+   cd '<REPO_ROOT>'
    python3 -c '
    import sys, os
    import glob, json, os, re, sys
@@ -285,7 +295,7 @@ Update task #3 to `in_progress`.
 Run a single Python call that reads all session and insight files and composes the brief — no sub-agent needed:
 
 ```bash
-cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+cd '<REPO_ROOT>'
 python3 -c '
 import sys, os
 import glob, json, os, re, sys
@@ -340,7 +350,7 @@ If unsummarized notes were upgraded in Step 2, also mention:
 Surface the project's top recurring themes (ranked by stored activation, kept fresh by `/consolidate` and `/emerge`). This is a fast, read-only DB read — `$PROJECT` is the value already derived in Step 1.
 
 ```bash
-cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+cd '<REPO_ROOT>'
 python3 -c '
 import sys, os
 import glob, json, os, re, sys

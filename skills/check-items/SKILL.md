@@ -120,7 +120,7 @@ If the block exits 2, stop and show the user the stderr verbatim; do not fall th
 ## Step 2 — Collect open items (Stage 1)
 
 ```bash
-raw_path=$(python3 -c "
+python3 -c "
 import sys, os, glob, json, itertools
 import glob, json, os, re, sys
 def _ob_hooks():
@@ -236,10 +236,8 @@ out_path = os.path.join(os.path.dirname(scope_path), 'raw_items.json')
 with open(out_path, 'w') as f:
     json.dump(raw_items, f, indent=2)
 os.chmod(out_path, 0o600)
-print(out_path)
-" "$scope_path")
-
-echo "raw_path=$raw_path"
+print('raw_path=' + out_path)
+" "$scope_path"
 ```
 
 ## Step 2b — Items whose tracked issue is closed (#65, #470)
@@ -247,7 +245,7 @@ echo "raw_path=$raw_path"
 `/retro` writes ` → [owner/repo#N](url)` on each Process Improvements item it filed as a GitHub issue, and lists the ref in the note's `tracked_issues` frontmatter. Such an item stays `- [ ]` until the issue closes. This step finds retro notes in scope whose tracked issue is now closed, and offers them for a tick in Step 7. The step makes one `gh issue view` call per distinct ref, and only for refs listed in `tracked_issues`. A `gh` failure for a ref (an error, a timeout, `gh` missing, bad output) offers nothing for that ref, and the failure is printed. A failure never produces a tick.
 
 ```bash
-closed_path=$(SCOPE_PATH="$scope_path" python3 << 'PYEOF'
+SCOPE_PATH="$scope_path" python3 << 'PYEOF'
 import sys, os, glob, json, subprocess
 import glob, json, os, re, sys
 def _ob_hooks():
@@ -296,11 +294,8 @@ out = os.path.join(os.path.dirname(scope_path), "closed_candidates.json")
 with open(out, "w") as f:
     json.dump(result, f, indent=2)
 os.chmod(out, 0o600)
-print(out)
+print("closed_path=" + out)
 PYEOF
-)
-
-echo "closed_path=$closed_path"
 ```
 
 Print every `!! closed-issue lookup failed` line to the user as it is. These candidates bypass Steps 3–6: the closed issue is the evidence, so no classifier runs on them.
@@ -310,7 +305,7 @@ Print every `!! closed-issue lookup failed` line to the user as it is. These can
 Convention: each step is a `bash` block. Steps 1-2 use `python3 -c "..."` with positional argv tokens (inputs passed as `sys.argv` args, e.g. `python3 -c "..." "$scope_path"`). Steps 2b-10 use `python3 << 'PYEOF' ... PYEOF` heredoc with inputs passed via environment variables (e.g. `SCOPE_PATH="$scope_path" python3 << 'PYEOF' ... PYEOF`); the Python reads them via `os.environ["VAR_NAME"]` — never via `sys.argv`. Both patterns produce a runnable shell block — never paste raw `python3` blocks that rely on `sys.argv` without an argv-passing wrapper, and never use env-var heredoc style for Steps 1-2 which expect positional args.
 
 ```bash
-part_path=$(SCOPE_PATH="$scope_path" RAW_PATH="$raw_path" python3 << 'PYEOF'
+SCOPE_PATH="$scope_path" RAW_PATH="$raw_path" python3 << 'PYEOF'
 import sys, os, glob, json, subprocess
 import glob, json, os, re, sys
 def _ob_hooks():
@@ -419,11 +414,8 @@ out = os.path.join(os.path.dirname(scope_path), "partition.json")
 with open(out, "w") as f:
     json.dump({"flat_groups": flat_groups, "known": known, "needs": needs, "heads": heads}, f, indent=2)
 os.chmod(out, 0o600)
-print(out)
+print("part_path=" + out)
 PYEOF
-)
-
-echo "part_path=$part_path"
 ```
 
 ## Step 4 — Semantic merge on needs-reclassification set (Stage 2b)
@@ -491,7 +483,7 @@ echo "merged_path=$merged_path"
 ## Step 5 — Gather evidence (Stage 3)
 
 ```bash
-_step5_out=$(SCOPE_PATH="$scope_path" MERGED_PATH="$merged_path" python3 << 'PYEOF'
+SCOPE_PATH="$scope_path" MERGED_PATH="$merged_path" python3 << 'PYEOF'
 import sys, os, glob, json, datetime
 import glob, json, os, re, sys
 def _ob_hooks():
@@ -588,16 +580,9 @@ with open(gaps_out, "w") as f:
     json.dump(evidence_gaps, f, default=str, indent=2)
 os.chmod(gaps_out, 0o600)
 
-print(out)
-print(gaps_out)
+print("evidence_path=" + out)
+print("gaps_path=" + gaps_out)
 PYEOF
-)
-
-evidence_path=$(echo "$_step5_out" | sed -n '1p')
-gaps_path=$(echo "$_step5_out" | sed -n '2p')
-
-echo "evidence_path=$evidence_path"
-echo "gaps_path=$gaps_path"
 ```
 
 `deep_analysis_pipeline` gathers per-project evidence for every project in `merged_by_proj`. Projects with a resolved local git repo carry commits, tags, releases, merged PRs, closed issues, changed paths, changelog excerpts and FTS-indexed vault mentions. Every project also gathers `note_completions` (#318, #339): a strictly newer session's own `## Summary` must report an item done, with the completion-phrase guard rejecting bare co-mentions. Step 6 stamps the per-verdict MED cap via `note_cap_for()` (`hooks/check_items_cli.py`). When notes are present, HIGH requires a literal ref shared by the citation, item text and git corroboration corpus; vault mentions, changed paths and notes never corroborate it. Step 7's `assign_tier` consumes the existing `note_evidence_only` key.
@@ -1081,7 +1066,7 @@ rm -f "$_skips_file"
 (Implemented in Task 22.) Every argument below is derived mechanically from files already on disk by this step's own block — #318 I1: before this fix, `classifications`/`merges`/`evidence_gaps` were prose instructions with no executable block behind them, the same "written, tested, and unreachable unless a model complies" shape as F14. `write_check_items_dashboard()`'s path convention: `<vault>/<check_items_folder>/check-items-<scope>-<YYYY-MM-DD>.md` (folder configurable, default `claude-check-items`).
 
 ```bash
-report_path=$(SCOPE_PATH="$scope_path" RAW_PATH="$raw_path" PART_PATH="$part_path" MERGED_PATH="$merged_path" CLASSIFICATIONS_PATH="$classifications_path" BUCKETS_PATH="$buckets_path" GAPS_PATH="$gaps_path" python3 << 'PYEOF'
+SCOPE_PATH="$scope_path" RAW_PATH="$raw_path" PART_PATH="$part_path" MERGED_PATH="$merged_path" CLASSIFICATIONS_PATH="$classifications_path" BUCKETS_PATH="$buckets_path" GAPS_PATH="$gaps_path" python3 << 'PYEOF'
 import sys, os, glob, json, re, subprocess, datetime
 import glob, json, os, re, sys
 def _ob_hooks():
@@ -1226,11 +1211,8 @@ report_path = write_check_items_dashboard(
     evidence_gaps=evidence_gaps,
     closed_on_github=closed_applied,
 )
-print(report_path)
+print(f"report_path={report_path}")
 PYEOF
-)
-
-echo "report_path=$report_path"
 ```
 
 `report_path` is the dashboard note's full path — surface it to the user in the terminal Output format's `Report:` line.
