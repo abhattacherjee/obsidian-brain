@@ -1,56 +1,55 @@
 """Execute the SKILL.md ``note_writer.py`` blocks under a real shell.
 
+Call sites are found by running EVERY fenced shell block of every skill under
+bash with stub ``python3``, ``git`` and ``gh`` that record their argv (#522),
+not by matching command text: regexes missed ``python3 -X utf8``, a ``\\``
+continuation before ``write`` and tilde fences, and counted a shell comment as
+a call. Execution only sees calls that ran, so a block that stops early or
+sits in an untaken branch records nothing. The pinned ``_CALL_SITES`` set
+names the blocks that record a call today, and the counts (8 ``write``, 1
+``append-update``) are pinned too. A new call site, or one that stops
+recording, fails the count test; update ``_CALL_SITES`` when a skill adds or
+removes one.
+
 Since #517 every ``write`` call takes the note from ``--body-file`` (a file the
 model writes with the Write tool), so no note text sits in the Bash command.
 Only /compress's ``append-update`` still pipes its section through a heredoc.
-Both shapes run here with the same hostile body.
 
 Why this module exists (and why it is NOT part of test_note_writer.py):
-``tests/test_note_writer.py`` invokes the CLI as
-``subprocess.run([sys.executable, NOTE_WRITER, ...], input=content)`` — list
-argv, ``shell=False``, content piped straight to the child's stdin. There is
-no shell, no heredoc and no delimiter anywhere in that test path, so the
-heredoc-delimiter collision bug was structurally unreachable by it. That
-scoping is correct; the gap was that NO test in the repo ever executed a
-SKILL.md bash block. ``test_skill_snippets.py`` only ``compile()``s
-``python3 -c`` fragments.
-
-Each block is extracted verbatim from its SKILL.md, minimally rewritten (see
-``_prepare``) and run through real ``bash`` against a scratch vault under
-``tmp_path``, with a note body that contains a **column-0 line equal to the
-documented delimiter base** — exactly what a note *about this plugin* looks
-like. The parameterization is over every matching block, so a new call site
-is covered the moment it is added.
+``tests/test_note_writer.py`` calls the CLI with list argv and ``shell=False``,
+so the heredoc-delimiter collision bug was unreachable there. Each block here is
+extracted verbatim, minimally rewritten (see ``_prepare``) and run through real
+``bash`` against a scratch vault, with a note body that contains a **column-0
+line equal to the documented delimiter base**, exactly what a note *about this
+plugin* looks like.
 """
 from __future__ import annotations
 
-import glob
 import os
 import re
 import shutil
+import signal
 import subprocess
+import time
+import uuid
+from collections import Counter
+from pathlib import Path
 
 import pytest
 
-_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-_HOOKS_DIR = os.path.join(_REPO_ROOT, "hooks")
+from skill_shell import (
+    HOOKS_DIR,
+    _blank_quotes_and_heredocs,
+    escaping_redirects,
+    fenced_blocks,
+    note_writer_calls,
+    python_script_call,
+    run_with_stubs,
+)
 
 _BASH = shutil.which("bash")
 requires_bash = pytest.mark.skipif(_BASH is None, reason="bash not available")
 
-# Blocks are located by walking OUTWARD from the note_writer.py invocation to
-# its enclosing ```bash / ``` fence, not by pairing fences globally: several
-# SKILL.md files contain unbalanced bare ``` lines inside prose/templates, and
-# a global non-greedy ```bash…``` regex silently matched a prose span instead
-# of the real block (which then looks like "no heredoc here" — a test that
-# quietly covers nothing).
-# One pattern for both the strict collector and the loose cross-check. It does not
-# list interpreter flags (`python3 -B`, `-X utf8`, `-W ignore`, ...): any line with
-# `note_writer.py` (optionally quoted) then whitespace then `write` or
-# `append-update` counts, wherever it sits on the line. A backtick before the match
-# marks a prose mention, so it is skipped.
-_INVOKE_PATTERN = r"""[^`\n]*?note_writer\.py["']?[ \t]+(?:write|append-update)\b"""
-_COLUMN0_INVOCATION_RE = re.compile(r"^" + _INVOKE_PATTERN)
 # Matches the opener under EITHER scheme -- with the per-invocation `<eof4>`
 # placeholder or the old fixed form. Deliberately scheme-agnostic so that
 # reverting to a fixed delimiter makes the execution test fail on its real
@@ -66,7 +65,6 @@ _HOOKS_LINE_RE = re.compile(r'^HOOKS=\$\(python3 -c "\n.*?\n"\)$', re.MULTILINE 
 # The filename positional of a `write` call: 3rd quoted argument.
 _WRITE_FILENAME_RE = re.compile(r'(write "\$VAULT_PATH" "\$\w+" )"[^"]*"')
 _WRITE_FOLDER_RE = re.compile(r'write "\$VAULT_PATH" "\$(\w+)"')
-_BODY_FILE_ARG = "--body-file '<BODY_FILE>'"
 
 # The hex the SKILL.md tells the model to substitute for <eof4> per run.
 _EOF4 = "beef"
@@ -79,75 +77,125 @@ FOLDERS = {
 }
 
 
-def _collect_blocks():
-    """Return (id, skill_name, block_text) for every SKILL.md bash block that
-    invokes note_writer.py through a heredoc."""
-    found = []
-    for skill_path in sorted(glob.glob(os.path.join(_REPO_ROOT, "skills/*/SKILL.md"))):
-        skill_name = skill_path.replace("\\", "/").split("/")[-2]
-        with open(skill_path, encoding="utf-8") as fh:
-            lines = fh.read().split("\n")
-        n = 0
-        for i, line in enumerate(lines):
-            if not _COLUMN0_INVOCATION_RE.match(line):
-                continue
-            start = next(
-                j for j in range(i, -1, -1) if lines[j].strip() == "```bash"
-            )
-            end = next(
-                j for j in range(i, len(lines)) if lines[j].strip() == "```"
-            )
-            block = "\n".join(lines[start + 1:end])
-            assert "<<'OB_" in block or _BODY_FILE_ARG in block, (
-                f"{skill_name}: note_writer.py block at line {i + 1} has neither "
-                "a heredoc nor --body-file"
-            )
-            found.append((f"{skill_name}-{n}", skill_name, block))
-            n += 1
+_SKILL_TEXTS = {
+    path.parent.name: path.read_text(encoding="utf-8")
+    for path in sorted(HOOKS_DIR.parent.glob("skills/*/SKILL.md"))
+}
+_ALL_BLOCKS = [
+    (f"{skill}-{block.line}", skill, block.body)
+    for skill, text in _SKILL_TEXTS.items()
+    for block in fenced_blocks(text)
+]
+# The blocks that record a note_writer.py call when run under the stubs.
+# Update when a skill adds or removes a call site.
+_CALL_SITES = frozenset({
+    "compress-250",
+    "compress-514",
+    "decide-262",
+    "error-log-252",
+    "retro-412",
+    "standup-325",
+    "standup-582",
+    "vault-import-285",
+    "vault-stats-238",
+})
+_CALL_BLOCKS = [block for block in _ALL_BLOCKS if block[0] in _CALL_SITES]
+# A call in an untaken branch is not recorded, so a call site must not sit
+# inside one.
+_BRANCH_WORDS = frozenset({"if", "case", "elif", "else", "while", "until"})
+# The one-line guard every call-site block opens with. It exits when it fails,
+# so it cannot hide a call. Matched on a whole line: a chained `; if ...` after
+# its `fi` is not part of it.
+_GUARD_LINE = re.compile(r"\s*if ! test -f [^;&|]+;\s*then\s+(?:[^;]+;\s*)*exit 1;\s*fi\s*")
+_COMMAND_LEADERS = frozenset({"then", "do", "time", "!"})
+
+
+def _recorded_calls(block_id, block, workdir):
+    result = run_with_stubs(block, workdir)
+    assert result.returncode == 0, f"{block_id}: {result.stderr}"
+    return note_writer_calls(result.calls)
+
+
+def _assert_body_file(args, block_id):
+    assert "--body-file" in args, (block_id, args)
+    start = args.index("--body-file")
+    assert args[start + 1:start + 2] == ["<BODY_FILE>"], (block_id, args)
+
+
+def _branch_words(block: str) -> set[str]:
+    """Branch keywords at any command position of the block.
+
+    Quotes and heredoc bodies are blanked first (they are text, not shell). The
+    code is split on `;`, `&`, `|` and newlines, and each piece's first word is
+    read after any `$(`, `(`, `{`, `then`, `do`, `!`, `VAR=` prefix and case-arm
+    `pat)` label.
+    """
+    code = "\n".join(
+        line for line in _blank_quotes_and_heredocs(block).splitlines()
+        if not _GUARD_LINE.fullmatch(line)
+    )
+    found = set()
+    for piece in re.split(r"[;&|)\n]", code.replace("$(", " ")):
+        words = piece.replace("(", " ").replace("{", " ").split()
+        while words and (
+            words[0] in _COMMAND_LEADERS
+            or words[0].endswith(")")
+            or re.fullmatch(r"\w+=\S*", words[0])
+        ):
+            words.pop(0)
+        if words and words[0] in _BRANCH_WORDS:
+            found.add(words[0])
     return found
 
 
-_BLOCKS = _collect_blocks()
+def test_a_call_inside_a_branch_is_detected():
+    assert _branch_words("if x; then\n  python3 n.py write\nfi") == {"if"}
+    assert _branch_words("case x in\n  a) python3 n.py ;;\nesac") == {"case"}
+    assert _branch_words("x\nelse\ny") == {"else"}
+    assert _branch_words("if ! test -f f; then exit 1; fi\ncat <<E\nif a\nE") == set()
 
 
-# A LOOSER match for the same thing `_collect_blocks` looks for: any
-# note_writer.py invocation at the start of a line, indented or not, with or
-# without the `python3` prefix. `_collect_blocks` requires the command at
-# column 0, so a new call site written any other way would be silently
-# uncovered — and a `>= 9` floor would still pass. Cross-checking the strict
-# collector against this loose count makes that failure loud instead.
-_LOOSE_INVOCATION_RE = re.compile(r"^" + _INVOKE_PATTERN, re.MULTILINE)
+@pytest.mark.parametrize(("block", "words"), [
+    (':; if false; then python3 "$HOOKS/note_writer.py" write x; fi', {"if"}),
+    ("echo a && while x; do y; done", {"while"}),
+    ("echo a | until x; do y; done", {"until"}),
+    ("x=$(if a; then b; fi)", {"if"}),
+    ("echo a; ( if a; then b; fi )", {"if"}),
+    ("case $x in a) if b; then c; fi ;; esac", {"case", "if"}),
+    ('if ! test -f f; then echo "no" >&2; exit 1; fi; if false; then y; fi', {"if"}),
+    ('if ! test -f "$H"; then echo "ERROR: no" >&2; exit 1; fi\necho ok', set()),
+    ("echo 'if a' \"while b\" # if c", set()),
+])
+def test_branch_words_are_read_at_every_command_position(block, words):
+    assert _branch_words(block) == words
 
 
-def _loose_invocation_count():
-    total = 0
-    for skill_path in sorted(glob.glob(os.path.join(_REPO_ROOT, "skills/*/SKILL.md"))):
-        with open(skill_path, encoding="utf-8") as fh:
-            total += len(_LOOSE_INVOCATION_RE.findall(fh.read()))
-    return total
+@requires_bash
+def test_note_writer_call_sites_match_the_pinned_counts(tmp_path):
+    assert {block_id for block_id, _skill, _block in _CALL_BLOCKS} == _CALL_SITES
+    recorded = set()
+    counts = Counter()
+    for block_id, _skill, block in _ALL_BLOCKS:
+        result = run_with_stubs(block, tmp_path / block_id)
+        calls = note_writer_calls(result.calls)
+        if not calls:
+            continue  # Other blocks may exit non-zero; only call sites are checked.
+        recorded.add(block_id)
+        assert result.returncode == 0, f"{block_id}: {result.stderr}"
+        for args in calls:
+            assert args, block_id
+            counts[args[0]] += 1
+            if args[0] == "write":
+                _assert_body_file(args, block_id)
+        if "<<" in block:
+            assert [args[0] for args in calls] == ["append-update"], block_id
+    assert recorded == _CALL_SITES
+    assert counts == {"write": 8, "append-update": 1}
+    for block_id, _skill, block in _CALL_BLOCKS:
+        assert _branch_words(block) == set(), block_id
 
 
-def test_every_note_writer_heredoc_site_is_covered():
-    """Nine known call sites today (compress x2, standup x2, decide,
-    error-log, retro, vault-import, vault-stats): eight ``write`` calls with
-    ``--body-file`` and one ``append-update`` heredoc.
-
-    Asserts EQUALITY against the loose count, not a `>= 9` floor: this
-    harness is the only thing standing between the repo and a repeat of the
-    heredoc-delimiter bug, so a call site it fails to match must fail the
-    suite rather than quietly reduce coverage to nothing."""
-    strict = [b[0] for b in _BLOCKS]
-    loose = _loose_invocation_count()
-    assert len(strict) == loose, (
-        f"{loose} note_writer.py invocation(s) found by a loose scan of "
-        f"skills/*/SKILL.md but only {len(strict)} extracted as runnable "
-        f"blocks ({strict}). A call site is not being executed by this "
-        "harness — fix _collect_blocks or the call site's formatting."
-    )
-    assert len(strict) >= 9, strict
-
-
-def _prepare(block: str, tmp_path, vault, note_name: str):
+def _prepare(block: str, tmp_path, note_name: str, *, is_update: bool):
     """Rewrite a SKILL.md block into a runnable script, changing as little as
     possible: only what the model would itself substitute at runtime.
 
@@ -158,21 +206,20 @@ def _prepare(block: str, tmp_path, vault, note_name: str):
     - The filename placeholder becomes a real name.
     - The heredoc BODY is replaced with the collision fixture.
     """
-    body_file = _BODY_FILE_ARG in block
-    if body_file:
-        raw = "OB_NOTE_EOF_<eof4>"  # the old delimiter, now only hostile note text
-    else:
+    if is_update:
         raw = _HEREDOC_OPEN_RE.search(block).group(1)
+    else:
+        raw = "OB_NOTE_EOF_<eof4>"  # the old delimiter, now only hostile note text
     terminator = raw.replace("<eof4>", _EOF4)
     delim_base = re.sub(r"_<eof4>$", "", raw)
 
     script = block.replace("cd '<REPO_ROOT>'", f"cd '{tmp_path}'")
-    script = _HOOKS_LINE_RE.sub(f'HOOKS="{_HOOKS_DIR}"', script)
+    script = _HOOKS_LINE_RE.sub(f'HOOKS="{HOOKS_DIR}"', script)
     # `.sub` is a silent no-op if the HOOKS= line ever changes shape. The
     # block's own `test -f` would then still pass -- against the INSTALLED
     # plugin cache -- and the whole harness would be testing shipped code
     # instead of the repo under test, while staying green.
-    assert _HOOKS_DIR in script, (
+    assert str(HOOKS_DIR) in script, (
         "HOOKS= line did not match _HOOKS_LINE_RE; the block would run "
         "against the installed plugin cache, not this repo"
     )
@@ -184,9 +231,8 @@ def _prepare(block: str, tmp_path, vault, note_name: str):
     # than weakening the allowlist to accommodate a placeholder.
     script = re.sub(r"<new-tag-(\d+)>", r"tag\1", script)
 
-    is_update = "append-update" in script
     body_head = (
-        f"## Update (2026-07-25)\n"
+        "## Update (2026-07-25)\n"
         if is_update
         else "---\ntype: claude-insight\ndate: 2026-07-25\ntags:\n"
              "  - claude/insight\n---\n\n# Note about note_writer.py\n"
@@ -202,7 +248,7 @@ def _prepare(block: str, tmp_path, vault, note_name: str):
         f"{SENTINEL}\n"
     )
 
-    if body_file:
+    if not is_update:
         body_path = tmp_path / "body.md"
         body_path.write_text(fixture_body, encoding="utf-8")
         script = script.replace("'<BODY_FILE>'", f"'{body_path}'")
@@ -244,7 +290,7 @@ EXISTING_NOTE = (
 
 @requires_bash
 @pytest.mark.parametrize(
-    "block_id,skill_name,block", _BLOCKS, ids=[b[0] for b in _BLOCKS]
+    "block_id,skill_name,block", _CALL_BLOCKS, ids=[b[0] for b in _CALL_BLOCKS]
 )
 def test_skill_heredoc_block_survives_delimiter_in_note_body(
     tmp_path, block_id, skill_name, block
@@ -261,7 +307,11 @@ def test_skill_heredoc_block_survives_delimiter_in_note_body(
     for folder in FOLDERS.values():
         (vault / folder).mkdir(parents=True)
 
-    is_update = "append-update" in block
+    calls = _recorded_calls(block_id, block, tmp_path / "stub")
+    assert len(calls) == 1, (block_id, calls)
+    args, = calls
+    assert args and args[0] in {"write", "append-update"}, (block_id, args)
+    is_update = args[0] == "append-update"
     if is_update:
         target = vault / "claude-insights" / "existing.md"
         target.write_text(EXISTING_NOTE, encoding="utf-8")
@@ -270,13 +320,13 @@ def test_skill_heredoc_block_survives_delimiter_in_note_body(
         folder_var = _WRITE_FOLDER_RE.search(block).group(1)
         target = vault / FOLDERS[folder_var] / "note.md"
         match_path = None
-        if "--overwrite" in block:
+        if "--overwrite" in args:
             # /standup Step 6.6 upgrades an EXISTING note in place; without a
             # pre-existing file the CLI would (correctly) still write, but the
             # block would not be exercising the case it documents.
             target.write_text(EXISTING_NOTE, encoding="utf-8")
 
-    script, terminator, delim_base = _prepare(block, tmp_path, vault, "note.md")
+    script, _, delim_base = _prepare(block, tmp_path, "note.md", is_update=is_update)
     script_path = tmp_path / "block.sh"
     script_path.write_text(script, encoding="utf-8")
 
@@ -305,83 +355,321 @@ def test_skill_heredoc_block_survives_delimiter_in_note_body(
     assert "command not found" not in result.stderr
 
 
-_HEREDOC_BLOCKS = [b for b in _BLOCKS if _BODY_FILE_ARG not in b[2]]
-
-
-def test_every_write_call_takes_the_note_from_a_body_file():
-    """#517: a PreToolUse hook reads the Bash command text, so a note body in a
-    heredoc can get the save refused over words the note quotes. Every
-    ``write`` call passes the body as a file instead."""
-    writes = [b for b in _BLOCKS if 'note_writer.py" write' in b[2]]
-    assert len(writes) == 8, [b[0] for b in writes]
-    for block_id, _skill, block in writes:
-        assert _BODY_FILE_ARG in block, block_id
-        assert "<<" not in block, block_id
-    assert [b[0] for b in _HEREDOC_BLOCKS] == ["compress-0"]
+@requires_bash
+def test_every_write_call_takes_the_note_from_a_body_file(tmp_path):
+    """Every write passes a body file so the hook sees no note text in Bash."""
+    for block_id, _skill, block in _CALL_BLOCKS:
+        for args in _recorded_calls(block_id, block, tmp_path / block_id):
+            if args[:1] == ["write"]:
+                _assert_body_file(args, block_id)
+                assert "<<" not in block, block_id
 
 
 @requires_bash
-@pytest.mark.parametrize(
-    "block_id,skill_name,block", _HEREDOC_BLOCKS, ids=[b[0] for b in _HEREDOC_BLOCKS]
-)
-def test_skill_heredoc_block_terminator_is_unique_per_invocation(
-    block_id, skill_name, block
-):
-    """Structural companion to the execution test: the opener must carry the
-    `<eof4>` placeholder and the terminator line must match it exactly."""
-    m = _HEREDOC_OPEN_RE.search(block)
-    assert m, f"{block_id}: no OB_... heredoc opener found"
-    terminator = m.group(1)
-    assert terminator.endswith("_<eof4>"), (
-        f"{block_id}: FIXED heredoc terminator {terminator!r} — note content "
-        "containing that exact line ends the heredoc early and executes the "
-        "remainder as shell"
+def test_skill_heredoc_block_terminator_is_unique_per_invocation(tmp_path):
+    """Structural companion to the execution test: every append-update block's
+    heredoc opener carries the `<eof4>` placeholder and its terminator line
+    matches it exactly."""
+    checked = []
+    for block_id, _skill, block in _CALL_BLOCKS:
+        calls = _recorded_calls(block_id, block, tmp_path / block_id)
+        if [args[:1] for args in calls] != [["append-update"]]:
+            continue
+        m = _HEREDOC_OPEN_RE.search(block)
+        assert m, f"{block_id}: no OB_... heredoc opener found"
+        terminator = m.group(1)
+        assert terminator.endswith("_<eof4>"), (
+            f"{block_id}: FIXED heredoc terminator {terminator!r} — note content "
+            "containing that exact line ends the heredoc early and executes the "
+            "remainder as shell"
+        )
+        assert any(ln == terminator for ln in block.split("\n")), (
+            f"{block_id}: no column-0 terminator line matching the opener"
+        )
+        checked.append(block_id)
+    assert len(checked) == 1, checked
+
+
+_SCRATCH_SETUP = """\
+cd '<REPO_ROOT>'
+HOOKS=$(python3 -c "print(1)")
+if ! test -f "$HOOKS/note_writer.py"; then echo "ERROR: missing note writer" >&2; exit 1; fi
+"""
+_SCRATCH_WRITE = """write "$VAULT_PATH" "$INSIGHTS_FOLDER" "n.md" --body-file '<BODY_FILE>'"""
+
+
+def _scratch_write_args(workdir):
+    """The recorded argv; run_with_stubs points VAULT_PATH at <workdir>/vault."""
+    vault = str(workdir.resolve() / "vault")
+    return [["write", vault, "insights", "n.md", "--body-file", "<BODY_FILE>"]]
+
+
+@requires_bash
+def test_stub_records_write_with_boolean_flag(tmp_path):
+    block = _SCRATCH_SETUP + f'python3 -B "$HOOKS/note_writer.py" {_SCRATCH_WRITE}'
+    assert _recorded_calls("boolean flag", block, tmp_path) == _scratch_write_args(tmp_path)
+
+
+@requires_bash
+def test_stub_records_write_with_value_flags(tmp_path):
+    block = _SCRATCH_SETUP + (
+        f'python3 -X utf8 -W ignore "$HOOKS/note_writer.py" {_SCRATCH_WRITE}'
     )
-    assert any(ln == terminator for ln in block.split("\n")), (
-        f"{block_id}: no column-0 terminator line matching the opener"
+    assert _recorded_calls("value flags", block, tmp_path) == _scratch_write_args(tmp_path)
+
+
+@requires_bash
+def test_stub_records_write_with_line_continuation(tmp_path):
+    block = _SCRATCH_SETUP + f'python3 "$HOOKS/note_writer.py" \\\n  {_SCRATCH_WRITE}'
+    assert _recorded_calls("line continuation", block, tmp_path) == _scratch_write_args(tmp_path)
+
+
+@requires_bash
+def test_stub_records_write_in_four_tilde_fence(tmp_path):
+    block = _SCRATCH_SETUP + f'python3 "$HOOKS/note_writer.py" {_SCRATCH_WRITE}'
+    parsed, = fenced_blocks(f"~~~~bash\n{block}\n~~~~")
+    assert _recorded_calls("four-tilde fence", parsed.body, tmp_path) == _scratch_write_args(tmp_path)
+
+
+@requires_bash
+def test_stub_ignores_commented_write(tmp_path):
+    block = _SCRATCH_SETUP + f'# python3 "$HOOKS/note_writer.py" {_SCRATCH_WRITE}'
+    assert _recorded_calls("commented write", block, tmp_path) == []
+
+
+@requires_bash
+def test_stub_does_not_record_absolute_python_path(tmp_path):
+    """A real python3 called by absolute path bypasses the stub, so it is not recorded."""
+    fake = tmp_path / "abs" / "python3"
+    fake.parent.mkdir(parents=True)
+    # `touch` is a recording stub in the run, so the fake marks itself with a builtin.
+    fake.write_text(f"#!/bin/sh\necho ran > '{fake.parent}/ran'\n", encoding="utf-8")
+    fake.chmod(0o755)
+    block = _SCRATCH_SETUP + f"'{fake}' \"$HOOKS/note_writer.py\" write"
+    result = run_with_stubs(block, tmp_path / "run")
+    assert (fake.parent / "ran").exists()
+    assert result.calls == [["python3", "-c", "print(1)"]]
+    assert note_writer_calls(result.calls) == []
+
+
+@requires_bash
+def test_grep_is_a_recording_stub_that_scans_nothing(tmp_path):
+    block = 'grep -rl "session_id:" "$VAULT_PATH/$SESSIONS_FOLDER/"'
+    result = run_with_stubs(block, tmp_path)
+    vault = tmp_path.resolve() / "vault"
+    assert result.returncode == 0
+    assert result.calls == [["grep", "-rl", "session_id:", f"{vault}/sessions/"]]
+    assert not (tmp_path / "bin" / "grep").resolve().samefile(shutil.which("grep"))
+
+
+def _pid_is_gone(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    return False
+
+
+def _timeout_leaves_no_child(tmp_path, block):
+    """Time out a block that backgrounds `sleep 300` and check the sleep is dead."""
+    run_dir = tmp_path / "run"
+    pid_file = run_dir / "tmp" / "pid"
+
+    def hung(*_args):
+        raise AssertionError("run_with_stubs did not return: the timeout did not end the run")
+
+    old_handler = signal.signal(signal.SIGALRM, hung)
+    signal.alarm(30)
+    started = time.monotonic()
+    try:
+        with pytest.raises(subprocess.TimeoutExpired):
+            run_with_stubs(block, run_dir, timeout=2)
+        elapsed = time.monotonic() - started
+        gone = pid_file.exists() and _pid_is_gone(int(pid_file.read_text()))
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old_handler)
+        if pid_file.exists():  # Never leave the sleep running, even on failure.
+            try:
+                os.kill(int(pid_file.read_text()), signal.SIGKILL)
+            except (ProcessLookupError, ValueError):
+                pass
+    assert elapsed < 15, elapsed
+    assert pid_file.exists(), "the block never wrote its child's pid"
+    assert gone, "the backgrounded child outlived the timeout"
+
+
+@requires_bash
+def test_a_timeout_kills_a_backgrounded_child(tmp_path):
+    _timeout_leaves_no_child(tmp_path, 'sleep 300 & echo $! > "$TMPDIR/pid"; wait')
+
+
+@requires_bash
+def test_a_timeout_kills_a_child_in_its_own_process_group(tmp_path):
+    """`set -m` gives each job its own group, so killpg of the block's group misses it."""
+    _timeout_leaves_no_child(tmp_path, 'set -m; sleep 300 & echo $! > "$TMPDIR/pid"; wait')
+
+
+@requires_bash
+def test_a_surviving_child_cannot_hold_the_run(tmp_path):
+    """Output goes to files, so a child that keeps stdout open does not block the run."""
+    pid_file = tmp_path / "run" / "tmp" / "pid"
+    started = time.monotonic()
+    try:
+        result = run_with_stubs('sleep 300 & echo $! > "$TMPDIR/pid"; echo out', tmp_path / "run")
+        elapsed = time.monotonic() - started
+        gone = _pid_is_gone(int(pid_file.read_text()))
+    finally:
+        if pid_file.exists():  # Never leave the sleep running, even on failure.
+            try:
+                os.kill(int(pid_file.read_text()), signal.SIGKILL)
+            except (ProcessLookupError, ValueError):
+                pass
+    assert elapsed < 15
+    assert result.stdout == "out\n"
+    assert gone
+
+
+_WRITERS = "mkdir touch chmod ln tee dd install rm cp mv".split()
+
+
+def _escape_names(tag):
+    return sorted(Path("/tmp").glob(f"ob-escape-{tag}*"))
+
+
+@requires_bash
+def test_every_file_writer_is_a_recording_stub(tmp_path):
+    run_with_stubs(":", tmp_path)
+    for name in _WRITERS:
+        stub = tmp_path.resolve() / "bin" / name
+        assert not stub.is_symlink(), name
+        assert stub.read_text().startswith("#!"), name
+
+
+@requires_bash
+def test_a_writer_stub_records_the_call_and_creates_nothing(tmp_path):
+    tag = uuid.uuid4().hex
+    target = f"/tmp/ob-escape-{tag}"
+    block = f"mkdir -p {target}-dir; touch {target}-file; rm -rf {target}-dir"
+    result = run_with_stubs(block, tmp_path)
+    assert result.calls == [
+        ["mkdir", "-p", f"{target}-dir"],
+        ["touch", f"{target}-file"],
+        ["rm", "-rf", f"{target}-dir"],
+    ]
+    assert _escape_names(tag) == []
+
+
+@requires_bash
+def test_a_redirect_to_an_absolute_path_raises_before_the_block_runs(tmp_path):
+    tag = uuid.uuid4().hex
+    with pytest.raises(ValueError, match="outside the workdir"):
+        run_with_stubs(f"echo x > /tmp/ob-escape-{tag}-$$", tmp_path)
+    assert _escape_names(tag) == []
+    assert not (tmp_path / "bin").exists()  # It raised before any setup.
+
+
+@requires_bash
+def test_the_literal_escape_block_from_the_review_raises(tmp_path):
+    before = _escape_names("")
+    with pytest.raises(ValueError):
+        run_with_stubs("echo x > /tmp/ob-escape-$$", tmp_path)
+    assert _escape_names("") == before
+
+
+@pytest.mark.parametrize(("block", "targets"), [
+    ("echo x > /tmp/f", ["/tmp/f"]),
+    ("echo x >> ../f", ["../f"]),
+    ("echo x &> /etc/f", ["/etc/f"]),
+    ('echo x >"/tmp/f"', ["/tmp/f"]),
+    ("echo x >&/tmp/f", ["/tmp/f"]),
+    ("echo x 1>/tmp/f 2>&1", ["/tmp/f"]),
+    ("x=$(echo y > /tmp/f)", ["/tmp/f"]),
+    ("echo x > /dev/null 2> /dev/stderr >/dev/stdout >&2 2>&1", []),
+    ('echo x > ~/f > "$HOME/f" > "$VAULT_PATH/f" > rel/f > ./f', []),
+    ("python3 -c 'print(1 > /x)' # > /y", []),
+    ("cat <<'E'\n> /x\nE", []),
+    ("diff <(a) >(b)", []),
+])
+def test_escaping_redirects(block, targets):
+    assert escaping_redirects(block) == targets
+
+
+def test_no_skill_block_redirects_outside_the_workdir():
+    """Every block runs under the stubs, so none may be refused for a redirect."""
+    refused = {
+        block_id: targets
+        for block_id, _skill, block in _ALL_BLOCKS
+        if (targets := escaping_redirects(block))
+    }
+    assert refused == {}
+
+
+@requires_bash
+def test_a_guarded_tool_refuses_a_path_outside_the_workdir(tmp_path):
+    tag = uuid.uuid4().hex
+    outside = f"/tmp/ob-escape-{tag}"
+    block = (
+        f"mktemp {outside}-XXXXXX; echo a > t.txt\n"
+        f"sed -i s/a/b/ {outside}-s; sort -o {outside}-o t.txt; env /bin/echo hi\n"
+        'mktemp "$TMPDIR/ok.XXXXXX"; sed s/a/b/ t.txt'
     )
+    result = run_with_stubs(block, tmp_path)
+    assert result.stderr.count("refused, outside the test workdir") == 4, result.stderr
+    assert _escape_names(tag) == []
+    assert result.stdout.strip().splitlines()[-1] == "b"
+    assert str(tmp_path.resolve() / "tmp" / "ok.") in result.stdout
 
 
-def test_invocation_regexes_accept_interpreter_flags():
-    """Positive control: `python3 -B "$HOOKS/note_writer.py" write ...` must be
-    matched by both the strict and the loose regex, else a call site written that
-    way would be silently uncovered."""
-    for flags in ("", "-B ", "-I -u ", "-Bu ", "-X utf8 ", "-W ignore ", "-X utf8 -W ignore "):
-        line = f'python3 {flags}"$HOOKS/note_writer.py" write "$VAULT_PATH" "$X" "n.md" --body-file \'<BODY_FILE>\''
-        assert _COLUMN0_INVOCATION_RE.match(line), line
-        assert _LOOSE_INVOCATION_RE.findall(line), line
-        assert _LOOSE_INVOCATION_RE.findall("  " + line), line
-    assert not _COLUMN0_INVOCATION_RE.match('Do not copy `--overwrite` to any other `note_writer.py write` block.')
+def test_python_script_call():
+    for flags in (
+        [], ["-B"], ["-I", "-u"], ["-Bu"], ["-BIuEsSOqbdvx"],
+        ["-X", "utf8"], ["-W", "ignore"], ["-Xutf8", "-Wignore"],
+        ["-X", "utf8", "-W", "ignore"],
+    ):
+        argv = ["python3", *flags, "/hooks/note_writer.py", "write", "-v"]
+        assert python_script_call(argv) == ("note_writer.py", ["write", "-v"]), argv
+
+    for argv in (
+        ["python3", "-B", "-c", "print(1)"],
+        ["python3", "-X", "utf8", "-m", "note_writer.py"],
+        ["python3", "-Wignore", "-", "note_writer.py"],
+        ["git", "note_writer.py", "write"],
+        ["python3"],
+        [],
+    ):
+        assert python_script_call(argv) is None, argv
 
 
-def _body_file_steps():
-    """(skill, prose) for every `note_writer.py write ... --body-file` site: the
-    prose runs from the preceding heading to the next one, headings outside fences."""
+def _body_file_steps(tmp_path):
+    """Find the surrounding Markdown step for each recorded body-file write."""
     found = []
-    for skill_path in sorted(glob.glob(os.path.join(_REPO_ROOT, "skills/*/SKILL.md"))):
-        skill = skill_path.replace("\\", "/").split("/")[-2]
-        with open(skill_path, encoding="utf-8") as fh:
-            lines = fh.read().split("\n")
-        in_fence, headings, sites = False, [], []
-        for i, line in enumerate(lines):
-            if line.lstrip().startswith("```"):
-                in_fence = not in_fence
-            elif not in_fence and line.startswith("#"):
-                headings.append(i)
-            if (_BODY_FILE_ARG in line
-                    and re.search(r"note_writer\.py\"? write\b", line)):
-                sites.append(i)
-        for i in sites:
-            start = max([h for h in headings if h < i], default=0)
-            end = min([h for h in headings if h > i], default=len(lines))
-            found.append((f"{skill}@{i + 1}", "\n".join(lines[start:end])))
+    for block_id, skill, block in _CALL_BLOCKS:
+        calls = _recorded_calls(block_id, block, tmp_path / block_id)
+        if not any(args[:1] == ["write"] and "--body-file" in args for args in calls):
+            continue
+        block_line = int(block_id.rsplit("-", 1)[1])
+        text = _SKILL_TEXTS[skill]
+        fenced_lines = {
+            line
+            for fence in fenced_blocks(text, langs=None)
+            for line in range(fence.line, fence.line + len(fence.body.splitlines()) + 1)
+        }
+        lines = text.splitlines()
+        headings = [
+            line for line, content in enumerate(lines, 1)
+            if line not in fenced_lines and content.startswith("#")
+        ]
+        start = max((line for line in headings if line < block_line), default=1)
+        end = min((line for line in headings if line > block_line), default=len(lines) + 1)
+        found.append((f"{skill}@{block_line}", "\n".join(lines[start - 1:end - 1])))
     return found
 
 
-def test_every_body_file_step_tells_the_model_to_write_remove_and_keep_the_file():
-    """#517: each `--body-file` step says to write the body with the Write tool,
-    to `rm -f` it after OK, and to keep it when the command fails."""
-    steps = _body_file_steps()
+@requires_bash
+def test_every_body_file_step_tells_the_model_to_write_remove_and_keep_the_file(tmp_path):
+    """Each body-file step tells the model to write, remove and retain the draft."""
+    steps = _body_file_steps(tmp_path)
     assert len(steps) == 8, [s[0] for s in steps]
     for site, prose in steps:
         assert "**Write tool**" in prose, site

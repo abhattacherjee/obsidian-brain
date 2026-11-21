@@ -11,6 +11,7 @@ import sys
 from pathlib import Path
 
 import retro_trace
+from skill_shell import fenced_blocks, isolation_problems, REFUSED_FORMS
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 RETRO = (REPO_ROOT / "skills" / "retro" / "SKILL.md").read_text(encoding="utf-8")
@@ -76,7 +77,7 @@ def test_apply_takes_traces_from_a_file_not_a_heredoc():
 
 
 def _first_bash_block(section: str) -> str:
-    return section.split("```bash\n", 1)[1].split("\n```", 1)[0]
+    return fenced_blocks(section)[0].body
 
 
 def test_check_items_step_2b_block_runs_and_lists_a_closed_candidate(tmp_path):
@@ -141,7 +142,7 @@ def test_step_8_writes_and_step_9_reads_closed_applied():
 
 def _step_8_block() -> str:
     step8 = _section(CHECK_ITEMS, "## Step 8", "## Step 9")
-    block = step8.split("```bash\n", 1)[1].split("\n```", 1)[0]
+    block = _first_bash_block(step8)
     assert "closed_applied.json" in block
     return block
 
@@ -182,10 +183,9 @@ def test_step_8_block_refuses_bad_json_and_non_lists(tmp_path):
 
 
 def _step_75_apply_block() -> str:
-    for part in STEP_75.split("```bash\n")[1:]:
-        block = part.split("\n```", 1)[0]
-        if 'retro_trace.py" apply' in block:
-            return block
+    for block in fenced_blocks(STEP_75):
+        if 'retro_trace.py" apply' in block.body:
+            return block.body
     raise AssertionError("apply bash block not found in Step 7.5")
 
 
@@ -229,41 +229,8 @@ def test_step_75_apply_test_catches_swapped_vault_and_note_arguments(tmp_path):
     assert retro_trace.parse_items(note.read_text(encoding="utf-8"))[0]["trace"] is None
 
 
-_SHELL_FENCE_RE = re.compile(
-    r"^[ \t]*(```|~~~)(?:bash|sh|shell|zsh)[ \t]*\n(.*?)^[ \t]*\1[ \t]*$", re.M | re.S)
-
-
 def _bash_blocks(text: str) -> list[str]:
-    """Every fenced shell block (bash, sh, shell, zsh; ``` or ~~~ fences), indented or not."""
-    return [m[1] for m in _SHELL_FENCE_RE.findall(text)]
-
-
-def _substitution_bodies(block: str) -> list[str]:
-    """The text inside every `$( ... )` (parens balanced; unclosed runs to the end)
-    and every backtick pair."""
-    bodies = []
-    for m in re.finditer(r"\$\(", block):
-        depth, k = 1, m.end()
-        while k < len(block) and depth:
-            depth += {"(": 1, ")": -1}.get(block[k], 0)
-            k += 1
-        bodies.append(block[m.end():k])
-    bodies += re.findall(r"`([^`]*)`", block)
-    return bodies
-
-
-def _isolation_problems(block: str) -> list[str]:
-    """What a worktree-isolated session refuses in a Bash block (#518): git inside a
-    command substitution or backticks, a `||`/`&&` brace group, or a heredoc."""
-    problems = []
-    if any(re.search(r"\bgit\b", body) for body in _substitution_bodies(block)):
-        problems.append("git inside a command substitution")
-    # \s* also spans a newline: `||` then `{` on the next line.
-    if re.search(r"(\|\||&&)\s*\{", block):
-        problems.append("brace group after || or &&")
-    if "<<" in block:
-        problems.append("heredoc")
-    return problems
+    return [b.body for b in fenced_blocks(text)]
 
 
 def test_retro_blocks_run_in_a_worktree_isolated_session():
@@ -273,30 +240,19 @@ def test_retro_blocks_run_in_a_worktree_isolated_session():
     blocks = _bash_blocks(RETRO)
     assert len(blocks) >= 9
     for block in blocks:
-        assert _isolation_problems(block) == [], block[:120]
+        assert isolation_problems(block, heredoc=True) == [], block[:120]
     assert "```bash\ngit rev-parse --show-toplevel\n```" in RETRO
-
-
-_REFUSED_FORMS = {
-    "plain": 'cd "$(git rev-parse --show-toplevel)"',
-    "command": 'x=$(command git rev-parse HEAD)',
-    "cd-and": 'cd "$(cd . && git rev-parse --show-toplevel)"',
-    "abs-path": 'x=$(/usr/bin/git rev-parse HEAD)',
-    "space": 'x=$( git rev-parse HEAD)',
-    "backticks": 'x=`git rev-parse HEAD`',
-    "or-group": 'test -f f || { echo missing; exit 1; }',
-    "and-group-tight": 'test -f f &&{ echo present; }',
-    "or-group-next-line": 'test -f f ||\n{\n  echo missing\n}',
-    "heredoc": "cat <<'EOF'\nx\nEOF",
-}
 
 
 def test_isolation_checker_flags_every_refused_form_and_passes_a_clean_block():
     """Positive control: the checker the real test uses really fires."""
-    for name, body in _REFUSED_FORMS.items():
-        assert _isolation_problems(body), name
+    for name, (body, expected) in REFUSED_FORMS.items():
+        assert expected in isolation_problems(body, heredoc=False), name
+    heredoc = "cat <<'EOF'\nx\nEOF"
+    assert isolation_problems(heredoc, heredoc=True) == ["heredoc"]
+    assert isolation_problems(heredoc) == []
     clean = "cd '/repo'\nif ! test -f f; then\n  echo missing >&2\n  exit 1\nfi\nx=$(python3 -c 'print(1)')"
-    assert _isolation_problems(clean) == []
+    assert isolation_problems(clean) == []
 
 
 def test_shell_block_collector_takes_every_fence_spelling():

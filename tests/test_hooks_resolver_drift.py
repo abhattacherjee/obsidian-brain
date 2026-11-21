@@ -2105,6 +2105,21 @@ def test_dev_test_reporting_branches_on_the_exit_status(sub):
     )
 
 
+def _fill_repo_root(script, env, cwd):
+    """Paste ``<REPO_ROOT>`` the way /dev-test's first step tells the model to:
+    the ``git rev-parse --show-toplevel`` output in that cwd, else the cwd (#521)."""
+    assert script.count("'<REPO_ROOT>'") == 1, "dev-test block lost its <REPO_ROOT> line"
+    git = shutil.which("git")
+    root = ""
+    if git:
+        proc = subprocess.run([git, "rev-parse", "--show-toplevel"], cwd=str(cwd), env=env,
+                              capture_output=True, text=True, timeout=60,
+                              stdin=subprocess.DEVNULL)
+        root = proc.stdout.strip() if proc.returncode == 0 else ""
+    root = root or str(cwd)
+    return script.replace("'<REPO_ROOT>'", "'" + root.replace("'", "'\\''") + "'")
+
+
 def _run_dev_test_block(script, home, cwd):
     env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
     env["HOME"] = str(home)
@@ -2113,7 +2128,7 @@ def _run_dev_test_block(script, home, cwd):
     # `git rev-parse --show-toplevel` answer for some other repo entirely, at
     # exit 0 — the fallback layer would then be measured against the wrong tree.
     return subprocess.run(
-        [_BASH, "-c", script],
+        [_BASH, "-c", _fill_repo_root(script, env, cwd)],
         capture_output=True,
         text=True,
         env=env,
@@ -2327,3 +2342,24 @@ def test_shell_fails_cleanly_outside_any_git_repository(
     assert result.returncode != 0, result.stdout
     assert _resolved(result) is None
     assert "ERROR" in result.stderr, result.stderr
+
+
+@_REQUIRES_BASH
+@_REQUIRES_PYTHON3
+@pytest.mark.parametrize("script", _DEV_TEST_BLOCK_PARAMS)
+def test_shell_refuses_an_unfilled_repo_root_placeholder(
+    script, fake_home, tmp_path
+):
+    """#521: left as the literal ``<REPO_ROOT>``, layer 1's sentinel check fails
+    and layer 2 would quietly pick the registered checkout (the #287 bug). The
+    block must refuse instead, even when a registered checkout exists."""
+    registered = _seed_checkout(fake_home / "registered-checkout")
+    _write_registry(fake_home, {"user-chosen-name": _dir_entry(registered)})
+    assert "'<REPO_ROOT>'" in script
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env["HOME"] = str(fake_home)
+    result = subprocess.run([_BASH, "-c", script], capture_output=True, text=True,
+                            env=env, cwd=str(tmp_path), timeout=120)
+    assert result.returncode == 1, result.stdout
+    assert _resolved(result) is None
+    assert "paste the repo root path" in result.stderr, result.stderr

@@ -15,6 +15,16 @@ seeder over unassigned notes; `--full` wipes and reclusters everything.
 
 ## Procedure
 
+### Repo root — run first
+
+Run this as a command of its own:
+
+```bash
+git rev-parse --show-toplevel
+```
+
+If it fails (not a git repo), run `pwd` instead. Keep the printed path; the steps below call it `<REPO_ROOT>`. Paste that literal path wherever a block below names `'<REPO_ROOT>'`, in single quotes (write a `'` inside it as `'\''`). Do not put `git` inside `$(...)`: a worktree-isolated session refuses any command substitution whose text contains `git` (#521).
+
 ### Step 1 — Parse arguments
 
 - no args / `--full`  → Step 2 (consolidate)
@@ -25,7 +35,7 @@ seeder over unassigned notes; `--full` wipes and reclusters everything.
 ### Step 2 — Consolidate (seed or full)
 
 ```bash
-cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+cd '<REPO_ROOT>'
 python3 -c '
 import glob, json, os, re, sys
 def _ob_hooks():
@@ -59,7 +69,7 @@ is provisional; a themed note that `capture_select` demotes later is removed on 
 ### Step 3 — Stats
 
 ```bash
-cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+cd '<REPO_ROOT>'
 python3 -c '
 import glob, json, os, re, sys
 def _ob_hooks():
@@ -88,7 +98,7 @@ Present `THEMES=`, `MEMBERS=`, `UNASSIGNED=`, the `LARGEST` rows, and any `NUDGE
 ### Step 4 — Split
 
 ```bash
-cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+cd '<REPO_ROOT>'
 python3 -c '
 import glob, json, os, re, sys
 def _ob_hooks():
@@ -117,7 +127,7 @@ Report `SPLIT` or `NO_SPLIT`.
 ### Step 5 — Merge
 
 ```bash
-cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+cd '<REPO_ROOT>'
 python3 -c '
 import glob, json, os, re, sys
 def _ob_hooks():

@@ -17,12 +17,22 @@ Synthesizes a reasoned answer to the user's question by searching session, insig
 
 Follow these steps exactly. Do not skip steps or reorder them.
 
+### Repo root — run first
+
+Run this as a command of its own:
+
+```bash
+git rev-parse --show-toplevel
+```
+
+If it fails (not a git repo), run `pwd` instead. Keep the printed path; the steps below call it `<REPO_ROOT>`. Paste that literal path wherever a block below names `'<REPO_ROOT>'`, in single quotes (write a `'` inside it as `'\''`). Do not put `git` inside `$(...)`: a worktree-isolated session refuses any command substitution whose text contains `git` (#521).
+
 ### Step 1 — Load config
 
 Run:
 
 ```bash
-cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+cd '<REPO_ROOT>'
 python3 -c '
 import sys, os
 import glob, json, os, re, sys
@@ -218,7 +228,7 @@ After collecting the union from Agents 1–3, drop every path containing `/_prov
 Check each call before you use its output. It succeeded only if it exited 0 and stderr has the `vault_scan: N match(es), M file(s) scanned, K skipped (...)` summary line; then stdout is the file list, and an empty stdout means no match. Anything else is a failure, not "no match": show the `ERROR:` line (or the whole stderr if there is none) to the user and stop. If K is more than 0, add this line to what you show the user: "K note(s) were not searched (see the breakdown) — run /vault-doctor".
 
 ```bash
-cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+cd '<REPO_ROOT>'
 HOOKS=$(python3 -c "
 import glob, json, os, re
 def _ob_hooks():
@@ -239,7 +249,7 @@ def _ob_hooks():
     return max(_c, key=lambda _p: ([int(_n) for _n in _p.split('/')[-2].split('.')], _p), default='hooks')
 print(_ob_hooks())
 ")
-test -f "$HOOKS/vault_scan.py" || { echo "ERROR: vault_scan.py not found under $HOOKS - resolution checks the marketplace registered install location first, then falls back to the plugin cache; neither path produced a hooks directory containing it. Verify the obsidian-brain install resolved at $HOOKS is complete (git pull for a directory-source checkout, or run /plugin marketplace update for a cache install), then retry." >&2; exit 1; }
+if ! test -f "$HOOKS/vault_scan.py"; then echo "ERROR: vault_scan.py not found under $HOOKS - resolution checks the marketplace registered install location first, then falls back to the plugin cache; neither path produced a hooks directory containing it. Verify the obsidian-brain install resolved at $HOOKS is complete (git pull for a directory-source checkout, or run /plugin marketplace update for a cache install), then retry." >&2; exit 1; fi
 python3 "$HOOKS/vault_scan.py" grep '<vault_path>' '<sessions_folder>' '<insights_folder>' '<wiki_folder>' --pattern='<term>' --ignore-case --exclude-dir=_provisional --exclude-dir=_rejected
 ```
 
@@ -271,7 +281,7 @@ Score each file in `CANDIDATE_FILES` using these rules:
 To get each note's `type` and `date` without reading the full file, run one `vault_scan.py meta` call over all of `CANDIDATE_FILES` (one quoted path per file):
 
 ```bash
-cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+cd '<REPO_ROOT>'
 HOOKS=$(python3 -c "
 import glob, json, os, re
 def _ob_hooks():
@@ -292,7 +302,7 @@ def _ob_hooks():
     return max(_c, key=lambda _p: ([int(_n) for _n in _p.split('/')[-2].split('.')], _p), default='hooks')
 print(_ob_hooks())
 ")
-test -f "$HOOKS/vault_scan.py" || { echo "ERROR: vault_scan.py not found under $HOOKS - resolution checks the marketplace registered install location first, then falls back to the plugin cache; neither path produced a hooks directory containing it. Verify the obsidian-brain install resolved at $HOOKS is complete (git pull for a directory-source checkout, or run /plugin marketplace update for a cache install), then retry." >&2; exit 1; }
+if ! test -f "$HOOKS/vault_scan.py"; then echo "ERROR: vault_scan.py not found under $HOOKS - resolution checks the marketplace registered install location first, then falls back to the plugin cache; neither path produced a hooks directory containing it. Verify the obsidian-brain install resolved at $HOOKS is complete (git pull for a directory-source checkout, or run /plugin marketplace update for a cache install), then retry." >&2; exit 1; fi
 python3 "$HOOKS/vault_scan.py" meta '<vault_path>' '<file_1>' '<file_2>'
 ```
 

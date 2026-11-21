@@ -23,10 +23,20 @@ Reads the lessons rollup (`retro_rollup.py`, #471) and walks the lessons that ke
 
 Follow these steps in order.
 
+### Repo root — run first
+
+Run this as a command of its own:
+
+```bash
+git rev-parse --show-toplevel
+```
+
+If it fails (not a git repo), run `pwd` instead. Keep the printed path; the steps below call it `<REPO_ROOT>`. Paste that literal path wherever a block below names `'<REPO_ROOT>'`, in single quotes (write a `'` inside it as `'\''`). Do not put `git` inside `$(...)`: a worktree-isolated session refuses any command substitution whose text contains `git` (#521).
+
 ### Step 1 — Load config
 
 ```bash
-cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+cd '<REPO_ROOT>'
 python3 -c '
 import sys, os
 import glob, json, os, re, sys
@@ -66,14 +76,14 @@ Every later block starts with the same two lines. Put the `HOOKS` value from thi
 
 ```bash
 HOOKS='<HOOKS from Step 1>'
-test -f "$HOOKS/retro_rollup.py" || { echo "ERROR: retro_rollup.py not found under $HOOKS - verify the obsidian-brain install resolved there is complete, then retry." >&2; exit 1; }
+if ! test -f "$HOOKS/retro_rollup.py"; then echo "ERROR: retro_rollup.py not found under $HOOKS - verify the obsidian-brain install resolved there is complete, then retry." >&2; exit 1; fi
 ```
 
 ### Step 2 — Refresh tracking
 
 ```bash
 HOOKS='<HOOKS from Step 1>'
-test -f "$HOOKS/retro_rollup.py" || { echo "ERROR: retro_rollup.py not found under $HOOKS" >&2; exit 1; }
+if ! test -f "$HOOKS/retro_rollup.py"; then echo "ERROR: retro_rollup.py not found under $HOOKS" >&2; exit 1; fi
 python3 "$HOOKS/retro_rollup.py" refresh-tracking < /dev/null
 ```
 
@@ -83,7 +93,7 @@ Exit 1 means some `gh` or memory lookups failed. Show the error lines, say the i
 
 ```bash
 HOOKS='<HOOKS from Step 1>'
-test -f "$HOOKS/retro_rollup.py" || { echo "ERROR: retro_rollup.py not found under $HOOKS" >&2; exit 1; }
+if ! test -f "$HOOKS/retro_rollup.py"; then echo "ERROR: retro_rollup.py not found under $HOOKS" >&2; exit 1; fi
 python3 "$HOOKS/retro_rollup.py" report --json < /dev/null
 ```
 
@@ -108,7 +118,7 @@ For buckets `didnt_hold` (closed issue) and `rule_not_followed`, offer only **Sk
 
 ```bash
 HOOKS='<HOOKS from Step 1>'
-test -f "$HOOKS/retro_rollup.py" || { echo "ERROR: retro_rollup.py not found under $HOOKS" >&2; exit 1; }
+if ! test -f "$HOOKS/retro_rollup.py"; then echo "ERROR: retro_rollup.py not found under $HOOKS" >&2; exit 1; fi
 python3 "$HOOKS/retro_rollup.py" show '<LESSON_ID>' --json < /dev/null
 ```
 
@@ -155,7 +165,7 @@ Ask for a date (default: today plus 30 days), then:
 
 ```bash
 HOOKS='<HOOKS from Step 1>'
-test -f "$HOOKS/retro_rollup.py" || { echo "ERROR: retro_rollup.py not found under $HOOKS" >&2; exit 1; }
+if ! test -f "$HOOKS/retro_rollup.py"; then echo "ERROR: retro_rollup.py not found under $HOOKS" >&2; exit 1; fi
 python3 "$HOOKS/retro_rollup.py" snooze '<LESSON_ID>' '<YYYY-MM-DD>' < /dev/null
 ```
 
@@ -167,7 +177,7 @@ Lessons tracked by a memory entry or a rule (buckets `rule_not_followed` and `qu
 
 ```bash
 HOOKS='<HOOKS from Step 1>'
-test -f "$HOOKS/retro_rollup.py" || { echo "ERROR: retro_rollup.py not found under $HOOKS" >&2; exit 1; }
+if ! test -f "$HOOKS/retro_rollup.py"; then echo "ERROR: retro_rollup.py not found under $HOOKS" >&2; exit 1; fi
 python3 "$HOOKS/retro_rollup.py" backfill < /dev/null
 ```
 
@@ -189,7 +199,7 @@ Dry run (no `--apply`): it reads the file, calls no `gh`, and writes nothing.
 
 ```bash
 HOOKS='<HOOKS from Step 1>'
-test -f "$HOOKS/retro_rollup.py" || { echo "ERROR: retro_rollup.py not found under $HOOKS" >&2; exit 1; }
+if ! test -f "$HOOKS/retro_rollup.py"; then echo "ERROR: retro_rollup.py not found under $HOOKS" >&2; exit 1; fi
 python3 "$HOOKS/retro_rollup.py" backfill --accept '<ACCEPT path>' < /dev/null
 ```
 
@@ -206,7 +216,7 @@ Ask once: "Apply: N issues to file, P pending reconcile (may file), M lessons to
 
 ```bash
 HOOKS='<HOOKS from Step 1>'
-test -f "$HOOKS/retro_rollup.py" || { echo "ERROR: retro_rollup.py not found under $HOOKS" >&2; exit 1; }
+if ! test -f "$HOOKS/retro_rollup.py"; then echo "ERROR: retro_rollup.py not found under $HOOKS" >&2; exit 1; fi
 python3 "$HOOKS/retro_rollup.py" backfill --apply --accept '<ACCEPT path>' < /dev/null
 echo "exit=$?"
 rm -f '<ACCEPT path>'

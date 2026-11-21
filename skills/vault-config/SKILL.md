@@ -13,12 +13,22 @@ Interactive menu for viewing and changing obsidian-brain configuration, one sett
 
 ## Procedure
 
+### Repo root — run first
+
+Run this as a command of its own:
+
+```bash
+git rev-parse --show-toplevel
+```
+
+If it fails (not a git repo), run `pwd` instead. Keep the printed path; the steps below call it `<REPO_ROOT>`. Paste that literal path wherever a block below names `'<REPO_ROOT>'`, in single quotes (write a `'` inside it as `'\''`). Do not put `git` inside `$(...)`: a worktree-isolated session refuses any command substitution whose text contains `git` (#521).
+
 ### Step 1 — Load current config
 
 Run:
 
 ```bash
-cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+cd '<REPO_ROOT>'
 python3 -c '
 import sys, os, json
 import glob, json, os, re, sys

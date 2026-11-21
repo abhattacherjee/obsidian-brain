@@ -14,6 +14,16 @@ date window, ranks them by activation, and synthesizes cross-cutting patterns.
 
 ## Procedure
 
+### Repo root — run first
+
+Run this as a command of its own:
+
+```bash
+git rev-parse --show-toplevel
+```
+
+If it fails (not a git repo), run `pwd` instead. Keep the printed path; the steps below call it `<REPO_ROOT>`. Paste that literal path wherever a block below names `'<REPO_ROOT>'`, in single quotes (write a `'` inside it as `'\''`). Do not put `git` inside `$(...)`: a worktree-isolated session refuses any command substitution whose text contains `git` (#521).
+
 ### Step 0 — Create task manifest
 
 ```
@@ -30,7 +40,7 @@ Track task IDs. Set task #1 to `in_progress`.
 Parse the arg as DAYS: no arg = 30, `Nd`/`N days` = N, `this week` = days since Monday. Bind it to `$DAYS`.
 
 ```bash
-cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+cd '<REPO_ROOT>'
 python3 -c '
 import glob, json, os, re, sys
 def _ob_hooks():
@@ -73,7 +83,7 @@ If no `WRITTEN:` response, report failure and stop. Mark task #2 `completed`.
 
 ### Step 3 — Build output + write note
 ```bash
-cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+cd '<REPO_ROOT>'
 python3 -c '
 import glob, json, os, re, sys
 def _ob_hooks():
@@ -105,7 +115,7 @@ Display report prefixed with **Pattern Discovery Results:**. Confirm saved path.
 Then add a section "Lessons growing in this window" (shown in the conversation, not saved in the note). Read the lessons:
 
 ```bash
-cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+cd '<REPO_ROOT>'
 HOOKS=$(python3 -c "
 import glob, json, os, re
 def _ob_hooks():
@@ -126,7 +136,7 @@ def _ob_hooks():
     return max(_c, key=lambda _p: ([int(_n) for _n in _p.split('/')[-2].split('.')], _p), default='hooks')
 print(_ob_hooks())
 ")
-test -f "$HOOKS/retro_rollup.py" || { echo "ERROR: retro_rollup.py not found under $HOOKS - verify the obsidian-brain install resolved there is complete (git pull for a directory-source checkout, or /plugin marketplace update for a cache install), then retry." >&2; exit 1; }
+if ! test -f "$HOOKS/retro_rollup.py"; then echo "ERROR: retro_rollup.py not found under $HOOKS - verify the obsidian-brain install resolved there is complete (git pull for a directory-source checkout, or /plugin marketplace update for a cache install), then retry." >&2; exit 1; fi
 python3 "$HOOKS/retro_rollup.py" report --json < /dev/null
 ```
 
