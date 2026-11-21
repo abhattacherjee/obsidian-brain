@@ -246,8 +246,8 @@ def test_retro_blocks_run_in_a_worktree_isolated_session():
 
 def test_isolation_checker_flags_every_refused_form_and_passes_a_clean_block():
     """Positive control: the checker the real test uses really fires."""
-    for name, body in REFUSED_FORMS.items():
-        assert isolation_problems(body, heredoc=False), name
+    for name, (body, expected) in REFUSED_FORMS.items():
+        assert expected in isolation_problems(body, heredoc=False), name
     heredoc = "cat <<'EOF'\nx\nEOF"
     assert isolation_problems(heredoc, heredoc=True) == ["heredoc"]
     assert isolation_problems(heredoc) == []

@@ -1,11 +1,15 @@
 """Execute the SKILL.md ``note_writer.py`` blocks under a real shell.
 
-Call sites are found by running each fenced shell block under bash with stub
-``python3``, ``git`` and ``gh`` that record their argv (#522), not by matching
-command text: regexes missed ``python3 -X utf8``, a ``\\`` continuation before
-``write`` and tilde fences, and counted a shell comment as a call. Execution
-only sees calls that ran, so the counts (8 ``write``, 1 ``append-update``) and
-the set of note_writer-mentioning blocks that record no call are pinned.
+Call sites are found by running EVERY fenced shell block of every skill under
+bash with stub ``python3``, ``git`` and ``gh`` that record their argv (#522),
+not by matching command text: regexes missed ``python3 -X utf8``, a ``\\``
+continuation before ``write`` and tilde fences, and counted a shell comment as
+a call. Execution only sees calls that ran, so a block that stops early or
+sits in an untaken branch records nothing. The pinned ``_CALL_SITES`` set
+names the blocks that record a call today, and the counts (8 ``write``, 1
+``append-update``) are pinned too. A new call site, or one that stops
+recording, fails the count test; update ``_CALL_SITES`` when a skill adds or
+removes one.
 
 Since #517 every ``write`` call takes the note from ``--body-file`` (a file the
 model writes with the Write tool), so no note text sits in the Bash command.
@@ -25,12 +29,14 @@ import os
 import re
 import shutil
 import subprocess
+import time
 from collections import Counter
 
 import pytest
 
 from skill_shell import (
     HOOKS_DIR,
+    _blank_quotes_and_heredocs,
     fenced_blocks,
     note_writer_calls,
     python_script_call,
@@ -71,14 +77,28 @@ _SKILL_TEXTS = {
     path.parent.name: path.read_text(encoding="utf-8")
     for path in sorted(HOOKS_DIR.parent.glob("skills/*/SKILL.md"))
 }
-_CANDIDATES = [
+_ALL_BLOCKS = [
     (f"{skill}-{block.line}", skill, block.body)
     for skill, text in _SKILL_TEXTS.items()
     for block in fenced_blocks(text)
-    if "note_writer" in block.body
 ]
-_NO_CALL = frozenset()  # Every current candidate invokes note_writer.py.
-_CALL_BLOCKS = [candidate for candidate in _CANDIDATES if candidate[0] not in _NO_CALL]
+# The blocks that record a note_writer.py call when run under the stubs.
+# Update when a skill adds or removes a call site.
+_CALL_SITES = frozenset({
+    "compress-250",
+    "compress-514",
+    "decide-262",
+    "error-log-252",
+    "retro-412",
+    "standup-325",
+    "standup-582",
+    "vault-import-285",
+    "vault-stats-238",
+})
+_CALL_BLOCKS = [block for block in _ALL_BLOCKS if block[0] in _CALL_SITES]
+# A call in an untaken branch is not recorded, so a call site must not sit
+# inside one.
+_BRANCH_WORDS = frozenset({"if", "case", "elif", "else", "while"})
 
 
 def _recorded_calls(block_id, block, workdir):
@@ -93,14 +113,38 @@ def _assert_body_file(args, block_id):
     assert args[start + 1:start + 2] == ["<BODY_FILE>"], (block_id, args)
 
 
+def _branch_words(block: str) -> set[str]:
+    """Branch keywords that start a command line of the block.
+
+    Heredoc bodies are note text, not shell. The one-line `if ! test -f` guard at
+    the top of each call-site block exits when it fails, so it cannot hide a call.
+    """
+    first_words = {
+        line.split()[0] for line in _blank_quotes_and_heredocs(block).splitlines()
+        if line.strip() and not line.lstrip().startswith("if ! test -f")
+    }
+    return first_words & _BRANCH_WORDS
+
+
+def test_a_call_inside_a_branch_is_detected():
+    assert _branch_words("if x; then\n  python3 n.py write\nfi") == {"if"}
+    assert _branch_words("case x in\n  a) python3 n.py ;;\nesac") == {"case"}
+    assert _branch_words("x\nelse\ny") == {"else"}
+    assert _branch_words("if ! test -f f; then exit 1; fi\ncat <<E\nif a\nE") == set()
+
+
 @requires_bash
 def test_note_writer_call_sites_match_the_pinned_counts(tmp_path):
-    no_call = set()
+    assert {block_id for block_id, _skill, _block in _CALL_BLOCKS} == _CALL_SITES
+    recorded = set()
     counts = Counter()
-    for block_id, _skill, block in _CANDIDATES:
-        calls = _recorded_calls(block_id, block, tmp_path / block_id)
+    for block_id, _skill, block in _ALL_BLOCKS:
+        result = run_with_stubs(block, tmp_path / block_id)
+        calls = note_writer_calls(result.calls)
         if not calls:
-            no_call.add(block_id)
+            continue  # Other blocks may exit non-zero; only call sites are checked.
+        recorded.add(block_id)
+        assert result.returncode == 0, f"{block_id}: {result.stderr}"
         for args in calls:
             assert args, block_id
             counts[args[0]] += 1
@@ -108,8 +152,10 @@ def test_note_writer_call_sites_match_the_pinned_counts(tmp_path):
                 _assert_body_file(args, block_id)
         if "<<" in block:
             assert [args[0] for args in calls] == ["append-update"], block_id
-    assert no_call == _NO_CALL
+    assert recorded == _CALL_SITES
     assert counts == {"write": 8, "append-update": 1}
+    for block_id, _skill, block in _CALL_BLOCKS:
+        assert _branch_words(block) == set(), block_id
 
 
 def _prepare(block: str, tmp_path, note_name: str, *, is_update: bool):
@@ -275,7 +321,7 @@ def test_skill_heredoc_block_survives_delimiter_in_note_body(
 @requires_bash
 def test_every_write_call_takes_the_note_from_a_body_file(tmp_path):
     """Every write passes a body file so the hook sees no note text in Bash."""
-    for block_id, _skill, block in _CANDIDATES:
+    for block_id, _skill, block in _CALL_BLOCKS:
         for args in _recorded_calls(block_id, block, tmp_path / block_id):
             if args[:1] == ["write"]:
                 _assert_body_file(args, block_id)
@@ -313,13 +359,18 @@ HOOKS=$(python3 -c "print(1)")
 if ! test -f "$HOOKS/note_writer.py"; then echo "ERROR: missing note writer" >&2; exit 1; fi
 """
 _SCRATCH_WRITE = """write "$VAULT_PATH" "$INSIGHTS_FOLDER" "n.md" --body-file '<BODY_FILE>'"""
-_SCRATCH_WRITE_ARGS = [["write", "", "", "n.md", "--body-file", "<BODY_FILE>"]]
+
+
+def _scratch_write_args(workdir):
+    """The recorded argv; run_with_stubs points VAULT_PATH at <workdir>/vault."""
+    vault = str(workdir.resolve() / "vault")
+    return [["write", vault, "insights", "n.md", "--body-file", "<BODY_FILE>"]]
 
 
 @requires_bash
 def test_stub_records_write_with_boolean_flag(tmp_path):
     block = _SCRATCH_SETUP + f'python3 -B "$HOOKS/note_writer.py" {_SCRATCH_WRITE}'
-    assert _recorded_calls("boolean flag", block, tmp_path) == _SCRATCH_WRITE_ARGS
+    assert _recorded_calls("boolean flag", block, tmp_path) == _scratch_write_args(tmp_path)
 
 
 @requires_bash
@@ -327,20 +378,20 @@ def test_stub_records_write_with_value_flags(tmp_path):
     block = _SCRATCH_SETUP + (
         f'python3 -X utf8 -W ignore "$HOOKS/note_writer.py" {_SCRATCH_WRITE}'
     )
-    assert _recorded_calls("value flags", block, tmp_path) == _SCRATCH_WRITE_ARGS
+    assert _recorded_calls("value flags", block, tmp_path) == _scratch_write_args(tmp_path)
 
 
 @requires_bash
 def test_stub_records_write_with_line_continuation(tmp_path):
     block = _SCRATCH_SETUP + f'python3 "$HOOKS/note_writer.py" \\\n  {_SCRATCH_WRITE}'
-    assert _recorded_calls("line continuation", block, tmp_path) == _SCRATCH_WRITE_ARGS
+    assert _recorded_calls("line continuation", block, tmp_path) == _scratch_write_args(tmp_path)
 
 
 @requires_bash
 def test_stub_records_write_in_four_tilde_fence(tmp_path):
     block = _SCRATCH_SETUP + f'python3 "$HOOKS/note_writer.py" {_SCRATCH_WRITE}'
     parsed, = fenced_blocks(f"~~~~bash\n{block}\n~~~~")
-    assert _recorded_calls("four-tilde fence", parsed.body, tmp_path) == _SCRATCH_WRITE_ARGS
+    assert _recorded_calls("four-tilde fence", parsed.body, tmp_path) == _scratch_write_args(tmp_path)
 
 
 @requires_bash
@@ -351,10 +402,44 @@ def test_stub_ignores_commented_write(tmp_path):
 
 @requires_bash
 def test_stub_does_not_record_absolute_python_path(tmp_path):
-    block = _SCRATCH_SETUP + '/usr/bin/python3 "$HOOKS/note_writer.py" write'
-    result = run_with_stubs(block, tmp_path)
+    """A real python3 called by absolute path bypasses the stub, so it is not recorded."""
+    fake = tmp_path / "abs" / "python3"
+    fake.parent.mkdir(parents=True)
+    fake.write_text(f"#!/bin/sh\ntouch '{fake.parent}/ran'\n", encoding="utf-8")
+    fake.chmod(0o755)
+    block = _SCRATCH_SETUP + f"'{fake}' \"$HOOKS/note_writer.py\" write"
+    result = run_with_stubs(block, tmp_path / "run")
+    assert (fake.parent / "ran").exists()
     assert result.calls == [["python3", "-c", "print(1)"]]
     assert note_writer_calls(result.calls) == []
+
+
+@requires_bash
+def test_grep_is_a_recording_stub_that_scans_nothing(tmp_path):
+    block = 'grep -rl "session_id:" "$VAULT_PATH/$SESSIONS_FOLDER/"'
+    result = run_with_stubs(block, tmp_path)
+    vault = tmp_path.resolve() / "vault"
+    assert result.returncode == 0
+    assert result.calls == [["grep", "-rl", "session_id:", f"{vault}/sessions/"]]
+    assert not (tmp_path / "bin" / "grep").resolve().samefile(shutil.which("grep"))
+
+
+@requires_bash
+def test_a_timeout_kills_the_whole_process_group(tmp_path):
+    pid_file = tmp_path / "pid"
+    block = f"/bin/sleep 300 &\necho $! > '{pid_file}'\nwait"
+    with pytest.raises(subprocess.TimeoutExpired):
+        run_with_stubs(block, tmp_path / "run", timeout=2)
+    pid = int(pid_file.read_text())
+    for _ in range(50):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.1)
+    else:
+        os.kill(pid, 9)
+        pytest.fail("the backgrounded child outlived the timeout")
 
 
 def test_python_script_call():
@@ -380,7 +465,7 @@ def test_python_script_call():
 def _body_file_steps(tmp_path):
     """Find the surrounding Markdown step for each recorded body-file write."""
     found = []
-    for block_id, skill, block in _CANDIDATES:
+    for block_id, skill, block in _CALL_BLOCKS:
         calls = _recorded_calls(block_id, block, tmp_path / block_id)
         if not any(args[:1] == ["write"] and "--body-file" in args for args in calls):
             continue

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -93,15 +95,31 @@ def note_writer_calls(calls: list[list[str]]) -> list[list[str]]:
     ]
 
 
-def run_with_stubs(block: str, workdir: Path) -> StubRun:
-    """Run a skill block with scratch paths and record the stubbed commands."""
+# Variables the skill blocks read without setting. Unset, `"$X/..."` becomes an
+# absolute path from the filesystem root, so each one points into the workdir.
+_SCRATCH_PATH_VARS = (
+    "FILE_PATH", "MATCH_PATH", "NOTE_PATH", "SUMMARY_TEMP_PATH",
+    "UNSUMMARIZED_PATH", "INSIGHTS_DIR", "SESSIONS_DIR",
+)
+
+
+def run_with_stubs(block: str, workdir: Path, timeout: int = 60) -> StubRun:
+    """Run a skill block with scratch paths and record the stubbed commands.
+
+    ``python3``, ``git``, ``gh`` and ``grep`` are stubs that record their argv:
+    grep is not the real one, so ``grep -r`` can never scan the filesystem. Every
+    path variable the blocks read points into ``workdir``. The block runs in its
+    own session; on a timeout the whole process group is killed.
+    """
     workdir = workdir.resolve()
     bin_dir = workdir / "bin"
     home = workdir / "home"
     cwd = workdir / "cwd"
     fake_hooks = workdir / "fakehooks"
+    tmp = workdir / "tmp"
+    vault = workdir / "vault"
     log = workdir / "calls.jsonl"
-    for directory in (bin_dir, home, cwd, fake_hooks):
+    for directory in (bin_dir, home, cwd, fake_hooks, tmp, vault):
         directory.mkdir(parents=True)
     log.touch()
     for hook in HOOKS_DIR.iterdir():
@@ -133,55 +151,185 @@ if name == "python3":
         except (OSError, ValueError):
             pass
 """
-    for name in ("python3", "git", "gh"):
+    for name in ("python3", "git", "gh", "grep"):
         stub = bin_dir / name
         stub.write_text(stub_source, encoding="utf-8")
         stub.chmod(0o755)
 
     utilities = (
-        "rm mkdir cat sed ls printf dirname basename mktemp chmod head tail "
-        "grep tr wc date touch cp mv env sort uniq awk cut"
+        "mkdir cat sed ls printf dirname basename mktemp chmod head tail "
+        "tr wc date touch env sort uniq awk cut"
     )
     for name in utilities.split():
         if path := shutil.which(name):
             (bin_dir / name).symlink_to(Path(path).absolute())
 
     quoted_cwd = "'" + str(cwd).replace("'", "'\\''") + "'"
-    result = subprocess.run(
+    (vault / "sessions").mkdir()
+    (vault / "insights").mkdir()
+    env = {
+        "PATH": str(bin_dir),
+        "HOME": str(home),
+        "TMPDIR": str(tmp),
+        "VAULT_PATH": str(vault),
+        "SESSIONS_FOLDER": "sessions",
+        "INSIGHTS_FOLDER": "insights",
+        "OB_STUB_LOG": str(log),
+        "LC_ALL": "C",
+    }
+    for name in _SCRATCH_PATH_VARS:
+        env[name] = str(workdir / "scratch" / name.lower())
+    proc = subprocess.Popen(
         [shutil.which("bash"), "-c", block.replace("'<REPO_ROOT>'", quoted_cwd)],
         cwd=cwd,
-        env={
-            "PATH": str(bin_dir),
-            "HOME": str(home),
-            "OB_STUB_LOG": str(log),
-            "LC_ALL": "C",
-        },
+        env=env,
         stdin=subprocess.DEVNULL,
-        timeout=60,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
+        start_new_session=True,
     )
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        os.killpg(proc.pid, signal.SIGKILL)
+        proc.communicate()
+        raise
+    finally:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)  # Leftover background children.
+        except (ProcessLookupError, PermissionError):
+            pass
     calls = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
-    return StubRun(calls, result.returncode, result.stdout, result.stderr)
+    return StubRun(calls, proc.returncode, stdout, stderr)
+
+
+# `_HEREDOC_OPEN` groups: 1 is the `-` of `<<-`, 2 the quote, 3 the delimiter.
+_HEREDOC_OPEN = re.compile(r"<<(-?)[ \t]*(['\"]?)([A-Za-z_][A-Za-z0-9_<>]*)\2")
+
+
+def _ends_heredoc(line: str, delimiter: str, dash: bool) -> bool:
+    """`<<` ends only at the exact delimiter; `<<-` also strips leading tabs."""
+    return (line.lstrip("\t") if dash else line) == delimiter
+
+
+def _scan(block: str):
+    """Walk the block like a shell: quotes, escapes, comments, heredoc bodies and
+    nested `$(...)`, `<(...)` and `>(...)`.
+
+    Returns (flags, subs). flags[i] is 0 for shell code and 1 for text inside a
+    quote, an escape or a comment, and 2 for a heredoc body. subs lists
+    [start, end] spans of every substitution body, outer before inner. An
+    unclosed one runs to the end of the block.
+
+    Known gap: a `)` in a `case` pattern inside `$(...)` still closes it early.
+    """
+    n = len(block)
+    flags = [0] * n
+    subs: list[list[int]] = []
+    stack = [["cmd", 0, None]]  # ["cmd", plain paren depth, subs index] or ["dq"]
+    pending: list[tuple[str, bool]] = []
+    i = 0
+
+    def push_sub(at: int) -> None:
+        subs.append([at + 2, n])
+        stack.append(["cmd", 0, len(subs) - 1])
+
+    while i < n:
+        ch = block[i]
+        frame = stack[-1]
+        if frame[0] == "dq":
+            if ch == "\\":
+                flags[i:i + 2] = [1] * len(flags[i:i + 2])
+                i += 2
+            elif ch == '"':
+                stack.pop()
+                i += 1
+            elif block.startswith("$(", i):
+                push_sub(i)
+                i += 2
+            else:
+                flags[i] = 1
+                i += 1
+            continue
+        if ch == "\\":
+            flags[i:i + 2] = [1] * len(flags[i:i + 2])
+            i += 2
+        elif ch == "'":
+            end = block.find("'", i + 1)
+            end = n if end < 0 else end
+            flags[i + 1:end] = [1] * (end - i - 1)
+            i = end + 1
+        elif ch == '"':
+            stack.append(["dq"])
+            i += 1
+        elif block.startswith(("$(", "<(", ">("), i):
+            push_sub(i)
+            i += 2
+        elif ch == "(":
+            frame[1] += 1
+            i += 1
+        elif ch == ")":
+            if frame[1]:
+                frame[1] -= 1
+            elif frame[2] is not None:
+                subs[frame[2]][1] = i
+                stack.pop()
+            i += 1
+        elif ch == "#" and (i == 0 or block[i - 1] in " \t\n;&|("):
+            end = block.find("\n", i)
+            end = n if end < 0 else end
+            flags[i:end] = [1] * (end - i)
+            i = end
+        elif block.startswith("<<", i):
+            match = _HEREDOC_OPEN.match(block, i)
+            triple = block.startswith("<<<", i) or (i and block[i - 1] == "<")
+            if match and not triple:
+                pending.append((match.group(3), bool(match.group(1))))
+                i = match.end()
+            else:
+                i += 3 if block.startswith("<<<", i) else 2
+        elif ch == "\n" and pending:
+            pos = i + 1
+            for delimiter, dash in pending:
+                while pos < n:
+                    end = block.find("\n", pos)
+                    end = n if end < 0 else end
+                    if _ends_heredoc(block[pos:end], delimiter, dash):
+                        pos = min(end + 1, n)
+                        break
+                    flags[pos:end] = [2] * (end - pos)
+                    pos = min(end + 1, n)
+            pending = []
+            i = pos
+        else:
+            i += 1
+    return flags, subs
 
 
 def substitution_bodies(block: str) -> list[str]:
-    """The text inside every `$( ... )` (parens balanced; unclosed runs to the end)
-    and every backtick pair."""
-    bodies = []
-    for m in re.finditer(r"\$\(", block):
-        depth, k = 1, m.end()
-        while k < len(block) and depth:
-            depth += {"(": 1, ")": -1}.get(block[k], 0)
-            k += 1
-        bodies.append(block[m.end():k])
-    bodies += re.findall(r"`([^`]*)`", block)
-    return bodies
+    """The text inside every `$(...)`, `<(...)` and `>(...)` (parens inside quotes,
+    escapes and heredoc bodies do not count; unclosed runs to the end) and every
+    backtick pair. Body text keeps its quotes."""
+    _flags, subs = _scan(block)
+    return [block[start:end] for start, end in subs] + re.findall(r"`([^`]*)`", block)
+
+
+def _blank_quotes_and_heredocs(block: str) -> str:
+    """The block with quoted text, escapes, comments and heredoc bodies replaced
+    by spaces. Same length; newlines kept."""
+    flags, _subs = _scan(block)
+    return "".join(
+        " " if flag and char != "\n" else char for char, flag in zip(block, flags)
+    )
 
 
 # The 2026-11-21 worktree-isolation probe refused both digit and legit in
 # substitutions, so match git as a substring.
 GIT_TEXT = re.compile(r"git", re.IGNORECASE)
+_BRACE_GROUP = re.compile(
+    r"(?:^|[;&|!(]|\b(?:then|do|else|elif)\b)[ \t]*\{(?=\s|$)", re.M
+)
 
 
 def isolation_problems(block: str, *, heredoc: bool = False) -> list[str]:
@@ -189,10 +337,12 @@ def isolation_problems(block: str, *, heredoc: bool = False) -> list[str]:
     problems = []
     if any(GIT_TEXT.search(body) for body in substitution_bodies(block)):
         problems.append("git inside a command substitution")
-    if re.search(r"(\|\||&&)\s*\{", block):
+    code = _blank_quotes_and_heredocs(block)
+    if re.search(r"(\|\||&&)\s*\{", code):
         problems.append("brace group after || or &&")
-    # A bare group containing git was refused. Flag every bare group to fail closed.
-    if re.search(r"^[ \t]*\{(\s|$)", block, re.M):
+    # A bare group containing git was refused. Flag every `{` that starts a
+    # command (not `${VAR}`, not text in a quote or heredoc) to fail closed.
+    if _BRACE_GROUP.search(code):
         problems.append("brace group")
     if heredoc and "<<" in block:
         problems.append("heredoc")
@@ -205,7 +355,6 @@ def isolation_problems(block: str, *, heredoc: bool = False) -> list[str]:
 # f-strings with `{exc}`, and `{a,b}` in a `cat << 'EOF'` body ran. The same
 # dict also ran under `python3 -c`. The harness cause is a hypothesis: the
 # probes showed refusal when a heredoc line had a quote after `{` before `}`.
-_HEREDOC_OPEN = re.compile(r"<<-?[ \t]*(['\"]?)([A-Za-z_][A-Za-z0-9_<>]*)\1")
 _QUOTED_BRACE = re.compile(r"\{[^}\n]*[\"']")
 
 
@@ -217,10 +366,10 @@ def heredoc_bodies(block: str) -> list[str]:
         for match in _HEREDOC_OPEN.finditer(line):
             if match.start() and line[match.start() - 1] == "<":
                 continue
-            delimiter = match.group(2)
+            delimiter, dash = match.group(3), bool(match.group(1))
             body = []
             for body_line in lines:
-                if body_line.strip() == delimiter:
+                if _ends_heredoc(body_line, delimiter, dash):
                     break
                 body.append(body_line)
             bodies.append("\n".join(body))
@@ -238,22 +387,40 @@ def heredoc_brace_problems(block: str) -> list[str]:
     ]
 
 
-REFUSED_FORMS: dict[str, str] = {
-    "plain": 'cd "$(git rev-parse --show-toplevel)"',
-    "command": 'x=$(command git rev-parse HEAD)',
-    "cd-and": 'cd "$(cd . && git rev-parse --show-toplevel)"',
-    "abs-path": 'x=$(/usr/bin/git rev-parse HEAD)',
-    "space": 'x=$( git rev-parse HEAD)',
-    "backticks": 'x=`git rev-parse HEAD`',
-    "or-group": 'test -f f || { echo missing; exit 1; }',
-    "and-group-tight": 'test -f f &&{ echo present; }',
-    "or-group-next-line": 'test -f f ||\n{\n  echo missing\n}',
-    "python-word": 'x=$(python3 -c "\nimport subprocess\nsubprocess.run([\'git\', \'--version\'])\n")',
-    "heredoc-in-sub": "out=$(FOO=1 python3 << 'PYEOF'\nprint(\"git\")\nPYEOF\n)",
-    "dquoted-sub": 'cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"',
-    "digit": 'x=$(echo digit)',
-    "legit": """x=$(python3 -c "print('legit')")""",
-    "upper": 'x=$(echo GIT)',
-    "bare-group": '{ echo git word; }',
-    "guard-msg": 'test -f f || { echo "ERROR: run git pull" >&2; exit 1; }',
+_SUB = "git inside a command substitution"
+_GROUP = "brace group"
+_AFTER_OR = "brace group after || or &&"
+
+# name -> (block, a problem isolation_problems must report for it)
+REFUSED_FORMS: dict[str, tuple[str, str]] = {
+    "plain": ('cd "$(git rev-parse --show-toplevel)"', _SUB),
+    "command": ('x=$(command git rev-parse HEAD)', _SUB),
+    "cd-and": ('cd "$(cd . && git rev-parse --show-toplevel)"', _SUB),
+    "abs-path": ('x=$(/usr/bin/git rev-parse HEAD)', _SUB),
+    "space": ('x=$( git rev-parse HEAD)', _SUB),
+    "backticks": ('x=`git rev-parse HEAD`', _SUB),
+    "or-group": ('test -f f || { echo missing; exit 1; }', _AFTER_OR),
+    "and-group-tight": ('test -f f &&{ echo present; }', _AFTER_OR),
+    "or-group-next-line": ('test -f f ||\n{\n  echo missing\n}', _AFTER_OR),
+    "python-word": (
+        'x=$(python3 -c "\nimport subprocess\nsubprocess.run([\'git\', \'--version\'])\n")',
+        _SUB,
+    ),
+    "heredoc-in-sub": ("out=$(FOO=1 python3 << 'PYEOF'\nprint(\"git\")\nPYEOF\n)", _SUB),
+    "dquoted-sub": ('cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"', _SUB),
+    "digit": ('x=$(echo digit)', _SUB),
+    "legit": ("""x=$(python3 -c "print('legit')")""", _SUB),
+    "upper": ('x=$(echo GIT)', _SUB),
+    "bare-group": ('{ echo git word; }', _GROUP),
+    "guard-msg": ('test -f f || { echo "ERROR: run git pull" >&2; exit 1; }', _AFTER_OR),
+    "group-after-semicolon": ('true; { echo git; }', _GROUP),
+    "group-after-then": ('if x; then { echo git; }; fi', _GROUP),
+    "group-after-pipe": ('echo | { cat; }', _GROUP),
+    "group-after-bang": ('! { echo; }', _GROUP),
+    "group-after-amp": ('echo & { echo; }', _GROUP),
+    "group-after-do": ('for i in 1; do { echo; }; done', _GROUP),
+    "group-in-subshell": ('( { echo; } )', _GROUP),
+    "paren-in-quotes": ("value=$(printf '%s' ')' && git rev-parse HEAD)", _SUB),
+    "paren-in-dquotes": ('x=$(echo ")" ; git x)', _SUB),
+    "process-substitution": ('diff <(git log) f', _SUB),
 }

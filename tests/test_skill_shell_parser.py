@@ -6,6 +6,7 @@ import pytest
 
 from skill_shell import (
     Block,
+    _blank_quotes_and_heredocs,
     REFUSED_FORMS,
     fenced_blocks,
     heredoc_brace_problems,
@@ -70,12 +71,35 @@ def test_line_is_one_based_opener_position():
 
 
 def test_substitution_bodies_balance_parentheses_and_keep_unclosed_tail():
-    assert substitution_bodies("$(a $(b)) `c` $(d") == ["a $(b))", "b)", "d", "c"]
+    assert substitution_bodies("$(a $(b)) `c` $(d") == ["a $(b)", "b", "d", "c"]
 
 
-@pytest.mark.parametrize("block", REFUSED_FORMS.values(), ids=REFUSED_FORMS.keys())
-def test_refused_forms(block):
-    assert isolation_problems(block)
+@pytest.mark.parametrize(("block", "bodies"), [
+    ("$(printf '%s' ')' && git x)", ["printf '%s' ')' && git x"]),
+    ('$(echo ")" ; git x)', ['echo ")" ; git x']),
+    (r"$(echo \) ; git x)", [r"echo \) ; git x"]),
+    ('"$(dirname "$(echo ")")")"', ['dirname "$(echo ")")"', 'echo ")"']),
+    ("<(git log) >(cat)", ["git log", "cat"]),
+    ("$(cat <<'E'\n)\nE\n)", ["cat <<'E'\n)\nE\n"]),
+])
+def test_substitution_bodies_skip_parens_in_quotes_escapes_and_heredocs(block, bodies):
+    assert substitution_bodies(block) == bodies
+
+
+def test_blank_quotes_and_heredocs_keeps_length_and_newlines():
+    block = "a '{ b' \"{ c\" d\ne <<-E\n\t{ x }\n\tE\nf # { g\nh"
+    blank = _blank_quotes_and_heredocs(block)
+    assert len(blank) == len(block)
+    assert blank.count("\n") == block.count("\n")
+    assert "{" not in blank
+    assert blank.startswith("a '   ' \"   \" d\ne <<-E\n")
+    assert blank.endswith("\tE\nf      \nh")
+
+
+@pytest.mark.parametrize("name", REFUSED_FORMS)
+def test_refused_forms(name):
+    block, expected = REFUSED_FORMS[name]
+    assert expected in isolation_problems(block), name
 
 
 def test_bare_group_fails_closed():
@@ -89,6 +113,12 @@ def test_bare_group_fails_closed():
     "test -f f && echo OK || echo MISSING",
     'echo "ERROR: run git pull"',
     "( echo git word )",
+    'echo "${HOME}"',
+    "python3 -c \"print({'a': 1})\"",
+    'x="a { b"',
+    "cat << 'E'\n{'a': 1}\nif x; then { y; }; fi\nE",
+    "f() { echo ok; }",
+    "echo {a,b}",
     "python3 -c \"import subprocess; subprocess.run(['git', '--version'])\"",
     "FOO=1 python3 << 'PYEOF'\nprint([\"git\"])\nPYEOF",
 ])
@@ -146,6 +176,21 @@ FIRST
 cat << SECOND
 {"b": 3}"""
     assert heredoc_brace_problems(block) == ['{"a": 1}', '{"b": 3}']
+
+
+def test_an_indented_delimiter_does_not_end_a_plain_heredoc():
+    block = "python3 << 'PYEOF'\n PYEOF\nx = {\"a\": 1}\nPYEOF\nafter"
+    assert heredoc_brace_problems(block) == ['x = {"a": 1}']
+
+
+def test_a_space_indented_delimiter_does_not_end_a_dash_heredoc():
+    block = "cat <<-EOF\n  EOF\n{\"a\": 1}\n\tEOF\n{\"outside\": 2}"
+    assert heredoc_brace_problems(block) == ['{"a": 1}']
+
+
+def test_a_tab_indented_delimiter_ends_a_dash_heredoc():
+    block = "cat <<-EOF\n\t{\"a\": 1}\n\t\tEOF\n{\"outside\": 2}"
+    assert heredoc_brace_problems(block) == ['{"a": 1}']
 
 
 def test_real_skill_fences_are_closed():
