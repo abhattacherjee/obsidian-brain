@@ -4,7 +4,8 @@ Skills previously persisted vault notes via a Write tool call, which breaks
 in environments that route writes through a context-blind helper sub-agent
 (#269). This gives skills two deterministic commands instead:
 
-- ``write``: create a new note. Reads note content from stdin, delegates to
+- ``write``: create a new note. Reads note content from stdin, or from
+  ``--body-file PATH`` (the form every skill uses since #517), delegates to
   obsidian_utils.write_vault_note for the atomic mkdir + traversal-checked +
   chmod 0o600 + rename write, and prints the absolute destination path on
   success so the skill can echo it back to the user.
@@ -13,7 +14,10 @@ in environments that route writes through a context-blind helper sub-agent
   (``last_updated``, new tags) in the SAME atomic write. Never creates a
   file -- the target must already exist.
 
-Stdin is capped at 1_000_000 characters (project CLAUDE.md security pattern)
+When given ``--body-file PATH``, ``write`` reads the note from that file
+(#517). This keeps note text out of the Bash command a PreToolUse hook reads.
+
+Input is capped at 1_000_000 characters (project CLAUDE.md security pattern)
 and OVERSIZE input is rejected, never truncated: a silently truncated note
 that still reports ``OK:`` is the exact failure mode this CLI exists to
 remove (worst at /standup's in-place overwrite, where a truncated write
@@ -74,6 +78,15 @@ def _read_stdin_capped() -> tuple[str, bool]:
     if len(text) > STDIN_CAP_CHARS:
         return text[:STDIN_CAP_CHARS], True
     return text, False
+
+
+def _read_file_capped(path: str) -> tuple[str, bool]:
+    """Read a regular UTF-8 file, preserving the note's line endings."""
+    if not os.path.isfile(path):
+        raise OSError("not a regular file")
+    with open(path, encoding="utf-8", errors="strict", newline="") as body:
+        text = body.read(STDIN_CAP_CHARS + 1)
+    return text[:STDIN_CAP_CHARS], len(text) > STDIN_CAP_CHARS
 
 
 def _validate_folder(folder: str):
@@ -1294,8 +1307,8 @@ def set_frontmatter_fields(vault_path: str, note_path: str, fields: dict, stat_o
         _release_lock(lock)
 
 
-def _oversize_error() -> str:
-    """The single ``ERROR:`` line both commands print on oversize stdin.
+def _oversize_error(source: str = "stdin") -> str:
+    """The single ``ERROR:`` line both commands print on oversize input.
 
     Rejecting rather than truncating: a truncated note written under an
     ``OK:`` line loses its tail (e.g. ``## Session Metadata``) with no
@@ -1303,7 +1316,7 @@ def _oversize_error() -> str:
     a complete note with a truncated one.
     """
     return (
-        f"ERROR: stdin exceeds the {STDIN_CAP_CHARS}-character cap; "
+        f"ERROR: {source} exceeds the {STDIN_CAP_CHARS}-character cap; "
         "nothing written (split the content or shorten the note)"
     )
 
@@ -1312,13 +1325,13 @@ def main():
     """CLI entrypoint.
 
     Usage:
-      note_writer.py write <vault_path> <folder> <filename> [--overwrite]
+      note_writer.py write <vault_path> <folder> <filename> [--overwrite] [--body-file PATH]
       note_writer.py append-update <vault_path> <note_path> \
 [--last-updated YYYY-MM-DD] [--add-tags a,b,c]
     """
     usage = (
         "usage: note_writer.py write <vault_path> <folder> <filename> "
-        "[--overwrite]\n"
+        "[--overwrite] [--body-file PATH]\n"
         "       note_writer.py append-update <vault_path> <note_path> "
         "[--last-updated YYYY-MM-DD] [--add-tags a,b,c]"
     )
@@ -1330,9 +1343,20 @@ def main():
     if cmd == "write":
         positional = []
         overwrite = False
-        for arg in sys.argv[2:]:
+        body_file = None
+        write_args = sys.argv[2:]
+        if write_args.count("--body-file") > 1:
+            print("ERROR: --body-file given more than once", file=sys.stderr)
+            sys.exit(2)
+        args = iter(write_args)
+        for arg in args:
             if arg == "--overwrite":
                 overwrite = True
+            elif arg == "--body-file":
+                body_file = next(args, None)
+                if body_file is None:
+                    print("ERROR: --body-file needs a path", file=sys.stderr)
+                    sys.exit(2)
             elif arg.startswith("--"):
                 print(f"ERROR: unknown flag: {arg!r}", file=sys.stderr)
                 sys.exit(2)
@@ -1342,9 +1366,16 @@ def main():
             print(usage, file=sys.stderr)
             sys.exit(2)
         vault_path, folder, filename = positional
-        content, oversized = _read_stdin_capped()
+        if body_file is None:
+            content, oversized = _read_stdin_capped()
+        else:
+            try:
+                content, oversized = _read_file_capped(body_file)
+            except (OSError, UnicodeDecodeError) as exc:
+                print(f"ERROR: cannot read --body-file {body_file}: {exc}", file=sys.stderr)
+                sys.exit(1)
         if oversized:
-            print(_oversize_error(), file=sys.stderr)
+            print(_oversize_error("stdin" if body_file is None else "--body-file"), file=sys.stderr)
             sys.exit(1)
         sys.exit(run_write(vault_path, folder, filename, content, overwrite=overwrite))
 

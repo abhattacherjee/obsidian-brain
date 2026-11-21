@@ -9,7 +9,7 @@ metadata:
 
 Discover historical Claude Code sessions, summarize them via parallel sub-agents, and write structured session notes to the Obsidian vault. Skips sessions already present in the vault.
 
-**Tools needed:** Bash, Read, Skill (for /context:shield sub-agents)
+**Tools needed:** Bash, Read, Write, Skill (for /context:shield sub-agents)
 
 **Prerequisites:**
 - `/context:search` skill must be installed (plugin `context@claude-code-skills`; was `conversation-search`)
@@ -258,7 +258,19 @@ Generate the filename using the same convention as other session notes:
 
 Final filename: `YYYY-MM-DD-<slug>-<hash>.md`
 
-Write each note by running the note-writer CLI once **per session**, piping that session's full note (frontmatter + body) in on stdin. It creates `$SESSIONS_FOLDER` if needed (idempotent across repeated calls in this loop — only the first call actually creates it) and writes each file atomically at mode `0o600` — no `mkdir`/`chmod` needed. **Two rules for the heredoc terminator, both load-bearing.** (1) It must stay **quoted** (`<<'OB_NOTE_EOF_<eof4>'`) — do not drop the quotes in a future edit. (2) It must be **unique per invocation**: substitute the same 4 random hex characters for `<eof4>` in BOTH the `<<'OB_NOTE_EOF_<eof4>'` opener and the terminator line, then confirm that **no line of the content you are about to emit is exactly that terminator** — if one is, pick different hex characters and re-check. **Never** replace this with a fixed delimiter. Quoting stops `$`/backtick expansion but does NOT stop early termination: a line equal to the terminator at column 0 ends the heredoc there, silently truncating the content AND handing everything after it to the shell as commands to execute. Notes written by this plugin routinely quote these very blocks, so a fixed terminator is a live hazard, not a theoretical one. **Self-check before you emit the block: if the terminator still contains `<` or `>`, you have not substituted it.** Stop and substitute it — the literal `<eof4>` form appears at column 0 inside these SKILL.md blocks themselves, so a note quoting one of them collides all over again, and nothing on the shell side can catch that. The `HOOKS=` line below checks the marketplace-registered directory-source install location FIRST (#278 — on a local checkout that is what loads, not the released cache), and only falls back to the plugin cache, where it sorts versions **numerically** (a plain `max()` is lexicographic and picks `3.9.0` over `3.10.0`, resolving to a cache with no `note_writer.py`); the `test -f` line turns a stale/incomplete cache into the documented `ERROR:` shape instead of a raw Python `can't open file` message. An unquoted delimiter lets the shell expand `$` variables and backtick commands embedded in imported session content, silently corrupting it:
+Write each note by running the note-writer CLI once **per session**, passing that session's note file with `--body-file`, so no imported session text goes into the Bash command (#517). It creates `$SESSIONS_FOLDER` if needed (idempotent across repeated calls in this loop — only the first call actually creates it) and writes each file atomically at mode `0o600` — no `mkdir`/`chmod` needed. The `HOOKS=` line below checks the marketplace-registered directory-source install location FIRST (#278 — on a local checkout that is what loads, not the released cache), and only falls back to the plugin cache, where it sorts versions **numerically** (a plain `max()` is lexicographic and picks `3.9.0` over `3.10.0`, resolving to a cache with no `note_writer.py`); the `test -f` line turns a stale/incomplete cache into the documented `ERROR:` shape instead of a raw Python `can't open file` message.
+
+Write the note with the **Write tool** to `~/.claude/obsidian-brain/<draft-id>-<filename>`, using the same filename the command below passes (expand `~` to your home directory; run `echo "$HOME"` if you do not know it). `<draft-id>` is 8 random hex characters you pick once per run, so two runs are very unlikely to share a draft file. That path is `<BODY_FILE>`. The file holds the whole note, shaped like this:
+
+```markdown
+---
+type: claude-session
+...
+---
+
+# <Session Title>
+...
+```
 
 ```bash
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
@@ -283,16 +295,10 @@ def _ob_hooks():
 print(_ob_hooks())
 ")
 test -f "$HOOKS/note_writer.py" || { echo "ERROR: note_writer.py not found under $HOOKS - resolution checks the marketplace registered install location first, then falls back to the plugin cache; neither path produced a hooks directory containing it. Verify the obsidian-brain install resolved at $HOOKS is complete (git pull for a directory-source checkout, or run /plugin marketplace update for a cache install), then retry." >&2; exit 1; }
-python3 "$HOOKS/note_writer.py" write "$VAULT_PATH" "$SESSIONS_FOLDER" "<filename>" <<'OB_NOTE_EOF_<eof4>'
----
-type: claude-session
-...
----
-
-# <Session Title>
-...
-OB_NOTE_EOF_<eof4>
+python3 "$HOOKS/note_writer.py" write "$VAULT_PATH" "$SESSIONS_FOLDER" "<filename>" --body-file '<BODY_FILE>'
 ```
+
+After an `OK:` line, run `rm -f '<BODY_FILE>'` (the literal path). If the command fails, keep `<BODY_FILE>` and tell the user its path, so the note text is not lost.
 
 On success this prints `OK: <absolute path>`. On failure it prints `ERROR: <reason>` to stderr and exits non-zero for THAT session only — record it under `<FAILED_COUNT>`/`<Failed sessions>` in Step 8 and continue importing the remaining sessions; one failed write must not abort the whole import loop.
 

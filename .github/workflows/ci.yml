@@ -105,7 +105,9 @@ jobs:
   # gate here; the 3.12 job above owns that.
   python-tests-py39:
     if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
+    # Pinned: ubuntu-latest is Ubuntu 26.04, which has no Python 3.9 build in
+    # actions/python-versions (3.9.25 ships for 22.04 and 24.04 only).
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
@@ -124,7 +126,8 @@ jobs:
   # run each collected test exactly once.
   timed-tests:
     if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
+    # Pinned for the 3.9 shards: see python-tests-py39.
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:

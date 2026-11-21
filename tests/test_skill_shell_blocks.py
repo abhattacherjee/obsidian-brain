@@ -1,4 +1,9 @@
-"""Execute the SKILL.md ``note_writer.py`` heredoc blocks under a real shell.
+"""Execute the SKILL.md ``note_writer.py`` blocks under a real shell.
+
+Since #517 every ``write`` call takes the note from ``--body-file`` (a file the
+model writes with the Write tool), so no note text sits in the Bash command.
+Only /compress's ``append-update`` still pipes its section through a heredoc.
+Both shapes run here with the same hostile body.
 
 Why this module exists (and why it is NOT part of test_note_writer.py):
 ``tests/test_note_writer.py`` invokes the CLI as
@@ -39,7 +44,13 @@ requires_bash = pytest.mark.skipif(_BASH is None, reason="bash not available")
 # a global non-greedy ```bash…``` regex silently matched a prose span instead
 # of the real block (which then looks like "no heredoc here" — a test that
 # quietly covers nothing).
-_CMD_LINE = 'python3 "$HOOKS/note_writer.py"'
+# One pattern for both the strict collector and the loose cross-check. It does not
+# list interpreter flags (`python3 -B`, `-X utf8`, `-W ignore`, ...): any line with
+# `note_writer.py` (optionally quoted) then whitespace then `write` or
+# `append-update` counts, wherever it sits on the line. A backtick before the match
+# marks a prose mention, so it is skipped.
+_INVOKE_PATTERN = r"""[^`\n]*?note_writer\.py["']?[ \t]+(?:write|append-update)\b"""
+_COLUMN0_INVOCATION_RE = re.compile(r"^" + _INVOKE_PATTERN)
 # Matches the opener under EITHER scheme -- with the per-invocation `<eof4>`
 # placeholder or the old fixed form. Deliberately scheme-agnostic so that
 # reverting to a fixed delimiter makes the execution test fail on its real
@@ -55,6 +66,7 @@ _HOOKS_LINE_RE = re.compile(r'^HOOKS=\$\(python3 -c "\n.*?\n"\)$', re.MULTILINE 
 # The filename positional of a `write` call: 3rd quoted argument.
 _WRITE_FILENAME_RE = re.compile(r'(write "\$VAULT_PATH" "\$\w+" )"[^"]*"')
 _WRITE_FOLDER_RE = re.compile(r'write "\$VAULT_PATH" "\$(\w+)"')
+_BODY_FILE_ARG = "--body-file '<BODY_FILE>'"
 
 # The hex the SKILL.md tells the model to substitute for <eof4> per run.
 _EOF4 = "beef"
@@ -77,7 +89,7 @@ def _collect_blocks():
             lines = fh.read().split("\n")
         n = 0
         for i, line in enumerate(lines):
-            if not line.startswith(_CMD_LINE):
+            if not _COLUMN0_INVOCATION_RE.match(line):
                 continue
             start = next(
                 j for j in range(i, -1, -1) if lines[j].strip() == "```bash"
@@ -86,8 +98,9 @@ def _collect_blocks():
                 j for j in range(i, len(lines)) if lines[j].strip() == "```"
             )
             block = "\n".join(lines[start + 1:end])
-            assert "<<'OB_" in block, (
-                f"{skill_name}: note_writer.py block at line {i + 1} has no heredoc"
+            assert "<<'OB_" in block or _BODY_FILE_ARG in block, (
+                f"{skill_name}: note_writer.py block at line {i + 1} has neither "
+                "a heredoc nor --body-file"
             )
             found.append((f"{skill_name}-{n}", skill_name, block))
             n += 1
@@ -103,11 +116,7 @@ _BLOCKS = _collect_blocks()
 # column 0, so a new call site written any other way would be silently
 # uncovered — and a `>= 9` floor would still pass. Cross-checking the strict
 # collector against this loose count makes that failure loud instead.
-_LOOSE_INVOCATION_RE = re.compile(
-    r"""^[ \t]*(?:python3\s+)?["']?[^"'\s]*note_writer\.py["']?\s+"""
-    r"""(?:write|append-update)\b""",
-    re.MULTILINE,
-)
+_LOOSE_INVOCATION_RE = re.compile(r"^" + _INVOKE_PATTERN, re.MULTILINE)
 
 
 def _loose_invocation_count():
@@ -120,7 +129,8 @@ def _loose_invocation_count():
 
 def test_every_note_writer_heredoc_site_is_covered():
     """Nine known call sites today (compress x2, standup x2, decide,
-    error-log, retro, vault-import, vault-stats).
+    error-log, retro, vault-import, vault-stats): eight ``write`` calls with
+    ``--body-file`` and one ``append-update`` heredoc.
 
     Asserts EQUALITY against the loose count, not a `>= 9` floor: this
     harness is the only thing standing between the repo and a repeat of the
@@ -148,11 +158,16 @@ def _prepare(block: str, tmp_path, vault, note_name: str):
     - The filename placeholder becomes a real name.
     - The heredoc BODY is replaced with the collision fixture.
     """
-    raw = _HEREDOC_OPEN_RE.search(block).group(1)
+    body_file = _BODY_FILE_ARG in block
+    if body_file:
+        raw = "OB_NOTE_EOF_<eof4>"  # the old delimiter, now only hostile note text
+    else:
+        raw = _HEREDOC_OPEN_RE.search(block).group(1)
     terminator = raw.replace("<eof4>", _EOF4)
     delim_base = re.sub(r"_<eof4>$", "", raw)
 
-    script = _HOOKS_LINE_RE.sub(f'HOOKS="{_HOOKS_DIR}"', block)
+    script = block.replace("cd '<REPO_ROOT>'", f"cd '{tmp_path}'")
+    script = _HOOKS_LINE_RE.sub(f'HOOKS="{_HOOKS_DIR}"', script)
     # `.sub` is a silent no-op if the HOOKS= line ever changes shape. The
     # block's own `test -f` would then still pass -- against the INSTALLED
     # plugin cache -- and the whole harness would be testing shipped code
@@ -186,6 +201,12 @@ def _prepare(block: str, tmp_path, vault, note_name: str):
         f"touch {tmp_path}/{SIDE_EFFECT}\n"
         f"{SENTINEL}\n"
     )
+
+    if body_file:
+        body_path = tmp_path / "body.md"
+        body_path.write_text(fixture_body, encoding="utf-8")
+        script = script.replace("'<BODY_FILE>'", f"'{body_path}'")
+        return script, terminator, delim_base
 
     lines = script.split("\n")
     open_idx = next(i for i, ln in enumerate(lines) if f"<<'{terminator}'" in ln)
@@ -284,9 +305,24 @@ def test_skill_heredoc_block_survives_delimiter_in_note_body(
     assert "command not found" not in result.stderr
 
 
+_HEREDOC_BLOCKS = [b for b in _BLOCKS if _BODY_FILE_ARG not in b[2]]
+
+
+def test_every_write_call_takes_the_note_from_a_body_file():
+    """#517: a PreToolUse hook reads the Bash command text, so a note body in a
+    heredoc can get the save refused over words the note quotes. Every
+    ``write`` call passes the body as a file instead."""
+    writes = [b for b in _BLOCKS if 'note_writer.py" write' in b[2]]
+    assert len(writes) == 8, [b[0] for b in writes]
+    for block_id, _skill, block in writes:
+        assert _BODY_FILE_ARG in block, block_id
+        assert "<<" not in block, block_id
+    assert [b[0] for b in _HEREDOC_BLOCKS] == ["compress-0"]
+
+
 @requires_bash
 @pytest.mark.parametrize(
-    "block_id,skill_name,block", _BLOCKS, ids=[b[0] for b in _BLOCKS]
+    "block_id,skill_name,block", _HEREDOC_BLOCKS, ids=[b[0] for b in _HEREDOC_BLOCKS]
 )
 def test_skill_heredoc_block_terminator_is_unique_per_invocation(
     block_id, skill_name, block
@@ -304,3 +340,55 @@ def test_skill_heredoc_block_terminator_is_unique_per_invocation(
     assert any(ln == terminator for ln in block.split("\n")), (
         f"{block_id}: no column-0 terminator line matching the opener"
     )
+
+
+def test_invocation_regexes_accept_interpreter_flags():
+    """Positive control: `python3 -B "$HOOKS/note_writer.py" write ...` must be
+    matched by both the strict and the loose regex, else a call site written that
+    way would be silently uncovered."""
+    for flags in ("", "-B ", "-I -u ", "-Bu ", "-X utf8 ", "-W ignore ", "-X utf8 -W ignore "):
+        line = f'python3 {flags}"$HOOKS/note_writer.py" write "$VAULT_PATH" "$X" "n.md" --body-file \'<BODY_FILE>\''
+        assert _COLUMN0_INVOCATION_RE.match(line), line
+        assert _LOOSE_INVOCATION_RE.findall(line), line
+        assert _LOOSE_INVOCATION_RE.findall("  " + line), line
+    assert not _COLUMN0_INVOCATION_RE.match('Do not copy `--overwrite` to any other `note_writer.py write` block.')
+
+
+def _body_file_steps():
+    """(skill, prose) for every `note_writer.py write ... --body-file` site: the
+    prose runs from the preceding heading to the next one, headings outside fences."""
+    found = []
+    for skill_path in sorted(glob.glob(os.path.join(_REPO_ROOT, "skills/*/SKILL.md"))):
+        skill = skill_path.replace("\\", "/").split("/")[-2]
+        with open(skill_path, encoding="utf-8") as fh:
+            lines = fh.read().split("\n")
+        in_fence, headings, sites = False, [], []
+        for i, line in enumerate(lines):
+            if line.lstrip().startswith("```"):
+                in_fence = not in_fence
+            elif not in_fence and line.startswith("#"):
+                headings.append(i)
+            if (_BODY_FILE_ARG in line
+                    and re.search(r"note_writer\.py\"? write\b", line)):
+                sites.append(i)
+        for i in sites:
+            start = max([h for h in headings if h < i], default=0)
+            end = min([h for h in headings if h > i], default=len(lines))
+            found.append((f"{skill}@{i + 1}", "\n".join(lines[start:end])))
+    return found
+
+
+def test_every_body_file_step_tells_the_model_to_write_remove_and_keep_the_file():
+    """#517: each `--body-file` step says to write the body with the Write tool,
+    to `rm -f` it after OK, and to keep it when the command fails."""
+    steps = _body_file_steps()
+    assert len(steps) == 8, [s[0] for s in steps]
+    for site, prose in steps:
+        assert "**Write tool**" in prose, site
+        assert "After an `OK:` line, run `rm -f '<BODY_FILE>'`" in prose, site
+        retro = site.startswith("retro@")
+        draft = ("`<WORK>/retro-note-<draft-id>.md`" if retro
+                 else "`~/.claude/obsidian-brain/<draft-id>-<filename>`")
+        assert draft in prose, site
+        assert "`<draft-id>` is 8 random hex characters you pick once per run" in prose, site
+        assert "keep `<BODY_FILE>`" in prose, site

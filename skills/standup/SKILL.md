@@ -9,7 +9,7 @@ metadata:
 
 Searches the Obsidian vault for session notes and insights within a date range, upgrades any unsummarized notes with AI summaries, groups findings by project, and generates a structured standup note.
 
-**Tools needed:** Bash, Grep, Read
+**Tools needed:** Bash, Grep, Read, Write
 
 ## Procedure
 
@@ -267,22 +267,50 @@ For each file in `UNSUMMARIZED`, if `upgrade_batch()` is unavailable or the prin
    - `## Errors Encountered` — Bulleted list with error messages, root causes, and fixes. If none, write "None."
    - `## Open Questions / Next Steps` — Checkbox list of specific, actionable items. If none, write "None."
 5. **Preserve the Session Metadata section** at the bottom if it exists.
-6. **Write the upgraded note** using the note-writer CLI — see Step 6.6 below for the exact structure and command. Do NOT reproduce the heredoc inline inside this list item; the fenced block below must stay outdented to column 0.
+6. **Write the upgraded note** using the note-writer CLI — see Step 6.6 below for the exact structure and command. Do NOT reproduce the command inline inside this list item.
 
 #### Step 6.6 — Write the upgraded note
 
-Run the note-writer CLI, piping the full rewritten file in on stdin — structured as:
+Write the full rewritten file with the Write tool, then pass it to the note-writer CLI with `--body-file`, so no note text goes into the Bash command (#517). The file is structured as:
 
 - Original frontmatter (unchanged)
 - `# <title from original note>`
 - The five summary sections
 - Session Metadata section (if it existed)
 
-This overwrites the note in place at its EXISTING path: pass `$SESSIONS_FOLDER` as the folder and the note's own basename (from `$NOTE_PATH`) as `<filename>` — never a new name. `write_vault_note()` (which the CLI delegates to) replaces an existing file atomically via the same temp-file + rename it uses to create one, so overwriting in place is a supported, safe case. **Two rules for the heredoc terminator, both load-bearing.** (1) It must stay **quoted** (`<<'OB_NOTE_EOF_<eof4>'`) — do not drop the quotes in a future edit. (2) It must be **unique per invocation**: substitute the same 4 random hex characters for `<eof4>` in BOTH the `<<'OB_NOTE_EOF_<eof4>'` opener and the terminator line, then confirm that **no line of the content you are about to emit is exactly that terminator** — if one is, pick different hex characters and re-check. **Never** replace this with a fixed delimiter. Quoting stops `$`/backtick expansion but does NOT stop early termination: a line equal to the terminator at column 0 ends the heredoc there, silently truncating the content AND handing everything after it to the shell as commands to execute. Notes written by this plugin routinely quote these very blocks, so a fixed terminator is a live hazard, not a theoretical one. **Self-check before you emit the block: if the terminator still contains `<` or `>`, you have not substituted it.** Stop and substitute it — the literal `<eof4>` form appears at column 0 inside these SKILL.md blocks themselves, so a note quoting one of them collides all over again, and nothing on the shell side can catch that. The `HOOKS=` line below checks the marketplace-registered directory-source install location FIRST (#278 — on a local checkout that is what loads, not the released cache), and only falls back to the plugin cache, where it sorts versions **numerically** (a plain `max()` is lexicographic and picks `3.9.0` over `3.10.0`, resolving to a cache with no `note_writer.py`); the `test -f` line turns a stale/incomplete cache into the documented `ERROR:` shape instead of a raw Python `can't open file` message. An unquoted delimiter lets the shell expand `$` variables and backtick commands embedded in the transcript content, silently corrupting the note.
+This overwrites the note in place at its EXISTING path: pass `$SESSIONS_FOLDER` as the folder and the note's own basename (from `$NOTE_PATH`) as `<filename>` — never a new name. `write_vault_note()` (which the CLI delegates to) replaces an existing file atomically via the same temp-file + rename it uses to create one, so overwriting in place is a supported, safe case. The `HOOKS=` line below checks the marketplace-registered directory-source install location FIRST (#278 — on a local checkout that is what loads, not the released cache), and only falls back to the plugin cache, where it sorts versions **numerically** (a plain `max()` is lexicographic and picks `3.9.0` over `3.10.0`, resolving to a cache with no `note_writer.py`); the `test -f` line turns a stale/incomplete cache into the documented `ERROR:` shape instead of a raw Python `can't open file` message.
 
-**The fence, its content, and the terminator below must all sit at column 0 — never indent this block, even though it is referenced from inside a numbered list item.** The heredoc is `<<'...'`, not `<<-'...'`, so POSIX requires the terminator at the start of its line; an indented terminator never closes the heredoc, which silently swallows every following command as note content.
+**The fences below sit at column 0 — never indent them, even though this step is referenced from inside a numbered list item.**
 
 This is also the ONE call site that passes `--overwrite`: it upgrades an existing note in place, and the CLI refuses to replace an existing file without that flag (a filename collision anywhere else must fail loudly rather than destroy a note). Do not copy `--overwrite` to any other `note_writer.py write` block.
+
+Write the note with the **Write tool** to `~/.claude/obsidian-brain/<draft-id>-<filename>`, using the same filename the command below passes (expand `~` to your home directory; run `echo "$HOME"` if you do not know it). `<draft-id>` is 8 random hex characters you pick once per run, so two runs are very unlikely to share a draft file. That path is `<BODY_FILE>`. The file holds the whole note, shaped like this:
+
+```markdown
+---
+<original frontmatter, unchanged>
+---
+
+# <title from original note>
+
+## Summary
+...
+
+## Key Decisions
+...
+
+## Changes Made
+...
+
+## Errors Encountered
+...
+
+## Open Questions / Next Steps
+...
+
+## Session Metadata
+...
+```
 
 ```bash
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
@@ -307,36 +335,14 @@ def _ob_hooks():
 print(_ob_hooks())
 ")
 test -f "$HOOKS/note_writer.py" || { echo "ERROR: note_writer.py not found under $HOOKS - resolution checks the marketplace registered install location first, then falls back to the plugin cache; neither path produced a hooks directory containing it. Verify the obsidian-brain install resolved at $HOOKS is complete (git pull for a directory-source checkout, or run /plugin marketplace update for a cache install), then retry." >&2; exit 1; }
-python3 "$HOOKS/note_writer.py" write "$VAULT_PATH" "$SESSIONS_FOLDER" "<existing basename>" --overwrite <<'OB_NOTE_EOF_<eof4>'
----
-<original frontmatter, unchanged>
----
-
-# <title from original note>
-
-## Summary
-...
-
-## Key Decisions
-...
-
-## Changes Made
-...
-
-## Errors Encountered
-...
-
-## Open Questions / Next Steps
-...
-
-## Session Metadata
-...
-OB_NOTE_EOF_<eof4>
+python3 "$HOOKS/note_writer.py" write "$VAULT_PATH" "$SESSIONS_FOLDER" "<existing basename>" --overwrite --body-file '<BODY_FILE>'
 ```
+
+After an `OK:` line, run `rm -f '<BODY_FILE>'` (the literal path). If the command fails, keep `<BODY_FILE>` and tell the user its path, so the note text is not lost.
 
 On success this prints `OK: <absolute path>` and the file is now at mode `0o600` (no separate `chmod` needed — the old `chmod 644` step is gone; this note is user data written by the plugin, same as every other CLI-written note). On failure it prints `ERROR: <reason>` to stderr and exits non-zero; treat this the same as an `upgrade_batch()` failure for this file. Either way — success or failure — this step never modifies frontmatter (see the Important note below), so the note stays at `status: auto-logged` regardless of outcome, and a later `/standup` run will re-attempt the upgrade for any note whose status is still `auto-logged`.
 
-**Important:** Do NOT modify frontmatter. Do NOT change the filename. Do NOT add or remove tags. The content piped into the CLI above must satisfy all three — frontmatter copied verbatim, filename the note's existing basename, tags untouched.
+**Important:** Do NOT modify frontmatter. Do NOT change the filename. Do NOT add or remove tags. The file passed to the CLI above must satisfy all three — frontmatter copied verbatim, filename the note's existing basename, tags untouched.
 
 Move all upgraded files from `UNSUMMARIZED` into the working set alongside `SUMMARIZED`. Track the count of upgraded notes as `UPGRADED_COUNT`.
 
@@ -549,7 +555,19 @@ Example: `2026-04-05-standup-daily-a3f2.md`
 
 ### Step 12 — Write the note
 
-Run the note-writer CLI, piping the full note (frontmatter + body) in on stdin. It creates `$INSIGHTS_FOLDER` if needed and writes the file atomically at mode `0o600` — no `mkdir`/`chmod` needed. **Two rules for the heredoc terminator, both load-bearing.** (1) It must stay **quoted** (`<<'OB_NOTE_EOF_<eof4>'`) — do not drop the quotes in a future edit. (2) It must be **unique per invocation**: substitute the same 4 random hex characters for `<eof4>` in BOTH the `<<'OB_NOTE_EOF_<eof4>'` opener and the terminator line, then confirm that **no line of the content you are about to emit is exactly that terminator** — if one is, pick different hex characters and re-check. **Never** replace this with a fixed delimiter. Quoting stops `$`/backtick expansion but does NOT stop early termination: a line equal to the terminator at column 0 ends the heredoc there, silently truncating the content AND handing everything after it to the shell as commands to execute. Notes written by this plugin routinely quote these very blocks, so a fixed terminator is a live hazard, not a theoretical one. **Self-check before you emit the block: if the terminator still contains `<` or `>`, you have not substituted it.** Stop and substitute it — the literal `<eof4>` form appears at column 0 inside these SKILL.md blocks themselves, so a note quoting one of them collides all over again, and nothing on the shell side can catch that. The `HOOKS=` line below checks the marketplace-registered directory-source install location FIRST (#278 — on a local checkout that is what loads, not the released cache), and only falls back to the plugin cache, where it sorts versions **numerically** (a plain `max()` is lexicographic and picks `3.9.0` over `3.10.0`, resolving to a cache with no `note_writer.py`); the `test -f` line turns a stale/incomplete cache into the documented `ERROR:` shape instead of a raw Python `can't open file` message. An unquoted delimiter lets the shell expand `$` variables and backtick commands embedded in the note body, silently corrupting it:
+Run the note-writer CLI, passing the note file with `--body-file`, so no note text goes into the Bash command (#517). It creates `$INSIGHTS_FOLDER` if needed and writes the file atomically at mode `0o600` — no `mkdir`/`chmod` needed. The `HOOKS=` line below checks the marketplace-registered directory-source install location FIRST (#278 — on a local checkout that is what loads, not the released cache), and only falls back to the plugin cache, where it sorts versions **numerically** (a plain `max()` is lexicographic and picks `3.9.0` over `3.10.0`, resolving to a cache with no `note_writer.py`); the `test -f` line turns a stale/incomplete cache into the documented `ERROR:` shape instead of a raw Python `can't open file` message.
+
+Write the note with the **Write tool** to `~/.claude/obsidian-brain/<draft-id>-<filename>`, using the same filename the command below passes (expand `~` to your home directory; run `echo "$HOME"` if you do not know it). `<draft-id>` is 8 random hex characters you pick once per run, so two runs are very unlikely to share a draft file. That path is `<BODY_FILE>`. The file holds the whole note, shaped like this:
+
+```markdown
+---
+type: claude-standup
+...
+---
+
+# Standup: ...
+...
+```
 
 ```bash
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
@@ -574,16 +592,10 @@ def _ob_hooks():
 print(_ob_hooks())
 ")
 test -f "$HOOKS/note_writer.py" || { echo "ERROR: note_writer.py not found under $HOOKS - resolution checks the marketplace registered install location first, then falls back to the plugin cache; neither path produced a hooks directory containing it. Verify the obsidian-brain install resolved at $HOOKS is complete (git pull for a directory-source checkout, or run /plugin marketplace update for a cache install), then retry." >&2; exit 1; }
-python3 "$HOOKS/note_writer.py" write "$VAULT_PATH" "$INSIGHTS_FOLDER" "YYYY-MM-DD-<slug>-<hash>.md" <<'OB_NOTE_EOF_<eof4>'
----
-type: claude-standup
-...
----
-
-# Standup: ...
-...
-OB_NOTE_EOF_<eof4>
+python3 "$HOOKS/note_writer.py" write "$VAULT_PATH" "$INSIGHTS_FOLDER" "YYYY-MM-DD-<slug>-<hash>.md" --body-file '<BODY_FILE>'
 ```
+
+After an `OK:` line, run `rm -f '<BODY_FILE>'` (the literal path). If the command fails, keep `<BODY_FILE>` and tell the user its path, so the note text is not lost.
 
 On success this prints `OK: <absolute path>` — that is the file at `$VAULT_PATH/$INSIGHTS_FOLDER/<filename>`. On failure it prints `ERROR: <reason>` to stderr and exits non-zero; surface that message to the user and stop here.
 

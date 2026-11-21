@@ -38,10 +38,9 @@ def test_step_75_names_every_trace_kind_the_cli_accepts():
 
 
 def _step_75_payload() -> dict:
-    """The JSON line inside the skill's apply heredoc, parsed."""
-    match = re.search(
-        r"<<'OB_TRACES_EOF_<eof4>'\n(?P<json>.*)\nOB_TRACES_EOF_<eof4>\n", STEP_75)
-    assert match, "apply heredoc not found in Step 7.5"
+    """The example traces-file content the skill shows, parsed."""
+    match = re.search(r"for example `(?P<json>\{\"traces\": .*?\})`", STEP_75)
+    assert match, "example traces file content not found in Step 7.5"
     return json.loads(match["json"])
 
 
@@ -69,9 +68,11 @@ def test_clear_step_reports_blocked_when_items_are_untraced():
     assert 'print(f"blocked: {untraced}' in STEP_75
 
 
-def test_apply_heredoc_terminator_is_per_invocation():
-    assert "<<'OB_TRACES_EOF_<eof4>'" in STEP_75
-    assert "\nOB_TRACES_EOF_<eof4>\n" in STEP_75
+def test_apply_takes_traces_from_a_file_not_a_heredoc():
+    """#518: the traces JSON goes in a file the Write tool made, never in the command."""
+    block = _step_75_apply_block()
+    assert "--traces-file '<TRACES_FILE>'" in block
+    assert "<<" not in block
 
 
 def _first_bash_block(section: str) -> str:
@@ -200,7 +201,10 @@ def _run_step_75_apply(tmp_path, swap: bool):
     note.write_text(
         "---\ntype: claude-retro\nproject: demo\ntags:\n  - claude/retro\n---\n"
         "\n## Process Improvements\n- [ ] One untraced item.\n", encoding="utf-8")
-    block = _step_75_apply_block().replace("<eof4>", "c0de")
+    traces = tmp_path / "traces.json"
+    traces.write_text(json.dumps(_step_75_payload()), encoding="utf-8")
+    block = _step_75_apply_block().replace("'<TRACES_FILE>'", f"'{traces}'")
+    block = block.replace("'<REPO_ROOT>'", f"'{REPO_ROOT}'")
     vault_arg, note_arg = '"$VAULT_PATH"', "'<NOTE_PATH>'"
     assert vault_arg in block and note_arg in block
     if swap:  # scratch copy only; the SKILL file is untouched
@@ -223,3 +227,164 @@ def test_step_75_apply_test_catches_swapped_vault_and_note_arguments(tmp_path):
     proc, note = _run_step_75_apply(tmp_path, swap=True)
     assert proc.returncode != 0
     assert retro_trace.parse_items(note.read_text(encoding="utf-8"))[0]["trace"] is None
+
+
+_SHELL_FENCE_RE = re.compile(
+    r"^[ \t]*(```|~~~)(?:bash|sh|shell|zsh)[ \t]*\n(.*?)^[ \t]*\1[ \t]*$", re.M | re.S)
+
+
+def _bash_blocks(text: str) -> list[str]:
+    """Every fenced shell block (bash, sh, shell, zsh; ``` or ~~~ fences), indented or not."""
+    return [m[1] for m in _SHELL_FENCE_RE.findall(text)]
+
+
+def _substitution_bodies(block: str) -> list[str]:
+    """The text inside every `$( ... )` (parens balanced; unclosed runs to the end)
+    and every backtick pair."""
+    bodies = []
+    for m in re.finditer(r"\$\(", block):
+        depth, k = 1, m.end()
+        while k < len(block) and depth:
+            depth += {"(": 1, ")": -1}.get(block[k], 0)
+            k += 1
+        bodies.append(block[m.end():k])
+    bodies += re.findall(r"`([^`]*)`", block)
+    return bodies
+
+
+def _isolation_problems(block: str) -> list[str]:
+    """What a worktree-isolated session refuses in a Bash block (#518): git inside a
+    command substitution or backticks, a `||`/`&&` brace group, or a heredoc."""
+    problems = []
+    if any(re.search(r"\bgit\b", body) for body in _substitution_bodies(block)):
+        problems.append("git inside a command substitution")
+    # \s* also spans a newline: `||` then `{` on the next line.
+    if re.search(r"(\|\||&&)\s*\{", block):
+        problems.append("brace group after || or &&")
+    if "<<" in block:
+        problems.append("heredoc")
+    return problems
+
+
+def test_retro_blocks_run_in_a_worktree_isolated_session():
+    """#518: a worktree-isolated session refuses git in a command substitution and
+    `|| { ...; }` groups (probed on Claude Code 2.1.330); guards use
+    `if ! test -f ...; then ...; fi`. No block may carry either, nor a heredoc."""
+    blocks = _bash_blocks(RETRO)
+    assert len(blocks) >= 9
+    for block in blocks:
+        assert _isolation_problems(block) == [], block[:120]
+    assert "```bash\ngit rev-parse --show-toplevel\n```" in RETRO
+
+
+_REFUSED_FORMS = {
+    "plain": 'cd "$(git rev-parse --show-toplevel)"',
+    "command": 'x=$(command git rev-parse HEAD)',
+    "cd-and": 'cd "$(cd . && git rev-parse --show-toplevel)"',
+    "abs-path": 'x=$(/usr/bin/git rev-parse HEAD)',
+    "space": 'x=$( git rev-parse HEAD)',
+    "backticks": 'x=`git rev-parse HEAD`',
+    "or-group": 'test -f f || { echo missing; exit 1; }',
+    "and-group-tight": 'test -f f &&{ echo present; }',
+    "or-group-next-line": 'test -f f ||\n{\n  echo missing\n}',
+    "heredoc": "cat <<'EOF'\nx\nEOF",
+}
+
+
+def test_isolation_checker_flags_every_refused_form_and_passes_a_clean_block():
+    """Positive control: the checker the real test uses really fires."""
+    for name, body in _REFUSED_FORMS.items():
+        assert _isolation_problems(body), name
+    clean = "cd '/repo'\nif ! test -f f; then\n  echo missing >&2\n  exit 1\nfi\nx=$(python3 -c 'print(1)')"
+    assert _isolation_problems(clean) == []
+
+
+def test_shell_block_collector_takes_every_fence_spelling():
+    text = ("```bash\na\n```\n```sh\nb\n```\n```shell\nc\n```\n```zsh\nd\n```\n"
+            "   ```bash\n   e\n   ```\n```python\nnot shell\n```\n"
+            "~~~bash\nf\n~~~\n  ~~~sh\n  g\n  ~~~\n~~~python\nnot shell\n~~~\n")
+    assert [b.strip() for b in _bash_blocks(text)] == ["a", "b", "c", "d", "e", "f", "g"]
+
+
+def _needs_repo_cd(block: str) -> bool:
+    """Blocks that load this repo's hooks. The datetime one-liner uses stdlib only,
+    so it never touches the repo."""
+    return "python3" in block and any(
+        marker in block for marker in ("$HOOKS", "_ob_hooks", "obsidian_utils", "retro_trace"))
+
+
+def test_every_hooks_block_starts_with_the_repo_root_cd():
+    """#518: each block that runs this repo's Python starts with `cd '<REPO_ROOT>'`,
+    because blocks run in separate shells and the cwd may not be the repo."""
+    needing = [b for b in _bash_blocks(RETRO) if _needs_repo_cd(b)]
+    for block in needing:
+        assert block.lstrip("\n").lstrip().splitlines()[0] == "cd '<REPO_ROOT>'", block[:120]
+    # Positive control: the blocks that exist today. A new one must be added here.
+    assert len(needing) == 8
+    # Blocks that need no cd, by content: the git probe and the `ls -l` check.
+    exempt = [b for b in _bash_blocks(RETRO) if not _needs_repo_cd(b)]
+    assert any(b.strip() == "git rev-parse --show-toplevel" for b in exempt)
+    assert any(b.strip() == "ls -l '<NOTE_PATH>'" for b in exempt)
+
+
+def _step_1_config_block() -> str:
+    for block in _bash_blocks(RETRO):
+        if 'print("VAULT=" + c["vault_path"])' in block:
+            return block
+    raise AssertionError("Step 1 config block not found")
+
+
+def _run_step_1(tmp_path, block: str, precreate_work: bool = True):
+    home = tmp_path / "home"
+    (home / ".claude" / "plugins").mkdir(parents=True)
+    (home / ".claude" / "plugins" / "known_marketplaces.json").write_text(json.dumps(
+        {"obsidian-brain": {"source": {"source": "directory", "path": str(REPO_ROOT)},
+                            "installLocation": str(REPO_ROOT)}}), encoding="utf-8")
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    (home / ".claude" / "obsidian-brain-config.json").write_text(
+        json.dumps({"vault_path": str(vault)}), encoding="utf-8")
+    work = home / ".claude" / "obsidian-brain"
+    if precreate_work:
+        work.mkdir()
+        work.chmod(0o755)
+    script = block.replace("'<REPO_ROOT>'", f"'{REPO_ROOT}'")
+    env = {**os.environ, "HOME": str(home)}
+    proc = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True,
+                          timeout=60, stdin=subprocess.DEVNULL, cwd=tmp_path)
+    return proc, home, work
+
+
+def test_step_1_config_block_prints_work_and_makes_it_private(tmp_path):
+    proc, home, work = _run_step_1(tmp_path, _step_1_config_block())
+    assert proc.returncode == 0, proc.stderr
+    assert f"WORK={work}" in proc.stdout.splitlines()
+    assert f"VAULT={tmp_path / 'vault'}" in proc.stdout.splitlines()
+    assert stat.S_IMODE(work.stat().st_mode) == 0o700
+
+
+def test_step_1_config_block_creates_work_private_when_it_does_not_exist(tmp_path):
+    """Fresh HOME: `~/.claude/obsidian-brain` is absent before the run."""
+    block = _step_1_config_block()
+    proc, home, work = _run_step_1(tmp_path, block, precreate_work=False)
+    assert proc.returncode == 0, proc.stderr
+    assert f"WORK={work}" in proc.stdout.splitlines()
+    assert stat.S_IMODE(work.stat().st_mode) == 0o700
+
+
+def test_step_1_test_catches_a_missing_chmod_and_a_missing_work_line(tmp_path):
+    """Mutation controls on a scratch copy of the block (the SKILL file is untouched)."""
+    block = _step_1_config_block()
+    assert "os.chmod(_w, 0o700)\n" in block and 'print("WORK=" + _w)\n' in block
+    proc, _home, work = _run_step_1(tmp_path / "a", block.replace("os.chmod(_w, 0o700)\n", ""))
+    assert stat.S_IMODE(work.stat().st_mode) == 0o755
+    proc, _home, _work = _run_step_1(tmp_path / "b", block.replace('print("WORK=" + _w)\n', ""))
+    assert not any(ln.startswith("WORK=") for ln in proc.stdout.splitlines())
+
+
+def test_retro_write_takes_the_note_from_a_body_file():
+    """#517: the note body comes from a file the Write tool made, never the command."""
+    writes = [b for b in _bash_blocks(RETRO) if 'note_writer.py" write' in b]
+    assert len(writes) == 1
+    assert "--body-file '<BODY_FILE>'" in writes[0]
+    assert "keep `<BODY_FILE>`" in RETRO

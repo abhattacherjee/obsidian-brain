@@ -3,7 +3,10 @@ from __future__ import annotations
 
 import io
 import json
+import os
 from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 
@@ -103,14 +106,114 @@ def test_cli_apply_partial_flag(tmp_path, monkeypatch, capsys):
     assert json.loads(capsys.readouterr().out)["untraced"] == 2
 
 
-@pytest.mark.parametrize("extra", [["--bogus"], ["extra"], ["--partial", "--bogus"],
-                                   ["--partial", "--partial"]])
+def test_cli_apply_file_matches_stdin(tmp_path, monkeypatch):
+    stdin_note = make_note(tmp_path).rename(tmp_path / "stdin.md")
+    file_note = make_note(tmp_path)
+    payload = json.dumps({"traces": TRACES})
+    traces_file = tmp_path / "traces.json"
+    traces_file.write_text(payload, encoding="utf-8")
+    monkeypatch.setattr("sys.stdin", io.StringIO(payload))
+    assert rt.main(["apply", str(tmp_path), stdin_note.name]) == 0
+
+    class UnusedInput:
+        def read(self, *args):
+            raise AssertionError("unexpected read from stdin")
+
+    monkeypatch.setattr("sys.stdin", UnusedInput())
+    assert rt.main(["apply", str(tmp_path), file_note.name, "--traces-file", str(traces_file)]) == 0
+    assert file_note.read_bytes() == stdin_note.read_bytes()
+
+
+@pytest.mark.parametrize("partial_first", [True, False])
+def test_cli_apply_partial_file(tmp_path, partial_first, capsys):
+    path = make_note(tmp_path)
+    traces_file = tmp_path / "traces.json"
+    traces_file.write_text(json.dumps({"traces": TRACES[:1]}), encoding="utf-8")
+    file_args = ["--traces-file", str(traces_file)]
+    flags = ["--partial", *file_args] if partial_first else [*file_args, "--partial"]
+    assert rt.main(["apply", str(tmp_path), path.name, *flags]) == 0
+    assert json.loads(capsys.readouterr().out)["untraced"] == 3
+    assert rt.untraced_count(path) == 3
+
+
+@pytest.mark.parametrize("case", ["missing", "directory", "invalid-utf8"])
+def test_cli_apply_file_read_error(tmp_path, case, capsys):
+    path = make_note(tmp_path)
+    before = snapshot(path)
+    traces_file = tmp_path / "traces.json"
+    if case == "directory":
+        traces_file.mkdir()
+    elif case == "invalid-utf8":
+        traces_file.write_bytes(b'{"traces": [], "extra": "\xff"}')
+    assert rt.main(["apply", str(tmp_path), path.name, "--traces-file", str(traces_file)]) == 2
+    assert f"cannot read --traces-file {traces_file}:" in capsys.readouterr().err
+    assert snapshot(path) == before
+
+
+def test_cli_apply_file_exactly_at_the_cap_is_accepted(tmp_path, capsys):
+    """The cap is `>`: STDIN_CAP_CHARS characters is allowed, one more is not."""
+    path = make_note(tmp_path)
+    payload = json.dumps({"traces": TRACES}).ljust(rt.STDIN_CAP_CHARS)
+    assert len(payload) == rt.STDIN_CAP_CHARS
+    traces_file = tmp_path / "traces.json"
+    traces_file.write_text(payload, encoding="utf-8")
+    assert rt.main(["apply", str(tmp_path), path.name, "--traces-file", str(traces_file)]) == 0
+    assert json.loads(capsys.readouterr().out)["untraced"] == 0
+    assert rt.untraced_count(path) == 0
+
+
+def test_cli_apply_unreadable_file_is_exit_2_and_leaves_the_note(tmp_path, capsys):
+    if os.geteuid() == 0:
+        pytest.skip("root can read a mode-000 file")
+    path = make_note(tmp_path)
+    before = snapshot(path)
+    traces_file = tmp_path / "traces.json"
+    traces_file.write_text(json.dumps({"traces": TRACES}), encoding="utf-8")
+    traces_file.chmod(0)
+    try:
+        assert rt.main(["apply", str(tmp_path), path.name, "--traces-file", str(traces_file)]) == 2
+    finally:
+        traces_file.chmod(0o600)
+    assert f"cannot read --traces-file {traces_file}:" in capsys.readouterr().err
+    assert snapshot(path) == before
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs os.mkfifo")
+def test_cli_apply_fifo_file_is_refused_without_blocking(tmp_path):
+    path = make_note(tmp_path)
+    before = snapshot(path)
+    fifo = tmp_path / "traces.fifo"
+    os.mkfifo(fifo)
+    # A hang raises TimeoutExpired and fails the test.
+    result = subprocess.run(
+        [sys.executable, rt.__file__, "apply", str(tmp_path), path.name, "--traces-file", str(fifo)],
+        stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=15)
+    assert result.returncode == 2
+    assert f"cannot read --traces-file {fifo}:" in result.stderr
+    assert snapshot(path) == before
+
+
+def test_cli_apply_oversized_file(tmp_path, capsys):
+    path = make_note(tmp_path)
+    before = snapshot(path)
+    traces_file = tmp_path / "traces.json"
+    payload = json.dumps({"traces": TRACES}).ljust(rt.STDIN_CAP_CHARS + 1)
+    traces_file.write_text(payload, encoding="utf-8")
+    assert rt.main(["apply", str(tmp_path), path.name, "--traces-file", str(traces_file)]) == 2
+    assert capsys.readouterr().err.strip() == "apply: input over the stdin cap; nothing written"
+    assert snapshot(path) == before
+
+
+@pytest.mark.parametrize("extra", [["--nope"], ["extra"], ["--partial", "--bogus"],
+                                   ["--partial", "--partial"], ["--traces-file"],
+                                   ["--traces-file", "--partial"],
+                                   ["--traces-file", "one", "--traces-file", "two"]])
 def test_cli_apply_unknown_flag_is_usage_error(tmp_path, capsys, extra):
     path = make_note(tmp_path, HEADER + PARTIAL_BODY)
     before = snapshot(path)
     assert rt.main(["apply", str(tmp_path), path.name, *extra]) == 2
     output = capsys.readouterr()
-    assert "usage:" in output.err and "[--partial]" in output.err
+    assert "usage:" in output.err and "apply <vault> <note> [--partial] [--traces-file PATH]" in output.err
     assert not output.out
     assert snapshot(path) == before
 
@@ -512,3 +615,25 @@ def test_verify_true_writes_and_none_skips_the_check(tmp_path):
     assert b"- [x] First. \xe2\x86\x92 memory `x`" in path.read_bytes()
     rt.apply_traces(str(tmp_path), path.name, [{"item": 2, "kind": "memory", "stem": "x"}], partial=True)
     assert b"- [x] Second. \xe2\x86\x92 memory `x`" in path.read_bytes()
+
+
+@pytest.mark.parametrize("dash", ["vault", "note"])
+def test_cli_apply_refuses_a_dash_leading_vault_or_note(tmp_path, monkeypatch, capsys, dash):
+    """A vault or note positional that starts with `-` is exit 2 with usage, and a
+    real note behind that name is left untouched."""
+    monkeypatch.chdir(tmp_path)
+    traces = tmp_path / "t.json"
+    traces.write_text(json.dumps({"traces": TRACES}), encoding="utf-8")
+    if dash == "vault":
+        vault = tmp_path / "-v"
+        vault.mkdir()
+        path = make_note(vault)
+        argv = ["apply", "-v", path.name, "--traces-file", str(traces)]
+    else:
+        path = tmp_path / "-n.md"
+        path.write_bytes((HEADER + BODY).encode())
+        argv = ["apply", str(tmp_path), "-n.md", "--traces-file", str(traces)]
+    before = snapshot(path)
+    assert rt.main(argv) == 2
+    assert "usage:" in capsys.readouterr().err
+    assert snapshot(path) == before

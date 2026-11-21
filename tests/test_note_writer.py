@@ -80,6 +80,138 @@ def _run_argv(*args: str, stdin: str = "") -> subprocess.CompletedProcess:
 # Happy path
 # ---------------------------------------------------------------------------
 
+class TestBodyFile:
+    def test_matches_stdin_bytes(self, tmp_path):
+        content = MINIMAL_FM + "Café\r\nsecond line\n"
+        body = tmp_path / "input note"
+        body.write_bytes(content.encode("utf-8"))
+
+        stdin_result = _run_write(tmp_path, "notes", "stdin.md", content)
+        file_result = _run_argv("write", "--body-file", str(body), str(tmp_path), "notes", "file.md")
+
+        assert stdin_result.returncode == 0, stdin_result.stderr
+        assert file_result.returncode == 0, file_result.stderr
+        assert (tmp_path / "notes/file.md").read_bytes() == (tmp_path / "notes/stdin.md").read_bytes()
+
+    def test_overwrite(self, tmp_path):
+        dest = _make_note(tmp_path, "notes", "note.md", MINIMAL_FM + "original\n")
+        body = tmp_path / "body"
+        body.write_text(MINIMAL_FM + "replacement\n", encoding="utf-8")
+
+        result = _run_argv("write", str(tmp_path), "notes", "--overwrite", "--body-file", str(body), dest.name)
+
+        assert result.returncode == 0, result.stderr
+        assert dest.read_bytes() == body.read_bytes()
+
+    @pytest.mark.parametrize("kind", ["missing", "directory", "unreadable", "invalid-utf8"])
+    def test_cannot_read(self, tmp_path, kind):
+        body = tmp_path / "body"
+        if kind == "directory":
+            body.mkdir()
+        elif kind == "unreadable":
+            if os.geteuid() == 0:
+                pytest.skip("root can read a mode-000 file")
+            body.write_text(MINIMAL_FM + "content\n", encoding="utf-8")
+            body.chmod(0)
+        elif kind == "invalid-utf8":
+            body.write_bytes(MINIMAL_FM.encode("utf-8") + b"\xff")
+
+        result = _run_argv("write", str(tmp_path), "notes", "note.md", "--body-file", str(body))
+
+        assert result.returncode == 1
+        assert result.stderr.startswith(f"ERROR: cannot read --body-file {body}: ")
+        assert not (tmp_path / "notes/note.md").exists()
+
+    def test_oversized(self, tmp_path):
+        body = tmp_path / "body"
+        body.write_text(MINIMAL_FM + "a" * (STDIN_CAP_CHARS + 1 - len(MINIMAL_FM)), encoding="utf-8")
+
+        result = _run_argv("write", str(tmp_path), "notes", "note.md", "--body-file", str(body))
+
+        assert result.returncode == 1
+        assert result.stderr.startswith("ERROR: --body-file exceeds")
+        assert not (tmp_path / "notes/note.md").exists()
+
+    @pytest.mark.parametrize(("flags", "error"), [
+        (["--body-file"], "--body-file needs a path"),
+        (["--body-file", "one", "--body-file", "two"], "--body-file given more than once"),
+    ])
+    def test_invalid_flags(self, tmp_path, flags, error):
+        result = _run_argv("write", str(tmp_path), "notes", "note.md", *flags)
+
+        assert result.returncode == 2
+        assert result.stderr.strip() == f"ERROR: {error}"
+        assert not (tmp_path / "notes/note.md").exists()
+
+    def test_ignores_stdin(self, tmp_path):
+        body = tmp_path / "body"
+        body.write_text(MINIMAL_FM + "from file\n", encoding="utf-8")
+        result = _run_argv("write", str(tmp_path), "notes", "note.md", "--body-file", str(body),
+                           stdin=MINIMAL_FM + "from stdin\n")
+
+        assert result.returncode == 0, result.stderr
+        assert (tmp_path / "notes/note.md").read_bytes() == body.read_bytes()
+
+    def test_does_not_wait_on_an_open_stdin(self, tmp_path):
+        """A stdin pipe that is never written or closed: a CLI that reads stdin
+        before the body file would hang here and fail the wait."""
+        body = tmp_path / "body"
+        body.write_text(MINIMAL_FM + "from file\n", encoding="utf-8")
+        proc = subprocess.Popen(
+            [sys.executable, str(NOTE_WRITER), "write", str(tmp_path), "notes", "note.md",
+             "--body-file", str(body)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            proc.wait(timeout=15)
+            out, err = proc.stdout.read(), proc.stderr.read()
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            pytest.fail("note_writer waited on stdin although --body-file was given")
+        finally:
+            proc.stdin.close()
+            proc.stdout.close()
+            proc.stderr.close()
+
+        assert proc.returncode == 0, err
+        assert (tmp_path / "notes/note.md").read_bytes() == body.read_bytes()
+
+    def test_exactly_at_the_cap_is_accepted(self, tmp_path):
+        """The cap is `>`: STDIN_CAP_CHARS characters is allowed, one more is not."""
+        content = MINIMAL_FM + "a" * (STDIN_CAP_CHARS - len(MINIMAL_FM))
+        assert len(content) == STDIN_CAP_CHARS
+        body = tmp_path / "body"
+        body.write_text(content, encoding="utf-8")
+
+        result = _run_argv("write", str(tmp_path), "notes", "note.md", "--body-file", str(body))
+
+        assert result.returncode == 0, result.stderr
+        assert (tmp_path / "notes/note.md").read_bytes() == body.read_bytes()
+
+    @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs os.mkfifo")
+    def test_fifo_is_refused_without_blocking(self, tmp_path):
+        fifo = tmp_path / "body.fifo"
+        os.mkfifo(fifo)
+
+        # A hang raises TimeoutExpired and fails the test.
+        result = subprocess.run(
+            [sys.executable, str(NOTE_WRITER), "write", str(tmp_path), "notes", "note.md",
+             "--body-file", str(fifo)],
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=15)
+
+        assert result.returncode == 1
+        assert result.stderr.startswith(f"ERROR: cannot read --body-file {fifo}: ")
+        assert not (tmp_path / "notes/note.md").exists()
+
+    def test_empty(self, tmp_path):
+        body = tmp_path / "body"
+        body.touch()
+        result = _run_argv("write", str(tmp_path), "notes", "note.md", "--body-file", str(body))
+
+        assert result.returncode == 1
+        assert not (tmp_path / "notes/note.md").exists()
+
+
 def test_write_creates_file_with_verbatim_content(tmp_path):
     vault = tmp_path / "vault"
     vault.mkdir()
