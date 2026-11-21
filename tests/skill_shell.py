@@ -110,6 +110,12 @@ def run_with_stubs(block: str, workdir: Path, timeout: int = 60) -> StubRun:
     grep is not the real one, so ``grep -r`` can never scan the filesystem. Every
     path variable the blocks read points into ``workdir``. The block runs in its
     own session; on a timeout the whole process group is killed.
+
+    Known limits (PR #523 review): the real coreutils still run, so an absolute
+    path, a `..` path or a redirection in a block could write outside
+    ``workdir`` (no current block does: every shell-level write goes to ``~``,
+    ``$VAULT_PATH`` or a literal placeholder); a child that leaves the process
+    group can outlive the timeout; and only the branch that ran is recorded.
     """
     workdir = workdir.resolve()
     bin_dir = workdir / "bin"
@@ -333,7 +339,14 @@ _BRACE_GROUP = re.compile(
 
 
 def isolation_problems(block: str, *, heredoc: bool = False) -> list[str]:
-    """Report refused shell forms and optionally enforce a skill-specific heredoc ban."""
+    """Report refused shell forms and optionally enforce a skill-specific heredoc ban.
+
+    Known gaps (PR #523 review; no current skill block uses these forms): a `)`
+    in a `case` pattern inside `$(...)`; an escaped or unmatched backtick; a
+    `<<` bit shift read as a heredoc opener, which can hide a later
+    substitution; `$(...)` inside an unquoted heredoc body; and a bare `{` word
+    passed as an ordinary argument, which is flagged as a brace group.
+    """
     problems = []
     if any(GIT_TEXT.search(body) for body in substitution_bodies(block)):
         problems.append("git inside a command substitution")

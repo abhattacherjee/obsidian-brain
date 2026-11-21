@@ -1,10 +1,12 @@
-"""Every SKILL.md shell block runs in a worktree-isolated session (#521).
+"""SKILL.md shell blocks avoid the forms a worktree-isolated session refuses (#521).
 
 A worktree-isolated Claude Code session refuses a Bash command whose
 command substitution or backticks contain the text ``git`` (even ``digit``,
 or Python source inside ``$(python3 ...)``), and a brace group holding it
-(probed on Claude Code 2.1.330, 2026-11-21). ``isolation_problems`` is the
-fail-closed check; this module runs it over every skill.
+(probed on Claude Code 2.1.330, 2026-11-21). ``isolation_problems`` is a
+conservative text check with known gaps (listed in ``skill_shell.py``); this
+module runs it over every skill. Heredoc bodies with a quoted brace are also
+refused; six check-items blocks still have one and are pinned below (#524).
 """
 from __future__ import annotations
 
