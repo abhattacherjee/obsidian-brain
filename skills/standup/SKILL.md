@@ -284,7 +284,7 @@ This overwrites the note in place at its EXISTING path: pass `$SESSIONS_FOLDER` 
 
 This is also the ONE call site that passes `--overwrite`: it upgrades an existing note in place, and the CLI refuses to replace an existing file without that flag (a filename collision anywhere else must fail loudly rather than destroy a note). Do not copy `--overwrite` to any other `note_writer.py write` block.
 
-Write the note with the **Write tool** to `~/.claude/obsidian-brain/<draft-id>-<filename>`, using the same filename the command below passes (expand `~` to your home directory; run `echo "$HOME"` if you do not know it). `<draft-id>` is 8 random hex characters you pick once per run, so two runs never share a draft file. That path is `<BODY_FILE>`. The file holds the whole note, shaped like this:
+Write the note with the **Write tool** to `~/.claude/obsidian-brain/<draft-id>-<filename>`, using the same filename the command below passes (expand `~` to your home directory; run `echo "$HOME"` if you do not know it). `<draft-id>` is 8 random hex characters you pick once per run, so two runs are very unlikely to share a draft file. That path is `<BODY_FILE>`. The file holds the whole note, shaped like this:
 
 ```markdown
 ---
@@ -557,7 +557,7 @@ Example: `2026-04-05-standup-daily-a3f2.md`
 
 Run the note-writer CLI, passing the note file with `--body-file`, so no note text goes into the Bash command (#517). It creates `$INSIGHTS_FOLDER` if needed and writes the file atomically at mode `0o600` — no `mkdir`/`chmod` needed. The `HOOKS=` line below checks the marketplace-registered directory-source install location FIRST (#278 — on a local checkout that is what loads, not the released cache), and only falls back to the plugin cache, where it sorts versions **numerically** (a plain `max()` is lexicographic and picks `3.9.0` over `3.10.0`, resolving to a cache with no `note_writer.py`); the `test -f` line turns a stale/incomplete cache into the documented `ERROR:` shape instead of a raw Python `can't open file` message.
 
-Write the note with the **Write tool** to `~/.claude/obsidian-brain/<draft-id>-<filename>`, using the same filename the command below passes (expand `~` to your home directory; run `echo "$HOME"` if you do not know it). `<draft-id>` is 8 random hex characters you pick once per run, so two runs never share a draft file. That path is `<BODY_FILE>`. The file holds the whole note, shaped like this:
+Write the note with the **Write tool** to `~/.claude/obsidian-brain/<draft-id>-<filename>`, using the same filename the command below passes (expand `~` to your home directory; run `echo "$HOME"` if you do not know it). `<draft-id>` is 8 random hex characters you pick once per run, so two runs are very unlikely to share a draft file. That path is `<BODY_FILE>`. The file holds the whole note, shaped like this:
 
 ```markdown
 ---

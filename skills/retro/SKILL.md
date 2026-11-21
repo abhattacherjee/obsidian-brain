@@ -23,7 +23,7 @@ First find the directory the later steps run from. Run this as a command of its 
 git rev-parse --show-toplevel
 ```
 
-If it fails (not a git repo), run `pwd` instead. Keep the printed path; the steps below call it `<REPO_ROOT>`. Every block below starts with `cd '<REPO_ROOT>'`: paste the literal path, in single quotes (write a `'` inside it as `'\''`). Do not put `git` inside `$(...)` on a `cd` line: a worktree-isolated session refuses that form ("names git in a form too complex to verify", #518).
+If it fails (not a git repo), run `pwd` instead. Keep the printed path; the steps below call it `<REPO_ROOT>`. Every block below that runs the plugin's hooks starts with `cd '<REPO_ROOT>'`: paste the literal path, in single quotes (write a `'` inside it as `'\''`). Do not put `git` inside `$(...)` on a `cd` line: a worktree-isolated session refuses that form ("names git in a form too complex to verify", #518).
 
 Then run:
 
@@ -407,7 +407,7 @@ Final filename: `YYYY-MM-DD-retro-<hash>.md`
 
 Example: `2026-04-05-retro-a3f2.md`
 
-First write the full note (frontmatter + body) with the **Write tool** to `<WORK>/retro-note-<draft-id>.md` (`<WORK>` from Step 1). `<draft-id>` is 8 random hex characters you pick once per run and reuse in Step 7.5, so two retros started in the same second never share a draft file. Call that path `<BODY_FILE>`. Then run the note-writer CLI with `--body-file`. The note text never goes into the Bash command, so a PreToolUse hook that reads command text cannot refuse the save over words the note quotes (#517). `note_writer.py` creates `$INSIGHTS_FOLDER` if needed and writes the note atomically at mode `0o600`; no `mkdir`/`chmod` needed. The `HOOKS=` line below checks the marketplace-registered directory-source install location FIRST (#278 — on a local checkout that is what loads, not the released cache), and only falls back to the plugin cache, where it sorts versions **numerically** (a plain `max()` is lexicographic and picks `3.9.0` over `3.10.0`, resolving to a cache with no `note_writer.py`); the `test -f` line turns a stale/incomplete cache into the documented `ERROR:` shape instead of a raw Python `can't open file` message:
+First write the full note (frontmatter + body) with the **Write tool** to `<WORK>/retro-note-<draft-id>.md` (`<WORK>` from Step 1). `<draft-id>` is 8 random hex characters you pick once per run and reuse in Step 7.5, so two retros started in the same second are very unlikely to share a draft file. Call that path `<BODY_FILE>`. Then run the note-writer CLI with `--body-file`. The note text never goes into the Bash command, so a PreToolUse hook that reads command text cannot refuse the save over words the note quotes (#517). `note_writer.py` creates `$INSIGHTS_FOLDER` if needed and writes the note atomically at mode `0o600`; no `mkdir`/`chmod` needed. The `HOOKS=` line below checks the marketplace-registered directory-source install location FIRST (#278 — on a local checkout that is what loads, not the released cache), and only falls back to the plugin cache, where it sorts versions **numerically** (a plain `max()` is lexicographic and picks `3.9.0` over `3.10.0`, resolving to a cache with no `note_writer.py`); the `test -f` line turns a stale/incomplete cache into the documented `ERROR:` shape instead of a raw Python `can't open file` message:
 
 ```bash
 cd '<REPO_ROOT>'
