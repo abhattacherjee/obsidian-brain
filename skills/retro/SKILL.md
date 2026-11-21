@@ -9,7 +9,7 @@ metadata:
 
 Analyze the current conversation candidly and save a structured retrospective to the Obsidian vault. The goal is honest reflection — not self-congratulation — so future sessions can improve.
 
-**Tools needed:** Bash, Read
+**Tools needed:** Bash, Read, Write
 
 ## Procedure
 
@@ -407,7 +407,7 @@ Final filename: `YYYY-MM-DD-retro-<hash>.md`
 
 Example: `2026-04-05-retro-a3f2.md`
 
-First write the full note (frontmatter + body) with the **Write tool** to `<WORK>/retro-note-<hash>.md` (the same `<hash>` as the filename; `<WORK>` from Step 1). Call that path `<BODY_FILE>`. Then run the note-writer CLI with `--body-file`. The note text never goes into the Bash command, so a PreToolUse hook that reads command text cannot refuse the save over words the note quotes (#517). `note_writer.py` creates `$INSIGHTS_FOLDER` if needed and writes the note atomically at mode `0o600`; no `mkdir`/`chmod` needed. The `HOOKS=` line below checks the marketplace-registered directory-source install location FIRST (#278 — on a local checkout that is what loads, not the released cache), and only falls back to the plugin cache, where it sorts versions **numerically** (a plain `max()` is lexicographic and picks `3.9.0` over `3.10.0`, resolving to a cache with no `note_writer.py`); the `test -f` line turns a stale/incomplete cache into the documented `ERROR:` shape instead of a raw Python `can't open file` message:
+First write the full note (frontmatter + body) with the **Write tool** to `<WORK>/retro-note-<draft-id>.md` (`<WORK>` from Step 1). `<draft-id>` is 8 random hex characters you pick once per run and reuse in Step 7.5, so two retros started in the same second never share a draft file. Call that path `<BODY_FILE>`. Then run the note-writer CLI with `--body-file`. The note text never goes into the Bash command, so a PreToolUse hook that reads command text cannot refuse the save over words the note quotes (#517). `note_writer.py` creates `$INSIGHTS_FOLDER` if needed and writes the note atomically at mode `0o600`; no `mkdir`/`chmod` needed. The `HOOKS=` line below checks the marketplace-registered directory-source install location FIRST (#278 — on a local checkout that is what loads, not the released cache), and only falls back to the plugin cache, where it sorts versions **numerically** (a plain `max()` is lexicographic and picks `3.9.0` over `3.10.0`, resolving to a cache with no `note_writer.py`); the `test -f` line turns a stale/incomplete cache into the documented `ERROR:` shape instead of a raw Python `can't open file` message:
 
 ```bash
 cd '<REPO_ROOT>'
@@ -516,7 +516,7 @@ python3 "$HOOKS/retro_trace.py" items '<NOTE_PATH>'
    - a direct doc or skill edit: `{"item": N, "kind": "path", "path": "<path you edited>"}`;
    - skipped, already covered or declined: `{"item": N, "kind": "skipped", "reason": "<why, citing the artifact>"}`.
 
-   Write `{"traces": [...]}` with the **Write tool** to `<WORK>/retro-traces-<hash>.json` (the `<hash>` from Step 7). Call that path `<TRACES_FILE>`. Then pass it to `apply` with `--traces-file`, so no JSON goes into the Bash command. The file holds one JSON object, for example `{"traces": [{"item": 1, "kind": "skipped", "reason": "<why>"}]}`:
+   Write `{"traces": [...]}` with the **Write tool** to `<WORK>/retro-traces-<draft-id>.json` (the same `<draft-id>` as Step 7). Call that path `<TRACES_FILE>`. Then pass it to `apply` with `--traces-file`, so no JSON goes into the Bash command. The file holds one JSON object, for example `{"traces": [{"item": 1, "kind": "skipped", "reason": "<why>"}]}`:
 
 ```bash
 cd '<REPO_ROOT>'

@@ -3,7 +3,10 @@ from __future__ import annotations
 
 import io
 import json
+import os
 from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 
@@ -144,6 +147,49 @@ def test_cli_apply_file_read_error(tmp_path, case, capsys):
         traces_file.write_bytes(b'{"traces": [], "extra": "\xff"}')
     assert rt.main(["apply", str(tmp_path), path.name, "--traces-file", str(traces_file)]) == 2
     assert f"cannot read --traces-file {traces_file}:" in capsys.readouterr().err
+    assert snapshot(path) == before
+
+
+def test_cli_apply_file_exactly_at_the_cap_is_accepted(tmp_path, capsys):
+    """The cap is `>`: STDIN_CAP_CHARS characters is allowed, one more is not."""
+    path = make_note(tmp_path)
+    payload = json.dumps({"traces": TRACES}).ljust(rt.STDIN_CAP_CHARS)
+    assert len(payload) == rt.STDIN_CAP_CHARS
+    traces_file = tmp_path / "traces.json"
+    traces_file.write_text(payload, encoding="utf-8")
+    assert rt.main(["apply", str(tmp_path), path.name, "--traces-file", str(traces_file)]) == 0
+    assert json.loads(capsys.readouterr().out)["untraced"] == 0
+    assert rt.untraced_count(path) == 0
+
+
+def test_cli_apply_unreadable_file_is_exit_2_and_leaves_the_note(tmp_path, capsys):
+    if os.geteuid() == 0:
+        pytest.skip("root can read a mode-000 file")
+    path = make_note(tmp_path)
+    before = snapshot(path)
+    traces_file = tmp_path / "traces.json"
+    traces_file.write_text(json.dumps({"traces": TRACES}), encoding="utf-8")
+    traces_file.chmod(0)
+    try:
+        assert rt.main(["apply", str(tmp_path), path.name, "--traces-file", str(traces_file)]) == 2
+    finally:
+        traces_file.chmod(0o600)
+    assert f"cannot read --traces-file {traces_file}:" in capsys.readouterr().err
+    assert snapshot(path) == before
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs os.mkfifo")
+def test_cli_apply_fifo_file_is_refused_without_blocking(tmp_path):
+    path = make_note(tmp_path)
+    before = snapshot(path)
+    fifo = tmp_path / "traces.fifo"
+    os.mkfifo(fifo)
+    # A hang raises TimeoutExpired and fails the test.
+    result = subprocess.run(
+        [sys.executable, rt.__file__, "apply", str(tmp_path), path.name, "--traces-file", str(fifo)],
+        stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=15)
+    assert result.returncode == 2
+    assert f"cannot read --traces-file {fifo}:" in result.stderr
     assert snapshot(path) == before
 
 

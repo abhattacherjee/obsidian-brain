@@ -44,7 +44,11 @@ requires_bash = pytest.mark.skipif(_BASH is None, reason="bash not available")
 # a global non-greedy ```bash…``` regex silently matched a prose span instead
 # of the real block (which then looks like "no heredoc here" — a test that
 # quietly covers nothing).
-_CMD_LINE = 'python3 "$HOOKS/note_writer.py"'
+# One regex for both the strict collector and the loose cross-check. It allows
+# interpreter flags between `python3` and the script (`python3 -B`, `python3 -I -u`).
+_INVOKE_PREFIX = r"""[ \t]*(?:python3(?:[ \t]+-[A-Za-z]+)*[ \t]+)?["']?[^"'\s]*note_writer\.py["']?\s+"""
+_COLUMN0_INVOCATION_RE = re.compile(
+    r"""^python3(?:[ \t]+-[A-Za-z]+)*[ \t]+"\$HOOKS/note_writer\.py\"""")
 # Matches the opener under EITHER scheme -- with the per-invocation `<eof4>`
 # placeholder or the old fixed form. Deliberately scheme-agnostic so that
 # reverting to a fixed delimiter makes the execution test fail on its real
@@ -83,7 +87,7 @@ def _collect_blocks():
             lines = fh.read().split("\n")
         n = 0
         for i, line in enumerate(lines):
-            if not line.startswith(_CMD_LINE):
+            if not _COLUMN0_INVOCATION_RE.match(line):
                 continue
             start = next(
                 j for j in range(i, -1, -1) if lines[j].strip() == "```bash"
@@ -111,10 +115,7 @@ _BLOCKS = _collect_blocks()
 # uncovered — and a `>= 9` floor would still pass. Cross-checking the strict
 # collector against this loose count makes that failure loud instead.
 _LOOSE_INVOCATION_RE = re.compile(
-    r"""^[ \t]*(?:python3\s+)?["']?[^"'\s]*note_writer\.py["']?\s+"""
-    r"""(?:write|append-update)\b""",
-    re.MULTILINE,
-)
+    r"^" + _INVOKE_PREFIX + r"(?:write|append-update)\b", re.MULTILINE)
 
 
 def _loose_invocation_count():
@@ -338,3 +339,50 @@ def test_skill_heredoc_block_terminator_is_unique_per_invocation(
     assert any(ln == terminator for ln in block.split("\n")), (
         f"{block_id}: no column-0 terminator line matching the opener"
     )
+
+
+def test_invocation_regexes_accept_interpreter_flags():
+    """Positive control: `python3 -B "$HOOKS/note_writer.py" write ...` must be
+    matched by both the strict and the loose regex, else a call site written that
+    way would be silently uncovered."""
+    for flags in ("", "-B ", "-I -u ", "-Bu "):
+        line = f'python3 {flags}"$HOOKS/note_writer.py" write "$VAULT_PATH" "$X" "n.md" --body-file \'<BODY_FILE>\''
+        assert _COLUMN0_INVOCATION_RE.match(line), line
+        assert _LOOSE_INVOCATION_RE.findall(line), line
+        assert _LOOSE_INVOCATION_RE.findall("  " + line), line
+    assert not _COLUMN0_INVOCATION_RE.match('echo python3 "$HOOKS/note_writer.py" write')
+
+
+def _body_file_steps():
+    """(skill, prose) for every `note_writer.py write ... --body-file` site: the
+    prose runs from the preceding heading to the next one, headings outside fences."""
+    found = []
+    for skill_path in sorted(glob.glob(os.path.join(_REPO_ROOT, "skills/*/SKILL.md"))):
+        skill = skill_path.replace("\\", "/").split("/")[-2]
+        with open(skill_path, encoding="utf-8") as fh:
+            lines = fh.read().split("\n")
+        in_fence, headings, sites = False, [], []
+        for i, line in enumerate(lines):
+            if line.lstrip().startswith("```"):
+                in_fence = not in_fence
+            elif not in_fence and line.startswith("#"):
+                headings.append(i)
+            if (_BODY_FILE_ARG in line
+                    and re.search(r"note_writer\.py\"? write\b", line)):
+                sites.append(i)
+        for i in sites:
+            start = max([h for h in headings if h < i], default=0)
+            end = min([h for h in headings if h > i], default=len(lines))
+            found.append((f"{skill}@{i + 1}", "\n".join(lines[start:end])))
+    return found
+
+
+def test_every_body_file_step_tells_the_model_to_write_remove_and_keep_the_file():
+    """#517: each `--body-file` step says to write the body with the Write tool,
+    to `rm -f` it after OK, and to keep it when the command fails."""
+    steps = _body_file_steps()
+    assert len(steps) == 8, [s[0] for s in steps]
+    for site, prose in steps:
+        assert "**Write tool**" in prose, site
+        assert "rm -f '<BODY_FILE>'" in prose, site
+        assert "keep `<BODY_FILE>`" in prose, site

@@ -4,7 +4,8 @@ Skills previously persisted vault notes via a Write tool call, which breaks
 in environments that route writes through a context-blind helper sub-agent
 (#269). This gives skills two deterministic commands instead:
 
-- ``write``: create a new note. Reads note content from stdin, delegates to
+- ``write``: create a new note. Reads note content from stdin, or from
+  ``--body-file PATH`` (the form every skill uses since #517), delegates to
   obsidian_utils.write_vault_note for the atomic mkdir + traversal-checked +
   chmod 0o600 + rename write, and prints the absolute destination path on
   success so the skill can echo it back to the user.

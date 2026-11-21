@@ -152,6 +152,57 @@ class TestBodyFile:
         assert result.returncode == 0, result.stderr
         assert (tmp_path / "notes/note.md").read_bytes() == body.read_bytes()
 
+    def test_does_not_wait_on_an_open_stdin(self, tmp_path):
+        """A stdin pipe that is never written or closed: a CLI that reads stdin
+        before the body file would hang here and fail the wait."""
+        body = tmp_path / "body"
+        body.write_text(MINIMAL_FM + "from file\n", encoding="utf-8")
+        proc = subprocess.Popen(
+            [sys.executable, str(NOTE_WRITER), "write", str(tmp_path), "notes", "note.md",
+             "--body-file", str(body)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            proc.wait(timeout=15)
+            out, err = proc.stdout.read(), proc.stderr.read()
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            pytest.fail("note_writer waited on stdin although --body-file was given")
+        finally:
+            proc.stdin.close()
+            proc.stdout.close()
+            proc.stderr.close()
+
+        assert proc.returncode == 0, err
+        assert (tmp_path / "notes/note.md").read_bytes() == body.read_bytes()
+
+    def test_exactly_at_the_cap_is_accepted(self, tmp_path):
+        """The cap is `>`: STDIN_CAP_CHARS characters is allowed, one more is not."""
+        content = MINIMAL_FM + "a" * (STDIN_CAP_CHARS - len(MINIMAL_FM))
+        assert len(content) == STDIN_CAP_CHARS
+        body = tmp_path / "body"
+        body.write_text(content, encoding="utf-8")
+
+        result = _run_argv("write", str(tmp_path), "notes", "note.md", "--body-file", str(body))
+
+        assert result.returncode == 0, result.stderr
+        assert (tmp_path / "notes/note.md").read_bytes() == body.read_bytes()
+
+    @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs os.mkfifo")
+    def test_fifo_is_refused_without_blocking(self, tmp_path):
+        fifo = tmp_path / "body.fifo"
+        os.mkfifo(fifo)
+
+        # A hang raises TimeoutExpired and fails the test.
+        result = subprocess.run(
+            [sys.executable, str(NOTE_WRITER), "write", str(tmp_path), "notes", "note.md",
+             "--body-file", str(fifo)],
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=15)
+
+        assert result.returncode == 1
+        assert result.stderr.startswith(f"ERROR: cannot read --body-file {fifo}: ")
+        assert not (tmp_path / "notes/note.md").exists()
+
     def test_empty(self, tmp_path):
         body = tmp_path / "body"
         body.touch()
