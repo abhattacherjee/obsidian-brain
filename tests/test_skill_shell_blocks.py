@@ -37,18 +37,26 @@ from pathlib import Path
 
 import pytest
 
+import skill_shell
 from skill_shell import (
     HOOKS_DIR,
+    SandboxUnavailable,
     _blank_quotes_and_heredocs,
-    escaping_redirects,
     fenced_blocks,
     note_writer_calls,
     python_script_call,
     run_with_stubs,
+    sandbox_prefix,
 )
 
 _BASH = shutil.which("bash")
 requires_bash = pytest.mark.skipif(_BASH is None, reason="bash not available")
+# Probed once per process. Without a sandbox only the pinned call-site blocks
+# run (unsandboxed_ok), so every other harness test skips (GH #526).
+requires_sandbox = pytest.mark.skipif(
+    _BASH is None or sandbox_prefix(Path.cwd()) is None,
+    reason="no OS sandbox (sandbox-exec or bwrap) for the stub harness",
+)
 
 # Matches the opener under EITHER scheme -- with the per-invocation `<eof4>`
 # placeholder or the old fixed form. Deliberately scheme-agnostic so that
@@ -111,7 +119,7 @@ _COMMAND_LEADERS = frozenset({"then", "do", "time", "!"})
 
 
 def _recorded_calls(block_id, block, workdir):
-    result = run_with_stubs(block, workdir)
+    result = run_with_stubs(block, workdir, unsandboxed_ok=block_id in _CALL_SITES)
     assert result.returncode == 0, f"{block_id}: {result.stderr}"
     return note_writer_calls(result.calls)
 
@@ -170,13 +178,13 @@ def test_branch_words_are_read_at_every_command_position(block, words):
     assert _branch_words(block) == words
 
 
-@requires_bash
-def test_note_writer_call_sites_match_the_pinned_counts(tmp_path):
+def _check_call_sites(blocks, tmp_path, **run_kwargs):
+    """Run ``blocks`` and check the recorded call sites and their counts."""
     assert {block_id for block_id, _skill, _block in _CALL_BLOCKS} == _CALL_SITES
     recorded = set()
     counts = Counter()
-    for block_id, _skill, block in _ALL_BLOCKS:
-        result = run_with_stubs(block, tmp_path / block_id)
+    for block_id, _skill, block in blocks:
+        result = run_with_stubs(block, tmp_path / block_id, **run_kwargs)
         calls = note_writer_calls(result.calls)
         if not calls:
             continue  # Other blocks may exit non-zero; only call sites are checked.
@@ -193,6 +201,12 @@ def test_note_writer_call_sites_match_the_pinned_counts(tmp_path):
     assert counts == {"write": 8, "append-update": 1}
     for block_id, _skill, block in _CALL_BLOCKS:
         assert _branch_words(block) == set(), block_id
+
+
+@requires_sandbox
+def test_note_writer_call_sites_match_the_pinned_counts(tmp_path):
+    """Every block runs, so a new call site anywhere fails the pinned set."""
+    _check_call_sites(_ALL_BLOCKS, tmp_path)
 
 
 def _prepare(block: str, tmp_path, note_name: str, *, is_update: bool):
@@ -404,13 +418,13 @@ def _scratch_write_args(workdir):
     return [["write", vault, "insights", "n.md", "--body-file", "<BODY_FILE>"]]
 
 
-@requires_bash
+@requires_sandbox
 def test_stub_records_write_with_boolean_flag(tmp_path):
     block = _SCRATCH_SETUP + f'python3 -B "$HOOKS/note_writer.py" {_SCRATCH_WRITE}'
     assert _recorded_calls("boolean flag", block, tmp_path) == _scratch_write_args(tmp_path)
 
 
-@requires_bash
+@requires_sandbox
 def test_stub_records_write_with_value_flags(tmp_path):
     block = _SCRATCH_SETUP + (
         f'python3 -X utf8 -W ignore "$HOOKS/note_writer.py" {_SCRATCH_WRITE}'
@@ -418,29 +432,29 @@ def test_stub_records_write_with_value_flags(tmp_path):
     assert _recorded_calls("value flags", block, tmp_path) == _scratch_write_args(tmp_path)
 
 
-@requires_bash
+@requires_sandbox
 def test_stub_records_write_with_line_continuation(tmp_path):
     block = _SCRATCH_SETUP + f'python3 "$HOOKS/note_writer.py" \\\n  {_SCRATCH_WRITE}'
     assert _recorded_calls("line continuation", block, tmp_path) == _scratch_write_args(tmp_path)
 
 
-@requires_bash
+@requires_sandbox
 def test_stub_records_write_in_four_tilde_fence(tmp_path):
     block = _SCRATCH_SETUP + f'python3 "$HOOKS/note_writer.py" {_SCRATCH_WRITE}'
     parsed, = fenced_blocks(f"~~~~bash\n{block}\n~~~~")
     assert _recorded_calls("four-tilde fence", parsed.body, tmp_path) == _scratch_write_args(tmp_path)
 
 
-@requires_bash
+@requires_sandbox
 def test_stub_ignores_commented_write(tmp_path):
     block = _SCRATCH_SETUP + f'# python3 "$HOOKS/note_writer.py" {_SCRATCH_WRITE}'
     assert _recorded_calls("commented write", block, tmp_path) == []
 
 
-@requires_bash
+@requires_sandbox
 def test_stub_does_not_record_absolute_python_path(tmp_path):
     """A real python3 called by absolute path bypasses the stub, so it is not recorded."""
-    fake = tmp_path / "abs" / "python3"
+    fake = tmp_path / "run" / "abs" / "python3"
     fake.parent.mkdir(parents=True)
     # `touch` is a recording stub in the run, so the fake marks itself with a builtin.
     fake.write_text(f"#!/bin/sh\necho ran > '{fake.parent}/ran'\n", encoding="utf-8")
@@ -452,7 +466,7 @@ def test_stub_does_not_record_absolute_python_path(tmp_path):
     assert note_writer_calls(result.calls) == []
 
 
-@requires_bash
+@requires_sandbox
 def test_grep_is_a_recording_stub_that_scans_nothing(tmp_path):
     block = 'grep -rl "session_id:" "$VAULT_PATH/$SESSIONS_FOLDER/"'
     result = run_with_stubs(block, tmp_path)
@@ -499,18 +513,18 @@ def _timeout_leaves_no_child(tmp_path, block):
     assert gone, "the backgrounded child outlived the timeout"
 
 
-@requires_bash
+@requires_sandbox
 def test_a_timeout_kills_a_backgrounded_child(tmp_path):
     _timeout_leaves_no_child(tmp_path, 'sleep 300 & echo $! > "$TMPDIR/pid"; wait')
 
 
-@requires_bash
+@requires_sandbox
 def test_a_timeout_kills_a_child_in_its_own_process_group(tmp_path):
     """`set -m` gives each job its own group, so killpg of the block's group misses it."""
     _timeout_leaves_no_child(tmp_path, 'set -m; sleep 300 & echo $! > "$TMPDIR/pid"; wait')
 
 
-@requires_bash
+@requires_sandbox
 def test_a_surviving_child_cannot_hold_the_run(tmp_path):
     """Output goes to files, so a child that keeps stdout open does not block the run."""
     pid_file = tmp_path / "run" / "tmp" / "pid"
@@ -530,95 +544,170 @@ def test_a_surviving_child_cannot_hold_the_run(tmp_path):
     assert gone
 
 
-_WRITERS = "mkdir touch chmod ln tee dd install rm cp mv".split()
+def _kill_pid_file(pid_file: Path) -> None:
+    """Never leave a test's sleep running, even on failure."""
+    if pid_file.exists():
+        try:
+            os.kill(int(pid_file.read_text()), signal.SIGKILL)
+        except (ProcessLookupError, ValueError):
+            pass
 
 
-def _escape_names(tag):
-    return sorted(Path("/tmp").glob(f"ob-escape-{tag}*"))
+def test_the_sandbox_is_there_when_ci_requires_it():
+    """CI sets OB_REQUIRE_SANDBOX=1 and installs bwrap, so it can never fall back
+    to the unsandboxed mode without failing here (GH #526)."""
+    if os.environ.get("OB_REQUIRE_SANDBOX") != "1":
+        pytest.skip("OB_REQUIRE_SANDBOX is not set")
+    assert sandbox_prefix(Path.cwd()) is not None
 
 
-@requires_bash
-def test_every_file_writer_is_a_recording_stub(tmp_path):
-    run_with_stubs(":", tmp_path)
-    for name in _WRITERS:
-        stub = tmp_path.resolve() / "bin" / name
-        assert not stub.is_symlink(), name
-        assert stub.read_text().startswith("#!"), name
-
-
-@requires_bash
-def test_a_writer_stub_records_the_call_and_creates_nothing(tmp_path):
-    tag = uuid.uuid4().hex
-    target = f"/tmp/ob-escape-{tag}"
-    block = f"mkdir -p {target}-dir; touch {target}-file; rm -rf {target}-dir"
-    result = run_with_stubs(block, tmp_path)
-    assert result.calls == [
-        ["mkdir", "-p", f"{target}-dir"],
-        ["touch", f"{target}-file"],
-        ["rm", "-rf", f"{target}-dir"],
-    ]
-    assert _escape_names(tag) == []
-
-
-@requires_bash
-def test_a_redirect_to_an_absolute_path_raises_before_the_block_runs(tmp_path):
-    tag = uuid.uuid4().hex
-    with pytest.raises(ValueError, match="outside the workdir"):
-        run_with_stubs(f"echo x > /tmp/ob-escape-{tag}-$$", tmp_path)
-    assert _escape_names(tag) == []
-    assert not (tmp_path / "bin").exists()  # It raised before any setup.
-
-
-@requires_bash
-def test_the_literal_escape_block_from_the_review_raises(tmp_path):
-    before = _escape_names("")
-    with pytest.raises(ValueError):
-        run_with_stubs("echo x > /tmp/ob-escape-$$", tmp_path)
-    assert _escape_names("") == before
-
-
-@pytest.mark.parametrize(("block", "targets"), [
-    ("echo x > /tmp/f", ["/tmp/f"]),
-    ("echo x >> ../f", ["../f"]),
-    ("echo x &> /etc/f", ["/etc/f"]),
-    ('echo x >"/tmp/f"', ["/tmp/f"]),
-    ("echo x >&/tmp/f", ["/tmp/f"]),
-    ("echo x 1>/tmp/f 2>&1", ["/tmp/f"]),
-    ("x=$(echo y > /tmp/f)", ["/tmp/f"]),
-    ("echo x > /dev/null 2> /dev/stderr >/dev/stdout >&2 2>&1", []),
-    ('echo x > ~/f > "$HOME/f" > "$VAULT_PATH/f" > rel/f > ./f', []),
-    ("python3 -c 'print(1 > /x)' # > /y", []),
-    ("cat <<'E'\n> /x\nE", []),
-    ("diff <(a) >(b)", []),
-])
-def test_escaping_redirects(block, targets):
-    assert escaping_redirects(block) == targets
-
-
-def test_no_skill_block_redirects_outside_the_workdir():
-    """Every block runs under the stubs, so none may be refused for a redirect."""
-    refused = {
-        block_id: targets
-        for block_id, _skill, block in _ALL_BLOCKS
-        if (targets := escaping_redirects(block))
-    }
-    assert refused == {}
-
-
-@requires_bash
-def test_a_guarded_tool_refuses_a_path_outside_the_workdir(tmp_path):
-    tag = uuid.uuid4().hex
-    outside = f"/tmp/ob-escape-{tag}"
-    block = (
-        f"mktemp {outside}-XXXXXX; echo a > t.txt\n"
-        f"sed -i s/a/b/ {outside}-s; sort -o {outside}-o t.txt; env /bin/echo hi\n"
-        'mktemp "$TMPDIR/ok.XXXXXX"; sed s/a/b/ t.txt'
+def _escape_block(outside: Path) -> str:
+    """Every cheap way out of the workdir that the old per-tool guards missed."""
+    return (
+        f"O='{outside}'\n"
+        'echo x >| "$O/clobber"\n'
+        "echo a > t.txt\n"
+        'sort -o "$O/sorted" t.txt\n'
+        # macOS mktemp ignores TMPDIR and uses the per-user temp dir, which is
+        # outside the workdir too; Linux mktemp follows TMPDIR into $O.
+        'echo "MKTEMP:$(TMPDIR="$O" mktemp)"\n'
+        'echo "MKTEMP:$(mktemp "$O/tmp.XXXXXX")"\n'
+        '/bin/cp t.txt "$O/abs-cp"\n'
+        'ln -s "$O" link; echo x > link/via-symlink\n'
+        'ln "$O/f" hard; echo pwned >> hard\n'
+        'sed -i.bak s/orig/sed/ "$O/f"\n'
+        "echo done\n"
     )
-    result = run_with_stubs(block, tmp_path)
-    assert result.stderr.count("refused, outside the test workdir") == 4, result.stderr
-    assert _escape_names(tag) == []
-    assert result.stdout.strip().splitlines()[-1] == "b"
-    assert str(tmp_path.resolve() / "tmp" / "ok.") in result.stdout
+
+
+def _made_temp_files(stdout: str) -> list[Path]:
+    return [Path(line[7:]) for line in stdout.splitlines() if line.startswith("MKTEMP:") and line[7:]]
+
+
+def _outside(tmp_path: Path) -> Path:
+    # A sibling of the workdir, not /tmp: an outer sandbox may deny /tmp on its
+    # own and make the test pass with no harness sandbox at all.
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "f").write_text("orig\n", encoding="utf-8")
+    return outside.resolve()
+
+
+@requires_sandbox
+def test_no_write_escapes_the_workdir(tmp_path):
+    outside = _outside(tmp_path)
+    result = run_with_stubs(_escape_block(outside), tmp_path / "run")
+    assert result.stdout.endswith("done\n"), result.stderr
+    assert _made_temp_files(result.stdout) == [], result.stdout
+    assert sorted(p.name for p in outside.iterdir()) == ["f"]
+    assert (outside / "f").read_text(encoding="utf-8") == "orig\n"
+    # The writes inside the workdir still happened.
+    assert (tmp_path / "run" / "cwd" / "t.txt").read_text(encoding="utf-8") == "a\n"
+
+
+@requires_bash
+def test_without_the_sandbox_the_same_block_escapes(tmp_path):
+    """Mutation check for the test above: the same block, run with real writers
+    and no sandbox prefix, writes outside. So the test above can fail."""
+    outside = _outside(tmp_path)
+    result = skill_shell._run(_escape_block(outside), tmp_path / "run", 60, [], real_writers=True)
+    made = _made_temp_files(result.stdout)
+    for path in made:  # The TMPDIR form may land in the per-user temp dir.
+        if not path.is_relative_to(outside):
+            path.unlink()
+    assert len(made) == 2, result.stdout
+    names = {p.name for p in outside.iterdir()}
+    assert {"clobber", "sorted", "abs-cp", "via-symlink", "f.bak"} <= names, names
+    assert any(name.startswith("tmp.") for name in names), names
+    assert (outside / "f").read_text(encoding="utf-8") == "sed\npwned\n"
+
+
+def test_a_refused_sandbox_raises_before_creating_anything(tmp_path, monkeypatch):
+    monkeypatch.setattr(skill_shell, "_sandbox_tool", lambda: None)
+    with pytest.raises(SandboxUnavailable):
+        run_with_stubs(":", tmp_path / "run")
+    assert not (tmp_path / "run").exists()
+
+
+@requires_bash
+def test_the_fallback_records_writers_and_creates_nothing(tmp_path, monkeypatch):
+    monkeypatch.setattr(skill_shell, "_sandbox_tool", lambda: None)
+    outside = _outside(tmp_path)
+    block = f"mkdir -p '{outside}/d'; touch '{outside}/t'; cp a '{outside}/c'; rm -rf '{outside}/f'"
+    result = run_with_stubs(block, tmp_path / "run", unsandboxed_ok=True)
+    assert result.calls == [
+        ["mkdir", "-p", f"{outside}/d"],
+        ["touch", f"{outside}/t"],
+        ["cp", "a", f"{outside}/c"],
+        ["rm", "-rf", f"{outside}/f"],
+    ]
+    assert sorted(p.name for p in outside.iterdir()) == ["f"]
+    for name in skill_shell._WRITERS:
+        stub = tmp_path.resolve() / "run" / "bin" / name
+        assert not stub.is_symlink(), name
+
+
+@requires_bash
+def test_the_pinned_call_sites_hold_without_a_sandbox(tmp_path, monkeypatch):
+    """The unsandboxed mode runs only the pinned blocks, and they still record
+    their 8 writes and 1 append-update."""
+    monkeypatch.setattr(skill_shell, "_sandbox_tool", lambda: None)
+    _check_call_sites(_CALL_BLOCKS, tmp_path, unsandboxed_ok=True)
+
+
+def test_the_probe_rejects_a_sandbox_that_denies_nothing(monkeypatch):
+    monkeypatch.setattr(skill_shell, "_prefix_for", lambda tool, workdir: [])
+    assert skill_shell._probe(("fake", "/nonexistent")) is False
+
+
+def test_the_probe_rejects_a_sandbox_that_fails_to_start(monkeypatch):
+    monkeypatch.setattr(skill_shell, "_prefix_for", lambda tool, workdir: ["/usr/bin/false"])
+    assert skill_shell._probe(("fake", "/usr/bin/false")) is False
+
+
+def test_the_probe_rejects_a_missing_sandbox_binary(monkeypatch):
+    monkeypatch.setattr(
+        skill_shell, "_prefix_for", lambda tool, workdir: ["/nonexistent/sandbox-exec"]
+    )
+    assert skill_shell._probe(("fake", "/nonexistent/sandbox-exec")) is False
+
+
+def _broken_listing():
+    raise PermissionError("ps: launch refused")
+
+
+@requires_sandbox
+def test_a_failed_process_listing_keeps_the_result(tmp_path, monkeypatch):
+    """X-025: cleanup must not replace the block's result, and the block's own
+    group is still killed. A `set -m` child needs the listing to be found."""
+    monkeypatch.setattr(skill_shell, "_list_pids", _broken_listing)
+    pid_file = tmp_path / "run" / "tmp" / "pid"
+    try:
+        result = run_with_stubs(
+            'sleep 300 & echo $! > "$TMPDIR/pid"; echo out; exit 3', tmp_path / "run"
+        )
+        gone = _pid_is_gone(int(pid_file.read_text()))
+    finally:
+        _kill_pid_file(pid_file)
+    assert (result.returncode, result.stdout) == (3, "out\n")
+    assert gone
+
+
+@requires_sandbox
+def test_a_failed_process_listing_keeps_the_timeout(tmp_path, monkeypatch):
+    monkeypatch.setattr(skill_shell, "_list_pids", _broken_listing)
+    with pytest.raises(subprocess.TimeoutExpired):
+        run_with_stubs("sleep 30", tmp_path / "run", timeout=1)
+
+
+def test_a_failing_ps_is_a_listing_error(monkeypatch):
+    class Failed:
+        returncode = 1
+        stdout = ""
+
+    monkeypatch.setattr(skill_shell.subprocess, "run", lambda *a, **k: Failed())
+    with pytest.raises(OSError):
+        skill_shell._list_pids()
 
 
 def test_python_script_call():

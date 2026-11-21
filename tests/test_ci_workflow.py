@@ -151,3 +151,26 @@ def test_aggregator_script_passes_only_when_every_need_succeeded(results, code, 
     )
     assert proc.returncode == code, proc.stdout + proc.stderr
     assert message in proc.stdout, proc.stdout + proc.stderr
+
+
+# The jobs that run the skill-block harness (GH #526). Each must install bwrap,
+# lift Ubuntu's AppArmor user-namespace limit before pytest, and run pytest with
+# OB_REQUIRE_SANDBOX=1, so a missing sandbox fails the job instead of skipping.
+SANDBOX_JOBS = ("python-tests", "python-tests-py39")
+
+
+@_REQUIRES_YAML
+@pytest.mark.parametrize("job", SANDBOX_JOBS)
+def test_harness_jobs_install_and_require_the_sandbox(job):
+    steps = _workflow()["jobs"][job]["steps"]
+    runs = [str(step.get("run", "")) for step in steps]
+    install = next(
+        (i for i, run in enumerate(runs) if "apt-get install" in run and "bubblewrap" in run), None
+    )
+    assert install is not None, job
+    assert "kernel.apparmor_restrict_unprivileged_userns=0" in runs[install], job
+    pytest_steps = [i for i, run in enumerate(runs) if "pytest tests/" in run]
+    assert pytest_steps, job
+    for i in pytest_steps:
+        assert i > install, job
+        assert steps[i].get("env", {}).get("OB_REQUIRE_SANDBOX") == "1", job
