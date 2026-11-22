@@ -401,9 +401,14 @@ def test_version_sync_runs_before_every_skip_mode(repo, flags, market, expected_
     """Repo part of the vendored preflight: no skip flag bypasses version sync."""
     _write_manifests(repo.root, "1.0.0", market)
     _git(repo, "add", ".claude-plugin")
+    # A tmp HOME, so the preflight's `_heavy` never finds the live
+    # ~/.claude/bin/heavy (#525).
+    home = repo.root.parent / "home"
+    home.mkdir(exist_ok=True)
     proc = subprocess.run(
         ["bash", str(repo.root / "scripts" / "commit-preflight.sh"), *flags],
-        cwd=repo.root, env=repo.env, capture_output=True, text=True, timeout=60,
+        cwd=repo.root, env={**repo.env, "HOME": str(home)}, capture_output=True,
+        text=True, timeout=60,
         stdin=subprocess.DEVNULL,
     )
     assert proc.returncode == expected_rc, proc.stdout[-800:] + proc.stderr[-400:]
