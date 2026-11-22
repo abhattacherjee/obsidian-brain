@@ -541,6 +541,7 @@ def test_a_zombie_counts_as_gone():
         os.kill(child.pid, 0)  # Still answers: it is a zombie, not reaped.
         assert _pid_is_gone(child.pid)
     finally:
+        child.kill()  # A failed assertion above must not wait out the sleep.
         child.wait()
 
 
@@ -883,6 +884,10 @@ def _unix_listener():
 
 
 @requires_sandbox
+@pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="known limit: bwrap does not hide pathname Unix sockets (GH #526)",
+)
 def test_the_sandbox_denies_unix_sockets(tmp_path):
     with _unix_listener() as (listener, path):
         result = run_with_stubs(_unix_connect_block(path), tmp_path / "run", timeout=20)

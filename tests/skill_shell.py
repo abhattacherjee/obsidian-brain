@@ -152,16 +152,13 @@ def _prefix_for(tool: tuple[str, str], workdir: str) -> list[str]:
     # host pids and the launcher's session, which `_kill_session` and the
     # timeout rely on.
     #
-    # `--unshare-net` does not hide pathname Unix sockets: they stay reachable
-    # through the read-only root bind (the Docker socket, a user bus, an agent
-    # socket in /run or /tmp). `--tmpfs /run --tmpfs /tmp` hide those
-    # directories. They come AFTER the root bind and BEFORE the workdir bind: a
-    # later bind mounts on top, so a workdir under /tmp stays reachable. Not
-    # `/var/run`: it is usually a symlink to /run, and a tmpfs there would
-    # replace the link.
+    # Known limit (GH #526 review): `--unshare-net` blocks IP networking, but
+    # pathname Unix sockets stay reachable through the read-only root bind.
+    # Hiding socket directories with tmpfs mounts broke checkouts under /tmp
+    # and let the write test pass with a writable root, so it was reverted.
+    # macOS is not affected: `(deny network*)` also blocks Unix sockets.
     return [
         path, "--unshare-net", "--ro-bind", "/", "/", "--dev", "/dev",
-        "--tmpfs", "/run", "--tmpfs", "/tmp",
         "--bind", workdir, workdir,
     ]
 
@@ -270,7 +267,8 @@ def run_with_stubs(
     writes to /dev/null, /dev/zero, /dev/stdout, /dev/stderr, /dev/dtracehelper,
     /dev/fd/* and /dev/tty* are allowed; under `bwrap`, /dev is a private
     tmpfs with a few device nodes, discarded after the run. The sandbox also
-    denies all network access. ``python3``, ``git``, ``gh`` and ``grep`` are
+    denies network access: all of it on macOS, IP networking under `bwrap`,
+    where pathname Unix sockets stay reachable (a known limit). ``python3``, ``git``, ``gh`` and ``grep`` are
     stubs that record their argv and do nothing else; file writers and text
     tools are the real ones. Every path variable the blocks read points into
     ``workdir``.
