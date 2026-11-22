@@ -94,7 +94,17 @@ jobs:
           python-version: '3.12'
       - name: Install pytest, coverage, xdist and PyYAML
         run: pip install pytest pytest-cov pytest-xdist pyyaml
+      # The skill-block harness runs each block under bwrap, so a block cannot
+      # write outside its workdir (GH #526). Ubuntu's AppArmor blocks the user
+      # namespace bwrap needs until the sysctl is 0.
+      - name: Install bubblewrap for the skill-block sandbox
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - name: Run tests with coverage
+        env:
+          OB_REQUIRE_SANDBOX: '1'
         run: |
           read -ra timed <<< "$TIMED_TESTS"
           pytest tests/ -n auto -v --tb=short "${timed[@]/#/--deselect=}" --durations=30 --cov=hooks --cov-report=term-missing --cov-fail-under=90
@@ -115,7 +125,15 @@ jobs:
           python-version: '3.9'
       - name: Install pytest, xdist and PyYAML
         run: pip install pytest pytest-xdist pyyaml
+      # Same sandbox as python-tests (GH #526); 24.04 needs the sysctl too.
+      - name: Install bubblewrap for the skill-block sandbox
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - name: Run tests on Python 3.9
+        env:
+          OB_REQUIRE_SANDBOX: '1'
         run: |
           read -ra timed <<< "$TIMED_TESTS"
           pytest tests/ -n auto -q --tb=short "${timed[@]/#/--deselect=}" --durations=30

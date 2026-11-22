@@ -19,6 +19,7 @@ hand-written text parser, and reviews kept finding ways round it (flow-style
 A real YAML parser closes that whole class.
 """
 
+import copy
 import os
 import shutil
 import subprocess
@@ -151,3 +152,82 @@ def test_aggregator_script_passes_only_when_every_need_succeeded(results, code, 
     )
     assert proc.returncode == code, proc.stdout + proc.stderr
     assert message in proc.stdout, proc.stdout + proc.stderr
+
+
+# The jobs that run the skill-block harness (GH #526). Each must install bwrap,
+# lift Ubuntu's AppArmor user-namespace limit before pytest, and run pytest with
+# OB_REQUIRE_SANDBOX=1, so a missing sandbox fails the job instead of skipping.
+SANDBOX_JOBS = ("python-tests", "python-tests-py39")
+
+
+def _harness_job_problems(workflow, job):
+    """What is wrong with how ``job`` installs and requires the sandbox."""
+    problems = []
+    spec = workflow["jobs"][job]
+    steps = spec["steps"]
+    runs = [str(step.get("run", "")) for step in steps]
+    install = next(
+        (i for i, run in enumerate(runs) if "apt-get install" in run and "bubblewrap" in run), None
+    )
+    pytest_steps = [i for i, run in enumerate(runs) if "pytest tests/" in run]
+    if install is None:
+        return ["no bubblewrap install step"]
+    if "kernel.apparmor_restrict_unprivileged_userns=0" not in runs[install]:
+        problems.append("the install step does not lift the AppArmor limit")
+    if not pytest_steps:
+        problems.append("no pytest step")
+    for i in pytest_steps:
+        # Strictly before: an install and pytest in one step has no ordering
+        # the check can see, and a failed install would not stop the pytest.
+        if i <= install:
+            problems.append(f"step {i} does not run pytest in a step after the install")
+        if steps[i].get("env", {}).get("OB_REQUIRE_SANDBOX") != "1":
+            problems.append(f"step {i} does not set OB_REQUIRE_SANDBOX=1")
+    # Any value but a literal false could pass the job on a failure (`true`,
+    # `"true"`, an expression).
+    for name, holder in [("job", spec)] + [
+        (f"step {i}", steps[i]) for i in [install, *pytest_steps]
+    ]:
+        if holder.get("continue-on-error", False) is not False:
+            problems.append(f"{name} has continue-on-error")
+    return problems
+
+
+@_REQUIRES_YAML
+@pytest.mark.parametrize("job", SANDBOX_JOBS)
+def test_harness_jobs_install_and_require_the_sandbox(job):
+    assert _harness_job_problems(_workflow(), job) == [], job
+
+
+@_REQUIRES_YAML
+@pytest.mark.parametrize("job", SANDBOX_JOBS)
+@pytest.mark.parametrize("where", ["job", "install", "pytest"])
+def test_continue_on_error_on_a_harness_job_is_caught(job, where):
+    """Fail-first: the same check on an in-memory copy with `continue-on-error: true`."""
+    workflow = copy.deepcopy(_workflow())
+    spec = workflow["jobs"][job]
+    steps = spec["steps"]
+    holder = {
+        "job": spec,
+        "install": next(s for s in steps if "bubblewrap" in str(s.get("run", ""))),
+        "pytest": next(s for s in steps if "pytest tests/" in str(s.get("run", ""))),
+    }[where]
+    assert _harness_job_problems(workflow, job) == []
+    holder["continue-on-error"] = True
+    assert _harness_job_problems(workflow, job) != [], (job, where)
+
+
+@_REQUIRES_YAML
+@pytest.mark.parametrize("job", SANDBOX_JOBS)
+def test_an_install_and_pytest_in_one_step_is_caught(job):
+    """Fail-first: merge the install commands and pytest into one step."""
+    workflow = copy.deepcopy(_workflow())
+    steps = workflow["jobs"][job]["steps"]
+    install = next(s for s in steps if "bubblewrap" in str(s.get("run", "")))
+    pytest_step = next(s for s in steps if "pytest tests/" in str(s.get("run", "")))
+    assert _harness_job_problems(workflow, job) == []
+    install["run"] = install["run"] + "\n" + pytest_step["run"]
+    install["env"] = {"OB_REQUIRE_SANDBOX": "1"}
+    steps.remove(pytest_step)
+    problems = _harness_job_problems(workflow, job)
+    assert any("after the install" in problem for problem in problems), problems
