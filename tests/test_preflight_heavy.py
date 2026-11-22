@@ -7,12 +7,17 @@ of an exact-line allowlist. Mutation tests prove it rejects a real line with
 `_heavy` removed. Shell tests run the script's own `_heavy`, `_run_pytest`
 and test section with a fresh HOME, so no test reaches the live
 ~/.claude/bin/heavy, and with stubbed python3/pytest/heavy binaries.
+
+Known limit: a runner name split by quotes (`py'test'`) or built from a
+variable (`-m "$MOD"`) is not seen; the exact counts and the allowlist guard
+the plain forms.
 """
 
 from __future__ import annotations
 
 import hashlib
 import os
+import pwd
 import shutil
 import site
 import subprocess
@@ -23,7 +28,10 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 PREFLIGHT = ROOT / "scripts" / "commit-preflight.sh"
 
-RUNNER_WORDS = ("pytest", "py.test", "vitest", "uv run")
+RUNNER_WORDS = (
+    "pytest", "py.test", "vitest", "uv run",
+    "unittest", "tox", "nox", "npm test", "make test",
+)
 ALLOWED = (
     "_run_pytest() {",
     'echo "   pytest-xdist found: running tests on $_workers workers"',
@@ -36,6 +44,8 @@ ALLOWED = (
     'echo "❌ tests/ directory exists but pytest is not installed"',
     'echo "   Install with: pip install pytest pytest-cov"',
 )
+# `2>&1` is refused on purpose (`&` is an operator; fail-closed). A plain
+# `> file` redirect is allowed.
 OPERATORS = (";", "&&", "||", "|", "&", "$(", "`", "<(", ">(")
 STATUS_SUFFIXES = (" || rc=$?", " || _rc=$?")
 GATED_COUNT = 4
@@ -122,6 +132,12 @@ def test_every_allowlisted_line_is_in_the_script():
     "npx vitest run",
     "uv run pytest",
     "uv run some-tests",
+    "python3 -m unittest discover",
+    "tox -e py",
+    "nox -s tests",
+    "npm test",
+    "make test",
+    "_heavy python3 -m pytest -q >out 2>&1",
     "command pytest",
     "$PY -m pytest",
     "env -u X python3 -m pytest",
@@ -137,6 +153,11 @@ def test_rejects_ungated_line(line):
     assert scan_script(line) == ([f"line 1: ungated test run: {line.strip()}"], 1, 0)
 
 
+def test_blind_spot_split_runner_name_is_not_seen():
+    # Documents a known limit: a runner name split by quotes is invisible.
+    assert scan_script("python3 -m py'test' -q") == ([], 0, 0)
+
+
 def test_rejects_ungated_line_after_comment_backslash():
     script = "# comment \\\npython3 -m pytest -q"
     assert scan_script(script) == (["line 2: ungated test run: python3 -m pytest -q"], 1, 0)
@@ -144,6 +165,7 @@ def test_rejects_ungated_line_after_comment_backslash():
 
 @pytest.mark.parametrize("line, checked, gated", [
     ("_heavy python3 -m pytest -q", 1, 1),
+    ("_heavy python3 -m pytest -q > out", 1, 1),
     ("_heavy env -u X python3 -m pytest a || rc=$?", 1, 1),
     ('    _heavy python3 -m pytest "$@" || _rc=$?', 1, 1),
     ("# python3 -m pytest only in a comment", 0, 0),
@@ -441,19 +463,35 @@ def test_run_pytest_runs_real_pytest_without_heavy(tmp_path, shell_env):
 # --- no test reaches the live heavy -----------------------------------------
 
 
-# Every test file that runs the real script in a subprocess. Each one gives
-# that subprocess a tmp HOME (#525). A new caller must join this list, and
-# give its run the same isolation.
-PREFLIGHT_RUNNERS = {"test_preflight_heavy.py", "test_security.py", "test_vendored_hooks.py"}
+# tests/conftest.py wraps subprocess.Popen: running the real
+# commit-preflight.sh with the developer's HOME raises (#525). These tests
+# prove that guard works. The argv never starts a process.
+def _real_home():
+    return pwd.getpwuid(os.getuid()).pw_dir
 
 
-def test_known_preflight_runners():
-    runners = {
-        path.name for path in (ROOT / "tests").glob("test_*.py")
-        if "commit-preflight.sh" in path.read_text(encoding="utf-8")
-        and "subprocess" in path.read_text(encoding="utf-8")
-    }
-    assert runners == PREFLIGHT_RUNNERS
+def test_guard_rejects_preflight_with_real_home_in_env():
+    with pytest.raises(AssertionError, match=r"\(#525\)"):
+        subprocess.run(["true", "x/commit-preflight.sh"],
+                       env={**os.environ, "HOME": _real_home()})
+
+
+def test_guard_rejects_preflight_with_real_home_from_environ(monkeypatch):
+    monkeypatch.setenv("HOME", _real_home())
+    with pytest.raises(AssertionError, match=r"\(#525\)"):
+        subprocess.run(["true", "x/commit-preflight.sh"])
+
+
+def test_guard_allows_preflight_with_tmp_home(tmp_path):
+    proc = subprocess.run(["true", "scripts/commit-preflight.sh"],
+                          env={**os.environ, "HOME": str(tmp_path)})
+    assert proc.returncode == 0
+
+
+def test_guard_ignores_other_commands_with_real_home():
+    proc = subprocess.run(["true", "scripts/other.sh"],
+                          env={**os.environ, "HOME": _real_home()})
+    assert proc.returncode == 0
 
 
 def _git(*args, cwd, env):
@@ -475,7 +513,7 @@ def test_slot_timeout_fails_the_real_preflight_and_leaves_no_token(tmp_path, she
     so, and writes no token."""
     env = {k: v for k, v in shell_env.items()
            if not k.startswith(("GIT_", "BASH_FUNC_"))
-           and k not in {"CLAUDE_PLUGIN_ROOT", "HARDEN_HOOK_DEADLINE"}}
+           and k not in {"CLAUDE_PLUGIN_ROOT", "HARDEN_HOOK_DEADLINE", "ASSERT_GATE"}}
     env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull)
     _stub_heavy(env, "exit 75\n")
     root = tmp_path / "target"
@@ -497,5 +535,10 @@ def test_slot_timeout_fails_the_real_preflight_and_leaves_no_token(tmp_path, she
         assert proc.returncode != 0, output
         assert SLOT_TIMEOUT in output, output
         assert not token.exists(), output
+        # No other failing check may stand in for the slot timeout.
+        failures = [line for line in output.splitlines() if "❌" in line]
+        assert len(failures) == 2, output
+        assert SLOT_TIMEOUT in failures[0], output
+        assert "PREFLIGHT FAILED" in failures[1], output
     finally:
         token.unlink(missing_ok=True)

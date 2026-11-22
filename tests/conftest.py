@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import json
 import os
+import pwd
+import subprocess
 import sys
 from pathlib import Path
 
@@ -348,3 +350,45 @@ def _isolate_hook_log(tmp_path_factory, monkeypatch):
     Every writer builds the path from ``~``, so each test gets a tmp HOME;
     subprocess hooks inherit it. Tests that set their own HOME still win."""
     monkeypatch.setenv("HOME", str(tmp_path_factory.mktemp("home")))
+
+
+# #525: a test that runs the real commit-preflight.sh with the developer's
+# HOME would reach the live ~/.claude/bin/heavy. Captured at import time,
+# before any test changes HOME.
+_REAL_HOMES = frozenset(
+    os.path.realpath(h)
+    for h in (pwd.getpwuid(os.getuid()).pw_dir, os.path.expanduser("~"))
+)
+
+
+def _names_preflight(args) -> bool:
+    items = [args] if isinstance(args, (str, bytes, os.PathLike)) else args
+    try:
+        for item in items:
+            if isinstance(item, bytes):
+                item = os.fsdecode(item)
+            if isinstance(item, (str, os.PathLike)) and (
+                os.path.basename(os.fspath(item)) == "commit-preflight.sh"
+            ):
+                return True
+    except TypeError:
+        return False
+    return False
+
+
+@pytest.fixture(autouse=True)
+def _no_real_home_preflight(monkeypatch):
+    real_init = subprocess.Popen.__init__
+
+    def guarded(self, args, *a, **kw):
+        if _names_preflight(args):
+            env = kw.get("env")
+            home = env.get("HOME") if env is not None else os.environ.get("HOME")
+            if home is not None and os.path.realpath(home) in _REAL_HOMES:
+                raise AssertionError(
+                    "test runs the real commit-preflight.sh with the real HOME "
+                    "(#525): give it a tmp HOME"
+                )
+        return real_init(self, args, *a, **kw)
+
+    monkeypatch.setattr(subprocess.Popen, "__init__", guarded)

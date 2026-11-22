@@ -1349,7 +1349,7 @@
           "files": [
             "scripts/commit-preflight.sh"
           ],
-          "purpose": "Vendored from harden-repo v1.3.0 (892d0f5) plus three repo parts: the plugin manifest version sync (always on, before every skip-mode exit), --allow-empty (an empty commit only: refuses when anything is staged or a tracked file is modified) and the pytest block with cov-fail-under 90. Writes a 5-minute token at /tmp/.preflight-token-<first 8 hex characters of the md5 of git-common-dir>, bound to HEAD, the staged tree and the checkout, so a linked worktree's own preflight authorises its own commit (#418). require-preflight keeps the token on approval, holds it for 5 s after a claim, and refuses a commit that could stage files in the same call. Other checks: secret scan, assertion-strength gate (warn), template drift (advisory). Flags: --docs-only, --skip-tests, --auto, --allow-empty."
+          "purpose": "Vendored from harden-repo v1.3.0 (892d0f5) plus three repo parts: the plugin manifest version sync (always on, before every skip-mode exit), --allow-empty (an empty commit only: refuses when anything is staged or a tracked file is modified) and the pytest block with cov-fail-under 90. Writes a 5-minute token at /tmp/.preflight-token-<first 8 hex characters of the md5 of git-common-dir>, bound to HEAD, the staged tree and the checkout, so a linked worktree's own preflight authorises its own commit (#418). require-preflight keeps the token on approval, holds it for 5 s after a claim, and refuses a commit that could stage files in the same call. Every pytest run (the main pass and the timed TestDecisionTimeIsBounded pass) goes through `_heavy`, the machine-wide heavy-run slot at ~/.claude/bin/heavy (claude-code-config#692, #525); a slot timeout (exit 75) fails the preflight with \"Tests not run\" and writes no token; without heavy the tests run directly with one warning line per run; `_heavy` and `_run_pytest` come from harden-repo develop 823346d. Other checks: secret scan, assertion-strength gate (warn), template drift (advisory). Flags: --docs-only, --skip-tests, --auto, --allow-empty."
         },
         {
           "id": "ops-ci",
@@ -3057,7 +3057,7 @@
     },
     {
       "name": "commit-preflight.sh",
-      "command": "preflight gate (harden-repo v1.3.0 + repo parts): manifest-sync + secret-scan + pytest cov>=90; mints the require-preflight token bound to HEAD, staged tree and checkout"
+      "command": "preflight gate (harden-repo v1.3.0 + repo parts): manifest-sync + secret-scan + pytest cov>=90 run through the heavy-run slot (_heavy); mints the require-preflight token bound to HEAD, staged tree and checkout"
     },
     {
       "name": "pre-commit.sh",
@@ -3120,7 +3120,7 @@
         ]
       }
     ],
-    "preflight": "./scripts/commit-preflight.sh — manifest-sync (always-on) + secret-scan + pytest cov>=90; required before every commit, staged and committed in separate calls",
+    "preflight": "./scripts/commit-preflight.sh — manifest-sync (always-on) + secret-scan + pytest cov>=90 (via the heavy-run slot); required before every commit, staged and committed in separate calls",
     "plugin": "abhattacherjee/git-flow",
     "currentVersion": "3.4.2"
   },
