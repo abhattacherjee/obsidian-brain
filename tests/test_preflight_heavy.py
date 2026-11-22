@@ -467,12 +467,16 @@ def test_run_pytest_runs_real_pytest_without_heavy(tmp_path, shell_env):
 # subprocess that inherits the environment cannot find the live heavy; the
 # three call sites that run the real preflight (test_security.py,
 # test_vendored_hooks.py) also pass their own tmp HOME.
-def test_every_test_runs_with_a_tmp_home():
+def test_every_test_runs_with_a_tmp_home(tmp_path_factory):
     home = Path(os.environ["HOME"])
     real = Path(os.path.realpath(pwd.getpwuid(os.getuid()).pw_dir))
     assert os.path.realpath(home) != str(real)
     assert Path(os.path.realpath(home)) not in (real, *real.parents)
     assert not (home / ".claude" / "bin" / "heavy").exists()
+    # A directory pytest made, not a fixed path that merely is not home.
+    assert home.is_dir()
+    base = Path(os.path.realpath(tmp_path_factory.getbasetemp()))
+    assert Path(os.path.realpath(home)).is_relative_to(base)
 
 
 def _git(*args, cwd, env):
