@@ -1,5 +1,6 @@
 """Contracts for the SKILL.md fence reader and worktree-isolation checks."""
 
+import random
 from pathlib import Path
 
 import pytest
@@ -7,6 +8,7 @@ import pytest
 from skill_shell import (
     Block,
     _blank_quotes_and_heredocs,
+    _scan,
     REFUSED_FORMS,
     fenced_blocks,
     heredoc_bodies,
@@ -303,6 +305,48 @@ def test_an_escaped_backtick_does_not_end_the_span():
 
 def test_backticks_in_single_quotes_are_text():
     assert isolation_problems("echo 'run `git log`'") == []
+
+
+def test_non_ascii_text_before_a_substitution():
+    assert isolation_problems("echo café") == []
+    assert "git inside a command substitution" in isolation_problems("echo café $(git x)")
+
+
+@pytest.mark.parametrize("block", [
+    "x=`echo ok # comment`\ngit status",
+    "y=`echo $(echo a # c) b`\ngit status",
+    'y=`echo "$(echo a # c) b"`\ngit status',
+])
+def test_backtick_closes_during_comment(block):
+    assert isolation_problems(block) == []
+
+
+def test_escaped_backtick_in_a_comment_does_not_close_the_substitution():
+    assert substitution_bodies(r"x=`echo ok # \` comment` git status") == [
+        r"echo ok # \` comment",
+    ]
+
+
+def test_later_backtick_substitution_still_reports_git():
+    assert "git inside a command substitution" in isolation_problems(
+        "z=`echo ok # c`; w=`git z`"
+    )
+    assert substitution_bodies("z=`echo ok # c`; w=`git z`") == ["echo ok # c", "git z"]
+
+
+def test_comment_in_parenthesis_substitution_ends_at_newline():
+    assert "git inside a command substitution" in isolation_problems(
+        "x=$(echo a # c\ngit y\n)"
+    )
+
+
+def test_scan_seeded_fuzz():
+    rng = random.Random(526)
+    alphabet = "$()`'\"#;&|<>{}[]\\\n\t =-_abcgitEOFéü中🙂"
+    for _ in range(5000):
+        block = "".join(rng.choices(alphabet, k=rng.randint(0, 60)))
+        assert len(_scan(block)[0]) == len(block), repr(block)
+        isolation_problems(block)
 
 
 # Fix 4 (X-022): a reserved word is a word only at command position.

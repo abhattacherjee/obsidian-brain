@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import json
 import os
 import re
@@ -9,6 +10,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -106,85 +108,127 @@ _SCRATCH_PATH_VARS = (
     "UNSUMMARIZED_PATH", "INSIGHTS_DIR", "SESSIONS_DIR",
 )
 
-# Stubs that only record their argv, so a block cannot create, change or delete
-# anything (grep is here too: `grep -r` must never scan the filesystem).
-_RECORDING_STUBS = (
-    "python3 git gh grep mkdir touch chmod ln tee dd install rm cp mv"
+# Stubs that only record their argv. A block must never run the real plugin,
+# git or gh, and `grep -r` must never scan the filesystem.
+_RECORDING_STUBS = "python3 git gh grep".split()
+# File writers. Under the OS sandbox they are the real tools; without one they
+# are recording stubs too (see `run_with_stubs`).
+_WRITERS = "mkdir touch chmod ln tee dd install rm cp mv".split()
+# Real tools in both modes.
+_REAL_UTILITIES = (
+    "cat ls printf dirname basename head tail tr wc date cut sleep "
+    "mktemp sed sort uniq awk env"
 ).split()
-# Real tools that can still write: each one first refuses a path argument that
-# resolves outside the workdir (see `escaping_argument`), then runs the real tool.
-_GUARDED_UTILITIES = "mktemp sed sort uniq awk env".split()
-# Real tools that only read or print.
-_READ_ONLY_UTILITIES = (
-    "cat ls printf dirname basename head tail tr wc date cut sleep"
-).split()
-
-_AWK_WRITES = re.compile(r"system\s*\(|\bprintf?\b[^;}\n]*[>|]|\bgetline\b")
 
 
-def escaping_argument(name: str, args: list[str], cwd: str, workdir: str) -> str | None:
-    """Return the first argument of a guarded tool that names a path outside
-    ``workdir``, or None. Paths resolve against ``cwd`` and through symlinks;
-    ``--opt=value``, ``-oVALUE`` and ``key=value`` are checked by their value."""
-    inside = workdir.rstrip(os.sep)
+class SandboxUnavailable(RuntimeError):
+    """No OS sandbox can keep a block's writes inside its workdir."""
 
-    def outside(token: str) -> bool:
-        path = os.path.realpath(os.path.join(cwd, token))
-        return not (path == inside or path.startswith(inside + os.sep))
 
-    for arg in args:
-        if name == "awk" and _AWK_WRITES.search(arg):
-            return arg
-        if arg.startswith("-"):
-            if "=" in arg:
-                value = arg.split("=", 1)[1]
-            elif len(arg) > 2:
-                value = arg[2:]
-            else:
-                continue
-        elif re.match(r"[A-Za-z_]+=", arg):
-            value = arg.split("=", 1)[1]
-        else:
-            value = arg
-        if value and outside(value):
-            return arg
+# Writes the sandbox allows outside the workdir: the null device, the run's own
+# output descriptors and the terminal. Nothing else.
+_SBPL_DEVICES = (
+    '(literal "/dev/null") (literal "/dev/zero") (literal "/dev/stdout") '
+    '(literal "/dev/stderr") (literal "/dev/dtracehelper") '
+    '(regex #"^/dev/fd/") (regex #"^/dev/tty")'
+)
+
+
+def _sbpl_string(text: str) -> str:
+    return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _prefix_for(tool: tuple[str, str], workdir: str) -> list[str]:
+    kind, path = tool
+    if kind == "sandbox-exec":
+        profile = (
+            "(version 1)(allow default)(deny network*)"
+            f"(deny file-write* (require-not (require-any (subpath {_sbpl_string(workdir)})"
+            f" {_SBPL_DEVICES})))"
+        )
+        return [path, "-p", profile]
+    # bwrap: the whole filesystem read-only, the workdir writable, a private
+    # /dev, no network. No --unshare-pid and no --new-session: the block keeps
+    # host pids and the launcher's session, which `_kill_session` and the
+    # timeout rely on.
+    #
+    # Known limit (GH #526 review): `--unshare-net` blocks IP networking and
+    # abstract Unix sockets, but pathname Unix sockets and named pipes (FIFOs)
+    # stay reachable through the read-only root bind: a read-only mount does
+    # not stop a connect() or an open() of a FIFO for writing.
+    # Hiding socket directories with tmpfs mounts broke checkouts under /tmp
+    # and let the write test pass with a writable root, so it was reverted.
+    # macOS is not affected: `(deny network*)` also blocks Unix sockets.
+    return [
+        path, "--unshare-net", "--ro-bind", "/", "/", "--dev", "/dev",
+        "--bind", workdir, workdir,
+    ]
+
+
+def _probe(tool: tuple[str, str]) -> bool:
+    """True when ``tool`` really denies a write outside a directory and allows
+    one inside it. A tool that is present but refused (nested `sandbox-exec`
+    exits 71 inside another sandbox; `bwrap` exits 1 without user namespaces)
+    fails here."""
+    base = None
+    try:
+        base = Path(tempfile.mkdtemp(prefix="ob-sandbox-probe-")).resolve()
+        inside, outside = base / "inside", base / "outside"
+        inside.mkdir()
+        outside.mkdir()
+        # The paths are arguments, never part of the shell source.
+        script = 'echo ok > "$1/ok"; echo bad > "$2/bad"; exit 0'
+        subprocess.run(
+            [*_prefix_for(tool, str(inside)), "/bin/sh", "-c", script, "sh",
+             str(inside), str(outside)],
+            stdin=subprocess.DEVNULL, capture_output=True, timeout=20,
+        )
+        return (inside / "ok").exists() and not (outside / "bad").exists()
+    except (OSError, subprocess.SubprocessError):
+        return False
+    finally:
+        if base is not None:
+            shutil.rmtree(base, ignore_errors=True)
+
+
+@functools.lru_cache(maxsize=None)
+def _sandbox_tool() -> tuple[str, str] | None:
+    """The OS sandbox this machine can use, probed once per process."""
+    if sys.platform == "darwin":
+        candidates = [("sandbox-exec", shutil.which("sandbox-exec"))]
+    elif sys.platform.startswith("linux"):
+        candidates = [("bwrap", shutil.which("bwrap"))]
+    else:
+        candidates = []
+    for kind, path in candidates:
+        if path and _probe((kind, path)):
+            return kind, path
     return None
 
 
-# A redirection operator: `>`, `>>`, `&>`, `&>>`, `>|` with an optional fd.
-_REDIRECT = re.compile(r"&>>?|[0-9]*>>?|[0-9]*>\|")
-_SAFE_REDIRECT_TARGETS = frozenset({"/dev/null", "/dev/stderr", "/dev/stdout"})
+def sandbox_prefix(workdir: Path) -> list[str] | None:
+    """The argv prefix that runs a command with writes allowed only inside
+    ``workdir`` (resolved), or None when this machine has no working sandbox."""
+    tool = _sandbox_tool()
+    return None if tool is None else _prefix_for(tool, str(Path(workdir).resolve()))
 
 
-def escaping_redirects(block: str) -> list[str]:
-    """Redirect targets in shell code that leave the workdir: an absolute path
-    other than /dev/null, /dev/stderr and /dev/stdout, or a path starting with
-    `..`. Quoted text, comments and heredoc bodies (so `python3 -c` strings) are
-    not code. `~` and `$HOME` are allowed: HOME is scratch in the run."""
-    flags, _subs, _ticks, _bodies = _scan(block)
-    found = []
-    for match in _REDIRECT.finditer(block):
-        if flags[match.start()] or block.startswith("(", match.end()):
-            continue
-        pos = match.end()
-        if block.startswith("&", pos) and not block.startswith("&>", match.start()):
-            if block[pos + 1:pos + 2].isdigit() or block[pos + 1:pos + 2] == "-":
-                continue  # `2>&1`, `>&2`, `>&-` copy a descriptor.
-            pos += 1
-        while block[pos:pos + 1] in (" ", "\t"):
-            pos += 1
-        target = re.match(r"""["']?([^\s;&|<>()"']*)""", block[pos:]).group(1)
-        if target not in _SAFE_REDIRECT_TARGETS and (
-            target.startswith("/") or target.startswith("..")
-        ):
-            found.append(target)
-    return found
+def _list_pids() -> list[int]:
+    """Every pid on the machine. Raises OSError when the listing fails."""
+    listing = subprocess.run(
+        ["ps", "-A", "-o", "pid="], capture_output=True, text=True, stdin=subprocess.DEVNULL
+    )
+    if listing.returncode != 0:
+        raise OSError(f"ps exited {listing.returncode}")
+    return [int(text) for text in listing.stdout.split()]
 
 
 def _kill_session(sid: int) -> None:
     """Kill every process of session ``sid`` (the block's bash is its leader), so a
     child in its own process group (`set -m`) cannot outlive the run. Returns when
-    none is left or after 3 s. A child that calls setsid() itself escapes: it is
+    none is left or after 3 s. Never raises: when the process listing fails, the
+    block's own group is still killed, but a `set -m` child (another group, same
+    session) can then survive. A child that calls setsid() itself escapes: it is
     in no group or session of ours."""
     try:
         os.killpg(sid, signal.SIGKILL)
@@ -192,12 +236,12 @@ def _kill_session(sid: int) -> None:
         pass
     deadline = time.monotonic() + 3
     while True:
-        listing = subprocess.run(
-            ["ps", "-A", "-o", "pid="], capture_output=True, text=True
-        ).stdout.split()
+        try:
+            pids = _list_pids()
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return
         left = []
-        for text in listing:
-            pid = int(text)
+        for pid in pids:
             try:
                 if pid > 1 and pid != os.getpid() and os.getsid(pid) == sid:
                     left.append(pid)
@@ -213,26 +257,50 @@ def _kill_session(sid: int) -> None:
         time.sleep(0.05)
 
 
-def run_with_stubs(block: str, workdir: Path, timeout: int = 60) -> StubRun:
+def run_with_stubs(
+    block: str, workdir: Path, timeout: int = 60, *, unsandboxed_ok: bool = False
+) -> StubRun:
     """Run a skill block with scratch paths and record the stubbed commands.
 
-    ``python3``, ``git``, ``gh``, ``grep`` and every file writer (``mkdir touch
-    chmod ln tee dd install rm cp mv``) are stubs that record their argv and do
-    nothing else. ``mktemp sed sort uniq awk env`` are real but refuse a path
-    outside ``workdir``. Every path variable the blocks read points into
-    ``workdir``, and a redirect to an absolute or `..` path raises before the
-    block runs. The block runs in its own session with job control off (no
-    ``-i``/``-m``); output goes to files, not pipes, so a child that outlives the
-    block cannot hold us. On a timeout, and after every run, the group and then
-    the whole session are killed.
+    The block runs under an OS sandbox (`sandbox-exec` on macOS, `bwrap` on
+    Linux) that denies every file write outside ``workdir``, whatever tool or
+    path makes it: a redirect, `sort -o`, `mktemp`, `/bin/cp`, a symlink or a
+    hardlink out of the workdir. The exception is the device files: on macOS,
+    writes to /dev/null, /dev/zero, /dev/stdout, /dev/stderr, /dev/dtracehelper,
+    /dev/fd/* and /dev/tty* are allowed; under `bwrap`, /dev is a private
+    tmpfs with a few device nodes, discarded after the run. The sandbox also
+    denies network access: all of it on macOS; under `bwrap`, IP networking
+    and abstract Unix sockets, while pathname Unix sockets and host named
+    pipes stay reachable (a known limit). ``python3``, ``git``, ``gh`` and ``grep`` are
+    stubs that record their argv and do nothing else; file writers and text
+    tools are the real ones. Every path variable the blocks read points into
+    ``workdir``.
 
-    Known limits: a block can still write by an absolute command path
-    (`/bin/rm`), by `exec`, or by `sed`'s `w` command; a child that calls
-    setsid() itself outlives the run; only the branch that ran is recorded.
+    With no working sandbox (inside another sandbox, or Linux without a usable
+    `bwrap`) it raises `SandboxUnavailable` before it creates anything, unless
+    ``unsandboxed_ok`` is set. That mode is for the pinned, hash-checked
+    call-site blocks only (`_CALL_SITES` in test_skill_shell_blocks.py): the
+    writers become recording stubs, but nothing contains their redirects or the
+    real `sed`, `sort`, `awk`, `mktemp` and `env` there.
+
+    The block runs in its own session with job control off (no ``-i``/``-m``);
+    output goes to files, not pipes, so a child that outlives the block cannot
+    hold us. On a timeout, and after every run, the group and then the whole
+    session are killed, and a failed cleanup never replaces the run's result.
+
+    Known limits: a child that calls setsid() itself outlives the run; only the
+    branch that ran is recorded.
     """
-    targets = escaping_redirects(block)
-    if targets:
-        raise ValueError(f"block redirects outside the workdir: {targets}")
+    prefix = sandbox_prefix(workdir)
+    if prefix is None and not unsandboxed_ok:
+        raise SandboxUnavailable(
+            "no OS sandbox (sandbox-exec or bwrap) can contain this block's writes"
+        )
+    return _run(block, workdir, timeout, prefix or [], real_writers=prefix is not None)
+
+
+def _run(block: str, workdir: Path, timeout: int, prefix: list[str], *, real_writers: bool) -> StubRun:
+    """`run_with_stubs` without the sandbox check. ``prefix`` wraps the bash call."""
     workdir = workdir.resolve()
     bin_dir = workdir / "bin"
     home = workdir / "home"
@@ -247,11 +315,6 @@ def run_with_stubs(block: str, workdir: Path, timeout: int = 60) -> StubRun:
     for hook in HOOKS_DIR.iterdir():
         (fake_hooks / hook.name).touch()
 
-    guarded = {
-        name: str(Path(path).absolute())
-        for name in _GUARDED_UTILITIES
-        if (path := shutil.which(name))
-    }
     stub_source = f"""#!{sys.executable}
 import json
 import os
@@ -262,17 +325,6 @@ sys.dont_write_bytecode = True
 name = Path(sys.argv[0]).name
 with open(os.environ["OB_STUB_LOG"], "a", encoding="utf-8") as log:
     log.write(json.dumps([name, *sys.argv[1:]]) + "\\n")
-
-GUARDED = {guarded!r}
-if name in GUARDED:
-    sys.path.insert(0, {str(Path(__file__).resolve().parent)!r})
-    from skill_shell import escaping_argument
-
-    bad = escaping_argument(name, sys.argv[1:], os.getcwd(), {str(workdir)!r})
-    if bad is not None:
-        sys.stderr.write(f"{{name}}: refused, outside the test workdir: {{bad}}\\n")
-        sys.exit(1)
-    os.execv(GUARDED[name], [name, *sys.argv[1:]])
 
 if name == "python3":
     sys.path.insert(0, {str(Path(__file__).resolve().parent)!r})
@@ -289,11 +341,14 @@ if name == "python3":
         except (OSError, ValueError):
             pass
 """
-    for name in (*_RECORDING_STUBS, *guarded):
+    stubs = list(_RECORDING_STUBS)
+    real = list(_REAL_UTILITIES)
+    (real if real_writers else stubs).extend(_WRITERS)
+    for name in stubs:
         stub = bin_dir / name
         stub.write_text(stub_source, encoding="utf-8")
         stub.chmod(0o755)
-    for name in _READ_ONLY_UTILITIES:
+    for name in real:
         if path := shutil.which(name):
             (bin_dir / name).symlink_to(Path(path).absolute())
 
@@ -315,7 +370,7 @@ if name == "python3":
     out_path, err_path = workdir / "stdout.txt", workdir / "stderr.txt"
     with open(out_path, "wb") as out, open(err_path, "wb") as err:
         proc = subprocess.Popen(
-            [shutil.which("bash"), "-c", block.replace("'<REPO_ROOT>'", quoted_cwd)],
+            [*prefix, shutil.which("bash"), "-c", block.replace("'<REPO_ROOT>'", quoted_cwd)],
             cwd=cwd,
             env=env,
             stdin=subprocess.DEVNULL,
@@ -524,6 +579,18 @@ def _scan(block: str):
         elif ch == "#" and (i == 0 or block[i - 1] in " \t\n;&|("):
             end = block.find("\n", i)
             end = n if end < 0 else end
+            if any(active["k"] == "bt" for active in stack):
+                pos = i + 1
+                while pos < end and block[pos] != "`":
+                    pos += 2 if block[pos] == "\\" else 1
+                if pos < end:
+                    end = pos
+                    # The backtick bounds any nested substitution spans, too.
+                    # Leave its frame on top for the backtick branch to close.
+                    while stack[-1]["k"] != "bt":
+                        nested = stack.pop()
+                        if nested["k"] == "cmd":
+                            subs[nested["idx"]][1] = end
             flags[i:end] = [1] * (end - i)
             i = end
         elif ch == ";" and cases and cases[-1] == "body" and block.startswith((";;", ";&"), i):
@@ -558,7 +625,7 @@ def _scan(block: str):
                     _heredoc_body_subs(block, body_start, body_end, subs, ticks)
             pending = []
             i = pos
-        elif ch.isalpha() or ch == "_":
+        elif ch.isascii() and (ch.isalpha() or ch == "_"):
             start = i
             i = _WORD.match(block, i).end()
             word = block[start:i]

@@ -20,6 +20,7 @@ from skill_shell import fenced_blocks, heredoc_brace_problems, isolation_problem
 SKILLS = Path(__file__).resolve().parents[1] / "skills"
 SKILL_FILES = sorted(SKILLS.glob("*/SKILL.md"))
 REPO_ROOT_STEP = "### Repo root — run first"
+_ROOT_COMMAND = "```bash\ngit rev-parse --show-toplevel\n```"
 OLD_CD = 'cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"'
 
 # Refused in a worktree-isolated session; tracked in #524. Remove an id when its block is fixed.
@@ -163,22 +164,28 @@ PYEOF
 _STEP_HEADING = re.compile(r"^#{2,3}\s+(?:Step\b|Phase\b|\d)")
 
 
+_ATX_HEADING = re.compile(r" {0,3}#{1,6}(?:\s|$)")
+
+
 def _heading_lines(text: str) -> list[tuple[int, str]]:
-    """(line number, heading) for each Markdown heading outside a fence."""
+    """(line number, heading) for each ATX heading outside a fence. CommonMark
+    allows 0-3 leading spaces; they are removed from the returned line. Known
+    limit: a Setext heading (text over `===` or `---`) is not read."""
     fenced = {
         line
         for fence in fenced_blocks(text, langs=None)
         for line in range(fence.line, fence.line + len(fence.body.splitlines()) + 2)
     }
     return [
-        (number, line) for number, line in enumerate(text.splitlines(), 1)
-        if line.startswith("#") and number not in fenced
+        (number, line.lstrip(" ")) for number, line in enumerate(text.splitlines(), 1)
+        if _ATX_HEADING.match(line) and number not in fenced
     ]
 
 
 def root_step_problems(text: str, skill: str) -> list[str]:
     """Why the "Repo root - run first" step is missing, malformed or too late."""
-    users = [b for b in fenced_blocks(text) if "'<REPO_ROOT>'" in b.body]
+    blocks = fenced_blocks(text)
+    users = [b for b in blocks if "'<REPO_ROOT>'" in b.body]
     if not users:
         return []
     headings = _heading_lines(text)
@@ -187,16 +194,24 @@ def root_step_problems(text: str, skill: str) -> list[str]:
         anchor = text.index("```bash\ngit rev-parse --show-toplevel\n```")
         first_line = text[:anchor].count("\n") + 1
         return [] if all(b.line > first_line for b in users) else ["a block runs before the step"]
-    if text.count(REPO_ROOT_STEP) != 1:
+    root_line = next((n for n, line in headings if REPO_ROOT_STEP in line), None)
+    if root_line is None or text.count(REPO_ROOT_STEP) != 1:
         return ["the root step heading is not there exactly once"]
+
+    lines = text.splitlines()
+    end_line = next((n for n, _ in headings if n > root_line), len(lines) + 1)
+    step = "\n".join(lines[root_line:end_line - 1])
+    command = _ROOT_COMMAND.splitlines()
+    command_line = next((
+        b.line for b in blocks
+        if root_line < b.line and b.line + len(command) <= end_line
+        and lines[b.line - 1:b.line - 1 + len(command)] == command
+    ), None)
+
     problems = []
-    anchor = text.index(REPO_ROOT_STEP)
-    end = text.find("\n### ", anchor + 1)
-    step = text[anchor:end if end >= 0 else len(text)]
-    if "```bash\ngit rev-parse --show-toplevel\n```" not in step or "run `pwd` instead" not in step:
+    if command_line is None or "run `pwd` instead" not in step:
         problems.append("the root step lacks its command or its pwd fallback")
-    root_line = text[:anchor].count("\n") + 1
-    if any(b.line <= root_line for b in users):
+    if any(b.line <= (command_line or root_line) for b in users):
         problems.append("a block runs before the step")
     first_step = next((n for n, line in headings if _STEP_HEADING.match(line)), None)
     if first_step is not None and first_step < root_line:
@@ -210,7 +225,37 @@ def test_the_repo_root_step_comes_before_any_block_that_needs_it(path):
     assert root_step_problems(text, path.parent.name) == [], path.parent.name
 
 
-_ROOT_STEP = REPO_ROOT_STEP + "\n\n```bash\ngit rev-parse --show-toplevel\n```\nIf it fails, run `pwd` instead.\n\n"
+_ROOT_STEP_BODY = f"{_ROOT_COMMAND}\nIf it fails, run `pwd` instead.\n\n"
+_ROOT_STEP = f"{REPO_ROOT_STEP}\n\n{_ROOT_STEP_BODY}"
+_ROOT_USER_BLOCK = "```bash\ncd '<REPO_ROOT>'\n```\n"
+
+
+def test_a_root_command_after_its_first_use_is_flagged():
+    text = (
+        f"# Skill\n\n{REPO_ROOT_STEP}\n\n{_ROOT_USER_BLOCK}\n"
+        f"## Step 1\n\n{_ROOT_STEP_BODY}"
+    )
+    problems = root_step_problems(text, "fixture")
+    assert "the root step lacks its command or its pwd fallback" in problems
+
+
+def test_a_root_command_before_its_first_use_passes():
+    assert root_step_problems(_ROOT_STEP + _ROOT_USER_BLOCK, "fixture") == []
+
+
+def test_a_root_use_between_the_heading_and_command_is_flagged():
+    text = f"{REPO_ROOT_STEP}\n\n{_ROOT_USER_BLOCK}\n{_ROOT_STEP_BODY}"
+    assert root_step_problems(text, "fixture") == ["a block runs before the step"]
+
+
+def test_an_indented_heading_ends_the_root_step():
+    """CommonMark allows 0-3 spaces before `#`, so `  ## Step 1` is a heading."""
+    text = f"{REPO_ROOT_STEP}\n\n  ## Step 1\n\n{_ROOT_STEP_BODY}{_ROOT_USER_BLOCK}"
+    problems = root_step_problems(text, "fixture")
+    assert "the root step lacks its command or its pwd fallback" in problems
+    # Four spaces is a code block, not a heading, so the step still holds.
+    code = f"{REPO_ROOT_STEP}\n\n    ## Step 1\n\n{_ROOT_STEP_BODY}{_ROOT_USER_BLOCK}"
+    assert root_step_problems(code, "fixture") == []
 
 
 @pytest.mark.parametrize("heading", [
