@@ -346,5 +346,7 @@ def _isolate_hook_log(tmp_path_factory, monkeypatch):
     Reaped, bootstrap) go to a tmp dir, never to the real
     ~/.claude/obsidian-brain-hook.log (fake lines leaked there before).
     Every writer builds the path from ``~``, so each test gets a tmp HOME;
-    subprocess hooks inherit it. Tests that set their own HOME still win."""
+    subprocess hooks inherit it. Tests that set their own HOME still win.
+    It also keeps every test's subprocesses, including the real
+    commit-preflight.sh, away from the live ~/.claude/bin/heavy (#525)."""
     monkeypatch.setenv("HOME", str(tmp_path_factory.mktemp("home")))

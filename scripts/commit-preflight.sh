@@ -15,6 +15,7 @@
 #
 # Installed by /harden-repo
 # Vendored from harden-repo v1.3.0 (892d0f5); repo parts: version sync, --allow-empty, test block.
+# _heavy and _run_pytest: harden-repo develop 823346d (#225), byte for byte.
 # Lint/test commands customized for this project during installation.
 
 set -e
@@ -157,6 +158,14 @@ _preflight_rearm() {
     trap 'exit 130' INT
     trap 'exit 143' TERM
 }
+# Test runs take the machine-wide heavy-run slot, so two sessions' suites do
+# not run at once (claude-code-config#692, harden-repo #225). Without heavy
+# (CI, other machines) they run directly, with one warning line per run.
+HEAVY_BIN="$HOME/.claude/bin/heavy"
+_heavy() {
+    if [ -x "$HEAVY_BIN" ]; then "$HEAVY_BIN" -- "$@"
+    else echo "⚠️  heavy not installed ($HEAVY_BIN): running without the shared run slot (#692)" >&2; "$@"; fi
+}
 # Run pytest with any arguments given. With pytest-xdist installed the suite
 # runs on half the cores (`-n <cores/2>`, at least 1); without it, serially,
 # as before. Most suites start a process or a git repo per test, which splits
@@ -169,6 +178,8 @@ _preflight_rearm() {
 # `-p no:xdist` in pytest.ini). Then pytest rejects `-n` with exit 4, a
 # usage error. Only that status triggers a second, serial run; any other
 # status is returned as is.
+# Each pytest run goes through `_heavy`. A 75 (heavy gave up waiting for the
+# slot) is returned as is, so the caller fails closed.
 _run_pytest() {
     if python3 -c 'import xdist' 2>/dev/null; then
         local _workers="${PREFLIGHT_WORKERS:-}"
@@ -179,17 +190,17 @@ _run_pytest() {
         esac
         echo "   pytest-xdist found: running tests on $_workers workers"
         local _rc=0
-        python3 -m pytest -n "$_workers" "$@" || _rc=$?
+        _heavy python3 -m pytest -n "$_workers" "$@" || _rc=$?
         if [ "$_rc" -eq 4 ]; then
             echo "   pytest rejected -n $_workers (xdist not loaded): running tests serially"
-            python3 -m pytest "$@"
+            _heavy python3 -m pytest "$@"
             return $?
         fi
         return "$_rc"
     else
         echo "   pytest-xdist not installed: running tests serially"
         echo "   (pip install pytest-xdist to run them in parallel)"
-        python3 -m pytest "$@"
+        _heavy python3 -m pytest "$@"
     fi
 }
 rm -f "$TOKEN_FILE"
@@ -603,11 +614,23 @@ if [ -d "tests" ]; then
         # afterwards: next to busy workers a 2,000 ms hang backstop measured
         # 2,042 ms. The second pass appends to the first pass's coverage data
         # and applies the 90% gate to both together.
+        # Each run takes the heavy slot (#525), so the timed run is a second
+        # take. It can give up after heavy's wait (300 s); that exits 75 and
+        # fails closed with the "Tests not run" line.
         _TIMED=tests/test_security.py::TestDecisionTimeIsBounded
-        if _run_pytest tests/ -v --tb=short --cov=hooks --cov-report= --deselect "$_TIMED" \
-            && python3 -m pytest "$_TIMED" -v --tb=short --cov=hooks --cov-append \
-                --cov-report=term-missing --cov-fail-under=90; then
+        _run_timed_tests() {
+            _heavy python3 -m pytest "$_TIMED" -v --tb=short --cov=hooks --cov-append --cov-report=term-missing --cov-fail-under=90
+        }
+        rc=0
+        _run_pytest tests/ -v --tb=short --cov=hooks --cov-report= --deselect "$_TIMED" || rc=$?
+        if [ "$rc" -eq 0 ]; then
+            _run_timed_tests || rc=$?
+        fi
+        if [ "$rc" -eq 0 ]; then
             CHECKS_RUN="${CHECKS_RUN}tests,"
+        elif [ "$rc" -eq 75 ]; then
+            echo "❌ Tests not run: gave up waiting for the heavy-run slot (claude-code-config#692)"
+            CHECKS_PASSED=false
         else
             echo "❌ Tests failed or coverage below 90%"
             CHECKS_PASSED=false

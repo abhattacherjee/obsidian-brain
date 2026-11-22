@@ -5509,7 +5509,8 @@ class TestPreflightTokenSurvivesADeniedCall:
         self._git(work, env, "add", "f.txt")
         proc = subprocess.run(
             ["bash", "scripts/commit-preflight.sh", "--skip-tests", "probe"],
-            cwd=work, env=env, capture_output=True, text=True, timeout=60)
+            cwd=work, env=self._isolated_home(work, env), capture_output=True,
+            text=True, timeout=60)
         assert proc.returncode == 0, proc.stdout[-400:] + proc.stderr[-400:]
         data = json.loads(token.read_text())
         assert data["head"] == self._git(work, env, "rev-parse", "HEAD")
@@ -5522,13 +5523,22 @@ class TestPreflightTokenSurvivesADeniedCall:
 
     EMPTY = "git " + C + " --allow-empty -m marker"
 
+    @staticmethod
+    def _isolated_home(work, env):
+        """The preflight's env with HOME under the test's tmp dir, so its
+        `_heavy` never finds the live ~/.claude/bin/heavy (#525)."""
+        home = work.parent / "home"
+        home.mkdir(exist_ok=True)
+        return {**env, "HOME": str(home)}
+
     def _preflight(self, work, env, *args):
         if not (work / "scripts").exists():
             (work / "scripts").mkdir()
             shutil.copy("scripts/commit-preflight.sh", work / "scripts")
         return subprocess.run(
             ["bash", "scripts/commit-preflight.sh", *args],
-            cwd=work, env=env, capture_output=True, text=True, timeout=60)
+            cwd=work, env=self._isolated_home(work, env), capture_output=True,
+            text=True, timeout=60)
 
     def test_allow_empty_mints_a_token_for_an_empty_commit(self, repo):
         work, env, token = repo
