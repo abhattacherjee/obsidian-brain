@@ -152,8 +152,10 @@ def _prefix_for(tool: tuple[str, str], workdir: str) -> list[str]:
     # host pids and the launcher's session, which `_kill_session` and the
     # timeout rely on.
     #
-    # Known limit (GH #526 review): `--unshare-net` blocks IP networking, but
-    # pathname Unix sockets stay reachable through the read-only root bind.
+    # Known limit (GH #526 review): `--unshare-net` blocks IP networking and
+    # abstract Unix sockets, but pathname Unix sockets and named pipes (FIFOs)
+    # stay reachable through the read-only root bind: a read-only mount does
+    # not stop a connect() or an open() of a FIFO for writing.
     # Hiding socket directories with tmpfs mounts broke checkouts under /tmp
     # and let the write test pass with a writable root, so it was reverted.
     # macOS is not affected: `(deny network*)` also blocks Unix sockets.
@@ -267,8 +269,9 @@ def run_with_stubs(
     writes to /dev/null, /dev/zero, /dev/stdout, /dev/stderr, /dev/dtracehelper,
     /dev/fd/* and /dev/tty* are allowed; under `bwrap`, /dev is a private
     tmpfs with a few device nodes, discarded after the run. The sandbox also
-    denies network access: all of it on macOS, IP networking under `bwrap`,
-    where pathname Unix sockets stay reachable (a known limit). ``python3``, ``git``, ``gh`` and ``grep`` are
+    denies network access: all of it on macOS; under `bwrap`, IP networking
+    and abstract Unix sockets, while pathname Unix sockets and host named
+    pipes stay reachable (a known limit). ``python3``, ``git``, ``gh`` and ``grep`` are
     stubs that record their argv and do nothing else; file writers and text
     tools are the real ones. Every path variable the blocks read points into
     ``workdir``.
