@@ -463,64 +463,16 @@ def test_run_pytest_runs_real_pytest_without_heavy(tmp_path, shell_env):
 # --- no test reaches the live heavy -----------------------------------------
 
 
-# tests/conftest.py wraps subprocess.Popen: running the real
-# commit-preflight.sh with the developer's HOME raises (#525). These tests
-# prove that guard works. The argv never starts a process.
-def _real_home():
-    return pwd.getpwuid(os.getuid()).pw_dir
-
-
-def test_guard_rejects_preflight_with_real_home_in_env():
-    with pytest.raises(AssertionError, match=r"\(#525\)"):
-        subprocess.run(["true", "x/commit-preflight.sh"],
-                       env={**os.environ, "HOME": _real_home()})
-
-
-def test_guard_rejects_preflight_with_real_home_from_environ(monkeypatch):
-    monkeypatch.setenv("HOME", _real_home())
-    with pytest.raises(AssertionError, match=r"\(#525\)"):
-        subprocess.run(["true", "x/commit-preflight.sh"])
-
-
-def test_guard_allows_preflight_with_tmp_home(tmp_path):
-    proc = subprocess.run(["true", "scripts/commit-preflight.sh"],
-                          env={**os.environ, "HOME": str(tmp_path)})
-    assert proc.returncode == 0
-
-
-def test_guard_ignores_other_commands_with_real_home():
-    proc = subprocess.run(["true", "scripts/other.sh"],
-                          env={**os.environ, "HOME": _real_home()})
-    assert proc.returncode == 0
-
-
-def test_guard_keeps_iterator_argv_working():
-    assert subprocess.run(iter(["true"])).returncode == 0
-
-
-def test_guard_rejects_bash_c_string_naming_preflight():
-    with pytest.raises(AssertionError, match=r"\(#525\)"):
-        subprocess.run(["bash", "-c", "bash scripts/commit-preflight.sh --auto"],
-                       env={**os.environ, "HOME": _real_home()})
-
-
-def test_guard_rejects_shell_true_string_naming_preflight():
-    with pytest.raises(AssertionError, match=r"\(#525\)"):
-        subprocess.run("bash scripts/commit-preflight.sh", shell=True,
-                       env={**os.environ, "HOME": _real_home()})
-
-
-def test_guard_reads_home_from_bytes_env_keys():
-    env = {k.encode(): v.encode() for k, v in os.environ.items() if k != "HOME"}
-    env[b"HOME"] = os.fsencode(_real_home())
-    with pytest.raises(AssertionError, match=r"\(#525\)"):
-        subprocess.run(["true", "x/commit-preflight.sh"], env=env)
-
-
-def test_guard_rejects_script_path_as_argv0():
-    with pytest.raises(AssertionError, match=r"\(#525\)"):
-        subprocess.run([str(PREFLIGHT), "--help"],
-                       env={**os.environ, "HOME": _real_home()})
+# conftest's autouse `_isolate_hook_log` gives each test a tmp HOME, so a
+# subprocess that inherits the environment cannot find the live heavy; the
+# three call sites that run the real preflight (test_security.py,
+# test_vendored_hooks.py) also pass their own tmp HOME.
+def test_every_test_runs_with_a_tmp_home():
+    home = Path(os.environ["HOME"])
+    real = Path(os.path.realpath(pwd.getpwuid(os.getuid()).pw_dir))
+    assert os.path.realpath(home) != str(real)
+    assert Path(os.path.realpath(home)) not in (real, *real.parents)
+    assert not (home / ".claude" / "bin" / "heavy").exists()
 
 
 def _git(*args, cwd, env):
