@@ -362,13 +362,14 @@ _REAL_HOMES = frozenset(
 
 
 def _names_preflight(args) -> bool:
+    # Substring match: fail closed on "bash -c 'bash scripts/commit-preflight.sh'".
     items = [args] if isinstance(args, (str, bytes, os.PathLike)) else args
     try:
         for item in items:
             if isinstance(item, bytes):
                 item = os.fsdecode(item)
             if isinstance(item, (str, os.PathLike)) and (
-                os.path.basename(os.fspath(item)) == "commit-preflight.sh"
+                "commit-preflight.sh" in os.fspath(item)
             ):
                 return True
     except TypeError:
@@ -376,14 +377,23 @@ def _names_preflight(args) -> bool:
     return False
 
 
+def _env_home(env):
+    home = env.get("HOME")
+    if home is None:
+        home = env.get(b"HOME")
+    return os.fsdecode(home) if home is not None else None
+
+
 @pytest.fixture(autouse=True)
 def _no_real_home_preflight(monkeypatch):
     real_init = subprocess.Popen.__init__
 
     def guarded(self, args, *a, **kw):
+        if not isinstance(args, (str, bytes, os.PathLike, list, tuple)):
+            args = list(args)  # a one-shot iterator: read it once
         if _names_preflight(args):
             env = kw.get("env")
-            home = env.get("HOME") if env is not None else os.environ.get("HOME")
+            home = _env_home(env) if env is not None else os.environ.get("HOME")
             if home is not None and os.path.realpath(home) in _REAL_HOMES:
                 raise AssertionError(
                     "test runs the real commit-preflight.sh with the real HOME "

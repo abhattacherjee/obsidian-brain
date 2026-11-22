@@ -494,6 +494,35 @@ def test_guard_ignores_other_commands_with_real_home():
     assert proc.returncode == 0
 
 
+def test_guard_keeps_iterator_argv_working():
+    assert subprocess.run(iter(["true"])).returncode == 0
+
+
+def test_guard_rejects_bash_c_string_naming_preflight():
+    with pytest.raises(AssertionError, match=r"\(#525\)"):
+        subprocess.run(["bash", "-c", "bash scripts/commit-preflight.sh --auto"],
+                       env={**os.environ, "HOME": _real_home()})
+
+
+def test_guard_rejects_shell_true_string_naming_preflight():
+    with pytest.raises(AssertionError, match=r"\(#525\)"):
+        subprocess.run("bash scripts/commit-preflight.sh", shell=True,
+                       env={**os.environ, "HOME": _real_home()})
+
+
+def test_guard_reads_home_from_bytes_env_keys():
+    env = {k.encode(): v.encode() for k, v in os.environ.items() if k != "HOME"}
+    env[b"HOME"] = os.fsencode(_real_home())
+    with pytest.raises(AssertionError, match=r"\(#525\)"):
+        subprocess.run(["true", "x/commit-preflight.sh"], env=env)
+
+
+def test_guard_rejects_script_path_as_argv0():
+    with pytest.raises(AssertionError, match=r"\(#525\)"):
+        subprocess.run([str(PREFLIGHT), "--help"],
+                       env={**os.environ, "HOME": _real_home()})
+
+
 def _git(*args, cwd, env):
     subprocess.run(["git", "-C", str(cwd), "-c", "user.email=t@example.invalid",
                     "-c", "user.name=t", *args],
