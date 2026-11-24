@@ -10,7 +10,7 @@ from collections import Counter
 from datetime import datetime
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import stat
 import subprocess
@@ -19,10 +19,11 @@ import sys
 if __name__ == "__main__":
     sys.dont_write_bytecode = True
 
+import vault_index
 from memory_links import line_pointers, line_asides, _link_targets, _md_child_link_targets
 from note_writer import _acquire_lock, _atomic_rewrite, _release_lock
 from memory_sources import _projects_root
-from obsidian_utils import (_cc_encoded_dirnames, canonical_project_name, load_config, scrub_secrets,
+from obsidian_utils import (_cc_encoded_dirnames, canonical_project_name, indexed_folders, load_config, scrub_secrets,
                             slugify, write_vault_note)
 
 
@@ -127,6 +128,16 @@ def read_entry(path: Path) -> dict:
                 body=body, text=text, mtime=mtime)
 
 
+def _index_references(lines: list[str], names: set[str]) -> tuple[Counter, set[str]]:
+    pointers = Counter()
+    referenced = set()
+    for line in lines:
+        ptr = line_pointers(line, names)
+        pointers.update(ptr)
+        referenced.update(ptr | line_asides(line, names))
+    return pointers, referenced
+
+
 def audit(store: Path) -> dict:
     text, _ = _read_file(store / "MEMORY.md")
     try:
@@ -134,12 +145,7 @@ def audit(store: Path) -> dict:
     except OSError as exc:
         raise StoreError(str(exc)) from exc
     lines = text.splitlines()
-    pointers = Counter()
-    referenced = set()
-    for line in lines:
-        ptr = line_pointers(line, names)
-        pointers.update(ptr)
-        referenced.update(ptr | line_asides(line, names))
+    pointers, referenced = _index_references(lines, names)
     size = len(text.encode("utf-8"))
     over = []
     if size >= 17000:
@@ -458,6 +464,10 @@ def _check_readback(path: Path, entry: dict, action: str, prefix: str | None = N
         text, _ = _read_file(path)
     except StoreError as exc:
         raise _ItemError(f"read-back failed: {exc}") from exc
+    _check_note_text(path, text, entry, action, prefix)
+
+
+def _check_note_text(path: Path, text: str, entry: dict, action: str, prefix: str | None = None) -> None:
     details = _details(text, entry["slug"], action)
     if details is None:
         raise _ItemError(f"read-back failed: markers missing in {path}")
@@ -611,9 +621,13 @@ class _Run:
         appended = sum(1 for w in self.data["written"] if w["action"] == "append" and w["slug"] in moved)
         retired = sum(1 for s in self.data["retired"] if s in moved)
         date = self.data["created_at"][:10]
+        backup = self.dir.absolute()
+        home = Path.home()
+        if backup.is_relative_to(home):
+            backup = Path("~") / backup.relative_to(home)
         return (f"- Moved to vault ({date}): {len(moved)} entries ({new} new notes tagged {MOVED_TAG}, "
                 f"{appended} appended to existing notes, {retired} retired); find them with /vault-ask; "
-                f"originals in {self.dir}")
+                f"originals in {backup}")
 
     def edit_index(self) -> None:
         """Step 5: re-read the live MEMORY.md, drop moved pointers, write atomically."""
@@ -965,6 +979,86 @@ def _main_apply(args) -> int:
         return 2
 
 
+def verify(backup_dir: Path, store: Path | None = None) -> tuple[bool, list[dict]]:
+    return _verify_run(backup_dir, _read_run(backup_dir), store)
+
+
+def _verify_run(backup_dir: Path, run: dict, store: Path | None) -> tuple[bool, list[dict]]:
+    live = Path(run["store"])
+    if store is not None and store.resolve() != live.resolve():
+        raise ApplyError(f"run.json is for {live}")
+    if run["state"] != "done":
+        return False, [dict(check="state", ok=False, detail=run["state"])]
+
+    checks = []
+
+    def record(name, issues):
+        checks.append(dict(check=name, ok=not issues, detail=", ".join(sorted(issues)) or "ok"))
+
+    full = backup_dir / "full-copy"
+    moved_dir = backup_dir / "moved"
+    moved = set(run["moved"])
+    baseline = run["baseline"]
+    text, _ = _read_file(live / "MEMORY.md")
+    names = {p.name for p in live.glob("*.md") if p.name != "MEMORY.md" and p.is_file()}
+    moved_names = {f"{slug}.md" for slug in moved}
+    pointers, referenced = _index_references(text.splitlines(), names | moved_names)
+    dangling = _md_child_link_targets(text) - names - {"MEMORY.md"}
+    record("index-links-resolve", dangling.difference(baseline["dangling"]))
+    duplicates = {Path(name).stem for name, count in pointers.items() if count > 1}
+    record("no-duplicates", duplicates.difference(baseline["duplicates"]))
+    orphans = {Path(name).stem for name in names - referenced}
+    record("all-indexed", orphans.difference(baseline["orphans"]))
+
+    snapshot = full / "MEMORY.md"
+    before = None
+    if snapshot.is_file():
+        before, _ = _read_file(snapshot)
+        old_names = {p.name for p in full.glob("*.md") if p.name != "MEMORY.md" and p.is_file()}
+        _, old = _index_references(before.splitlines(), old_names)
+        removed = {Path(name).stem for name in old - referenced}
+        expected = moved & {Path(name).stem for name in old}
+        detail = f"unexpected: {sorted(removed - expected)}; missing: {sorted(expected - removed)}"
+        checks.append(dict(check="removed-equals-moved", ok=removed == expected, detail=detail))
+    else:
+        record("removed-equals-moved", ["missing full-copy/MEMORY.md"])
+
+    vault = Path(run["vault"])
+    issues = []
+    for row in run["written"]:
+        slug, action = row["slug"], row["action"]
+        try:
+            note = _contained(vault / row["note"], vault)
+            note_text, _ = _read_file(note)
+            original = read_entry(_contained(moved_dir / f"{slug}.md", backup_dir))
+            _check_note_text(note, note_text, original, action)
+            if action == "new":
+                front = _frontmatter(note_text)
+                markers = re.findall(r"^migrated_from_memory:([^\n]*)$", front, re.M)
+                if slug not in map(_unquote, markers):
+                    issues.append(f"{slug}: missing migrated_from_memory in frontmatter")
+        except (_ItemError, StoreError, ValueError) as exc:
+            issues.append(f"{slug}: {exc}")
+    record("notes-lossless", issues)
+
+    missing = [f"missing moved/{name}" for name in moved_names if not (moved_dir / name).is_file()]
+    remaining = [f"still in store: {name}" for name in moved_names if os.path.lexists(live / name)]
+    if before is None:
+        missing.append("missing full-copy/MEMORY.md")
+    record("backups-present", missing + remaining)
+
+    units = "{bytes} bytes, {chars} chars, {lines} lines"
+    before_size = units.format(**_sizes(before)) if before is not None else "unavailable"
+    detail = f"before: {before_size}; after: {units.format(**_sizes(text))}"
+    checks.append(dict(check="sizes", ok=True, detail=detail))
+    return all(check["ok"] for check in checks), checks
+
+
+def smoke(vault_root: Path, config: dict, db_path: str, query: str) -> list[dict]:
+    vault_index.ensure_index(str(vault_root), indexed_folders(config), db_path)
+    return vault_index.search_vault(db_path, query, log_access=False)
+
+
 class _ArgumentParser(argparse.ArgumentParser):
     def error(self, message):
         self.print_usage(sys.stderr)
@@ -987,12 +1081,52 @@ def main(argv=None) -> int:
     apply_parser.add_argument("--insights-folder")
     apply_parser.add_argument("--project")
     apply_parser.add_argument("--backup-root")
+    verify_parser = commands.add_parser("verify", help="check a finished consolidation run")
+    verify_parser.add_argument("--backup", required=True, type=Path)
+    verify_parser.add_argument("--store", type=Path)
+    smoke_parser = commands.add_parser("smoke", help="reindex the vault and search for a moved note")
+    smoke_parser.add_argument("--query", required=True)
+    smoke_parser.add_argument("--expect", metavar="NOTE", action="append", type=PurePosixPath, default=[],
+                              help="require this vault-relative note among the hits (repeatable)")
+    smoke_parser.add_argument("--vault")
+    smoke_parser.add_argument("--db")
     try:
         args = parser.parse_args(argv)
     except SystemExit as exc:
         return int(exc.code)
     if args.command == "apply":
         return _main_apply(args)
+    if args.command == "verify":
+        try:
+            run = _read_run(args.backup)
+            print(f"store: {run['store']}")
+            ok, checks = _verify_run(args.backup, run, args.store)
+            for check in checks:
+                print(f"{'PASS' if check['ok'] else 'FAIL'} {check['check']}: {check['detail']}")
+            print("verify: ok" if ok else "verify: FAILED")
+            return int(not ok)
+        except (ApplyError, StoreError, OSError, KeyError, TypeError, ValueError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+    if args.command == "smoke":
+        try:
+            config = load_config(fresh=True)
+            vault = config.get("vault_path") if args.vault is None else args.vault
+            if not vault or not Path(vault).is_dir():
+                raise ApplyError(f"vault is not a directory: {vault!r}")
+            db = str(Path(args.db).resolve()) if args.db is not None else vault_index._default_db_path()
+            hits = smoke(Path(vault), config, db, args.query)
+            paths = [PurePosixPath(os.path.relpath(hit["path"], vault)) for hit in hits]
+            print(f"smoke: {len(hits)} hit(s) for {args.query}")
+            for path in paths[:15]:
+                print(f"HIT {path}")
+            missing = [path for path in args.expect if path not in paths]
+            for path in missing:
+                print(f"MISSING {path}")
+            return int(not hits or bool(missing))
+        except Exception as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
     try:
         store = resolve_store(args.store, os.getcwd())
         print(f"store: {store}")

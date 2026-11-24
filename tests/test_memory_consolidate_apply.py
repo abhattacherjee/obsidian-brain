@@ -229,9 +229,19 @@ def test_index_rewrite_changes_only_the_moved_line(env):
     [added] = [l for l in after if l not in before]
     assert added.startswith("- Moved to vault (2026-11-24): 1 entries (1 new notes tagged "
                             "claude/topic/moved-from-memory, 0 appended")
-    assert added.endswith(f"originals in {backup_dir(env)}")
+    assert added.endswith(f"originals in ~/{backup_dir(env).relative_to(env['tmp'])}")
+    assert str(env["tmp"]) not in added
     # The pointer line goes after the last kept index line.
     assert after.index(added) == after.index("- [Old project](project_c.md) — stale") + 1
+
+
+def test_pointer_keeps_absolute_backup_path_outside_home(env, tmp_path_factory):
+    env["backups"] = tmp_path_factory.mktemp("outside-home")
+    code, out = run_apply(env, "--apply")
+    assert code == 0, out
+    lines = (env["store"] / "MEMORY.md").read_text().splitlines()
+    [pointer] = [line for line in lines if line.startswith("- Moved to vault (")]
+    assert pointer.endswith(f"originals in {backup_dir(env)}")
 
 
 def test_moved_note_not_counted_for_the_moving_session(env):
