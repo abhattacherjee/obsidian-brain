@@ -218,14 +218,15 @@ print(_ob_repo())"""
 # #474: one FORM_A site in /lessons Step 1. 80 -> 81.
 # #475: one FORM_B site each in /retro Step 7.6, /standup Recurring lessons and
 # /emerge Step 4. 81 -> 84.
+# #309: one FORM_B site in /memory-consolidate Step 0. 84 -> 85.
 EXPECTED_FORM_COUNTS = {
     FORM_A: 59,
     FORM_A_SINGLE: 2,
-    FORM_B: 19,
+    FORM_B: 20,
     FORM_C: 1,
     FORM_D: 3,
 }
-EXPECTED_SITE_COUNT = 84
+EXPECTED_SITE_COUNT = 85
 
 #: Every canonical form, mapped to its constant NAME. One table, consulted by
 #: both ``_distinct_blocks()`` and ``test_canonical_form_family_counts_are_exact``
