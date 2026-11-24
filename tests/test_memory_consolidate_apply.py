@@ -1,0 +1,755 @@
+"""apply: dry run, --apply and --resume for /memory-consolidate (#309).
+
+HOME, the store, the vault and the backup root all sit under tmp_path.
+"""
+
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import pytest
+
+_ROOT = Path(__file__).parent.parent
+sys.path.insert(0, str(_ROOT / "hooks"))
+
+import memory_consolidate as mc
+from memory_consolidate import audit, index_edit, main
+from obsidian_utils import gather_session_evidence
+
+SCRIPT = _ROOT / "hooks" / "memory_consolidate.py"
+TZ = timezone(timedelta(hours=-8))
+NOW = datetime(2026, 11, 24, 12, 0, 0, tzinfo=TZ)
+STAMP = "20261124-120000"
+SID = "11111111-2222-3333-4444-555555555555"
+
+INDEX = (
+    "# Memory index\n"
+    "\n"
+    "## Feedback\n"
+    "- [Alpha lesson](feedback_a.md) — first\n"
+    "- [Beta lesson](feedback_b.md) — second\n"
+    "- [Stays](stay.md) — kept\n"
+    "- [Old project](project_c.md) — stale\n"
+    "\n"
+    "Footer prose.\n"
+)
+ENTRIES = {
+    "feedback_a": ("Alpha", "Alpha description", "Line one of alpha.\n\n## A heading in the body\n- item [[x]]\n"),
+    "feedback_b": ("Beta", "Beta description", "Beta body text."),
+    "project_c": ("Gamma", "Stale project", "Project state that git now holds."),
+    "stay": ("Stay", "A rule that stays", "Keep me."),
+}
+TARGET = "claude-insights/2026-11-01-existing-0d18.md"
+TARGET_TEXT = "---\ntype: claude-insight\nproject: proj\n---\n\n# Existing\n\nOriginal body.\n"
+
+
+def entry_text(name, desc, body, mtype="feedback"):
+    return f"---\nname: {name}\ndescription: {desc}\ntype: {mtype}\n---\n\n{body}"
+
+
+@pytest.fixture
+def env(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    store = tmp_path / ".claude/projects/-x-proj/memory"
+    store.mkdir(parents=True)
+    (store / "MEMORY.md").write_text(INDEX, encoding="utf-8")
+    for slug, parts in ENTRIES.items():
+        (store / f"{slug}.md").write_text(entry_text(*parts), encoding="utf-8")
+    vault = tmp_path / "vault"
+    (vault / "claude-insights").mkdir(parents=True)
+    (vault / TARGET).write_text(TARGET_TEXT, encoding="utf-8")
+    backups = tmp_path / "backups"
+    backups.mkdir()
+    return dict(tmp=tmp_path, store=store, vault=vault, backups=backups)
+
+
+ITEMS = [
+    dict(slug="feedback_a", action="new", type="claude-error-fix", topic="testing"),
+    dict(slug="feedback_b", action="append", target=TARGET),
+    dict(slug="project_c", action="retire", reason="PR merged; git holds it"),
+]
+
+
+def write_plan(env, items=ITEMS, name="plan.json"):
+    path = env["tmp"] / name
+    path.write_text(json.dumps(dict(version=1, store=str(env["store"]), items=items)), encoding="utf-8")
+    return path
+
+
+def run_apply(env, *extra, plan=None, now=NOW, out=None):
+    """In-process apply, the same call main() makes."""
+    lines = [] if out is None else out
+    code = mc.apply(plan or write_plan(env), env["store"], env["vault"], "claude-insights", "proj",
+                    env["backups"], "--apply" in extra, now, out=lines.append)
+    return code, lines
+
+
+def cli(env, *args):
+    return subprocess.run(
+        [sys.executable, str(SCRIPT), *args], capture_output=True, text=True, stdin=subprocess.DEVNULL,
+        env={**os.environ, "HOME": str(env["tmp"])}, timeout=60,
+    )
+
+
+def cli_apply(env, plan, *extra):
+    return cli(env, "apply", "--plan", str(plan), "--store", str(env["store"]), "--vault", str(env["vault"]),
+               "--insights-folder", "claude-insights", "--project", "proj",
+               "--backup-root", str(env["backups"]), *extra)
+
+
+def tree_hash(root):
+    h = hashlib.sha256()
+    for p in sorted(Path(root).rglob("*")):
+        h.update(str(p.relative_to(root)).encode())
+        if p.is_file():
+            h.update(p.read_bytes())
+    return h.hexdigest()
+
+
+def trees(env):
+    return [tree_hash(env[k]) for k in ("vault", "store", "backups")]
+
+
+def backup_dir(env, stamp=STAMP):
+    return env["backups"] / f"memory-moved-{stamp}--x-proj"
+
+
+def marked_notes(env, slug):
+    return [p for p in (env["vault"] / "claude-insights").rglob("*.md")
+            if f'migrated_from_memory: "{slug}"' in p.read_text()]
+
+
+def assert_finished(env):
+    """No duplicate note or section, no dangling line, one pointer line."""
+    assert len(marked_notes(env, "feedback_a")) == 1
+    target = (env["vault"] / TARGET).read_text()
+    assert target.count("<!-- migrated_from_memory: feedback_b -->") == 1
+    assert target.startswith(TARGET_TEXT)
+    report = audit(env["store"])
+    assert report["dangling"] == []
+    index = (env["store"] / "MEMORY.md").read_text()
+    assert index.count("- Moved to vault (") == 1
+    for slug in ("feedback_a", "feedback_b", "project_c"):
+        assert not (env["store"] / f"{slug}.md").exists()
+        assert f"{slug}.md" not in index
+    run = json.loads((backup_dir(env) / "run.json").read_text())
+    assert run["state"] == "done"
+    assert sorted(run["moved"]) == ["feedback_a", "feedback_b", "project_c"]
+    return run
+
+
+# --- dry run -----------------------------------------------------------------
+
+def test_dry_run_touches_nothing(env):
+    plan = write_plan(env)
+    before = trees(env)
+    result = cli_apply(env, plan)
+    assert result.returncode == 0, result.stderr
+    assert trees(env) == before
+    out = result.stdout.splitlines()
+    assert out[0] == f"store: {env['store']}"
+    assert re.fullmatch(f"backup: {re.escape(str(env['backups']))}/memory-moved-\\d{{8}}-\\d{{6}}--x-proj", out[1])
+    assert any(line.startswith("NEW feedback_a -> claude-insights/") and line.endswith("-alpha-lesson-"
+               + hashlib.sha1(b"feedback_a").hexdigest()[:4] + ".md") for line in out)
+    assert any(line.startswith(f"APPEND feedback_b -> {TARGET} (+") for line in out)
+    assert "RETIRE project_c: PR merged; git holds it" in out
+    assert "DROP - [Alpha lesson](feedback_a.md) — first" in out
+    assert out[-1] == "dry run: nothing written; add --apply to write"
+
+
+def test_dry_run_in_process_also_leaves_trees(env):
+    before = trees(env)
+    code, out = run_apply(env)
+    assert code == 0
+    assert trees(env) == before
+
+
+# --- full apply ----------------------------------------------------------------
+
+def test_apply_writes_reads_back_moves_and_edits_index(env):
+    code, out = run_apply(env, "--apply")
+    assert code == 0, out
+    run = assert_finished(env)
+    [note] = marked_notes(env, "feedback_a")
+    assert note.name == "2026-11-24-alpha-lesson-" + hashlib.sha1(b"feedback_a").hexdigest()[:4] + ".md"
+    text = note.read_text()
+    front = text.split("---\n")[1]
+    assert front.splitlines() == [
+        "type: claude-error-fix", "date: 2026-11-24", "created_at: 2026-11-24T12:00:00-08:00",
+        "project: proj", 'migrated_from_memory: "feedback_a"',
+        f'synced_from: "{env["store"] / "feedback_a.md"}"', 'memory_type: "feedback"', "status: active",
+        "tags:", "  - claude/error-fix", "  - claude/project/proj", "  - claude/topic/moved-from-memory",
+        "  - claude/topic/testing",
+    ]
+    assert "source_session" not in text
+    assert "\n# Alpha lesson\n" in text
+    assert f"`{backup_dir(env)}`" in text
+    assert "\n## Summary\n\nAlpha description\n" in text
+    assert mc._details(text, "feedback_a", "new").strip() == ENTRIES["feedback_a"][2].strip()
+    assert oct(note.stat().st_mode & 0o777) == "0o600"
+    # Originals in moved/, a full copy, private modes.
+    bdir = backup_dir(env)
+    for slug in ("feedback_a", "feedback_b", "project_c"):
+        assert (bdir / "moved" / f"{slug}.md").read_text() == entry_text(*ENTRIES[slug])
+    assert (bdir / "full-copy" / "MEMORY.md").read_text() == INDEX
+    assert (bdir / "full-copy" / "stay.md").exists()
+    for d in (bdir, bdir / "moved", bdir / "full-copy"):
+        assert oct(d.stat().st_mode & 0o777) == "0o700"
+    assert oct((bdir / "run.json").stat().st_mode & 0o777) == "0o600"
+    assert run["written"] == [dict(slug="feedback_a", action="new", note=str(note.relative_to(env["vault"]))),
+                              dict(slug="feedback_b", action="append", note=TARGET)]
+    assert run["retired"] == ["project_c"]
+    assert run["sizes"]["before"] == dict(bytes=len(INDEX.encode()), chars=len(INDEX), lines=9)
+    assert run["sizes"]["after"]["bytes"] == len((env["store"] / "MEMORY.md").read_bytes())
+    assert run["baseline"] == dict(indexed=["feedback_a", "feedback_b", "project_c", "stay"],
+                                   dangling=[], duplicates=[], orphans=[])
+
+
+def test_run_json_field_names(env):
+    run_apply(env, "--apply")
+    run = json.loads((backup_dir(env) / "run.json").read_text())
+    assert set(run) == {"version", "state", "store", "vault", "insights_folder", "project", "created_at",
+                        "updated_at", "backup_dir", "plan", "refused", "warnings", "written", "retired",
+                        "moved", "dropped_lines", "baseline", "sizes"}
+    assert run["dropped_lines"] == ["- [Alpha lesson](feedback_a.md) — first",
+                                    "- [Beta lesson](feedback_b.md) — second",
+                                    "- [Old project](project_c.md) — stale"]
+
+
+def test_index_rewrite_changes_only_the_moved_line(env):
+    run_apply(env, "--apply", plan=write_plan(env, [ITEMS[0]]))
+    after = (env["store"] / "MEMORY.md").read_text().split("\n")
+    before = INDEX.split("\n")
+    assert [l for l in before if l not in after] == ["- [Alpha lesson](feedback_a.md) — first"]
+    [added] = [l for l in after if l not in before]
+    assert added.startswith("- Moved to vault (2026-11-24): 1 entries (1 new notes tagged "
+                            "claude/topic/moved-from-memory, 0 appended")
+    assert added.endswith(f"originals in {backup_dir(env)}")
+    # The pointer line goes after the last kept index line.
+    assert after.index(added) == after.index("- [Old project](project_c.md) — stale") + 1
+
+
+def test_moved_note_not_counted_for_the_moving_session(env):
+    run_apply(env, "--apply")
+    [note] = marked_notes(env, "feedback_a")
+    bundle = gather_session_evidence(str(env["vault"]), "claude-sessions", "claude-insights", SID, "proj")
+    assert bundle["error_fixes"] == [] and bundle["insights"] == []
+    # Positive control: the same note with source_session set IS counted.
+    text = note.read_text().replace("project: proj\n", f"project: proj\nsource_session: {SID}\n", 1)
+    note.write_text(text)
+    bundle = gather_session_evidence(str(env["vault"]), "claude-sessions", "claude-insights", SID, "proj")
+    assert [e["path"] for e in bundle["error_fixes"]] == [str(note)]
+
+
+def test_append_leaves_rest_of_target_byte_identical(env):
+    code, out = run_apply(env, "--apply", plan=write_plan(env, [ITEMS[1]]))
+    assert code == 0, out
+    text = (env["vault"] / TARGET).read_text()
+    assert text.startswith(TARGET_TEXT)
+    section = text[len(TARGET_TEXT):]
+    assert section.startswith("\n## From project memory: Beta lesson (moved 2026-11-24)\n"
+                              "<!-- migrated_from_memory: feedback_b -->\n")
+    assert mc._details(text, "feedback_b", "append").strip() == "Beta body text."
+    assert not (env["vault"] / f".{Path(TARGET).name}.ob-lock").exists()
+
+
+# --- refusals -----------------------------------------------------------------
+
+def test_lossless_check_catches_one_character(env, monkeypatch):
+    real = mc.write_vault_note
+
+    def corrupt(vault, folder, name, content):
+        return real(vault, folder, name, content.replace("Line one of alpha.", "Line one of alpha!"))
+
+    monkeypatch.setattr(mc, "write_vault_note", corrupt)
+    code, out = run_apply(env, "--apply", plan=write_plan(env, ITEMS[:2]))
+    assert code == 1
+    assert any(l.startswith("REFUSE feedback_a: read-back failed: copied text differs") for l in out)
+    assert (env["store"] / "feedback_a.md").exists()
+    assert "feedback_a.md" in (env["store"] / "MEMORY.md").read_text()
+    assert not (env["store"] / "feedback_b.md").exists()
+
+
+def test_write_failure_leaves_that_original(env, monkeypatch):
+    monkeypatch.setattr(mc, "write_vault_note", lambda *a: "write failed: disk full")
+    code, out = run_apply(env, "--apply")
+    assert code == 1
+    assert "REFUSE feedback_a: write failed: disk full" in out
+    assert (env["store"] / "feedback_a.md").read_text() == entry_text(*ENTRIES["feedback_a"])
+    assert "- [Alpha lesson](feedback_a.md) — first" in (env["store"] / "MEMORY.md").read_text()
+    assert not (env["store"] / "feedback_b.md").exists()
+
+
+def test_append_target_changed_during_write_is_refused(env, monkeypatch):
+    real = mc._atomic_rewrite
+
+    def racing(dest, content, expect_stat=None, stat_out=None):
+        if dest.name == "MEMORY.md":
+            return real(dest, content, expect_stat=expect_stat, stat_out=stat_out)
+        with open(dest, "a") as fh:
+            fh.write("someone else\n")
+        return real(dest, content, expect_stat=expect_stat, stat_out=stat_out)
+
+    monkeypatch.setattr(mc, "_atomic_rewrite", racing)
+    code, out = run_apply(env, "--apply", plan=write_plan(env, ITEMS[1:]))
+    assert code == 1
+    assert any(l.startswith("REFUSE feedback_b: write failed") for l in out)
+    assert (env["vault"] / TARGET).read_text() == TARGET_TEXT + "someone else\n"
+    assert (env["store"] / "feedback_b.md").exists()
+
+
+@pytest.mark.parametrize("target", ["../outside.md", "link.md"])
+def test_append_target_outside_vault_or_symlink_refused(env, target):
+    (env["tmp"] / "outside.md").write_text("x")
+    os.symlink(env["tmp"] / "outside.md", env["vault"] / "link.md")
+    plan = write_plan(env, [dict(slug="feedback_b", action="append", target=target)])
+    before = trees(env)
+    result = cli_apply(env, plan, "--apply")
+    assert result.returncode == 2
+    assert "bad plan" in result.stderr
+    assert trees(env) == before
+
+
+def test_symlinked_insights_folder_refused(env):
+    outside = env["tmp"] / "elsewhere"
+    outside.mkdir()
+    (env["vault"] / "claude-insights").rename(env["tmp"] / "moved-insights")
+    os.symlink(outside, env["vault"] / "claude-insights")
+    code, out = run_apply(env, "--apply", plan=write_plan(env, [ITEMS[0]]))
+    assert code == 2
+    assert any(l.startswith("REFUSE feedback_a: symlink in write path") for l in out)
+    assert list(outside.iterdir()) == []
+    assert (env["store"] / "feedback_a.md").exists()
+
+
+def test_secret_shaped_body_refused(env):
+    token = "gh" + "p_" + "A1b2C3d4" * 5
+    (env["store"] / "feedback_a.md").write_text(entry_text("Alpha", "d", f"Use {token} here."))
+    code, out = run_apply(env, "--apply", plan=write_plan(env, ITEMS[:2]))
+    assert code == 1
+    assert "REFUSE feedback_a: text holds a secret-shaped string (scrub_secrets would change it)" in out
+    assert marked_notes(env, "feedback_a") == []
+    assert token not in "".join(p.read_text() for p in env["vault"].rglob("*.md"))
+    assert (env["store"] / "feedback_a.md").exists()
+
+
+def test_mixed_pointer_line_refuses_its_moving_slug(env):
+    (env["store"] / "MEMORY.md").write_text(INDEX.replace(
+        "- [Alpha lesson](feedback_a.md) — first", "- Pair: [Alpha lesson](feedback_a.md) · [Stays](stay.md)"))
+    code, out = run_apply(env, "--apply", plan=write_plan(env, ITEMS[:2]))
+    assert code == 1
+    assert "REFUSE feedback_a: index line also points at staying entries: stay.md" in out
+    assert marked_notes(env, "feedback_a") == []
+    assert (env["store"] / "feedback_a.md").exists()
+    assert audit(env["store"])["dangling"] == []
+
+
+def test_refusal_cascades_across_lines(env):
+    """A slug refused on one mixed line makes another of its lines mixed."""
+    index = INDEX.replace("- [Alpha lesson](feedback_a.md) — first",
+                          "- [Alpha lesson](feedback_a.md) · [Stays](stay.md)\n"
+                          "- [Alpha again](feedback_a.md) · [Beta again](feedback_b.md)")
+    (env["store"] / "MEMORY.md").write_text(index)
+    code, out = run_apply(env, "--apply", plan=write_plan(env, ITEMS[:2]))
+    assert code == 2  # nothing could move
+    assert any(l.startswith("REFUSE feedback_b: index line also points at staying entries: feedback_a.md")
+               for l in out)
+    assert (env["store"] / "feedback_b.md").exists()
+    assert audit(env["store"])["dangling"] == []
+
+
+@pytest.mark.parametrize(("text", "expected"), [
+    ("- [A](a.md) [S](s.md)\n- [A2](a.md) [B](b.md)\n", {"a", "b"}),
+    # The shared line comes first, so one top-to-bottom pass misses b.
+    ("- [A2](a.md) [B](b.md)\n- [A](a.md) [S](s.md)\n", {"a", "b"}),
+    ("- [B](b.md) [C](c.md)\n- [A2](a.md) [B](b.md)\n- [A](a.md) [S](s.md)\n", {"a", "b", "c"}),
+])
+def test_index_edit_cascade_unit(text, expected):
+    names = {"a.md", "b.md", "c.md", "s.md"}
+    new, dropped, refused, _ = index_edit(text, names, names - {"s.md"}, "- P")
+    assert (new, dropped) == (text, [])
+    assert set(refused) == expected
+
+
+def test_secret_refusal_cascades_to_line_partner(env):
+    token = "AKIA" + "ABCDEFGHIJKLMNOP"
+    (env["store"] / "feedback_a.md").write_text(entry_text("Alpha", "d", token))
+    (env["store"] / "MEMORY.md").write_text(INDEX.replace(
+        "- [Alpha lesson](feedback_a.md) — first", "- [Alpha lesson](feedback_a.md) · [Beta](feedback_b.md)"))
+    code, out = run_apply(env, "--apply", plan=write_plan(env, ITEMS))
+    assert code == 1
+    assert "REFUSE feedback_b: index line also points at staying entries: feedback_a.md" in out
+    assert (env["store"] / "feedback_b.md").exists()
+    assert (env["vault"] / TARGET).read_text() == TARGET_TEXT
+    assert audit(env["store"])["dangling"] == []
+
+
+def test_readback_refuses_a_note_with_source_session(env, monkeypatch):
+    real = mc.write_vault_note
+
+    def inject(vault, folder, name, content):
+        return real(vault, folder, name, content.replace("project: proj\n", f"project: proj\nsource_session: {SID}\n", 1))
+
+    monkeypatch.setattr(mc, "write_vault_note", inject)
+    code, out = run_apply(env, "--apply", plan=write_plan(env, ITEMS[:2]))
+    assert code == 1
+    assert any(l.startswith("REFUSE feedback_a: read-back failed:") and l.endswith("carries source_session")
+               for l in out)
+    assert (env["store"] / "feedback_a.md").exists()
+
+
+def test_readback_refuses_append_that_changed_the_rest(env, monkeypatch):
+    real = mc._atomic_rewrite
+
+    def clobber(dest, content, expect_stat=None, stat_out=None):
+        if dest.name != "MEMORY.md":
+            content = content.replace("Original body.", "Original body!")
+        return real(dest, content, expect_stat=expect_stat, stat_out=stat_out)
+
+    monkeypatch.setattr(mc, "_atomic_rewrite", clobber)
+    code, out = run_apply(env, "--apply", plan=write_plan(env, ITEMS[1:]))
+    assert code == 1
+    assert any(l.startswith("REFUSE feedback_b: read-back failed: the rest of") for l in out)
+    assert (env["store"] / "feedback_b.md").exists()
+
+
+def test_index_edit_warns_on_aside_of_dropped_line():
+    text = "- [A](a.md) see [[s]]\n- [S](s.md)\n"
+    _, dropped, _, warnings = index_edit(text, {"a.md", "s.md"}, {"a.md"}, "- P")
+    assert dropped == ["- [A](a.md) see [[s]]"]
+    assert warnings == {"s": "named as an aside on a dropped index line"}
+
+
+def test_mention_in_another_entry_warns(env):
+    (env["store"] / "stay.md").write_text(entry_text("Stay", "d", "See feedback_a.md for why."))
+    code, out = run_apply(env, plan=write_plan(env, [ITEMS[0]]))
+    assert code == 0
+    assert "WARN feedback_a: mentioned in stay.md" in out
+
+
+def test_line_appended_during_run_survives(env, monkeypatch):
+    added = "- [Added by another session](stay.md) — later"
+
+    def other_session(name):
+        if name == "moved":
+            with open(env["store"] / "MEMORY.md", "a", encoding="utf-8") as fh:
+                fh.write(added + "\n")
+
+    monkeypatch.setattr(mc, "_checkpoint", other_session)
+    code, out = run_apply(env, "--apply")
+    assert code == 0, out
+    index = (env["store"] / "MEMORY.md").read_text()
+    assert added in index
+    assert "feedback_a.md" not in index
+
+
+def test_index_stat_mismatch_retries(env, monkeypatch):
+    real = mc._atomic_rewrite
+    calls = []
+
+    def flaky(dest, content, expect_stat=None, stat_out=None):
+        calls.append(dest.name)
+        if len(calls) == 1:
+            with open(dest, "a") as fh:
+                fh.write("- late line\n")
+        return real(dest, content, expect_stat=expect_stat, stat_out=stat_out)
+
+    monkeypatch.setattr(mc, "_atomic_rewrite", flaky)
+    code, out = run_apply(env, "--apply", plan=write_plan(env, [ITEMS[0]]))
+    assert code == 0, out
+    assert calls == ["MEMORY.md", "MEMORY.md"]
+    index = (env["store"] / "MEMORY.md").read_text()
+    assert "- late line" in index and "feedback_a.md" not in index
+
+
+def test_index_that_keeps_changing_exits_2(env, monkeypatch):
+    monkeypatch.setattr(mc, "_atomic_rewrite", lambda *a, **k: "note changed on disk")
+    with pytest.raises(mc.ApplyError, match="kept changing; finish with: apply --resume"):
+        run_apply(env, "--apply", plan=write_plan(env, [ITEMS[0]]))
+    restore()
+    run = json.loads((backup_dir(env) / "run.json").read_text())
+    assert run["state"] == "moved"
+    assert main(["apply", "--resume", str(backup_dir(env))]) == 0
+
+
+def test_index_line_added_mid_run_moves_original_back(env, monkeypatch):
+    def other_session(name):
+        if name == "moved":
+            with open(env["store"] / "MEMORY.md", "a", encoding="utf-8") as fh:
+                fh.write("- Mixed: [Alpha lesson](feedback_a.md) · [Stays](stay.md)\n")
+
+    monkeypatch.setattr(mc, "_checkpoint", other_session)
+    code, out = run_apply(env, "--apply")
+    assert code == 1
+    assert any(l.startswith("REFUSE feedback_a: index line also points") and l.endswith("moved back to the store")
+               for l in out)
+    assert (env["store"] / "feedback_a.md").exists()
+    assert audit(env["store"])["dangling"] == []
+
+
+def test_backup_dir_reuse_refused(env):
+    backup_dir(env).mkdir()
+    before = trees(env)
+    with pytest.raises(mc.ApplyError, match="backup dir already exists"):
+        run_apply(env, "--apply")
+    restore()
+    assert trees(env) == before
+
+
+def test_existing_note_without_marker_refused(env):
+    name = "2026-11-24-alpha-lesson-" + hashlib.sha1(b"feedback_a").hexdigest()[:4] + ".md"
+    (env["vault"] / "claude-insights" / name).write_text("mine\n")
+    code, out = run_apply(env, "--apply", plan=write_plan(env, ITEMS[:2]))
+    assert code == 1
+    assert any(l.startswith("REFUSE feedback_a:") and "already exists and has no marker" in l for l in out)
+    assert (env["vault"] / "claude-insights" / name).read_text() == "mine\n"
+
+
+def test_unfinished_run_blocks_a_fresh_apply(env, monkeypatch):
+    monkeypatch.setattr(mc, "_checkpoint", lambda n: (_ for _ in ()).throw(KeyboardInterrupt) if n == "backup" else None)
+    with pytest.raises(KeyboardInterrupt):
+        run_apply(env, "--apply", plan=write_plan(env, ITEMS[:1]))
+    restore()
+    result = cli_apply(env, write_plan(env, ITEMS[1:]), "--apply")
+    assert result.returncode == 2
+    assert f"apply --resume {backup_dir(env)}" in result.stderr
+
+
+def test_midnight_boundary(env):
+    late = datetime(2026, 11, 24, 23, 59, 59, tzinfo=TZ)
+    code, out = run_apply(env, "--apply", now=late)
+    assert code == 0
+    [note] = marked_notes(env, "feedback_a")
+    assert note.name.startswith("2026-11-24-")
+    assert "created_at: 2026-11-24T23:59:59-08:00" in note.read_text()
+    assert backup_dir(env, "20261124-235959").is_dir()
+
+
+# --- stop points and rerun ----------------------------------------------------
+
+class Crash(Exception):
+    pass
+
+
+def crash_at(monkeypatch, point):
+    def hook(name):
+        if name == point:
+            raise Crash(name)
+    monkeypatch.setattr(mc, "_checkpoint", hook)
+
+
+_REAL = dict(_checkpoint=mc._checkpoint, _atomic_rewrite=mc._atomic_rewrite,
+             write_vault_note=mc.write_vault_note)
+_REAL_SAVE = mc._Run.save
+
+
+def restore():
+    """Undo the crash and fault patches but keep HOME (monkeypatch.undo would reset it)."""
+    for name, value in _REAL.items():
+        setattr(mc, name, value)
+    mc._Run.save = _REAL_SAVE
+
+
+def test_stop_after_step_2_finishes_on_rerun(env, monkeypatch):
+    crash_at(monkeypatch, "notes")
+    with pytest.raises(Crash):
+        run_apply(env, "--apply")
+    restore()
+    assert not backup_dir(env).exists()
+    later = NOW + timedelta(minutes=5)
+    code, out = run_apply(env, "--apply", now=later)
+    assert code == 0, out
+    assert any("(already written" in l or l.startswith("NEW feedback_a") for l in out)
+    # The rerun reuses the backup dir name its notes already carry.
+    run = assert_finished(env)
+    assert run["backup_dir"] == str(backup_dir(env))
+
+
+@pytest.mark.parametrize("point", ["backup", "mid-4", "moved", "index-written"])
+def test_stop_finishes_with_resume(env, monkeypatch, point):
+    crash_at(monkeypatch, point)
+    with pytest.raises(Crash):
+        run_apply(env, "--apply")
+    restore()
+    if point == "mid-4":
+        moved = sorted(p.stem for p in (backup_dir(env) / "moved").iterdir())
+        assert moved == ["feedback_a"]
+    result = cli(env, "apply", "--resume", str(backup_dir(env)), "--vault", str(env["vault"]))
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.splitlines()[0] == f"store: {env['store']}"
+    assert_finished(env)
+
+
+def test_resume_mid_4_after_moved_file_without_record(env, monkeypatch):
+    """Crash between the rename and the run.json update: the file in moved/ counts."""
+    real = mc._Run.save
+    state = {"n": 0}
+
+    def save(self, state_name=None):
+        if self.data["moved"] and state_name is None and state["n"] == 0:
+            state["n"] = 1
+            self.data["moved"].pop()
+            real(self)
+            raise Crash("after rename, before record")
+        real(self, state_name)
+
+    monkeypatch.setattr(mc._Run, "save", save)
+    with pytest.raises(Crash):
+        run_apply(env, "--apply")
+    restore()
+    assert main(["apply", "--resume", str(backup_dir(env))]) == 0
+    assert_finished(env)
+
+
+def test_resume_done_is_a_no_op(env):
+    run_apply(env, "--apply")
+    before = trees(env)
+    result = cli(env, "apply", "--resume", str(backup_dir(env)))
+    assert result.returncode == 0
+    assert "resuming from state: done" in result.stdout
+    assert trees(env) == before
+
+
+def test_resume_rechecks_notes_before_moving(env, monkeypatch):
+    crash_at(monkeypatch, "backup")
+    with pytest.raises(Crash):
+        run_apply(env, "--apply", plan=write_plan(env, ITEMS[:2]))
+    restore()
+    [note] = marked_notes(env, "feedback_a")
+    note.write_text(note.read_text().replace("Line one of alpha.", "Line one of alpha?"))
+    result = cli(env, "apply", "--resume", str(backup_dir(env)))
+    assert result.returncode == 1
+    assert "REFUSE feedback_a: read-back failed" in result.stdout
+    assert (env["store"] / "feedback_a.md").exists()
+    assert not (env["store"] / "feedback_b.md").exists()
+    assert audit(env["store"])["dangling"] == []
+
+
+def test_resume_refuses_original_changed_after_backup(env, monkeypatch):
+    crash_at(monkeypatch, "backup")
+    with pytest.raises(Crash):
+        run_apply(env, "--apply", plan=write_plan(env, ITEMS[:2]))
+    restore()
+    (env["store"] / "feedback_b.md").write_text(entry_text("Beta", "d", "edited by another session"))
+    result = cli(env, "apply", "--resume", str(backup_dir(env)))
+    assert result.returncode == 1
+    assert "REFUSE feedback_b: original changed after the notes were written; not moved" in result.stdout
+    assert (env["store"] / "feedback_b.md").exists()
+    assert "feedback_b.md" in (env["store"] / "MEMORY.md").read_text()
+
+
+# --- exit codes and inputs ----------------------------------------------------
+
+def test_exit_0_via_cli(env):
+    result = cli_apply(env, write_plan(env, ITEMS[:1]), "--apply")
+    assert result.returncode == 0, result.stderr
+    assert not (env["store"] / "feedback_a.md").exists()
+
+
+def test_exit_1_via_cli(env):
+    (env["store"] / "stay.md").write_text(entry_text("Stay", "d", "pass" + "word: hunter2"))
+    plan = write_plan(env, [dict(slug="stay", action="retire", reason="x"), ITEMS[2]], "plan2.json")
+    result = cli_apply(env, plan, "--apply")
+    assert result.returncode == 1, result.stderr
+    assert not (env["store"] / "project_c.md").exists()
+    assert "REFUSE stay: text holds a secret-shaped string" in result.stdout
+
+
+@pytest.mark.parametrize("items", [
+    [dict(slug="missing_slug", action="new")],
+    [dict(slug="feedback_a", action="delete")],
+    [dict(slug="feedback_a", action="retire")],
+])
+def test_exit_2_bad_plan(env, items):
+    before = trees(env)
+    result = cli_apply(env, write_plan(env, items), "--apply")
+    assert result.returncode == 2
+    assert result.stdout.splitlines() == [f"store: {env['store']}"]
+    assert "bad plan" in result.stderr
+    assert trees(env) == before
+
+
+def test_exit_2_store_refused(env):
+    result = cli(env, "apply", "--plan", str(write_plan(env)), "--store", str(env["tmp"] / "nope"),
+                 "--vault", str(env["vault"]), "--insights-folder", "claude-insights")
+    assert result.returncode == 2
+    assert "not a directory" in result.stderr
+
+
+def test_exit_2_when_nothing_can_move(env):
+    (env["store"] / "feedback_a.md").write_text(entry_text("Alpha", "d", "AKIA" + "ABCDEFGHIJKLMNOP"))
+    before = trees(env)
+    result = cli_apply(env, write_plan(env, ITEMS[:1]), "--apply")
+    assert result.returncode == 2
+    assert "nothing to move" in result.stdout
+    assert trees(env) == before
+    assert cli_apply(env, write_plan(env, ITEMS[:1])).returncode == 2  # dry run agrees
+
+
+def test_exit_2_append_target_deleted_after_dry_run(env):
+    plan = write_plan(env, [ITEMS[1]])
+    assert cli_apply(env, plan).returncode == 0
+    (env["vault"] / TARGET).unlink()
+    result = cli_apply(env, plan, "--apply")
+    assert result.returncode == 2
+    assert "target is not an existing file" in result.stderr
+    assert (env["store"] / "feedback_b.md").exists()
+
+
+def test_exit_2_missing_index(env):
+    (env["store"] / "MEMORY.md").unlink()
+    assert cli_apply(env, write_plan(env), "--apply").returncode == 2
+
+
+def test_exit_2_bad_vault(env):
+    result = cli(env, "apply", "--plan", str(write_plan(env)), "--store", str(env["store"]),
+                 "--vault", str(env["tmp"] / "novault"), "--insights-folder", "claude-insights")
+    assert result.returncode == 2
+    assert "vault is not a directory" in result.stderr
+
+
+@pytest.mark.parametrize("folder", ["../out", "/abs"])
+def test_exit_2_bad_insights_folder(env, folder):
+    result = cli(env, "apply", "--plan", str(write_plan(env)), "--store", str(env["store"]),
+                 "--vault", str(env["vault"]), "--insights-folder", folder)
+    assert result.returncode == 2
+    assert "vault-relative" in result.stderr
+
+
+def test_resume_exit_2_cases(env, monkeypatch):
+    assert cli(env, "apply", "--resume", str(env["tmp"] / "none")).returncode == 2
+    crash_at(monkeypatch, "backup")
+    with pytest.raises(Crash):
+        run_apply(env, "--apply")
+    restore()
+    bdir = str(backup_dir(env))
+    other = env["tmp"] / "other-vault"
+    other.mkdir()
+    result = cli(env, "apply", "--resume", bdir, "--vault", str(other))
+    assert result.returncode == 2 and "is not the run's vault" in result.stderr
+    result = cli(env, "apply", "--resume", bdir, "--apply")
+    assert result.returncode == 2 and "--resume takes only" in result.stderr
+    # run.json from another store
+    store2 = env["tmp"] / ".claude/projects/-y-proj/memory"
+    store2.mkdir(parents=True)
+    (store2 / "MEMORY.md").write_text("")
+    run_path = backup_dir(env) / "run.json"
+    run = json.loads(run_path.read_text())
+    run["store"] = str(store2)
+    run_path.write_text(json.dumps(run))
+    result = cli(env, "apply", "--resume", bdir)
+    assert result.returncode == 2 and "bad plan in run.json" in result.stderr
+    run_path.write_text("{not json")
+    assert cli(env, "apply", "--resume", bdir).returncode == 2
+
+
+def test_audit_human_output_lists_counts_not_every_slug(env, capsys):
+    assert main(["audit", "--store", str(env["store"])]) == 0
+    out = capsys.readouterr().out.splitlines()
+    assert "entries: 4 (4 indexed)" in out
+    assert not any("feedback_a" in line for line in out)

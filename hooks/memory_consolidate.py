@@ -1,8 +1,11 @@
-"""Read-only project memory audit and consolidation plan validation."""
+"""Project memory consolidation: audit the index, validate a move plan, apply it."""
 
 from __future__ import annotations
 
 import argparse
+import hashlib
+import shutil
+import tempfile
 from collections import Counter
 from datetime import datetime
 import json
@@ -16,9 +19,11 @@ import sys
 if __name__ == "__main__":
     sys.dont_write_bytecode = True
 
-from memory_links import line_pointers, line_asides, _md_child_link_targets
+from memory_links import line_pointers, line_asides, _link_targets, _md_child_link_targets
+from note_writer import _acquire_lock, _atomic_rewrite, _release_lock
 from memory_sources import _projects_root
-from obsidian_utils import _cc_encoded_dirnames
+from obsidian_utils import (_cc_encoded_dirnames, canonical_project_name, load_config, scrub_secrets,
+                            slugify, write_vault_note)
 
 
 class StoreError(Exception):
@@ -189,7 +194,8 @@ _ACTION_KEYS = {"new": {"type", "topic"}, "append": {"target"}, "retire": {"reas
 _TYPES = ("claude-insight", "claude-error-fix", "claude-decision")
 
 
-def load_plan(path: Path, store: Path, vault_root: Path) -> tuple[list[dict], list[str]]:
+def load_plan(path: Path, store: Path, vault_root: Path,
+              moved_dir: Path | None = None) -> tuple[list[dict], list[str]]:
     def reject_constant(value):
         raise PlanError(f"invalid JSON constant: {value}")
 
@@ -198,6 +204,13 @@ def load_plan(path: Path, store: Path, vault_root: Path) -> tuple[list[dict], li
         plan = json.loads(text, parse_constant=reject_constant)
     except (StoreError, PlanError, ValueError, RecursionError) as exc:
         return [], [str(exc)]
+    return validate_plan(plan, store, vault_root, moved_dir)
+
+
+def validate_plan(plan, store: Path, vault_root: Path,
+                  moved_dir: Path | None = None) -> tuple[list[dict], list[str]]:
+    """Check a parsed plan. ``moved_dir`` (resume only) lets an entry whose
+    original an interrupted run already moved count as present."""
     if not isinstance(plan, dict):
         return [], ["plan must be an object"]
     errors = []
@@ -230,6 +243,8 @@ def load_plan(path: Path, store: Path, vault_root: Path) -> tuple[list[dict], li
                 issues.append("duplicate slug")
             seen.add(slug)
             source = store / (slug + ".md")
+            if moved_dir is not None and not os.path.lexists(source):
+                source = moved_dir / (slug + ".md")
             if source.is_symlink() or not source.is_file():
                 issues.append("missing or non-regular entry file")
         action = item.get("action")
@@ -262,33 +277,692 @@ def index_edit(
     index_text: str, store_names: set[str], moving: set[str], pointer_line: str
 ) -> tuple[str, list[str], dict[str, str], dict[str, str]]:
     lines = index_text.split("\n")
+    pointers = [line_pointers(line, store_names) for line in lines]
     refused = {}
-    for line in lines:
-        ptr = line_pointers(line, store_names)
-        staying = ptr - moving
-        if staying:
-            for name in ptr & moving:
-                refused[Path(name).stem] = "index line also points at staying entries: " + ", ".join(sorted(staying))
+    eligible = set(moving)
+    # Repeat until no new refusal: a slug refused on one mixed line stays, so
+    # another line it shares with a moving slug becomes mixed too. One pass
+    # kept that second line and left the moving slug's pointer dangling.
+    changed = True
+    while changed:
+        changed = False
+        for ptr in pointers:
+            staying = ptr - eligible
+            if staying and ptr & eligible:
+                for name in ptr & eligible:
+                    refused[Path(name).stem] = ("index line also points at staying entries: "
+                                                + ", ".join(sorted(staying)))
+                eligible -= ptr
+                changed = True
 
-    eligible = {name for name in moving if Path(name).stem not in refused}
     kept, dropped, warnings = [], [], {}
     insert_at = None
-    for line in lines:
-        ptr = line_pointers(line, store_names)
+    for line, ptr in zip(lines, pointers):
         if ptr and ptr <= eligible:
             dropped.append(line)
+            # A staying entry named only here loses its last reference.
+            for name in line_asides(line, store_names) - moving:
+                warnings[Path(name).stem] = "named as an aside on a dropped index line"
             continue
         kept.append(line)
         if ptr and line.startswith("- "):
             insert_at = len(kept)
-        if not (ptr & moving and ptr - moving):
-            for name in line_asides(line, store_names) & moving:
-                warnings[Path(name).stem] = "named as an aside on a kept index line"
+        for name in line_asides(line, store_names) & eligible:
+            warnings[Path(name).stem] = "named as an aside on a kept index line"
     if dropped and pointer_line:
         if insert_at is None:
             insert_at = len(kept) - int(index_text.endswith("\n"))
         kept.insert(insert_at, pointer_line)
     return "\n".join(kept), dropped, refused, warnings
+
+
+# ---------------------------------------------------------------------------
+# apply: write vault notes, back up the store, move originals, edit the index
+# ---------------------------------------------------------------------------
+
+_TYPE_TAGS = {"claude-insight": "claude/insight", "claude-error-fix": "claude/error-fix",
+              "claude-decision": "claude/decision"}
+MOVED_TAG = "claude/topic/moved-from-memory"
+RUN_STATES = ("notes-written", "moved", "done")
+_BACKUP_PREFIX = "memory-moved-"
+# The start marker is the one a rerun searches for (plan "Markers"). The end
+# marker bounds the copied body, so the lossless check still works after a
+# later append to the same note adds sections below it.
+_START = "<!-- migrated_from_memory: {slug} -->"
+_END = "<!-- /migrated_from_memory: {slug} -->"
+_END_PREFIX = "<!-- /migrated_from_memory:"
+_PROVENANCE_RE = re.compile(r"originals? (?:at|in) `([^`\n]{1,2000})`")
+
+
+class ApplyError(Exception):
+    """The run cannot go on (exit 2)."""
+
+
+class _ItemError(Exception):
+    """One item is refused; the rest of the run goes on."""
+
+
+def _checkpoint(name: str) -> None:
+    """Test hook: the stop-point tests raise here to simulate a crash."""
+
+
+def _sizes(text: str) -> dict:
+    return dict(bytes=len(text.encode("utf-8")), chars=len(text), lines=len(text.splitlines()))
+
+
+def _private_dirs(path: Path) -> None:
+    """Create each missing level of ``path`` 0o700 (makedirs' mode is leaf-only)."""
+    missing = []
+    p = path
+    while not os.path.lexists(p):
+        missing.append(p)
+        p = p.parent
+    if os.path.islink(p) or not p.is_dir():
+        raise ApplyError(f"not a real directory: {p}")
+    for d in reversed(missing):
+        os.mkdir(d, 0o700)
+        os.chmod(d, 0o700)
+
+
+def _contained(path: Path, vault_root: Path) -> Path:
+    """Refuse a write target that is or passes through a symlink, or leaves the vault."""
+    rel = path.relative_to(vault_root)
+    p = vault_root
+    for part in rel.parts:
+        p = p / part
+        if os.path.islink(p):
+            raise _ItemError(f"symlink in write path: {p}")
+    if not path.resolve().is_relative_to(vault_root.resolve()):
+        raise _ItemError(f"write path escapes the vault: {path}")
+    return path
+
+
+def _yaml(value: str) -> str:
+    # JSON strings are valid YAML double-quoted scalars; quoting keeps a slug
+    # such as "1.5" or "true" a string.
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _title(index_text: str, entry: dict) -> str:
+    slug = entry["slug"]
+    m = re.search(r"\[([^\[\]\n]{1,300})\]\(\s*<?(?:\./)?" + re.escape(slug) + r"\.md[\s>)\"']",
+                  index_text)
+    title = (m.group(1) if m else "") or entry["name"] or entry["description"] or slug
+    return " ".join(title.split())
+
+
+def _summary(entry: dict) -> str:
+    return " ".join(entry["description"].split()) or "(no description in the memory file)"
+
+
+def _provenance(slug: str, date: str, backup_dir: Path) -> str:
+    return (f"> Moved from project memory `{slug}` on {date}; "
+            f"originals in `{backup_dir}` (`moved/{slug}.md`).")
+
+
+def _render_new(item, entry, title, project, now, store, backup_dir) -> str:
+    slug, date = entry["slug"], now.strftime("%Y-%m-%d")
+    tags = [_TYPE_TAGS[item["type"]], f"claude/project/{project}", MOVED_TAG]
+    if f"claude/topic/{item['topic']}" not in tags:
+        tags.append(f"claude/topic/{item['topic']}")
+    # No source_session / source_session_note: gather_session_evidence picks
+    # insights by source_session, so the moving session would count a moved
+    # fact as its own finding (#495).
+    front = [
+        "---", f"type: {item['type']}", f"date: {date}",
+        f"created_at: {now.isoformat(timespec='seconds')}", f"project: {project}",
+        f"migrated_from_memory: {_yaml(slug)}", f"synced_from: {_yaml(str(store / (slug + '.md')))}",
+        f"memory_type: {_yaml(entry['memory_type'])}", "status: active", "tags:",
+        *(f"  - {tag}" for tag in tags), "---",
+    ]
+    return "\n".join(front) + (
+        f"\n\n# {title}\n\n{_provenance(slug, date, backup_dir)}\n\n## Summary\n\n{_summary(entry)}"
+        f"\n\n## Details\n\n{entry['body'].strip()}\n\n{_END.format(slug=slug)}\n")
+
+
+def _render_section(entry, title, now, backup_dir) -> str:
+    slug, date = entry["slug"], now.strftime("%Y-%m-%d")
+    return (f"## From project memory: {title} (moved {date})\n{_START.format(slug=slug)}\n\n"
+            f"{_provenance(slug, date, backup_dir)}\n\n### Summary\n\n{_summary(entry)}\n\n"
+            f"### Details\n\n{entry['body'].strip()}\n\n{_END.format(slug=slug)}\n")
+
+
+def _details(text: str, slug: str, action: str) -> str | None:
+    """The copied body in a written note, or None when the markers are missing."""
+    if action == "new":
+        start, header = 0, "\n## Details\n"
+    else:
+        start, header = text.find(_START.format(slug=slug)), "\n### Details\n"
+        if start < 0:
+            return None
+    at = text.find(header, start)
+    end = text.find(_END.format(slug=slug), start)
+    if at < 0 or end < at:
+        return None
+    return text[at + len(header):end]
+
+
+def _frontmatter(text: str) -> str:
+    lines = text.split("\n")
+    if not lines or lines[0].rstrip("\r") != "---":
+        return ""
+    for i, line in enumerate(lines[1:], 1):
+        if line.rstrip("\r") == "---":
+            return "\n".join(lines[1:i])
+    return ""
+
+
+def _check_readback(path: Path, entry: dict, action: str, prefix: str | None = None) -> None:
+    """Lossless check: the copied text must equal the memory body exactly."""
+    try:
+        text, _ = _read_file(path)
+    except StoreError as exc:
+        raise _ItemError(f"read-back failed: {exc}") from exc
+    details = _details(text, entry["slug"], action)
+    if details is None:
+        raise _ItemError(f"read-back failed: markers missing in {path}")
+    if details.strip() != entry["body"].strip():
+        raise _ItemError(f"read-back failed: copied text differs from the memory body in {path}")
+    if prefix is not None and not text.startswith(prefix):
+        raise _ItemError(f"read-back failed: the rest of {path} changed")
+    if action == "new" and re.search(r"^source_session", _frontmatter(text), re.M):
+        raise _ItemError(f"read-back failed: {path} carries source_session")
+
+
+def _scan_markers(folder: Path) -> dict[str, list[Path]]:
+    """Map slug -> notes under ``folder`` whose frontmatter has migrated_from_memory."""
+    found: dict[str, list[Path]] = {}
+    if not folder.is_dir():
+        return found
+    pattern = re.compile(r'^migrated_from_memory:[ \t]*"?([A-Za-z0-9][A-Za-z0-9_.-]{0,200})"?[ \t]*\r?$', re.M)
+    for note in sorted(folder.rglob("*.md")):
+        if note.is_symlink() or not note.is_file():
+            continue
+        try:
+            with open(note, encoding="utf-8", errors="replace") as stream:
+                head = stream.read(16_384)
+        except OSError:
+            continue
+        for slug in pattern.findall(_frontmatter(head)):
+            found.setdefault(slug, []).append(note)
+    return found
+
+
+def _write_json(path: Path, data: dict) -> None:
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".run-", suffix=".json.tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(data, stream, indent=2, ensure_ascii=False)
+            stream.write("\n")
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _read_run(backup_dir: Path) -> dict:
+    if os.path.islink(backup_dir) or not backup_dir.is_dir():
+        raise ApplyError(f"not a backup directory: {backup_dir}")
+    try:
+        text, _ = _read_file(backup_dir / "run.json")
+        run = json.loads(text)
+    except (StoreError, ValueError, RecursionError) as exc:
+        raise ApplyError(f"cannot read run.json: {exc}") from exc
+    keys = ("version", "state", "store", "vault", "insights_folder", "plan", "refused", "written",
+            "retired", "moved")
+    if not isinstance(run, dict) or any(k not in run for k in keys):
+        raise ApplyError("run.json is missing fields")
+    if run["version"] != 1 or run["state"] not in RUN_STATES:
+        raise ApplyError(f"run.json has version {run['version']!r}, state {run['state']!r}")
+    return run
+
+
+def _unfinished_runs(backup_root: Path, store: Path) -> list[Path]:
+    out = []
+    try:
+        dirs = sorted(backup_root.glob(_BACKUP_PREFIX + "*"))
+    except OSError:
+        return out
+    for d in dirs:
+        try:
+            run = _read_run(d)
+        except ApplyError:
+            continue
+        if run["store"] == str(store) and run["state"] != "done":
+            out.append(d)
+    return out
+
+
+def _move(src: Path, dst: Path) -> None:
+    if os.path.lexists(dst):
+        raise _ItemError(f"{dst} already exists")
+    os.rename(src, dst)  # same filesystem: the store and backups both live under ~/.claude
+    os.chmod(dst, 0o600)
+
+
+class _Run:
+    """One apply run. ``data`` is what run.json holds."""
+
+    def __init__(self, data: dict, backup_dir: Path, out):
+        self.data = data
+        self.dir = backup_dir
+        self.out = out
+
+    @property
+    def store(self) -> Path:
+        return Path(self.data["store"])
+
+    def refuse(self, slug: str, reason: str) -> None:
+        self.data["refused"].append(dict(slug=slug, reason=reason))
+        self.out(f"REFUSE {slug}: {reason}")
+
+    def save(self, state: str | None = None) -> None:
+        if state:
+            self.data["state"] = state
+        self.data["updated_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
+        _write_json(self.dir / "run.json", self.data)
+
+    def original(self, slug: str) -> dict:
+        """The entry as it was at backup time (full-copy/), else in the store."""
+        for p in (self.dir / "full-copy" / f"{slug}.md", self.store / f"{slug}.md",
+                  self.dir / "moved" / f"{slug}.md"):
+            if os.path.lexists(p):
+                return read_entry(p)
+        raise _ItemError("original not found in full-copy/, the store or moved/")
+
+    def move_all(self) -> None:
+        """Step 4. An original that is already in moved/ counts as moved."""
+        moved_dir = self.dir / "moved"
+        if not moved_dir.exists():
+            os.mkdir(moved_dir, 0o700)
+        done = set(self.data["moved"])
+        slugs = [w["slug"] for w in self.data["written"]] + list(self.data["retired"])
+        for slug in slugs:
+            if slug in done:
+                continue
+            src, dst = self.store / f"{slug}.md", moved_dir / f"{slug}.md"
+            try:
+                if not os.path.lexists(src):
+                    if os.path.lexists(dst):
+                        pass  # moved before an interruption
+                    else:
+                        raise _ItemError("original is missing from the store")
+                else:
+                    snapshot = self.dir / "full-copy" / f"{slug}.md"
+                    if read_entry(src)["text"] != read_entry(snapshot)["text"]:
+                        raise _ItemError("original changed after the notes were written; not moved")
+                    _move(src, dst)
+            except (_ItemError, StoreError, OSError) as exc:
+                self.refuse(slug, str(exc))
+                continue
+            self.data["moved"].append(slug)
+            done.add(slug)
+            self.save()
+            self.out(f"MOVED {slug} -> {dst}")
+            _checkpoint("mid-4")
+        self.save("moved")
+
+    def pointer_line(self, moved: list[str]) -> str:
+        new = sum(1 for w in self.data["written"] if w["action"] == "new" and w["slug"] in moved)
+        appended = sum(1 for w in self.data["written"] if w["action"] == "append" and w["slug"] in moved)
+        retired = sum(1 for s in self.data["retired"] if s in moved)
+        date = self.data["created_at"][:10]
+        return (f"- Moved to vault ({date}): {len(moved)} entries ({new} new notes tagged {MOVED_TAG}, "
+                f"{appended} appended to existing notes, {retired} retired); find them with /vault-ask; "
+                f"originals in {self.dir}")
+
+    def edit_index(self) -> None:
+        """Step 5: re-read the live MEMORY.md, drop moved pointers, write atomically."""
+        index = self.store / "MEMORY.md"
+        lock, err = _acquire_lock(index)
+        if err:
+            raise ApplyError(err)
+        try:
+            for _attempt in range(3):
+                st = os.lstat(index)  # stat before read: a change after it fails expect_stat
+                text, _ = _read_file(index)
+                names = {p.name for p in self.store.iterdir()
+                         if p.name.endswith(".md") and p.name != "MEMORY.md"}
+                moved = list(self.data["moved"])
+                names |= {f"{s}.md" for s in moved}
+                new_text, dropped, refused, _w = index_edit(text, names, {f"{s}.md" for s in moved},
+                                                            self.pointer_line(moved))
+                if refused:
+                    # A line written since validation now mixes a moved entry
+                    # with a staying one. Put those originals back so the index
+                    # never points at a moved file.
+                    for slug, reason in sorted(refused.items()):
+                        try:
+                            _move(self.dir / "moved" / f"{slug}.md", self.store / f"{slug}.md")
+                        except (_ItemError, OSError) as exc:
+                            raise ApplyError(f"cannot move {slug} back: {exc}") from exc
+                        self.data["moved"].remove(slug)
+                        self.refuse(slug, reason + "; moved back to the store")
+                    self.save()
+                    continue
+                if new_text != text:
+                    err = _atomic_rewrite(index, new_text, expect_stat=(st.st_mtime_ns, st.st_size))
+                    if err:
+                        self.out(f"index changed while writing, retrying: {err}")
+                        continue
+                self.data["dropped_lines"] = self.data.get("dropped_lines", []) + dropped
+                self.data["sizes"]["after"] = _sizes(new_text)
+                break
+            else:
+                raise ApplyError(f"MEMORY.md kept changing; finish with: apply --resume {self.dir}")
+        finally:
+            _release_lock(lock)
+        _checkpoint("index-written")
+        self.save("done")
+
+    def finish(self) -> int:
+        if self.data["state"] == "notes-written":
+            self.move_all()
+            _checkpoint("moved")
+        if self.data["state"] == "moved":
+            self.edit_index()
+        sizes = self.data["sizes"]
+        for key in ("before", "after"):
+            if sizes.get(key):
+                self.out("index {}: {bytes} bytes, {chars} chars, {lines} lines".format(key, **sizes[key]))
+        self.out(f"backup: {self.dir}")
+        if not self.data["moved"]:
+            return 2
+        return 1 if self.data["refused"] else 0
+
+
+def _prepare(items, store: Path, vault_root: Path, insights_folder: str, project: str, now,
+             backup_root: Path, out):
+    """Step 1: validate every entry, choose the backup dir, plan each note."""
+    data = dict(version=1, state="planned", store=str(store), vault=str(vault_root),
+                insights_folder=insights_folder, project=project,
+                created_at=now.isoformat(timespec="seconds"),
+                plan=dict(version=1, store=str(store), items=items),
+                refused=[], warnings=[], written=[], retired=[], moved=[], dropped_lines=[])
+    refused, warnings = {}, {}
+    entries = {}
+    for item in items:
+        slug = item["slug"]
+        try:
+            entry = read_entry(store / f"{slug}.md")
+        except StoreError as exc:
+            refused[slug] = str(exc)
+            continue
+        if scrub_secrets(entry["text"]) != entry["text"]:
+            refused[slug] = "text holds a secret-shaped string (scrub_secrets would change it)"
+        elif _END_PREFIX in entry["body"]:
+            refused[slug] = "body contains the end marker text"
+        else:
+            entries[slug] = entry
+    index_text, _ = _read_file(store / "MEMORY.md")
+    baseline = audit(store)
+    data["baseline"] = dict(indexed=[e["slug"] for e in baseline["entries"] if e["indexed"]],
+                            dangling=baseline["dangling"], duplicates=baseline["duplicates"],
+                            orphans=baseline["orphans"])
+    data["sizes"] = dict(before=_sizes(index_text), after=None)
+    # Plan each note. A marker already present means an earlier run wrote it.
+    folder = vault_root / insights_folder
+    markers = _scan_markers(folder) if any(i["action"] == "new" for i in items) else {}
+    plans = []
+    reused_dirs = set()
+    for item in items:
+        slug = item["slug"]
+        if slug not in entries:
+            continue
+        entry = entries[slug]
+        title = _title(index_text, entry)
+        try:
+            if item["action"] == "new":
+                hits = markers.get(slug, [])
+                if len(hits) > 1:
+                    raise _ItemError("more than one note carries its marker: "
+                                     + ", ".join(str(h.relative_to(vault_root)) for h in hits))
+                if hits:
+                    plans.append(dict(item=item, entry=entry, title=title, dest=hits[0], reuse=True))
+                else:
+                    name = (f"{now.strftime('%Y-%m-%d')}-{slugify(title, 50)}-"
+                            f"{hashlib.sha1(slug.encode()).hexdigest()[:4]}.md")
+                    dest = _contained(folder / name, vault_root)
+                    if os.path.lexists(dest):
+                        raise _ItemError(f"{dest.relative_to(vault_root)} already exists and has no marker")
+                    plans.append(dict(item=item, entry=entry, title=title, dest=dest, reuse=False))
+            elif item["action"] == "append":
+                errs = _target_errors(item["target"], vault_root)
+                if errs:
+                    raise _ItemError("; ".join(errs))
+                dest = _contained(vault_root / item["target"], vault_root)
+                text, _ = _read_file(dest)
+                count = text.count(_START.format(slug=slug))
+                if count > 1:
+                    raise _ItemError(f"{item['target']} carries its marker {count} times")
+                plans.append(dict(item=item, entry=entry, title=title, dest=dest, reuse=count == 1))
+            else:
+                plans.append(dict(item=item, entry=entry, title=title, dest=None, reuse=False))
+        except (_ItemError, StoreError, ValueError, OSError) as exc:
+            refused[slug] = str(exc)
+            continue
+        if plans[-1]["reuse"]:
+            text, _ = _read_file(plans[-1]["dest"])
+            m = _PROVENANCE_RE.search(text[text.find(_START.format(slug=slug)):]
+                                      if item["action"] == "append" else text)
+            if m:
+                reused_dirs.add(m.group(1))
+
+    # Index rule, repeated until stable: a slug refused above stays, which can
+    # make a line it shares with a moving slug mixed.
+    names = {e["slug"] + ".md" for e in baseline["entries"]}
+    while True:
+        moving = {p["item"]["slug"] + ".md" for p in plans}
+        _, dropped, idx_refused, idx_warnings = index_edit(index_text, names, moving, "")
+        if not idx_refused:
+            break
+        refused.update(idx_refused)
+        plans = [p for p in plans if p["item"]["slug"] not in idx_refused]
+    warnings.update(idx_warnings)
+    for e in baseline["entries"]:
+        if e["slug"] + ".md" in moving:
+            continue
+        try:
+            other, _ = _read_file(store / f"{e['slug']}.md")
+        except StoreError:
+            continue
+        for name in _link_targets(other) & moving:
+            warnings.setdefault(Path(name).stem, f"mentioned in {e['slug']}.md")
+
+    # The backup dir name is fixed before any note is written, because each
+    # note names it. A rerun after a stop at step 2 reuses the name its notes
+    # already carry, when that dir was never created.
+    backup_dir = backup_root / f"{_BACKUP_PREFIX}{now.strftime('%Y%m%d-%H%M%S')}-{store.parent.name}"
+    if len(reused_dirs) == 1:
+        earlier = Path(reused_dirs.pop())
+        if earlier.parent == backup_root and earlier.name.startswith(_BACKUP_PREFIX) and not os.path.lexists(earlier):
+            backup_dir = earlier
+    data["backup_dir"] = str(backup_dir)
+    data["refused"] = [dict(slug=s, reason=r) for s, r in refused.items()]
+    data["warnings"] = [dict(slug=s, reason=r) for s, r in sorted(warnings.items())]
+    data["dropped_lines"] = []
+    return data, plans, backup_dir, dropped, index_text
+
+
+def _write_note(plan, vault_root: Path, insights_folder: str, project: str, now, store: Path,
+                backup_dir: Path) -> tuple[str, int]:
+    """Step 2 for one item: write (or find) its note and read it back."""
+    item, entry, dest = plan["item"], plan["entry"], plan["dest"]
+    if item["action"] == "new":
+        if not plan["reuse"]:
+            content = _render_new(item, entry, plan["title"], project, now, store, backup_dir)
+            _private_dirs(dest.parent)
+            # write_vault_note overwrites, so refuse an existing file right before it.
+            if os.path.lexists(dest):
+                raise _ItemError(f"{dest} appeared during the run")
+            err = write_vault_note(str(vault_root), str(dest.parent.relative_to(vault_root)),
+                                   dest.name, content)
+            if err:
+                raise _ItemError(err)
+        _check_readback(dest, entry, "new")
+        return str(dest.relative_to(vault_root)), 0
+    _contained(dest, vault_root)
+    if plan["reuse"]:
+        _check_readback(dest, entry, "append")
+        return str(dest.relative_to(vault_root)), 0
+    section = _render_section(entry, plan["title"], now, backup_dir)
+    lock, err = _acquire_lock(dest)
+    if err:
+        raise _ItemError(err)
+    try:
+        st = os.lstat(dest)  # stat before read: a change after it fails expect_stat
+        text, _ = _read_file(dest)
+        if _START.format(slug=entry["slug"]) in text:
+            raise _ItemError(f"{dest} gained its marker during the run")
+        sep = "" if text.endswith("\n\n") or not text else "\n" if text.endswith("\n") else "\n\n"
+        err = _atomic_rewrite(dest, text + sep + section, expect_stat=(st.st_mtime_ns, st.st_size))
+        if err:
+            raise _ItemError(err)
+    finally:
+        _release_lock(lock)
+    _check_readback(dest, entry, "append", prefix=text)
+    return str(dest.relative_to(vault_root)), len(sep + section)
+
+
+def apply(plan_path: Path, store: Path, vault_root: Path, insights_folder: str, project: str,
+          backup_root: Path, do_apply: bool, now: datetime, out=print) -> int:
+    """Dry run (default) or ``--apply``, following the plan's "Write order"."""
+    vault_root = vault_root.resolve()
+    if os.path.islink(backup_root):
+        raise ApplyError(f"backup root is a symlink: {backup_root}")
+    items, errors = load_plan(plan_path, store, vault_root)
+    if errors:
+        raise ApplyError("bad plan: " + "; ".join(errors))
+    unfinished = _unfinished_runs(backup_root, store)
+    if unfinished:
+        raise ApplyError(f"unfinished run for this store; finish it with: apply --resume {unfinished[0]}")
+    data, plans, backup_dir, dropped, _ = _prepare(items, store, vault_root, insights_folder,
+                                                   project, now, backup_root, out)
+    if os.path.lexists(backup_dir):
+        raise ApplyError(f"backup dir already exists: {backup_dir}")
+    out(f"backup: {backup_dir}")
+    for r in data["refused"]:
+        out(f"REFUSE {r['slug']}: {r['reason']}")
+    for w in data["warnings"]:
+        out(f"WARN {w['slug']}: {w['reason']}")
+    if not do_apply:
+        for plan in plans:
+            item, slug = plan["item"], plan["item"]["slug"]
+            if item["action"] == "retire":
+                out(f"RETIRE {slug}: {item['reason']}")
+                continue
+            rel = plan["dest"].relative_to(vault_root)
+            if plan["reuse"]:
+                out(f"{item['action'].upper()} {slug} -> {rel} (already written; read back only)")
+            elif item["action"] == "new":
+                out(f"NEW {slug} -> {rel}")
+            else:
+                size = len(_render_section(plan["entry"], plan["title"], now, backup_dir)) + 2
+                out(f"APPEND {slug} -> {rel} (+{size} chars)")
+        # The preview drops only lines whose entries all still move.
+        for line in dropped:
+            out(f"DROP {line}")
+        out("dry run: nothing written; add --apply to write")
+        if not plans:
+            return 2
+        return 1 if data["refused"] else 0
+
+    # Step 2: write every note and read it back. A failed item is refused and
+    # its original stays in the store.
+    for plan in plans:
+        item, slug = plan["item"], plan["item"]["slug"]
+        if item["action"] == "retire":
+            data["retired"].append(slug)
+            out(f"RETIRE {slug}: {item['reason']}")
+            continue
+        try:
+            note, grew = _write_note(plan, vault_root, insights_folder, project, now, store, backup_dir)
+        except (_ItemError, StoreError, OSError, ApplyError) as exc:
+            data["refused"].append(dict(slug=slug, reason=str(exc)))
+            out(f"REFUSE {slug}: {exc}")
+            continue
+        data["written"].append(dict(slug=slug, action=item["action"], note=note))
+        out(f"{item['action'].upper()} {slug} -> {note}" + (f" (+{grew} chars)" if grew else ""))
+    _checkpoint("notes")
+    if not data["written"] and not data["retired"]:
+        out("nothing to move")
+        return 2
+
+    # Step 3: back up the whole store, then record the run.
+    if os.path.lexists(backup_dir):
+        raise ApplyError(f"backup dir already exists: {backup_dir}")
+    _private_dirs(backup_dir)
+    full = backup_dir / "full-copy"
+    shutil.copytree(store, full, symlinks=True)
+    for root, dirs, files in os.walk(full):
+        os.chmod(root, 0o700)
+        for name in files:
+            if not os.path.islink(os.path.join(root, name)):
+                os.chmod(os.path.join(root, name), 0o600)
+    run = _Run(data, backup_dir, out)
+    run.save("notes-written")
+    _checkpoint("backup")
+    return run.finish()
+
+
+def resume(backup_dir: Path, vault_arg: str | None, insights_arg: str | None, out=print) -> int:
+    """Finish an interrupted run from the state its run.json records."""
+    backup_dir = Path(backup_dir)
+    data = _read_run(backup_dir)
+    store = resolve_store(data["store"], os.getcwd())
+    out(f"store: {store}")
+    if str(store) != data["store"]:
+        raise ApplyError(f"run.json store {data['store']} is not {store}")
+    vault_root = Path(data["vault"])
+    if vault_arg is not None and Path(vault_arg).resolve() != vault_root.resolve():
+        raise ApplyError(f"--vault {vault_arg} is not the run's vault {vault_root}")
+    if insights_arg is not None and insights_arg != data["insights_folder"]:
+        raise ApplyError(f"--insights-folder {insights_arg} is not the run's {data['insights_folder']}")
+    _, errors = validate_plan(data["plan"], store, vault_root, moved_dir=backup_dir / "moved")
+    if errors:
+        raise ApplyError("bad plan in run.json: " + "; ".join(errors))
+    run = _Run(data, backup_dir, out)
+    out(f"resuming from state: {data['state']}")
+    if data["state"] == "notes-written":
+        # Re-check each note before its original moves.
+        for w in list(data["written"]):
+            try:
+                _check_readback(vault_root / w["note"], run.original(w["slug"]), w["action"])
+                _contained(vault_root / w["note"], vault_root)
+            except (_ItemError, StoreError, ValueError) as exc:
+                data["written"].remove(w)
+                run.refuse(w["slug"], str(exc))
+        run.save()
+    return run.finish()
+
+
+def _main_apply(args) -> int:
+    try:
+        if args.resume:
+            if args.plan or args.store or args.apply or args.project or args.backup_root:
+                raise ApplyError("--resume takes only --vault and --insights-folder")
+            return resume(Path(args.resume), args.vault, args.insights_folder)
+        store = resolve_store(args.store, os.getcwd())
+        print(f"store: {store}")
+        if args.vault is None or args.insights_folder is None:
+            config = load_config(fresh=True)
+        vault = args.vault if args.vault is not None else config.get("vault_path", "")
+        folder = args.insights_folder if args.insights_folder is not None else config["insights_folder"]
+        if not vault or not Path(vault).is_dir():
+            raise ApplyError(f"vault is not a directory: {vault!r}; pass --vault")
+        if not folder or Path(folder).is_absolute() or ".." in Path(folder).parts:
+            raise ApplyError(f"insights folder must be vault-relative: {folder!r}")
+        project = args.project or canonical_project_name(os.getcwd())
+        backup_root = Path(args.backup_root or Path.home() / ".claude" / "backups")
+        return apply(Path(args.plan), store, Path(vault), folder, project, backup_root,
+                     args.apply, datetime.now().astimezone())
+    except (StoreError, ApplyError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
 
 
 class _ArgumentParser(argparse.ArgumentParser):
@@ -303,10 +977,22 @@ def main(argv=None) -> int:
     audit_parser = commands.add_parser("audit", help="report memory index limits and drift")
     audit_parser.add_argument("--store")
     audit_parser.add_argument("--json", action="store_true")
+    apply_parser = commands.add_parser("apply", help="dry run (default) or apply a move plan")
+    source = apply_parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--plan")
+    source.add_argument("--resume", metavar="DIR")
+    apply_parser.add_argument("--store")
+    apply_parser.add_argument("--apply", action="store_true")
+    apply_parser.add_argument("--vault")
+    apply_parser.add_argument("--insights-folder")
+    apply_parser.add_argument("--project")
+    apply_parser.add_argument("--backup-root")
     try:
         args = parser.parse_args(argv)
     except SystemExit as exc:
         return int(exc.code)
+    if args.command == "apply":
+        return _main_apply(args)
     try:
         store = resolve_store(args.store, os.getcwd())
         print(f"store: {store}")
@@ -323,9 +1009,11 @@ def main(argv=None) -> int:
               "{line_limit} lines".format(**index))
         print("over:", ", ".join(index["over"]) or "none")
         print("mode:", report["mode"])
-        for key in ("entries", "orphans", "dangling", "duplicates"):
-            names = [e["slug"] for e in report[key]] if key == "entries" else report[key]
-            print(f"{key} ({len(names)}): {', '.join(names)}")
+        # Counts, plus the names that need action; --json keeps every entry.
+        entries = report["entries"]
+        print(f"entries: {len(entries)} ({sum(e['indexed'] for e in entries)} indexed)")
+        for key in ("orphans", "dangling", "duplicates"):
+            print(f"{key} ({len(report[key])}): {', '.join(report[key])}")
     return int(report["mode"] != "ok" or bool(report["dangling"] or report["duplicates"]))
 
 

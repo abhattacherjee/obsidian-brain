@@ -40,7 +40,7 @@ def test_clean(store, capsys):
     assert capsys.readouterr().out.splitlines() == [
         f"store: {store}", "index: 12 bytes, 12 chars, 1 lines",
         "limits: 17000 soft bytes, 24000 hard bytes, 200 lines", "over: none",
-        "mode: ok", "entries (1): a", "orphans (0): ", "dangling (0): ", "duplicates (0): ",
+        "mode: ok", "entries: 1 (1 indexed)", "orphans (0): ", "dangling (0): ", "duplicates (0): ",
     ]
 
 
