@@ -393,8 +393,11 @@ def _title(index_text: str, entry: dict) -> str:
     slug = entry["slug"]
     m = re.search(r"\[([^\[\]\n]{1,300})\]\(\s*<?(?:\./)?" + re.escape(slug) + r"\.md[\s>)\"']",
                   index_text)
-    title = (m.group(1) if m else "") or entry["name"] or entry["description"] or slug
-    return " ".join(title.split())
+    link = m.group(1) if m else ""
+    named = re.sub(r"[-_]+", " ", re.sub(r"^(feedback|technical|reference|project|user)[-_]", "", entry["name"])).strip()
+    words = r"[A-Za-z0-9]+"
+    title = link if len(re.findall(words, link)) >= len(re.findall(words, named)) else named
+    return " ".join((title or named or entry["description"] or slug).split())
 
 
 def _summary(entry: dict) -> str:

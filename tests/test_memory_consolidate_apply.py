@@ -171,6 +171,35 @@ def test_dry_run_in_process_also_leaves_trees(env):
 
 # --- full apply ----------------------------------------------------------------
 
+@pytest.mark.parametrize(("link", "name", "expected"), [
+    ("adversarial + heuristic", "adversarial-fixture-with-heuristic", "adversarial fixture with heuristic"),
+    ("makedirs mode is leaf-only", "makedirs-leaf", "makedirs mode is leaf-only"),
+    ("Leaf-only", "makedirs-leaf", "Leaf-only"),
+    ("", "foo_bar_baz", "foo bar baz"),
+    ("", "feedback_differential_oracle_for_grammar_code", "differential oracle for grammar code"),
+    ("oracle", "technical-db-access-via-connect", "db access via connect"),
+    ("", "", "Desc here"),
+])
+def test_title(link, name, expected):
+    slug = "feedback_adversarial_fixture_with_heuristic"
+    index = f"- [{link}]({slug}.md)" if link else ""
+    assert mc._title(index, dict(slug=slug, name=name, description="Desc here")) == expected
+
+
+def test_grouped_line_uses_longer_name_for_note_filename(env):
+    slug = "feedback_adversarial_fixture_with_heuristic"
+    store = env["store"]
+    (store / f"{slug}.md").write_text(entry_text("adversarial-fixture-with-heuristic", "Fixture", "Use both."))
+    (store / "MEMORY.md").write_text(INDEX.replace(
+        "[Alpha lesson](feedback_a.md)", f"[Alpha lesson](feedback_a.md) · [adversarial + heuristic]({slug}.md)"))
+    plan = write_plan(env, [ITEMS[0], dict(ITEMS[0], slug=slug)])
+    code, out = run_apply(env, "--apply", plan=plan)
+    assert code == 0, out
+    [note] = marked_notes(env, slug)
+    suffix = hashlib.sha1(slug.encode()).hexdigest()[:4]
+    assert note.name == f"2026-11-24-adversarial-fixture-with-heuristic-{suffix}.md"
+
+
 def test_apply_writes_reads_back_moves_and_edits_index(env):
     code, out = run_apply(env, "--apply")
     assert code == 0, out
