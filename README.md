@@ -100,6 +100,7 @@ Run `/obsidian-setup` after installation. It will:
 | `/lessons` | Act on retro lessons that keep coming back: file an issue, raise an issue's milestone or priority, skip or snooze, and confirm rule and memory matches in one batch |
 | `/vault-ask` | Ask questions and get synthesized answers grounded in vault history |
 | `/check-items` | Cross-project sweep for completed open items — auto-checks off matches after user confirmation |
+| `/memory-consolidate` | Move facts out of a project's Claude Code memory into the vault, one note per fact, so `MEMORY.md` shrinks or loses its orphans. Dry run first; originals are backed up, never deleted. |
 | `/vault-doctor` | Audit and repair the vault — detects stale `source_session` backlinks and other health issues (dry-run by default) |
 | `/vault-reindex` | Rebuild the SQLite + FTS5 search index from scratch — use after bulk edits in Obsidian or to recover from a corrupt index |
 | `/vault-stats` | Vault health diagnostics and usage analytics — signal coverage, access patterns, importance distribution, top accessed notes. Saves report to vault for trend tracking. |

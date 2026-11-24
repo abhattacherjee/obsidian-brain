@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `/memory-consolidate` moves facts out of a project's Claude Code memory store into the vault (#309). It works when `MEMORY.md` is near its size limit (shrink) and when memory files have no index line (rescue). Claude decides what to keep, move or retire and checks the vault for a note that already covers each fact. `hooks/memory_consolidate.py` does the rest: `audit` reports the index size in bytes, characters and lines; `apply` is a dry run unless given `--apply`; `verify` checks the finished run; `smoke` reindexes and searches for a moved note. Each moved fact becomes one note with the memory text copied word for word and `migrated_from_memory: <slug>` in its frontmatter, and no `source_session`, so retro does not count it as the moving session's finding. A fact the vault already covers is appended to that note. Nothing is deleted: the whole store is copied to `~/.claude/backups/memory-moved-<time>-<project>/` first, and each original moves to its `moved/` folder. An entry with secret-shaped text, or one on an index line that also points at entries that stay, is refused. An interrupted run finishes with `apply --resume <dir>`.
+- `hooks/memory_links.py` holds the `MEMORY.md` link parser, shared by the `memory-index` vault-doctor check and the new CLI (#309).
+
 ### Changed
 - `note_writer.py write` takes the note from `--body-file PATH` as well as stdin (#517). `/retro`, `/decide`, `/compress`, `/error-log`, `/standup`, `/vault-import` and `/vault-stats` now write the note with the Write tool and pass the file, so no note text sits in the Bash command, where a PreToolUse hook could refuse the save over words the note quotes. A missing, unreadable or non-UTF-8 file exits 1 and writes nothing; the skill keeps the file and names it so the text is not lost. `/compress`'s `append-update` still reads stdin.
 - `retro_trace.py apply` takes the traces JSON from `--traces-file PATH` as well as stdin (#518). A missing or unreadable file exits 2 and leaves the note unchanged.
