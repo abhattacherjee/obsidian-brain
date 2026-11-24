@@ -113,6 +113,107 @@ def test_baseline_dangling(env):
     assert mc.verify(finish(env))[0]
 
 
+def test_baseline_duplicate(env):
+    append_line(env["store"] / "MEMORY.md", "- [Again](stay.md)")
+    assert mc.verify(finish(env))[0]
+
+
+def test_baseline_orphan(env):
+    (env["store"] / "extra.md").write_text("Extra")
+    assert mc.verify(finish(env))[0]
+
+
+def test_baseline_does_not_hide_new_drift(env, capsys):
+    """The baseline only excuses what was already wrong before the run."""
+    append_line(env["store"] / "MEMORY.md", "- [Again](stay.md)")
+    backup = finish(env)
+    (env["store"] / "extra.md").write_text("Extra")
+    assert_failures(backup, capsys, "all-indexed")
+
+
+def test_partial_move_verifies_clean(env, monkeypatch, capsys):
+    """An original refused during the move stays live; its note still matches it (X-008)."""
+    edited = (env["store"] / "feedback_b.md").read_text().replace("Beta body text.", "Edited later.")
+
+    def edit(name):
+        if name == "backup":  # after the backup copy, before the move
+            (env["store"] / "feedback_b.md").write_text(edited, encoding="utf-8")
+
+    monkeypatch.setattr(mc, "_checkpoint", edit)
+    append_line(env["store"] / "feedback_a.md", "Chrysoprase.")
+    assert mc.main(["apply", "--plan", str(write_plan(env)), "--store", str(env["store"]),
+                    "--vault", str(env["vault"]), "--project", "proj", "--insights-folder", "claude-insights",
+                    "--backup-root", str(env["backups"]), "--apply"]) == 1
+    [backup] = env["backups"].iterdir()
+    assert (env["store"] / "feedback_b.md").read_text() == edited
+    capsys.readouterr()
+    assert mc.main(["verify", "--backup", str(backup)]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert "PASS removed-equals-moved: unexpected: []; missing: []" in lines
+    assert "PASS notes-lossless: ok" in lines
+
+
+def test_missing_backup(backup, capsys):
+    (backup / "moved/project_c.md").unlink()
+    assert_failures(backup, capsys, "backups-present")
+
+
+def test_missing_full_copy_entry(backup, capsys):
+    (backup / "full-copy/stay.md").unlink()
+    capsys.readouterr()
+    assert mc.main(["verify", "--backup", str(backup)]) == 1
+    out = capsys.readouterr().out
+    assert "FAIL backups-present: missing full-copy/stay.md" in out.splitlines()
+
+
+def test_changed_full_copy_entry(backup, capsys):
+    (backup / "full-copy/stay.md").write_text("tampered")
+    capsys.readouterr()
+    assert mc.main(["verify", "--backup", str(backup)]) == 1
+    assert "FAIL backups-present: changed full-copy/stay.md" in capsys.readouterr().out.splitlines()
+
+
+def strip_file_list(backup):
+    path = backup / "run.json"
+    data = json.loads(path.read_text())
+    del data["full_copy"]
+    path.write_text(json.dumps(data))
+
+
+def test_old_run_json_without_a_file_list_warns(backup, capsys):
+    strip_file_list(backup)
+    (backup / "full-copy/stay.md").unlink()
+    capsys.readouterr()
+    assert mc.main(["verify", "--backup", str(backup)]) == 0
+    out = capsys.readouterr().out.splitlines()
+    assert any(line.startswith("WARN backups-present: run.json lists no full-copy files") for line in out)
+    assert "PASS backups-present: ok" in out
+
+
+def test_still_in_store(env, backup, capsys):
+    """An original copied back into the store fails backups-present (and is an orphan)."""
+    (env["store"] / "project_c.md").write_text((backup / "moved/project_c.md").read_text())
+    capsys.readouterr()
+    assert mc.main(["verify", "--backup", str(backup)]) == 1
+    out = capsys.readouterr().out.splitlines()
+    assert "FAIL backups-present: still in store: project_c.md" in out
+    assert {l.split(":")[0] for l in out if l.startswith("FAIL ")} == {"FAIL backups-present", "FAIL all-indexed"}
+
+
+@pytest.mark.parametrize("with_list", [True, False], ids=["file-list", "old-run-json"])
+def test_missing_full_copy_index(backup, capsys, with_list):
+    if not with_list:
+        strip_file_list(backup)
+    (backup / "full-copy/MEMORY.md").unlink()
+    capsys.readouterr()
+    assert mc.main(["verify", "--backup", str(backup)]) == 1
+    out = capsys.readouterr().out.splitlines()
+    assert "FAIL removed-equals-moved: missing full-copy/MEMORY.md" in out
+    [line] = [l for l in out if l.startswith("FAIL backups-present")]
+    assert "missing full-copy/MEMORY.md" in line
+    assert "PASS sizes: before: unavailable; after: " in "\n".join(out)
+
+
 def test_foreign_store(env, backup, capsys):
     other = env["tmp"] / ".claude/projects/-other/memory"
     other.mkdir(parents=True)

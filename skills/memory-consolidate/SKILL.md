@@ -72,8 +72,10 @@ python3 '<HOOKS>/memory_consolidate.py' audit
 
 The first line is `store: <path>`: the store this run works on (the main worktree's store, even
 from a worktree). Keep it as `<STORE>`. If the user names another project, add
-`--store '<that store path>'`. The plan JSON carries the store (Step 4), so `apply` and `verify`
-need no `--store`. Exit 2 means the store could not be chosen; show the error and stop.
+`--store '<that store path>'` here and keep that path as `<STORE>`. Steps 5 to 7 pass the same
+`--store '<STORE>'`: without it `apply` picks the store of the current directory and refuses
+another project's plan as a `store mismatch`. Exit 2 means the store could not be chosen; show
+the error and stop.
 
 Report to the user: index size in bytes, characters and lines (say which unit), the limits,
 the mode (`shrink`, `rescue` or `ok`), and any orphans, dangling links or duplicates. Mode `ok`
@@ -136,7 +138,7 @@ Keep the path as `<PLAN>`.
 ### Step 5 — Dry run, then ask
 
 ```bash
-python3 '<HOOKS>/memory_consolidate.py' apply --plan '<PLAN>'
+python3 '<HOOKS>/memory_consolidate.py' apply --plan '<PLAN>' --store '<STORE>'
 ```
 
 It prints `NEW`, `APPEND`, `RETIRE`, `REFUSE` and `WARN` lines and every index line it would
@@ -149,17 +151,18 @@ A `REFUSE` for a secret-shaped string means the entry stays in memory; tell the 
 ### Step 6 — Apply
 
 ```bash
-python3 '<HOOKS>/memory_consolidate.py' apply --plan '<PLAN>' --apply
+python3 '<HOOKS>/memory_consolidate.py' apply --plan '<PLAN>' --store '<STORE>' --apply
 ```
 
 Keep the `backup:` line's path as `<BACKUP>`. Exit 1 means some items were refused and the rest
-were done. If the run stops partway, it prints the `apply --resume '<BACKUP>'` line to finish it;
-run that.
+were done. Exit 2 means the run could not go on. If it stopped after the backup dir was made
+(an I/O error such as a full disk), the error is followed by a `finish with: apply --resume
+<BACKUP>` line: run `apply --resume '<BACKUP>'` to finish it (`--resume` takes no `--store`).
 
 ### Step 7 — Verify
 
 ```bash
-python3 '<HOOKS>/memory_consolidate.py' verify --backup '<BACKUP>'
+python3 '<HOOKS>/memory_consolidate.py' verify --backup '<BACKUP>' --store '<STORE>'
 ```
 
 It prints one line per check: `index-links-resolve`, `no-duplicates`, `all-indexed`,
@@ -177,7 +180,10 @@ python3 '<HOOKS>/memory_consolidate.py' smoke --query '<phrase>' --expect '<note
 ```
 
 This runs the default (non-wiping) reindex, then searches. Exit 0 means the moved note was found.
-Exit 1 (`MISSING`) means the move is not retrievable yet: report it, do not claim success.
+Exit 1 means the move is not retrievable yet: either the search had no hits (`smoke: 0 hit(s)`)
+or a `MISSING <note path>` line names a note `--expect` did not find. Report it, do not claim
+success. Exit 2 means the smoke run itself failed (`error:` line, for example a vault that is not
+a directory): stop and report the error, do not claim success.
 
 ### Step 9 — Report
 

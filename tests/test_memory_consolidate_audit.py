@@ -82,7 +82,11 @@ def test_drift(store):
     ("é" * 8499 + " ", []), ("é" * 8500, ["soft_bytes"]),
     ("\n" * 200, []), ("\n" * 201, ["lines"]),
     ("\n" * 201 + " " * 23799, ["soft_bytes", "hard_bytes", "lines"]),
-], ids=["16999-bytes", "17000-bytes", "200-lines", "201-lines", "all-limits"])
+    # The hard limit is `>=`: 23999 stays under it, 24000 and 24001 are over.
+    (" " * 23999, ["soft_bytes"]), (" " * 24000, ["soft_bytes", "hard_bytes"]),
+    (" " * 24001, ["soft_bytes", "hard_bytes"]),
+], ids=["16999-bytes", "17000-bytes", "200-lines", "201-lines", "all-limits",
+        "23999-bytes", "24000-bytes", "24001-bytes"])
 def test_index_limits(store, index, over):
     populate(store, index)
     assert audit(store)["index"] == dict(bytes=len(index.encode()), chars=len(index),
@@ -132,6 +136,19 @@ def test_bad_args(capsys):
     assert capsys.readouterr().err.splitlines()[-1] == "error: unrecognized arguments: --unknown"
 
 
+@pytest.mark.parametrize("argv", [
+    ["audit", "--jso"], ["apply", "--plan", "p", "--appl"], ["verify", "--backu", "b"],
+    ["smoke", "--quer", "q"], ["apply", "--pla", "p"],
+])
+def test_abbreviated_flags_are_rejected(store, argv, capsys):
+    """argparse would take --app for --apply and turn a dry run into a write.
+
+    The ``store`` fixture points HOME at tmp_path, so an accepted abbreviation would fail
+    later for another reason; only a parse error prints the usage line, which tells them apart."""
+    assert main(argv) == 2
+    assert "usage:" in capsys.readouterr().err
+
+
 def test_unreadable_entries(store, capsys):
     with pytest.raises(StoreError, match="MEMORY.md"):
         audit(store)
@@ -152,9 +169,9 @@ def test_read_entry(store, header, kind):
     text = "---\nname: 'A'\ndescription: \"A \\\"quote\\\"\"\n" + header + "\n---\n\n body \n"
     path.write_text(text, encoding="utf-8")
     assert read_entry(path) == dict(slug="a", name="A", description='A "quote"', memory_type=kind,
-                                   body="body", text=text, mtime=path.stat().st_mtime)
+                                   body=" body", text=text, mtime=path.stat().st_mtime)
     populate(store, "see [[a]]")
-    assert audit(store)["entries"] == [dict(slug="a", memory_type=kind, body_chars=4, indexed=True,
+    assert audit(store)["entries"] == [dict(slug="a", memory_type=kind, body_chars=5, indexed=True,
         mtime=datetime.fromtimestamp(path.stat().st_mtime).astimezone().isoformat(timespec="seconds"))]
 
 
@@ -210,6 +227,9 @@ def test_empty_items(plan_env):
 @pytest.mark.parametrize(("slug", "fields", "error"), [
     ("../a", {"action": "new"}, "invalid slug"),
     ("MEMORY", {"action": "new"}, "invalid slug"),
+    ("memory", {"action": "new"}, "invalid slug"),
+    ("Memory", {"action": "new"}, "invalid slug"),
+    ("memory.md", {"action": "new"}, "invalid slug"),
     ("absent", {"action": "new"}, "missing or non-regular entry file"),
     ("a", {"action": "skip"}, "invalid action"),
     ("a", {"action": "new", "target": "note.md"}, "unknown key target"),

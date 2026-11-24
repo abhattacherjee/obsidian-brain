@@ -119,7 +119,7 @@
         ]
       },
       {
-        "arrowLabel": "on demand (20 skills)",
+        "arrowLabel": "on demand (21 skills)",
         "nodes": [
           {
             "label": "Capture / Recall",
@@ -438,7 +438,7 @@
           "files": [
             "hooks/memory_consolidate.py"
           ],
-          "purpose": "Stdlib CLI behind /memory-consolidate (#309): audit, apply, verify, smoke. audit reports the selected store (main worktree's store by default, via _cc_encoded_dirnames; symlinked stores and entries refused), MEMORY.md size in bytes, chars and lines against the 17,000/24,000-byte and 200-line limits, orphans, dangling links, duplicates and a mode (shrink, rescue, ok). apply takes a plan JSON of new/append/retire items, dry run by default. With --apply it refuses secret-shaped entries and entries on an index line that also points at staying entries, writes one note per fact with the body copied word for word (frontmatter migrated_from_memory and synced_from, no source_session) or appends a marked section, reads each back with a lossless check, copies the whole store to a backup dir, moves each original to <backup>/moved/, then rewrites the live MEMORY.md atomically with a stat check and adds one pointer line. run.json records each state (notes-written, moved, done) so apply --resume finishes an interrupted run. verify checks a finished run (links resolve, no duplicates, all indexed, removed set equals moved set, notes lossless, backups present, sizes) against the run's baseline; smoke reindexes (non-wiping) and requires the expected note among the search hits."
+          "purpose": "Stdlib CLI behind /memory-consolidate (#309): audit, apply, verify, smoke. audit reports the selected store (main worktree's store by default, via _cc_encoded_dirnames; symlinked stores and entries refused), MEMORY.md size in bytes, chars and lines against the 17,000/24,000-byte and 200-line limits, orphans, dangling links, duplicates and a mode (shrink, rescue, ok). apply takes a plan JSON of new/append/retire items, dry run by default. With --apply it refuses secret-shaped entries (file text or the MEMORY.md link label that titles the note) and entries on an index line that also points at staying entries, writes one note per fact with the body copied word for word (frontmatter migrated_from_memory and synced_from, no source_session) or appends a marked section, reads each back with a lossless check, copies the whole store to a backup dir, moves each original to <backup>/moved/, then rewrites the live MEMORY.md atomically with a stat check and adds one pointer line. An original is moved only when the live file and the backup copy both match the sha256 of the text its note was written from. run.json is written before the backup copy and records each state (backing-up, notes-written, moved, done) so apply --resume finishes an interrupted run, including one stopped during the copy; an OSError exits 2 with the resume line (exit 1 stays some-items-refused), and apply and verify take --store so a plan for another project applies. verify checks a finished run (links resolve, no duplicates, all indexed, removed set equals moved set, notes lossless, backups present including every file listed in run.json full_copy, sizes) against the run's baseline; smoke reindexes (non-wiping) and requires the expected note among the search hits."
         }
       ]
     },
@@ -1358,7 +1358,7 @@
           "name": "Memory move backups",
           "kind": "datastore",
           "files": [],
-          "purpose": "~/.claude/backups/memory-moved-<YYYYMMDD-HHMMSS>-<project dir>/ (0700), one per /memory-consolidate apply run: run.json (state, plan, refused, written, moved, baseline, sizes), full-copy/ (the whole memory store before the move) and moved/<slug>.md (each moved or retired original). A run never reuses an existing dir; apply --resume <dir> finishes one from its recorded state."
+          "purpose": "~/.claude/backups/memory-moved-<YYYYMMDD-HHMMSS>-<project dir>/ (0700), one per /memory-consolidate apply run: run.json (state, plan, refused, written with each entry's sha256, moved, baseline, sizes, full_copy file list), full-copy/ (the whole memory store before the move) and moved/<slug>.md (each moved or retired original). A run never reuses an existing dir; apply --resume <dir> finishes one from its recorded state."
         }
       ]
     },
