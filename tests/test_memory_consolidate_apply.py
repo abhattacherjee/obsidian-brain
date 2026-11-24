@@ -314,6 +314,15 @@ def test_lossless_check_catches_one_character(env, monkeypatch):
     assert not (env["store"] / "feedback_b.md").exists()
 
 
+def test_check_note_text_rejects_tampered_summary(tmp_path):
+    entry = {"slug": "feedback_a", "description": "Alpha description", "body": "Alpha body."}
+    text = "\n## Summary\n\nAlphx description\n\n## Details\n\nAlpha body.\n\n"
+    text += mc._END.format(slug=entry["slug"])
+    path = tmp_path / "note.md"
+    with pytest.raises(mc._ItemError, match="copied summary differs from the memory description"):
+        mc._check_note_text(path, text, entry, "new")
+
+
 def test_write_failure_leaves_that_original(env, monkeypatch):
     monkeypatch.setattr(mc, "write_vault_note", lambda *a: "write failed: disk full")
     code, out = run_apply(env, "--apply")

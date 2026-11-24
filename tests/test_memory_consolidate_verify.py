@@ -89,13 +89,17 @@ def test_moved_entry_still_referenced(env, backup, capsys):
 @pytest.mark.parametrize(("action", "old", "new"), [
     ("new", "Chrysoprase.", "Chrysoprase!"),
     ("append", "Beta body text.", "Beta body text!"),
+    ("new", "\n## Summary\n\nAlpha description", "\n## Summary\n\nAlphx description"),
+    ("append", "\n### Summary\n\nBeta description", "\n### Summary\n\nBetx description"),
     ("new", 'migrated_from_memory: "feedback_a"', "migrated_from_memory: other"),
     ("new", "status: active", "source_session_note: example"),
 ])
 def test_note_drift(env, backup, capsys, action, old, new):
     run = json.loads((backup / "run.json").read_text())
     [note] = [env["vault"] / row["note"] for row in run["written"] if row["action"] == action]
-    note.write_text(note.read_text().replace(old, new))
+    text = note.read_text()
+    assert old in text
+    note.write_text(text.replace(old, new, 1))
     assert_failures(backup, capsys, "notes-lossless")
 
 

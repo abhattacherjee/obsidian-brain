@@ -451,6 +451,22 @@ def _details(text: str, slug: str, action: str) -> str | None:
     return text[at + len(header):end]
 
 
+def _summary_text(text: str, slug: str, action: str) -> str | None:
+    """The copied summary in a written note, or None when its markers are missing."""
+    if action == "new":
+        start, summary, details = 0, "\n## Summary\n", "\n## Details\n"
+    else:
+        start = text.find(_START.format(slug=slug))
+        if start < 0:
+            return None
+        summary, details = "\n### Summary\n", "\n### Details\n"
+    at = text.find(summary, start)
+    end = text.find(details, start)
+    if at < 0 or end < at + len(summary):
+        return None
+    return text[at + len(summary):end]
+
+
 def _frontmatter(text: str) -> str:
     lines = text.split("\n")
     if not lines or lines[0].rstrip("\r") != "---":
@@ -462,7 +478,7 @@ def _frontmatter(text: str) -> str:
 
 
 def _check_readback(path: Path, entry: dict, action: str, prefix: str | None = None) -> None:
-    """Lossless check: the copied text must equal the memory body exactly."""
+    """Check the copied body and whitespace-normalized summary against the memory."""
     try:
         text, _ = _read_file(path)
     except StoreError as exc:
@@ -476,6 +492,9 @@ def _check_note_text(path: Path, text: str, entry: dict, action: str, prefix: st
         raise _ItemError(f"read-back failed: markers missing in {path}")
     if details.strip() != entry["body"].strip():
         raise _ItemError(f"read-back failed: copied text differs from the memory body in {path}")
+    summary = _summary_text(text, entry["slug"], action)
+    if summary is None or " ".join(summary.split()) != _summary(entry):
+        raise _ItemError(f"read-back failed: copied summary differs from the memory description in {path}")
     if prefix is not None and not text.startswith(prefix):
         raise _ItemError(f"read-back failed: the rest of {path} changed")
     if action == "new" and re.search(r"^source_session", _frontmatter(text), re.M):

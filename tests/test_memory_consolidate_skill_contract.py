@@ -72,5 +72,15 @@ def test_no_source_session_in_plan_or_commands(text):
     assert "no `source_session`" in text
 
 
+def test_verify_check_names_are_documented_and_exist(text):
+    cli = CLI.read_text(encoding="utf-8")
+    for name in (
+        "index-links-resolve", "no-duplicates", "all-indexed", "removed-equals-moved",
+        "notes-lossless", "backups-present", "sizes",
+    ):
+        assert f"`{name}`" in text, name
+        assert f'"{name}"' in cli, name
+
+
 def test_smoke_checks_the_moved_note(text):
     assert "--expect '<note path>'" in text

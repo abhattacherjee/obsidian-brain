@@ -38,6 +38,9 @@ Claude makes the judgement calls (keep or move, note type, dedupe). The CLI
 Run this as a command of its own and keep the printed hooks directory; the steps below call it
 `<HOOKS>`. Paste it literally, in single quotes.
 
+If it prints the bare word `hooks`, the plugin install was not found: stop and tell the user to
+check the obsidian-brain install.
+
 ```bash
 python3 -c "
 import glob, json, os, re
@@ -69,7 +72,8 @@ python3 '<HOOKS>/memory_consolidate.py' audit
 
 The first line is `store: <path>`: the store this run works on (the main worktree's store, even
 from a worktree). Keep it as `<STORE>`. If the user names another project, add
-`--store '<that store path>'`. Exit 2 means the store could not be chosen; show the error and stop.
+`--store '<that store path>'`. The plan JSON carries the store (Step 4), so `apply` and `verify`
+need no `--store`. Exit 2 means the store could not be chosen; show the error and stop.
 
 Report to the user: index size in bytes, characters and lines (say which unit), the limits,
 the mode (`shrink`, `rescue` or `ok`), and any orphans, dangling links or duplicates. Mode `ok`
@@ -86,6 +90,10 @@ Read each candidate entry in `<STORE>` (Read tool). Apply this test:
   already says.
 - **Retire** point-in-time state that git or GitHub now holds (PR status, "shipped on <date>",
   filed-issue records). Retired entries are backed up but get no vault note.
+
+When the user asks for a number of entries or for older ones, use `audit --json` (each entry has
+`mtime` and `body_chars`) to pick, oldest first, among those that pass the move test; if fewer
+pass, move only those and say so.
 
 Pick a note type per moved entry: `claude-insight` (a reusable rule; the default),
 `claude-error-fix` (a diagnosed failure and its fix) or `claude-decision` (a chosen option with
@@ -135,7 +143,8 @@ It prints `NEW`, `APPEND`, `RETIRE`, `REFUSE` and `WARN` lines and every index l
 drop, and writes nothing. Exit 2 means the plan is bad: fix it and rerun.
 
 Show the user the full list, every `RETIRE` and `REFUSE` line in particular, and ask before going
-on. A `REFUSE` for a secret-shaped string means the entry stays in memory; tell the user which.
+on. If the user drops or changes items, edit the plan and rerun this dry run before Step 6.
+A `REFUSE` for a secret-shaped string means the entry stays in memory; tell the user which.
 
 ### Step 6 — Apply
 
@@ -153,8 +162,11 @@ run that.
 python3 '<HOOKS>/memory_consolidate.py' verify --backup '<BACKUP>'
 ```
 
-Every line must be `PASS`. Any `FAIL` (exit 1): report it to the user with its detail line. The
-originals are all in `<BACKUP>/moved/` and `<BACKUP>/full-copy/`, so nothing is lost.
+It prints one line per check: `index-links-resolve`, `no-duplicates`, `all-indexed`,
+`removed-equals-moved`, `notes-lossless`, `backups-present`, `sizes`, then `verify: ok`.
+Every line must be `PASS`; a missing line counts as a failure.
+Any `FAIL` (exit 1): report it to the user with its detail line. The originals are all in
+`<BACKUP>/moved/` and `<BACKUP>/full-copy/`, so nothing is lost.
 
 ### Step 8 — Reindex and search
 
