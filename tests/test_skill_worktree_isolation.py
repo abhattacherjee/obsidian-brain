@@ -47,6 +47,7 @@ SHELL_BLOCK_COUNTS = {
     "error-log": 6,
     "lessons": 15,
     "link": 6,
+    "memory-consolidate": 6,
     "obsidian-setup": 15,
     "recall": 8,
     "retro": 12,
