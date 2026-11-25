@@ -3,7 +3,7 @@
   "displayName": "Obsidian Brain",
   "version": "3.11.0",
   "tagline": "A Claude Code plugin that turns an Obsidian vault into a persistent brain across sessions — auto-logging, curated knowledge capture, snapshot-on-compact, and fast cross-project recall, all via direct filesystem writes.",
-  "lastUpdated": "2026-11-24",
+  "lastUpdated": "2026-11-25",
   "repository": "https://github.com/abhattacherjee/obsidian-brain",
   "defaultBranch": "main",
   "techStack": {
@@ -1384,7 +1384,7 @@
           "files": [
             "scripts/commit-preflight.sh"
           ],
-          "purpose": "Vendored from harden-repo v1.3.0 (892d0f5) plus three repo parts: the plugin manifest version sync (always on, before every skip-mode exit), --allow-empty (an empty commit only: refuses when anything is staged or a tracked file is modified) and the pytest block with cov-fail-under 90. Writes a 5-minute token at /tmp/.preflight-token-<first 8 hex characters of the md5 of git-common-dir>, bound to HEAD, the staged tree and the checkout, so a linked worktree's own preflight authorises its own commit (#418). require-preflight keeps the token on approval, holds it for 5 s after a claim, and refuses a commit that could stage files in the same call. Every pytest run (the main pass and the timed TestDecisionTimeIsBounded pass) goes through `_heavy`, the machine-wide heavy-run slot at ~/.claude/bin/heavy (claude-code-config#692, #525); a slot timeout (exit 75) fails the preflight with \"Tests not run\" and writes no token; without heavy the tests run directly with one warning line per run; `_heavy` and `_run_pytest` come from harden-repo develop 823346d. Other checks: secret scan, assertion-strength gate (warn), template drift (advisory). Flags: --docs-only, --skip-tests, --auto, --allow-empty."
+          "purpose": "The harden-repo v1.5.0 (9424640) template, unchanged outside its marker blocks (#532). The repo's parts sit inside them: the LINT block checks that plugin.json and marketplace.json name one version (normal mode only; skip modes exit first, and tests/test_manifest_version_sync.py checks it in CI), and the TEST block runs pytest with cov-fail-under 90. Writes a 5-minute token at ${XDG_CACHE_HOME:-$HOME/.cache}/claude/preflight/harden-token-<first 8 hex characters of the md5 of git-common-dir>, in a 0700 directory it checks, bound to HEAD, the staged tree and the checkout, so a linked worktree's own preflight authorises its own commit (#418). require-preflight keeps the token on approval, holds it for 5 s after a claim, and refuses a commit that could stage files in the same call. Every pytest run (the main pass and the timed TestDecisionTimeIsBounded pass) goes through `_heavy`, the machine-wide heavy-run slot at ~/.claude/bin/heavy (claude-code-config#692, #525); a slot timeout (exit 75) fails the preflight with \"Tests not run\" and writes no token; without heavy the tests run directly with one warning line per run; Other checks: secret scan, assertion-strength gate (warn), template drift (advisory). Flags: --docs-only, --skip-tests, --auto (--allow-empty went with #532)."
         },
         {
           "id": "ops-ci",
@@ -1393,7 +1393,7 @@
           "files": [
             ".github/workflows/ci.yml"
           ],
-          "purpose": "Adaptive cost-optimized CI: secret-scan, changelog-check (PRs to main), python-tests (3.12, cov>=90), python-tests-py39 (suite on 3.9 minus the timed tests, the macOS system python3; no coverage gate, #371), both on pytest-xdist, plus timed-tests (the wall-clock budget tests run serially in two shards per Python, each on its own runner, for 3.12 and 3.9, #485), no-default-db AST guard, security-tests, tests-passed (needs the five test jobs, runs with always(), passes only when all succeeded; develop requires it with secret-scan and python-tests, #505), and an advisory detect-release-merge check."
+          "purpose": "Adaptive cost-optimized CI: secret-scan, changelog-check (PRs to main), python-tests (3.12, cov>=90), python-tests-py39 (suite on 3.9 minus the timed tests, the macOS system python3; no coverage gate, #371), both on pytest-xdist, plus timed-tests (the wall-clock budget tests run serially in two shards per Python, each on its own runner, for 3.12 and 3.9, #485), no-default-db AST guard, security-tests, tests-passed (needs the five test jobs, runs with always(), passes only when all succeeded; develop requires it with secret-scan and python-tests, #505); every PR job carries harden-repo's draft gate, so a draft PR runs nothing until ready_for_review (#532), and an advisory detect-release-merge check."
         },
         {
           "id": "ops-no-default-db",
@@ -3031,7 +3031,7 @@
       "Direct filesystem writes only — no MCP server, no REST API, no daemon; the vault works even when Obsidian is closed.",
       "Hooks are pure stdlib, deterministic, and always exit 0; they never import the index (indexing is a skill-side concern).",
       "Everything is recoverable: the SQLite index is derived and fully rebuildable from the markdown vault.",
-      "Defense in depth on writes: path containment, atomic temp+rename, 0600/0700 perms, secret scrubbing, and stdin caps (1 MB in hooks/ and scripts/; the five .claude/hooks/ gates read up to 16 MiB and judge the whole payload). The stdin-cap AST guard walks all three in-repo Python trees: hooks/, scripts/ and .claude/hooks/. The five .claude/hooks/ PreToolUse gates (prevent-direct-push, require-preflight, validate-branch-name, update-changelog-before-pr, enforce-pr-base-branch) are vendored unchanged from harden-repo v1.3.0 (892d0f5); tests/test_vendored_hooks.py pins their sha256, so a fix goes upstream, not here (#418). They share one shell-scanner block that is kept byte-identical across the five files. Every unusable input fails closed with permissionDecision: deny at exit 0. A verb mentioned only as data (a heredoc body, a quoted argument) is allowed (#343), a quoted or escaped command name is judged like the plain one (#366), and the scope guard is linear in the number of cd and -C prefixes (#353). Known costs, accepted when vendoring: a cd or -C target that does not exist counts as in scope; staging and committing in one Bash call is refused; and a command word built from an unresolved variable next to the words push or commit is denied (harden-repo#138)."
+      "Defense in depth on writes: path containment, atomic temp+rename, 0600/0700 perms, secret scrubbing, and stdin caps (1 MB in hooks/ and scripts/; the five .claude/hooks/ gates read up to 16 MiB and judge the whole payload). The stdin-cap AST guard walks all three in-repo Python trees: hooks/, scripts/ and .claude/hooks/. The five .claude/hooks/ PreToolUse gates (prevent-direct-push, require-preflight, validate-branch-name, update-changelog-before-pr, enforce-pr-base-branch) are vendored unchanged from harden-repo v1.5.0 (9424640); tests/test_vendored_hooks.py checks them against harden-repo's template ledger, so a fix goes upstream, not here (#418). They share one shell-scanner block that is kept byte-identical across the five files. Every unusable input fails closed with permissionDecision: deny at exit 0. A verb mentioned only as data (a heredoc body, a quoted argument) is allowed (#343), a quoted or escaped command name is judged like the plain one (#366), and the scope guard is linear in the number of cd and -C prefixes (#353). Known costs, accepted when vendoring: a cd or -C target that does not exist counts as in scope; staging and committing in one Bash call is refused; and a command word built from an unresolved variable next to the words push or commit is denied (harden-repo#138)."
     ],
     "constraints": [
       "Python stdlib only — no pip dependencies (hooks run at session boundaries where install state is unknown).",
@@ -3159,7 +3159,7 @@
     },
     {
       "name": "commit-preflight.sh",
-      "command": "preflight gate (harden-repo v1.3.0 + repo parts): manifest-sync + secret-scan + pytest cov>=90 run through the heavy-run slot (_heavy); mints the require-preflight token bound to HEAD, staged tree and checkout"
+      "command": "preflight gate (harden-repo v1.5.0 template, repo parts in its marker blocks): manifest-sync + secret-scan + pytest cov>=90 run through the heavy-run slot (_heavy); mints the require-preflight token bound to HEAD, staged tree and checkout"
     },
     {
       "name": "pre-commit.sh",
@@ -3222,7 +3222,7 @@
         ]
       }
     ],
-    "preflight": "./scripts/commit-preflight.sh — manifest-sync (always-on) + secret-scan + pytest cov>=90 (via the heavy-run slot); required before every commit, staged and committed in separate calls",
+    "preflight": "./scripts/commit-preflight.sh — manifest-sync (LINT block; skipped by --docs-only, --skip-tests and a docs-only --auto, and checked in CI by tests/test_manifest_version_sync.py) + secret-scan + pytest cov>=90 (via the heavy-run slot); required before every commit, staged and committed in separate calls",
     "plugin": "abhattacherjee/git-flow",
     "currentVersion": "3.4.2"
   },

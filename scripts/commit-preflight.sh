@@ -10,12 +10,8 @@
 #   ./scripts/commit-preflight.sh --docs-only  # Skip tests for docs changes
 #   ./scripts/commit-preflight.sh --skip-tests "reason"  # Skip with reason
 #   ./scripts/commit-preflight.sh --auto       # Auto-detect if tests needed
-#   ./scripts/commit-preflight.sh --allow-empty  # For `git commit --allow-empty`
-#                                                # (refuses if anything is staged or modified)
 #
 # Installed by /harden-repo
-# Vendored from harden-repo v1.3.0 (892d0f5); repo parts: version sync, --allow-empty, test block.
-# _heavy and _run_pytest: harden-repo develop 823346d (#225), byte for byte.
 # Lint/test commands customized for this project during installation.
 
 set -e
@@ -46,7 +42,7 @@ cd "$PROJECT_DIR" || exit 1
 # `--git-common-dir` is the one path identical from a main worktree and from
 # every worktree linked to it, so it is what makes this agree with
 # require-preflight.py's _get_token_path() in a worktree. Hashing a path meant
-# this wrote /tmp/.preflight-token-<worktreeHash> while the hook read
+# this wrote the token under <worktreeHash> while the hook read
 # <mainHash>, blocking every commit made from a worktree immediately after a
 # preflight that had just printed PASSED.
 # Falls back to the script's own location when git cannot answer (no git, not
@@ -56,6 +52,17 @@ if [ -n "$PROJECT_KEY" ] && [ -d "$PROJECT_KEY" ]; then
     PROJECT_KEY="$(cd "$PROJECT_KEY" && pwd -P)"
 else
     PROJECT_KEY="$(realpath "$PROJECT_DIR" 2>/dev/null || (cd "$PROJECT_DIR" && pwd -P))"
+fi
+# The token directory as the shell names it, by the rule the Python block
+# below uses: XDG_CACHE_HOME when absolute, else HOME/.cache when HOME is
+# absolute. Used only for messages, and for the cleanup when Python cannot
+# name or check the directory.
+if [[ "${XDG_CACHE_HOME:-}" == /* ]]; then
+    _TOKEN_DIR_GUESS="$XDG_CACHE_HOME/claude/preflight"
+elif [[ "${HOME:-}" == /* ]]; then
+    _TOKEN_DIR_GUESS="$HOME/.cache/claude/preflight"
+else
+    _TOKEN_DIR_GUESS=""
 fi
 # The first 8 hex characters of md5(key), which require-preflight.py computes
 # the same way. python3 is tried first, then `md5 -q -s` (macOS) and `md5sum`.
@@ -72,10 +79,92 @@ if [ -z "$PROJECT_HASH" ]; then
 fi
 if ! [[ "$PROJECT_HASH" =~ ^[0-9a-f]{8}$ ]]; then
     echo "❌ PREFLIGHT ABORTED — cannot compute the token path (python3, md5 and md5sum all failed)." >&2
-    echo "   An earlier run's token may still be valid. Delete /tmp/.preflight-token-* and fix the toolchain." >&2
+    echo "   An earlier run's token may still be valid. Delete ${_TOKEN_DIR_GUESS:-~/.cache/claude/preflight}/harden-token-* and fix the toolchain." >&2
     exit 1
 fi
-TOKEN_FILE="/tmp/.preflight-token-${PROJECT_HASH}"
+# The token directory, ${XDG_CACHE_HOME:-$HOME/.cache}/claude/preflight: made
+# here with mode 0700, then checked by the same Python block the hook uses
+# (a test keeps the two copies byte-identical), so the two sides cannot
+# disagree on the path or on what counts as safe. It used to be /tmp, where
+# any local user could plant or pre-create the token (#47, #170). Checked
+# BEFORE the start-of-run `rm -f` below, so nothing is removed or written in
+# a directory someone else made. Any problem fails loudly: like the hash
+# lookup, this must not fall through to `set -e` with no message. It runs
+# after the hash, so its failure can still remove an earlier token.
+TOKEN_DIR=$(python3 -E - <<'PY'
+import os, sys
+# --- BEGIN shared token dir v1 (keep in sync: this hook and commit-preflight.sh) ---
+def _token_dir(environ):
+    """``${XDG_CACHE_HOME:-$HOME/.cache}/claude/preflight``, or None.
+
+    XDG_CACHE_HOME counts only when it is absolute (the XDG spec ignores a
+    relative one), and HOME must be absolute too; otherwise there is no
+    token directory and no commit can pass. Both come from the environment,
+    never from expanduser(): with HOME unset that falls back to the passwd
+    entry, which the shell would not. claude-code-config uses the same rule
+    and the same directory (#179).
+    """
+    root = environ.get("XDG_CACHE_HOME", "")
+    if not root.startswith("/"):
+        home = environ.get("HOME", "")
+        if not home.startswith("/"):
+            return None
+        root = os.path.join(home, ".cache")
+    return os.path.join(root, "claude", "preflight")
+
+
+def _token_dir_problem(path):
+    """Why *path* is not a safe token directory, or None when it is.
+
+    Only this user may be able to put a token there: a real directory (a
+    symlink is refused, never followed), owned by this user, mode exactly
+    0700. Only the last component is checked, with lstat: an ancestor may
+    be a symlink, as macOS's /var is. Raises FileNotFoundError when *path*
+    does not exist.
+    """
+    import stat as _stat
+    st = os.lstat(path)
+    if _stat.S_ISLNK(st.st_mode):
+        return f"{path} is a symlink"
+    if not _stat.S_ISDIR(st.st_mode):
+        return f"{path} is not a directory"
+    if st.st_uid != os.getuid():
+        return f"{path} is not owned by you"
+    if _stat.S_IMODE(st.st_mode) != 0o700:
+        return f"{path} has mode {oct(_stat.S_IMODE(st.st_mode))}, not 0o700"
+    return None
+# --- END shared token dir v1 ---
+
+token_dir = _token_dir(os.environ)
+if token_dir is None:
+    sys.exit("neither XDG_CACHE_HOME nor HOME is an absolute path")
+# umask 077 for the directories made here, whatever the caller's umask: a
+# umask that clears the owner's bits would make a parent that cannot be
+# entered, or a leaf that is not 0700.
+os.umask(0o077)
+try:
+    os.makedirs(token_dir, mode=0o700, exist_ok=True)
+    problem = _token_dir_problem(token_dir)
+except OSError as exc:
+    problem = f"{token_dir} cannot be made or checked ({exc.strerror})"
+if problem:
+    sys.exit(problem)
+print(token_dir)
+PY
+) || TOKEN_DIR=""
+if [ -z "$TOKEN_DIR" ]; then
+    # This exit comes BEFORE the start-of-run removal, so remove an earlier
+    # run's token here, or a broken run would leave it valid (#71). Only in a
+    # real directory this user owns: `rm -f` never follows the final name.
+    if [ -n "$_TOKEN_DIR_GUESS" ] && [ -d "$_TOKEN_DIR_GUESS" ] \
+            && [ ! -L "$_TOKEN_DIR_GUESS" ] && [ -O "$_TOKEN_DIR_GUESS" ]; then
+        rm -f "$_TOKEN_DIR_GUESS/harden-token-${PROJECT_HASH}"
+    fi
+    echo "❌ PREFLIGHT ABORTED — no safe token directory (see the line above)." >&2
+    echo "   Only a real directory owned by you with mode 0700 may hold the token." >&2
+    exit 1
+fi
+TOKEN_FILE="$TOKEN_DIR/harden-token-${PROJECT_HASH}"
 TOKEN_EXPIRY_SECONDS=300  # Token valid for 5 minutes
 
 # Invariant: no token exists while the checks are in flight. A token left by an
@@ -212,7 +301,6 @@ trap 'exit 143' TERM
 SKIP_TESTS=false
 SKIP_REASON=""
 AUTO_DETECT=false
-ALLOW_EMPTY=false
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -224,7 +312,7 @@ while [[ $# -gt 0 ]]; do
         --skip-tests)
             if [ -z "${2:-}" ]; then
                 echo "--skip-tests needs a reason"
-                echo "Usage: $0 [--docs-only | --skip-tests \"reason\" | --auto | --allow-empty]"
+                echo "Usage: $0 [--docs-only | --skip-tests \"reason\" | --auto]"
                 _PREFLIGHT_REPORTED=1
                 exit 1
             fi
@@ -236,13 +324,9 @@ while [[ $# -gt 0 ]]; do
             AUTO_DETECT=true
             shift
             ;;
-        --allow-empty)
-            ALLOW_EMPTY=true
-            shift
-            ;;
         *)
             echo "Unknown option: $1"
-            echo "Usage: $0 [--docs-only | --skip-tests \"reason\" | --auto | --allow-empty]"
+            echo "Usage: $0 [--docs-only | --skip-tests \"reason\" | --auto]"
             _PREFLIGHT_REPORTED=1
             exit 1
             ;;
@@ -255,70 +339,19 @@ echo ""
 # Get staged files
 STAGED_FILES=$(git diff --cached --name-only 2>/dev/null || echo "")
 
-# Count non-empty lines: `echo "" | wc -l` would count an empty list as 1.
-STAGED_COUNT=$(printf '%s' "$STAGED_FILES" | grep -c '' || true)
-
-if [ "$ALLOW_EMPTY" = true ]; then
-    # An empty commit has nothing to scan or test (#116). Ask git directly:
-    # the `|| echo ""` above turns a git failure into an empty list, which
-    # must not read as "nothing staged" here. Two checks, because the hook
-    # only checks the token's expiry and HEAD: an empty index alone would let
-    # `git commit -a` or `git commit -m x <path>` commit modified tracked
-    # files with no scan or test.
-    INDEX_STATE=0
-    git diff --cached --quiet 2>/dev/null || INDEX_STATE=$?
-    case "$INDEX_STATE" in
-        0)
-            ;;
-        1)
-            echo "❌ --allow-empty is for a commit with nothing staged, but files are staged:"
-            echo "$STAGED_FILES" | head -10 | sed 's/^/   /'
-            echo "   Unstage them, or run preflight without --allow-empty."
-            _PREFLIGHT_REPORTED=1
-            exit 1
-            ;;
-        *)
-            echo "❌ Could not read the git index (git exited $INDEX_STATE)."
-            _PREFLIGHT_REPORTED=1
-            exit 1
-            ;;
-    esac
-    TREE_STATE=0
-    git diff --quiet 2>/dev/null || TREE_STATE=$?
-    case "$TREE_STATE" in
-        0)
-            ;;
-        1)
-            echo "❌ --allow-empty needs a clean working tree: tracked files have unstaged changes, and 'git commit -a' or a pathspec would commit them unchecked:"
-            git diff --name-only | head -10 | sed 's/^/   /'
-            echo "   Commit or stash them, or run preflight without --allow-empty."
-            _PREFLIGHT_REPORTED=1
-            exit 1
-            ;;
-        *)
-            echo "❌ Could not read the working tree (git exited $TREE_STATE)."
-            _PREFLIGHT_REPORTED=1
-            exit 1
-            ;;
-    esac
-    echo "📭 Nothing staged: preflight for 'git commit --allow-empty'"
-    echo ""
-    SKIP_TESTS=true
-    SKIP_REASON="empty commit (--allow-empty)"
-    AUTO_DETECT=false
-elif [ -z "$STAGED_FILES" ]; then
+if [ -z "$STAGED_FILES" ]; then
     echo "⚠️  No staged files. Stage files first with 'git add'"
-    echo "   (For an empty commit, run: $0 --allow-empty)"
     _PREFLIGHT_REPORTED=1
     exit 1
-else
-    echo "📁 Staged files:"
-    echo "$STAGED_FILES" | head -10
-    if [ "$STAGED_COUNT" -gt 10 ]; then
-        echo "   ... and $((STAGED_COUNT - 10)) more"
-    fi
-    echo ""
 fi
+
+echo "📁 Staged files:"
+echo "$STAGED_FILES" | head -10
+TOTAL=$(echo "$STAGED_FILES" | wc -l | tr -d ' ')
+if [ "$TOTAL" -gt 10 ]; then
+    echo "   ... and $((TOTAL - 10)) more"
+fi
+echo ""
 
 # What this run checks, recorded in the token (#128). require-preflight.py
 # keeps the token across commit calls only while HEAD, the staged tree and
@@ -397,98 +430,6 @@ if [ "$AUTO_DETECT" = true ]; then
     echo ""
 fi
 
-# ── Plugin manifest version sync (ALWAYS runs, even in skip modes) ──
-# Must run BEFORE the --docs-only / --skip-tests / --auto early-exit
-# below — those skip modes intentionally bypass tests, but version
-# drift between plugin.json and marketplace.json must NEVER be skipped
-# regardless of flag. This is the gate that catches the bug PR #14
-# was opened to fix; if it lives below the early-exit it provides
-# zero protection against any user who runs preflight with a skip flag
-# (Copilot iter-4 finding on PR #14).
-PLUGIN_JSON_PRE="$PROJECT_DIR/.claude-plugin/plugin.json"
-MARKETPLACE_JSON_PRE="$PROJECT_DIR/.claude-plugin/marketplace.json"
-VERSION_SYNC_RAN=false
-if [ -f "$PLUGIN_JSON_PRE" ] && [ -f "$MARKETPLACE_JSON_PRE" ]; then
-    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo "🔖 Checking plugin manifest version sync..."
-    VERSION_SYNC_EXIT=0
-    VERSION_CHECK_TMP=$(mktemp "${TMPDIR:-/tmp}/preflight-version.XXXXXX")
-    VERSION_CHECK_STDOUT=$(python3 - "$PLUGIN_JSON_PRE" "$MARKETPLACE_JSON_PRE" 2>"$VERSION_CHECK_TMP" <<'PY'
-import json, sys, traceback
-plugin_path, market_path = sys.argv[1], sys.argv[2]
-try:
-    plugin = json.load(open(plugin_path))
-    market = json.load(open(market_path))
-except Exception as e:
-    sys.stderr.write(f"parse error: {e}\n")
-    sys.exit(2)
-plugin_v = plugin.get("version")
-plugin_name = plugin.get("name")
-if not plugin_v or not plugin_name:
-    sys.stderr.write("plugin.json missing 'name' or 'version'\n")
-    sys.exit(2)
-try:
-    entries = [p for p in market.get("plugins", []) if p.get("name") == plugin_name]
-    if not entries:
-        sys.stderr.write(f"marketplace.json has no entry for '{plugin_name}'\n")
-        sys.exit(2)
-    mismatches = []
-    for idx, entry in enumerate(entries):
-        market_v = entry.get("version")
-        if market_v is None:
-            sys.stderr.write(
-                f"marketplace.json entry #{idx} for '{plugin_name}' has no 'version' field\n"
-            )
-            sys.exit(2)
-        if market_v != plugin_v:
-            mismatches.append((idx, market_v))
-    if mismatches:
-        details = ", ".join(f"entry#{i}={v}" for i, v in mismatches)
-        print(f"MISMATCH: plugin.json={plugin_v} marketplace.json={details}")
-        sys.exit(1)
-    suffix = "" if len(entries) == 1 else f" ({len(entries)} entries)"
-    print(f"OK: {plugin_name}@{plugin_v}{suffix}")
-except Exception:
-    sys.stderr.write("unexpected error during version sync check:\n")
-    traceback.print_exc(file=sys.stderr)
-    sys.exit(2)
-PY
-) || VERSION_SYNC_EXIT=$?
-    VERSION_CHECK_STDERR=$(cat "$VERSION_CHECK_TMP" 2>/dev/null || true)
-    rm -f "$VERSION_CHECK_TMP"
-    if [ -n "$VERSION_CHECK_STDOUT" ]; then
-        echo "$VERSION_CHECK_STDOUT"
-    fi
-    case "$VERSION_SYNC_EXIT" in
-        0)
-            VERSION_SYNC_RAN=true
-            ;;
-        1)
-            echo ""
-            echo "❌ Plugin manifest versions are out of sync."
-            echo "   Update .claude-plugin/marketplace.json to match plugin.json,"
-            echo "   or run ./scripts/bump-version.sh which updates both."
-            echo "   This check runs even in --skip-tests modes."
-            _PREFLIGHT_REPORTED=1
-            exit 1
-            ;;
-        *)
-            echo ""
-            echo "❌ Plugin manifest version check failed with a structural error:"
-            if [ -n "$VERSION_CHECK_STDERR" ]; then
-                echo "$VERSION_CHECK_STDERR" | sed 's/^/   /'
-            else
-                echo "   (no error output — python exited with code $VERSION_SYNC_EXIT)"
-            fi
-            echo "   Fix the manifest files before committing."
-            _PREFLIGHT_REPORTED=1
-            exit 1
-            ;;
-    esac
-    unset VERSION_SYNC_EXIT VERSION_CHECK_STDOUT VERSION_CHECK_STDERR VERSION_CHECK_TMP
-    echo ""
-fi
-
 # Handle skip tests mode
 if [ "$SKIP_TESTS" = true ]; then
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -497,13 +438,9 @@ if [ "$SKIP_TESTS" = true ]; then
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo ""
 
-    # version-sync is the one check never skipped; record it when it ran.
-    SKIP_CHECKS_RUN="skipped"
-    if [ "$VERSION_SYNC_RAN" = true ]; then
-        SKIP_CHECKS_RUN="version-sync,skipped"
-    fi
     TIMESTAMP=$(date +%s)
-    _preflight_write_token "$TIMESTAMP" "$STAGED_COUNT" "$SKIP_CHECKS_RUN" "$SKIP_REASON"
+    STAGED_COUNT=$(echo "$STAGED_FILES" | wc -l | tr -d ' ')
+    _preflight_write_token "$TIMESTAMP" "$STAGED_COUNT" skipped "$SKIP_REASON"
     _PREFLIGHT_TOKEN_OK=1
 
     echo "✅ PREFLIGHT PASSED (tests skipped)"
@@ -515,12 +452,6 @@ fi
 # Track what we checked
 CHECKS_RUN=""
 CHECKS_PASSED=true
-
-# Plugin manifest version sync already ran above, before the skip-mode exit,
-# so no flag can bypass it. Record it here for the normal-mode token.
-if [ "$VERSION_SYNC_RAN" = true ]; then
-    CHECKS_RUN="${CHECKS_RUN}version-sync,"
-fi
 
 # ── Secret scanning (always runs) ────────────────────────────
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -593,7 +524,85 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 echo "📋 Running lint checks..."
 
 # __HARDEN_LINT_START__
-echo "⏭️  No linter detected — skipping lint"
+# Plugin manifest version sync (obsidian-brain): plugin.json and
+# marketplace.json must name the same version. Lives in the LINT block so the
+# rest of this file stays the harden-repo template (#532). --docs-only and
+# --skip-tests exit before this block, and so does --auto when it finds docs
+# or config files only; CI's tests/test_manifest_version_sync.py checks the
+# same pair on every PR.
+PLUGIN_JSON_PRE="$PROJECT_DIR/.claude-plugin/plugin.json"
+MARKETPLACE_JSON_PRE="$PROJECT_DIR/.claude-plugin/marketplace.json"
+if [ -f "$PLUGIN_JSON_PRE" ] && [ -f "$MARKETPLACE_JSON_PRE" ]; then
+    echo "🔖 Checking plugin manifest version sync..."
+    VERSION_SYNC_EXIT=0
+    python3 - "$PLUGIN_JSON_PRE" "$MARKETPLACE_JSON_PRE" <<'PY' || VERSION_SYNC_EXIT=$?
+import json, sys
+plugin_path, market_path = sys.argv[1], sys.argv[2]
+try:
+    with open(plugin_path, encoding="utf-8") as fh:
+        plugin = json.load(fh)
+    with open(market_path, encoding="utf-8") as fh:
+        market = json.load(fh)
+except Exception as e:
+    sys.stderr.write(f"parse error: {e}\n")
+    sys.exit(2)
+if not isinstance(plugin, dict) or not isinstance(market, dict):
+    sys.stderr.write("manifest is not a JSON object\n")
+    sys.exit(2)
+plugin_v = plugin.get("version")
+plugin_name = plugin.get("name")
+if not isinstance(plugin_v, str) or not plugin_v or not isinstance(plugin_name, str) or not plugin_name:
+    sys.stderr.write("plugin.json missing 'name' or 'version'\n")
+    sys.exit(2)
+plugins = market.get("plugins")
+if not isinstance(plugins, list):
+    sys.stderr.write("marketplace.json has no 'plugins' list\n")
+    sys.exit(2)
+bad = [i for i, p in enumerate(plugins)
+       if not isinstance(p, dict) or not isinstance(p.get("name"), str) or not p["name"]]
+if bad:
+    # Positions only: an entry's other fields are not echoed.
+    sys.stderr.write(f"marketplace.json plugins entries {bad} are not objects with a name\n")
+    sys.exit(2)
+entries = [p for p in plugins if p.get("name") == plugin_name]
+if not entries:
+    sys.stderr.write(f"marketplace.json has no entry for '{plugin_name}'\n")
+    sys.exit(2)
+mismatches = []
+for idx, entry in enumerate(entries):
+    market_v = entry.get("version")
+    if market_v is None:
+        sys.stderr.write(f"marketplace.json entry #{idx} for '{plugin_name}' has no 'version' field\n")
+        sys.exit(2)
+    if market_v != plugin_v:
+        mismatches.append((idx, market_v))
+if mismatches:
+    details = ", ".join(f"entry#{i}={v}" for i, v in mismatches)
+    print(f"MISMATCH: plugin.json={plugin_v} marketplace.json={details}")
+    sys.exit(1)
+suffix = "" if len(entries) == 1 else f" ({len(entries)} entries)"
+print(f"OK: {plugin_name}@{plugin_v}{suffix}")
+PY
+    case "$VERSION_SYNC_EXIT" in
+        0)
+            CHECKS_RUN="${CHECKS_RUN}version-sync,"
+            ;;
+        1)
+            echo "❌ Plugin manifest versions are out of sync."
+            echo "   Update .claude-plugin/marketplace.json to match plugin.json,"
+            echo "   or run ./scripts/bump-version.sh which updates both."
+            CHECKS_PASSED=false
+            ;;
+        *)
+            echo "❌ Plugin manifest version check failed (exit $VERSION_SYNC_EXIT, see the line above)."
+            echo "   Fix the manifest files before committing."
+            CHECKS_PASSED=false
+            ;;
+    esac
+    unset VERSION_SYNC_EXIT
+else
+    echo "⏭️  No plugin manifests — skipping version sync"
+fi
 # __HARDEN_LINT_END__
 _preflight_rearm
 
@@ -1027,6 +1036,17 @@ findings = report.get("findings") or []
 settings = report.get("settings") or []
 warnings = report.get("warnings") or []
 
+# summary.findings also counts an ungated or unknown draft gate (#214),
+# which is in neither list. Without it the guard below read every repo
+# with an ungated ci.yml as a self-contradictory report (#117).
+gate = report.get("draft_gate")
+gate = gate if isinstance(gate, dict) else {}
+gate_state = gate.get("state") if isinstance(gate.get("state"), str) else None
+gate_count = 1 if gate_state in ("ungated", "unknown") else 0
+gate_detail = gate.get("detail")
+gate_detail = ("; ".join(d for d in gate_detail if isinstance(d, str))
+               if isinstance(gate_detail, list) else "")
+
 # IN-SYNC rows are dropped before anything below counts them. The doctor
 # already filters them out of --json unless -v is passed, so today this
 # changes nothing -- and that is precisely the trap. summary.findings counts
@@ -1046,7 +1066,7 @@ if isinstance(findings, list):
 # printed `DRIFT 5 (no artifact findings, see notes below)` with no notes
 # below it, and handed the user a repair command for five findings it could
 # not name. Both are UNKNOWN.
-if total != counted(findings) + counted(settings):
+if total != counted(findings) + counted(settings) + gate_count:
     print("count and findings disagree — drift is UNKNOWN, not clean")
     raise SystemExit(0)
 
@@ -1070,6 +1090,8 @@ for item in findings:
     states[state] = states.get(state, 0) + 1
 if settings:
     states["settings.json"] = len(settings)
+if gate_count:
+    states["draft gate"] = gate_count
 detail = ", ".join("%d %s" % (n, s) for s, n in sorted(states.items()))
 print("DRIFT %d (%s)" % (total, detail or "no artifact findings, see notes below"))
 for item in findings[:5]:
@@ -1083,6 +1105,8 @@ for entry in settings[:5]:
     print("   %-14s %s" % ("settings.json", flat(entry)))
 if len(settings) > 5:
     print("   ... and %d more" % (len(settings) - 5))
+if gate_count:
+    print("   %-14s %s  %s" % ("draft gate", flat(gate_state), flat(gate_detail)))
 for warning in warnings:
     print("   note: %s" % flat(warning))
 # A machine-readable marker, stripped again before any of this is shown.
@@ -1193,7 +1217,7 @@ fi
 
 # Create confirmation token
 TIMESTAMP=$(date +%s)
-_preflight_write_token "$TIMESTAMP" "$STAGED_COUNT" "${CHECKS_RUN%,}" ""
+_preflight_write_token "$TIMESTAMP" "$(echo "$STAGED_FILES" | wc -l | tr -d ' ')" "${CHECKS_RUN%,}" ""
 _PREFLIGHT_TOKEN_OK=1
 
 echo ""

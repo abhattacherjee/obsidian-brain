@@ -45,9 +45,11 @@ instead of stamping `source_session: unknown`.
   branch and create a PR (no real review required — this is throwaway):
 
   ```bash
-  # Nothing staged: --allow-empty mints the token for an empty commit (#116)
-  ./scripts/commit-preflight.sh --allow-empty
-  git commit --allow-empty -m "test: throwaway for #105 dev-test"
+  # The preflight refuses an empty commit (--allow-empty went with #532),
+  # so stage a throwaway file.
+  echo "#105 dev-test" > dev-test-105.md && git add dev-test-105.md
+  ./scripts/commit-preflight.sh --docs-only
+  git commit -m "test: throwaway for #105 dev-test"
   git push -u origin feature/test-105-cwd-gone-throwaway
   gh pr create --base develop --title "DO NOT MERGE — #105 dev-test throwaway" \
       --body "Throwaway PR for #105 dev-test. Will be closed."

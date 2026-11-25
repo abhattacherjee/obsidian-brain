@@ -15,7 +15,6 @@ the plain forms.
 
 from __future__ import annotations
 
-import hashlib
 import os
 import pwd
 import shutil
@@ -486,11 +485,9 @@ def _git(*args, cwd, env):
 
 
 def _token_path(root, env):
-    common = subprocess.run(
-        ["git", "-C", str(root), "rev-parse", "--path-format=absolute", "--git-common-dir"],
-        check=True, capture_output=True, text=True, env=env).stdout.strip()
-    digest = hashlib.md5(os.path.realpath(common).encode()).hexdigest()[:8]
-    return Path(f"/tmp/.preflight-token-{digest}")
+    """Where the preflight run with *env* would write its token (#532)."""
+    from preflight_token import token_path
+    return token_path(root, env)
 
 
 def test_slot_timeout_fails_the_real_preflight_and_leaves_no_token(tmp_path, shell_env):
@@ -513,7 +510,10 @@ def test_slot_timeout_fails_the_real_preflight_and_leaves_no_token(tmp_path, she
     (root / "tests" / "test_one.py").write_text("def test_one():\n    assert 1 + 1 == 2\n")
     _git("add", "-A", cwd=root, env=env)
     token = _token_path(root, env)
-    token.unlink(missing_ok=True)
+    # A stale token at the path the hook reads: the run must remove it. This
+    # is what makes "no token" below mean something; with a wrong path the
+    # assertion passed vacuously (#532).
+    token.write_text("{}")
     try:
         proc = _run(["bash", "scripts/commit-preflight.sh"], root, env)
         output = proc.stdout + proc.stderr
