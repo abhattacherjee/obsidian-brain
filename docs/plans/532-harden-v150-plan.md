@@ -114,3 +114,12 @@ CLAUDE.md (vendored v1.5.0 lines), CHANGELOG `[Unreleased]`,
   ledger (source: harden-repo checkout or plugin cache; stale copy → the
   shared-version check fails, missing → skip), plugin.json/marketplace.json
   (the repo's).
+
+## Task 6: pre-commit.sh scans `++` lines (found in Phase 4)
+Delegate: claude — a two-file fix found while checking the skipped files; done here.
+
+v1.5.0 changed its `pre-commit.sh` template to mark added lines with
+`--output-indicator-new='>'`. This repo's own `pre-commit.sh` (repo-owned,
+UNRECOGNIZED) still had `grep '^+' | grep -v '^+++'`, which drops an added
+line starting with `++`. Reproduced red first (`double-plus`,
+`header-shaped`), then fixed; a grep failure now fails closed.
