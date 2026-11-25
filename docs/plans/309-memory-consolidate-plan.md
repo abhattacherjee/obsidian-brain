@@ -82,53 +82,75 @@ Every command prints `store: <path>` first.
 
 The note's `## Details` text (new) or the appended section's details text must equal the memory
 file's body (frontmatter stripped, then `.strip()` on both) exactly. Read-back in apply and
-`verify` check 5 both compare against the original (`moved/<slug>.md` once moved). The writer
+`verify` check 5 both compare against the original (`moved/<slug>.md` once moved; `full-copy/<slug>.md`, the text the note was written from, for an original that stayed). The writer
 does no scrub, no wikilink escaping and no line-ending change; `[[slug]]` links in a body are
 copied as they are (Obsidian shows them as unresolved links; recorded as a known cost).
-`write_vault_note` overwrites, so `new` checks `dest.exists()` right before the write and refuses.
+`write_vault_note` overwrites, so `new` writes only when `dest` does not exist; an existing `dest` is read back, and refused when the read-back fails.
 
 ### Write order (apply)
 
+`apply --apply` and `apply --resume` first take one lock per store: `<backup root>/.memory-consolidate-<project dir name>.lock`,
+created with `O_CREAT|O_EXCL` (0o600), holding the pid and an ISO time, removed on exit. A lock whose
+pid is alive exits 2 ("another run holds the lock"); a lock whose pid is dead prints
+`WARN stale lock from pid N (<time>); taking it` and is taken over. A dry run takes no lock.
+
 1. Validate the plan and every entry (file exists or is already moved, frontmatter parses,
-   `scrub_secrets(text) == text`, index rule). Choose the backup dir
+   `scrub_secrets(text) == text`, index rule) and hash each entry's text. Choose the backup dir
    `<backup root>/memory-moved-<YYYYMMDD-HHMMSS>-<store-dir-name>/` (default backup root
    `~/.claude/backups`) and refuse if it exists. Refused entries are dropped and listed.
-2. Write each `new` note and each `append` (lock + `_atomic_rewrite` via `note_writer`). Read each
-   back with the lossless check. An entry whose read-back fails is not moved.
-3. Create the backup dir (0o700, each new level made private), copy the whole store to
-   `full-copy/`, and write `run.json` (schema below) with `"state": "notes-written"`.
-4. Move each written or `retire` original to `moved/<slug>.md`; update `run.json` to
-   `"state": "moved"`.
-5. Re-read the live `MEMORY.md`, apply the index rule, write it with
-   `_atomic_rewrite(expect_stat=...)`, retrying the read-edit-write up to 3 times on a stat
-   mismatch; update `run.json` to `"state": "done"` with the after sizes.
+2. Back up first, atomically. Make `<backup dir>.tmp-<random>` (0o700), copy the whole store to
+   `full-copy/` there, write `manifest.json` (the file list) and `run.json` (`"state": "backed-up"`),
+   then rename the temp dir to the backup dir. A stop before the rename leaves only a `.tmp-` dir:
+   no run, no note, nothing moved; the next apply prints `WARN leftover partial backup <path>`. So
+   every backup dir that exists is complete, and every note names a real backup.
+3. `finish()`, the one path for a fresh run and a resume. Each step is idempotent and works from
+   the snapshot (`full-copy/`), and `run.json` is saved after each as a progress marker:
+   - **notes** (`"notes-written"`): an entry whose snapshot hash differs from the step-1 hash is
+     refused ("changed during the run"). Each other `new` or `append` note is written from the
+     snapshot (lock + `_atomic_rewrite` via `note_writer`), or, when it is already there, only read
+     back; a missing append target or a failed read-back refuses that item. This runs on every
+     resume.
+   - **moves** (`"moved"`): status comes from the filesystem. In `moved/` and absent from the store:
+     moved. In the store and equal (hash) to the snapshot: moved now. In the store but changed, or
+     missing: refused, left alone. A refused item found in `moved/` goes back to the store (exit 2
+     naming it when the store path is taken). `run.json`'s `moved` is rewritten from what is on disk.
+   - **index** (`"done"`): re-read the live `MEMORY.md`, apply the index rule, write it with
+     `_atomic_rewrite(expect_stat=...)`, retrying up to 3 times on a stat mismatch. A line that now
+     mixes a moved and a staying entry puts the moved original back and refuses it.
 
-**Rerun after an interruption.** `apply --resume <backup dir>` reads its `run.json` and finishes
-from the recorded state: an entry whose original is gone and whose marked note exists counts as
-moved, and its index line is still dropped. A plain rerun with the same plan skips the write for
-a slug whose marker is already present (re-reading it back). Tests cover a stop after steps 2,
-3, mid-4, 4 and 5.
+**Rerun after an interruption.** `apply --resume <backup dir>` takes the lock, re-reads `run.json`
+and runs step 3 again. No branch depends on the saved state except `done` ("nothing to do",
+exit 0). A plain rerun after a stop before the rename needs no resume: no run exists. Tests cover a
+stop before the rename, after the backup, after the notes, mid-moves, after the moves and after the
+index, a second resume (lock), and an entry edited between validation and backup.
 
 ### `run.json` schema (v1)
 
 ```json
 {
   "version": 1,
-  "state": "notes-written | moved | done",
+  "state": "backed-up | notes-written | moved | done",
   "store": "/abs/store",
   "vault": "/abs/vault",
   "insights_folder": "claude-insights",
+  "project": "name",
   "created_at": "2026-11-24T12:00:00-08:00",
   "plan": {"...": "the validated plan"},
+  "planned": [{"slug": "x", "action": "new|append|retire", "title": "...", "note": "claude-insights/....md or null", "sha256": "hash of the entry text"}],
   "refused": [{"slug": "x", "reason": "..."}],
   "warnings": [{"slug": "x", "reason": "..."}],
-  "written": [{"slug": "x", "action": "new|append", "note": "claude-insights/....md"}],
+  "written": [{"slug": "x", "action": "new|append", "note": "claude-insights/....md", "sha256": "..."}],
   "retired": ["slug"],
   "moved": ["slug"],
   "baseline": {"indexed": ["slug"], "dangling": ["name.md"], "duplicates": ["slug"], "orphans": ["slug"]},
   "sizes": {"before": {"bytes": 0, "chars": 0, "lines": 0}, "after": {"bytes": 0, "chars": 0, "lines": 0}}
 }
 ```
+
+`manifest.json` sits beside it (read with its own 50,000,000-byte cap): `{"version": 1, "files":
+[{"name": "a.md", "kind": "file", "sha256": "..."}, {"name": "ref", "kind": "symlink", "target":
+"a.md"}]}`, one row per entry under `full-copy/`. `verify` checks every row: files by hash,
+symlinks by `os.readlink`.
 
 Task 4's brief copies these names from the committed Task 3 code, not from this sketch.
 
@@ -189,7 +211,7 @@ Delegate: claude — the destructive path; writes to the vault, the store and th
   `WARN <slug>: <reason>`) and the index lines it would drop, and touches nothing.
 - New note: filename `<date>-<slugify(title, 50)>-<sha1(slug)[:4]>.md`; title is the index line's
   link text, else the entry's `name:`/`description:` frontmatter, else the slug. Frontmatter
-  exactly: `type`, `date`, `created_at` (aware ISO), `project` (`canonical_project_name`),
+  exactly: `type`, `date`, `created_at` (aware ISO), `project` (`--project`, else the store's own project: the cwd's when the cwd resolves to this store, else the cwd a transcript in the store's project folder recorded; never the caller's cwd by default),
   `migrated_from_memory`, `synced_from`, `memory_type`, `status: active`, `tags` (type tag,
   `claude/project/<project>`, `claude/topic/moved-from-memory`, `claude/topic/<topic>`).
   No `source_session` or `source_session_note`. Body: `# <title>`, a one-line provenance quote
@@ -208,7 +230,8 @@ Delegate: claude — the destructive path; writes to the vault, the store and th
   target outside the vault or a symlink is refused; a secret-shaped body is refused; a line
   appended to `MEMORY.md` between load and index write survives; a mixed pointer line refuses its
   slug; a write failure for one item leaves that original in place; backup dir reuse is refused;
-  a stop after steps 2, 3, mid-4, 4 and 5 each finishes with `--resume` or a rerun, with no
+  a stop before the rename (a rerun), and after the backup, the notes, mid-moves, the moves and the
+  index (each `--resume`), each finish with no
   duplicate note or appended section and no dangling index line.
 - Check: `python3 -m pytest -q tests/test_memory_consolidate_apply.py`
 

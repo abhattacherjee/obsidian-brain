@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import glob
 import hashlib
 import shutil
 import tempfile
@@ -23,8 +25,8 @@ import vault_index
 from memory_links import line_pointers, line_asides, _link_targets, _md_child_link_targets
 from note_writer import _acquire_lock, _atomic_rewrite, _release_lock
 from memory_sources import _projects_root
-from obsidian_utils import (_cc_encoded_dirnames, canonical_project_name, indexed_folders, load_config, scrub_secrets,
-                            slugify, write_vault_note)
+from obsidian_utils import (_cc_encoded_dirnames, _transcript_cwd, canonical_project_name, indexed_folders,
+                            load_config, scrub_secrets, slugify, write_vault_note)
 
 
 class StoreError(Exception):
@@ -69,7 +71,7 @@ def resolve_store(store_arg: str | None, cwd: str) -> Path:
         raise StoreError(str(exc)) from exc
 
 
-def _read_file(path: Path) -> tuple[str, float]:
+def _read_file(path: Path, limit: int = 2_000_000) -> tuple[str, float]:
     def open_regular(name, flags):
         # A replacement symlink or FIFO must not redirect or block the read.
         return os.open(name, flags | os.O_NOFOLLOW | os.O_NONBLOCK)
@@ -81,9 +83,9 @@ def _read_file(path: Path) -> tuple[str, float]:
             info = os.fstat(stream.fileno())
             if not stat.S_ISREG(info.st_mode):
                 raise StoreError(f"expected a regular file: {path}")
-            text = stream.read(2_000_001)
-        if len(text) > 2_000_000:
-            raise StoreError(f"{path} exceeds 2,000,000 characters")
+            text = stream.read(limit + 1)
+        if len(text) > limit:
+            raise StoreError(f"{path} exceeds {limit:,} characters")
         return text, info.st_mtime
     except (OSError, UnicodeError) as exc:
         raise StoreError(f"cannot read {path}: {exc}") from exc
@@ -335,7 +337,13 @@ def index_edit(
 _TYPE_TAGS = {"claude-insight": "claude/insight", "claude-error-fix": "claude/error-fix",
               "claude-decision": "claude/decision"}
 MOVED_TAG = "claude/topic/moved-from-memory"
-RUN_STATES = ("backing-up", "notes-written", "moved", "done")
+# Progress markers only: the steps re-run from the snapshot and read the
+# filesystem, so no branch depends on a state except "done".
+RUN_STATES = ("backed-up", "notes-written", "moved", "done")
+_MANIFEST_LIMIT = 50_000_000
+# Every name `verify` emits, in order. The skill contract test checks SKILL.md names each one.
+VERIFY_CHECKS = ("state", "index-links-resolve", "no-duplicates", "all-indexed", "removed-equals-moved",
+                 "notes-lossless", "backups-present", "sizes")
 _BACKUP_PREFIX = "memory-moved-"
 # The start marker is the one a rerun searches for (plan "Markers"). The end
 # marker bounds the copied body, so the lossless check still works after a
@@ -343,7 +351,6 @@ _BACKUP_PREFIX = "memory-moved-"
 _START = "<!-- migrated_from_memory: {slug} -->"
 _END = "<!-- /migrated_from_memory: {slug} -->"
 _END_PREFIX = "<!-- /migrated_from_memory:"
-_PROVENANCE_RE = re.compile(r"originals? (?:at|in) `([^`\n]{1,2000})`")
 
 
 class ApplyError(Exception):
@@ -568,7 +575,7 @@ def _read_run(backup_dir: Path) -> dict:
         run = json.loads(text)
     except (StoreError, ValueError, RecursionError) as exc:
         raise ApplyError(f"cannot read run.json: {exc}") from exc
-    keys = ("version", "state", "store", "vault", "insights_folder", "plan", "refused", "written",
+    keys = ("version", "state", "store", "vault", "insights_folder", "plan", "planned", "refused", "written",
             "retired", "moved")
     if not isinstance(run, dict) or any(k not in run for k in keys):
         raise ApplyError("run.json is missing fields")
@@ -584,6 +591,8 @@ def _unfinished_runs(backup_root: Path, store: Path) -> list[Path]:
     except OSError:
         return out
     for d in dirs:
+        if ".tmp-" in d.name:
+            continue  # a partial backup that was never renamed into place is not a run
         try:
             run = _read_run(d)
         except ApplyError:
@@ -593,6 +602,13 @@ def _unfinished_runs(backup_root: Path, store: Path) -> list[Path]:
     return out
 
 
+def _leftover_backups(backup_root: Path, store: Path) -> list[Path]:
+    try:
+        return sorted(backup_root.glob(f"{_BACKUP_PREFIX}*-{glob.escape(store.parent.name)}.tmp-*"))
+    except OSError:
+        return []
+
+
 def _move(src: Path, dst: Path) -> None:
     if os.path.lexists(dst):
         raise _ItemError(f"{dst} already exists")
@@ -600,8 +616,60 @@ def _move(src: Path, dst: Path) -> None:
     os.chmod(dst, 0o600)
 
 
+def _lock_holder(path: Path) -> tuple[int | None, str]:
+    """The pid and time a lock file records, or (None, "") when it is unreadable."""
+    try:
+        text, _ = _read_file(path, 1000)
+        pid, _, when = text.strip().partition(" ")
+        return (int(pid) if int(pid) > 0 else None), when
+    except (StoreError, ValueError):
+        return None, ""
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True  # exists, but belongs to someone else
+    return True
+
+
+@contextlib.contextmanager
+def _store_lock(backup_root: Path, store: Path, out):
+    """One exclusive lock per store: ``apply --apply`` and ``apply --resume`` hold it, so two
+    runs never move the same store's files at once. A lock left by a dead pid is taken over."""
+    _private_dirs(backup_root)
+    path = backup_root / f".memory-consolidate-{store.parent.name}.lock"
+    for attempt in (0, 1):
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+            break
+        except FileExistsError:
+            pid, when = _lock_holder(path)
+            if attempt or pid is None or _pid_alive(pid):
+                who = f"pid {pid} since {when}" if pid else "an unreadable lock file; remove it if no run is active"
+                raise ApplyError(f"another run holds the lock {path} ({who})") from None
+            out(f"WARN stale lock from pid {pid} ({when}); taking it")
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+    with os.fdopen(fd, "w", encoding="utf-8") as stream:
+        stream.write(f"{os.getpid()} {datetime.now().astimezone().isoformat(timespec='seconds')}\n")
+    try:
+        yield
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
 class _Run:
-    """One apply run. ``data`` is what run.json holds."""
+    """One apply run. ``data`` is what run.json holds. Every step re-runs from the backup's
+    snapshot and reads the filesystem, so a resume is the same code as a fresh run."""
 
     def __init__(self, data: dict, backup_dir: Path, out):
         self.data = data
@@ -622,77 +690,85 @@ class _Run:
         self.data["updated_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
         _write_json(self.dir / "run.json", self.data)
 
-    def original(self, slug: str) -> dict:
-        """The entry as it was at backup time (full-copy/), else in the store."""
-        for p in (self.dir / "full-copy" / f"{slug}.md", self.store / f"{slug}.md",
-                  self.dir / "moved" / f"{slug}.md"):
-            if os.path.lexists(p):
-                return read_entry(p)
-        raise _ItemError("original not found in full-copy/, the store or moved/")
+    def write_notes(self) -> None:
+        """Step 1: write each note from the snapshot, or reuse the one already there, and read it back."""
+        d = self.data
+        vault = Path(d["vault"])
+        now = datetime.fromisoformat(d["created_at"])
+        items = {i["slug"]: i for i in d["plan"]["items"]}
+        refused = {r["slug"] for r in d["refused"]}
+        rows = {w["slug"]: w for w in d["written"]}
+        retired = list(d["retired"])
+        for row in d["planned"]:
+            slug = row["slug"]
+            if slug in refused:
+                continue
+            item = items[slug]
+            try:
+                entry = read_entry(self.dir / "full-copy" / f"{slug}.md")
+                if _sha256(entry["text"]) != row["sha256"]:
+                    raise _ItemError("changed during the run: the backup copy differs from the text that was checked")
+                if item["action"] == "retire":
+                    if slug not in retired:
+                        retired.append(slug)
+                    self.out(f"RETIRE {slug}: {item['reason']}")
+                    continue
+                grew = _write_note(row, item, entry, vault, d["project"], now, self.store, self.dir)
+            except (_ItemError, StoreError, OSError, ApplyError) as exc:
+                # An original that already moved goes back in move_all.
+                rows.pop(slug, None)
+                if slug in retired:
+                    retired.remove(slug)
+                refused.add(slug)
+                self.refuse(slug, str(exc))
+                continue
+            rows[slug] = dict(slug=slug, action=item["action"], note=row["note"], sha256=row["sha256"])
+            self.out(f"{item['action'].upper()} {slug} -> {row['note']}" + (f" (+{grew} chars)" if grew else ""))
+        order = [r["slug"] for r in d["planned"]]
+        d["written"] = [rows[s] for s in order if s in rows]
+        d["retired"] = [s for s in order if s in retired]
 
     def move_all(self) -> None:
-        """Step 4. An original that is already in moved/ counts as moved."""
+        """Step 2. Each item's status comes from the filesystem, never from the journal."""
+        d = self.data
         moved_dir = self.dir / "moved"
         if not moved_dir.exists():
             os.mkdir(moved_dir, 0o700)
-        done = set(self.data["moved"])
-        slugs = [w["slug"] for w in self.data["written"]] + list(self.data["retired"])
-        # The text each vault note was written from; a retired entry has no note.
-        wanted = {w["slug"]: w["sha256"] for w in self.data["written"] if w.get("sha256")}
+        refused = {r["slug"] for r in d["refused"]}
+        wanted = {r["slug"]: r["sha256"] for r in d["planned"]}
+        slugs = [i["slug"] for i in d["plan"]["items"]]
         for slug in slugs:
-            if slug in done:
-                continue
             src, dst = self.store / f"{slug}.md", moved_dir / f"{slug}.md"
+            in_store, in_moved = os.path.lexists(src), os.path.lexists(dst)
+            if slug in refused:
+                if in_moved:
+                    # Its note failed (or was never written), so its original goes back.
+                    if in_store:
+                        raise ApplyError(f"{slug} is refused and its original is in {dst}, but the store "
+                                         f"path {src} is taken; move one of them by hand, then resume")
+                    _move(dst, src)
+                    self.out(f"RESTORED {slug} -> {src}")
+                continue
+            if slug not in wanted:
+                continue
+            if in_moved:
+                if in_store:
+                    raise ApplyError(f"{slug} is in both the store and {dst}; move one of them by hand, then resume")
+                continue  # moved before an interruption
             try:
-                if not os.path.lexists(src):
-                    if os.path.lexists(dst):
-                        pass  # moved before an interruption
-                    else:
-                        raise _ItemError("original is missing from the store")
-                else:
-                    snapshot = self.dir / "full-copy" / f"{slug}.md"
-                    live, backed = read_entry(src)["text"], read_entry(snapshot)["text"]
-                    if live != backed:
-                        raise _ItemError("original changed after the notes were written; not moved")
-                    if slug in wanted and _sha256(live) != wanted[slug]:
-                        raise _ItemError("original changed before the backup copy; the vault note "
-                                         "holds the older text; not moved")
-                    _move(src, dst)
+                if not in_store:
+                    raise _ItemError("original is missing from the store")
+                if _sha256(read_entry(src)["text"]) != wanted[slug]:
+                    raise _ItemError("original changed after the backup copy; not moved")
+                _move(src, dst)
             except (_ItemError, StoreError, OSError) as exc:
                 self.refuse(slug, str(exc))
+                refused.add(slug)
                 continue
-            self.data["moved"].append(slug)
-            done.add(slug)
-            self.save()
             self.out(f"MOVED {slug} -> {dst}")
             _checkpoint("mid-4")
-        self.save("moved")
-
-    def move_back(self, slug: str) -> None:
-        """Put a moved original back in the store. Safe to repeat: a crash between the
-        rename and the run.json save leaves the file in the store and nothing in moved/."""
-        src, dst = self.dir / "moved" / f"{slug}.md", self.store / f"{slug}.md"
-        if not os.path.lexists(src) and os.path.lexists(dst):
-            snapshot = self.dir / "full-copy" / f"{slug}.md"
-            if read_entry(dst)["text"] == read_entry(snapshot)["text"]:
-                return
-        _move(src, dst)
-
-    def backup_store(self) -> None:
-        """Step 3: copy the whole store to full-copy/ and record what was copied."""
-        full = self.dir / "full-copy"
-        shutil.copytree(self.store, full, symlinks=True)
-        files = []
-        for root, dirs, names in os.walk(full):
-            os.chmod(root, 0o700)
-            for name in sorted(names):
-                path = Path(root) / name
-                if os.path.islink(path):
-                    continue
-                os.chmod(path, 0o600)
-                files.append(dict(name=path.relative_to(full).as_posix(),
-                                  sha256=hashlib.sha256(path.read_bytes()).hexdigest()))
-        self.data["full_copy"] = sorted(files, key=lambda f: f["name"])
+        d["moved"] = [s for s in slugs if s not in refused and os.path.lexists(moved_dir / f"{s}.md")
+                      and not os.path.lexists(self.store / f"{s}.md")]
 
     def pointer_line(self, moved: list[str]) -> str:
         new = sum(1 for w in self.data["written"] if w["action"] == "new" and w["slug"] in moved)
@@ -708,7 +784,7 @@ class _Run:
                 f"originals in {backup}")
 
     def edit_index(self) -> None:
-        """Step 5: re-read the live MEMORY.md, drop moved pointers, write atomically."""
+        """Step 3: re-read the live MEMORY.md, drop moved pointers, write atomically."""
         index = self.store / "MEMORY.md"
         lock, err = _acquire_lock(index)
         if err:
@@ -729,7 +805,7 @@ class _Run:
                     # never points at a moved file.
                     for slug, reason in sorted(refused.items()):
                         try:
-                            self.move_back(slug)
+                            _move(self.dir / "moved" / f"{slug}.md", self.store / f"{slug}.md")
                         except (_ItemError, OSError) as exc:
                             raise ApplyError(f"cannot move {slug} back: {exc}") from exc
                         self.data["moved"].remove(slug)
@@ -749,22 +825,56 @@ class _Run:
         finally:
             _release_lock(lock)
         _checkpoint("index-written")
-        self.save("done")
 
     def finish(self) -> int:
-        if self.data["state"] == "notes-written":
-            self.move_all()
-            _checkpoint("moved")
-        if self.data["state"] == "moved":
-            self.edit_index()
-        sizes = self.data["sizes"]
+        """Notes, moves, index, done: the one path for a fresh run and a resume."""
+        d = self.data
+        if d["state"] == "done":
+            self.out("nothing to do: this run is finished")
+            return 0
+        self.write_notes()
+        self.save("notes-written")
+        _checkpoint("notes")
+        self.move_all()
+        self.save("moved")
+        _checkpoint("moved")
+        self.edit_index()
+        self.save("done")
         for key in ("before", "after"):
-            if sizes.get(key):
-                self.out("index {}: {bytes} bytes, {chars} chars, {lines} lines".format(key, **sizes[key]))
+            if d["sizes"].get(key):
+                self.out("index {}: {bytes} bytes, {chars} chars, {lines} lines".format(key, **d["sizes"][key]))
         self.out(f"backup: {self.dir}")
-        if not self.data["moved"]:
+        if not d["moved"]:
             return 2
-        return 1 if self.data["refused"] else 0
+        return 1 if d["refused"] else 0
+
+
+def _backup(data: dict, store: Path, backup_root: Path, backup_dir: Path) -> None:
+    """Copy the store into a temp sibling, add manifest.json and run.json, then rename it to
+    ``backup_dir``. A stop before the rename leaves only a ``.tmp-`` dir; any backup dir that
+    exists is complete."""
+    _private_dirs(backup_root)
+    tmp = Path(tempfile.mkdtemp(dir=backup_root, prefix=backup_dir.name + ".tmp-"))
+    full = tmp / "full-copy"
+    shutil.copytree(store, full, symlinks=True)
+    rows = []
+    for root, dirs, names in os.walk(full):
+        os.chmod(root, 0o700)
+        for name in sorted(dirs + names):
+            path = Path(root) / name
+            rel = path.relative_to(full).as_posix()
+            if os.path.islink(path):
+                rows.append(dict(name=rel, kind="symlink", target=os.readlink(path)))
+            elif name in names:
+                os.chmod(path, 0o600)
+                rows.append(dict(name=rel, kind="file", sha256=hashlib.sha256(path.read_bytes()).hexdigest()))
+    _write_json(tmp / "manifest.json", dict(version=1, files=sorted(rows, key=lambda r: r["name"])))
+    data["state"] = "backed-up"
+    data["updated_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
+    _write_json(tmp / "run.json", data)
+    if os.path.lexists(backup_dir):
+        raise ApplyError(f"backup dir already exists: {backup_dir}")
+    os.rename(tmp, backup_dir)
 
 
 def _prepare(items, store: Path, vault_root: Path, insights_folder: str, project: str, now,
@@ -774,7 +884,7 @@ def _prepare(items, store: Path, vault_root: Path, insights_folder: str, project
                 insights_folder=insights_folder, project=project,
                 created_at=now.isoformat(timespec="seconds"),
                 plan=dict(version=1, store=str(store), items=items),
-                refused=[], warnings=[], written=[], retired=[], moved=[], dropped_lines=[])
+                refused=[], warnings=[], planned=[], written=[], retired=[], moved=[], dropped_lines=[])
     refused, warnings = {}, {}
     entries = {}
     index_text, _ = _read_file(store / "MEMORY.md")
@@ -803,7 +913,6 @@ def _prepare(items, store: Path, vault_root: Path, insights_folder: str, project
     folder = vault_root / insights_folder
     markers = _scan_markers(folder) if any(i["action"] == "new" for i in items) else {}
     plans = []
-    reused_dirs = set()
     for item in items:
         slug = item["slug"]
         if slug not in entries:
@@ -847,12 +956,6 @@ def _prepare(items, store: Path, vault_root: Path, insights_folder: str, project
         except (_ItemError, StoreError, ValueError, OSError) as exc:
             refused[slug] = str(exc)
             continue
-        if plans[-1]["reuse"]:
-            text, _ = _read_file(plans[-1]["dest"])
-            m = _PROVENANCE_RE.search(text[text.find(_START.format(slug=slug)):]
-                                      if item["action"] == "append" else text)
-            if m:
-                reused_dirs.add(m.group(1))
 
     # Index rule, repeated until stable: a slug refused above stays, which can
     # make a line it shares with a moving slug mixed.
@@ -875,43 +978,44 @@ def _prepare(items, store: Path, vault_root: Path, insights_folder: str, project
         for name in _link_targets(other) & moving:
             warnings.setdefault(Path(name).stem, f"mentioned in {e['slug']}.md")
 
-    # The backup dir name is fixed before any note is written, because each
-    # note names it. A rerun after a stop at step 2 reuses the name its notes
-    # already carry, when that dir was never created.
+    # The backup dir name is fixed before any note is written, because each note names it.
     backup_dir = backup_root / f"{_BACKUP_PREFIX}{now.strftime('%Y%m%d-%H%M%S')}-{store.parent.name}"
-    if len(reused_dirs) == 1:
-        earlier = Path(reused_dirs.pop())
-        if earlier.parent == backup_root and earlier.name.startswith(_BACKUP_PREFIX) and not os.path.lexists(earlier):
-            backup_dir = earlier
     data["backup_dir"] = str(backup_dir)
+    # What the notes are written from, and what each move must still find: one hash per entry.
+    data["planned"] = [dict(slug=p["item"]["slug"], action=p["item"]["action"], title=p["title"],
+                            note=str(p["dest"].relative_to(vault_root)) if p["dest"] else None,
+                            sha256=_sha256(p["entry"]["text"])) for p in plans]
     data["refused"] = [dict(slug=s, reason=r) for s, r in refused.items()]
     data["warnings"] = [dict(slug=s, reason=r) for s, r in sorted(warnings.items())]
     data["dropped_lines"] = []
     return data, plans, backup_dir, dropped, index_text
 
 
-def _write_note(plan, vault_root: Path, insights_folder: str, project: str, now, store: Path,
-                backup_dir: Path) -> tuple[str, int]:
-    """Step 2 for one item: write (or find) its note and read it back."""
-    item, entry, dest = plan["item"], plan["entry"], plan["dest"]
+def _write_note(row, item, entry, vault_root: Path, project: str, now, store: Path, backup_dir: Path) -> int:
+    """Write (or find) one note from the snapshot ``entry`` and read it back; return the chars added.
+    Idempotent: a note that is already there is only read back."""
+    dest = _contained(vault_root / row["note"], vault_root)
     if item["action"] == "new":
-        if not plan["reuse"]:
-            content = _render_new(item, entry, plan["title"], project, now, store, backup_dir)
+        if not os.path.lexists(dest):
+            content = _render_new(item, entry, row["title"], project, now, store, backup_dir)
             _private_dirs(dest.parent)
-            # write_vault_note overwrites, so refuse an existing file right before it.
-            if os.path.lexists(dest):
-                raise _ItemError(f"{dest} appeared during the run")
             err = write_vault_note(str(vault_root), str(dest.parent.relative_to(vault_root)),
                                    dest.name, content)
             if err:
                 raise _ItemError(err)
         _check_readback(dest, entry, "new")
-        return str(dest.relative_to(vault_root)), 0
-    _contained(dest, vault_root)
-    if plan["reuse"]:
+        return 0
+    try:
+        text, _ = _read_file(dest)
+    except StoreError as exc:
+        raise _ItemError(f"append target is missing or unreadable: {exc}") from exc
+    count = text.count(_START.format(slug=entry["slug"]))
+    if count > 1:
+        raise _ItemError(f"{row['note']} carries its marker {count} times")
+    if count == 1:
         _check_readback(dest, entry, "append")
-        return str(dest.relative_to(vault_root)), 0
-    section = _render_section(entry, plan["title"], now, backup_dir)
+        return 0
+    section = _render_section(entry, row["title"], now, backup_dir)
     lock, err = _acquire_lock(dest)
     if err:
         raise _ItemError(err)
@@ -927,18 +1031,27 @@ def _write_note(plan, vault_root: Path, insights_folder: str, project: str, now,
     finally:
         _release_lock(lock)
     _check_readback(dest, entry, "append", prefix=text)
-    return str(dest.relative_to(vault_root)), len(sep + section)
+    return len(sep + section)
 
 
 def apply(plan_path: Path, store: Path, vault_root: Path, insights_folder: str, project: str,
           backup_root: Path, do_apply: bool, now: datetime, out=print) -> int:
     """Dry run (default) or ``--apply``, following the plan's "Write order"."""
-    vault_root = vault_root.resolve()
     if os.path.islink(backup_root):
         raise ApplyError(f"backup root is a symlink: {backup_root}")
+    args = (plan_path, store, vault_root.resolve(), insights_folder, project, backup_root, do_apply, now, out)
+    if not do_apply:
+        return _apply(*args)  # a dry run writes nothing, so it takes no lock
+    with _store_lock(backup_root, store, out):
+        return _apply(*args)
+
+
+def _apply(plan_path, store, vault_root, insights_folder, project, backup_root, do_apply, now, out) -> int:
     items, errors = load_plan(plan_path, store, vault_root)
     if errors:
         raise ApplyError("bad plan: " + "; ".join(errors))
+    for leftover in _leftover_backups(backup_root, store):
+        out(f"WARN leftover partial backup {leftover}")
     unfinished = _unfinished_runs(backup_root, store)
     if unfinished:
         raise ApplyError(f"unfinished run for this store; finish it with: apply --resume {unfinished[0]}")
@@ -972,53 +1085,21 @@ def apply(plan_path: Path, store: Path, vault_root: Path, insights_folder: str, 
         if not plans:
             return 2
         return 1 if data["refused"] else 0
-
-    try:
-        return _apply_steps(data, plans, store, vault_root, insights_folder, project, backup_dir, now, out)
-    except OSError as exc:
-        exc.backup_dir = backup_dir  # lets _main_apply print the resume hint
-        raise
-
-
-def _apply_steps(data, plans, store, vault_root, insights_folder, project, backup_dir, now, out) -> int:
-    # Step 2: write every note and read it back. A failed item is refused and
-    # its original stays in the store.
-    for plan in plans:
-        item, slug = plan["item"], plan["item"]["slug"]
-        if item["action"] == "retire":
-            data["retired"].append(slug)
-            out(f"RETIRE {slug}: {item['reason']}")
-            continue
-        try:
-            note, grew = _write_note(plan, vault_root, insights_folder, project, now, store, backup_dir)
-        except (_ItemError, StoreError, OSError, ApplyError) as exc:
-            data["refused"].append(dict(slug=slug, reason=str(exc)))
-            out(f"REFUSE {slug}: {exc}")
-            continue
-        data["written"].append(dict(slug=slug, action=item["action"], note=note,
-                                    sha256=_sha256(plan["entry"]["text"])))
-        out(f"{item['action'].upper()} {slug} -> {note}" + (f" (+{grew} chars)" if grew else ""))
-    _checkpoint("notes")
-    if not data["written"] and not data["retired"]:
+    if not plans:
         out("nothing to move")
         return 2
 
-    # Step 3: back up the whole store, then record the run.
-    if os.path.lexists(backup_dir):
-        raise ApplyError(f"backup dir already exists: {backup_dir}")
-    _private_dirs(backup_dir)
-    run = _Run(data, backup_dir, out)
-    # Journal first: the notes already name this dir, so it must hold a run.json
-    # even if the copy below stops partway.
-    run.save("backing-up")
-    run.backup_store()
-    run.save("notes-written")
-    _checkpoint("backup")
-    return run.finish()
+    try:
+        _backup(data, store, backup_root, backup_dir)
+        _checkpoint("backup")
+        return _Run(data, backup_dir, out).finish()
+    except OSError as exc:
+        exc.backup_dir = backup_dir  # lets _main_apply print the resume hint once run.json exists
+        raise
 
 
 def resume(backup_dir: Path, vault_arg: str | None, insights_arg: str | None, out=print) -> int:
-    """Finish an interrupted run from the state its run.json records."""
+    """Run the same steps again from the backup's snapshot; each one is idempotent."""
     backup_dir = Path(backup_dir)
     data = _read_run(backup_dir)
     store = resolve_store(data["store"], os.getcwd())
@@ -1030,40 +1111,32 @@ def resume(backup_dir: Path, vault_arg: str | None, insights_arg: str | None, ou
         raise ApplyError(f"--vault {vault_arg} is not the run's vault {vault_root}")
     if insights_arg is not None and insights_arg != data["insights_folder"]:
         raise ApplyError(f"--insights-folder {insights_arg} is not the run's {data['insights_folder']}")
-    _, errors = validate_plan(data["plan"], store, vault_root, moved_dir=backup_dir / "moved")
-    if errors:
-        raise ApplyError("bad plan in run.json: " + "; ".join(errors))
-    run = _Run(data, backup_dir, out)
-    out(f"resuming from state: {data['state']}")
-    if data["state"] == "backing-up":
-        # Only the partial full-copy/ goes; the run's other files stay.
-        full = backup_dir / "full-copy"
-        if os.path.islink(full):
-            raise ApplyError(f"full-copy is a symlink: {full}")
-        if os.path.lexists(full):
-            shutil.rmtree(full)
-        run.backup_store()
-        run.save("notes-written")
-    if data["state"] == "notes-written":
-        # Re-check each note before its original moves.
-        for w in list(data["written"]):
-            try:
-                _check_readback(vault_root / w["note"], run.original(w["slug"]), w["action"])
-                _contained(vault_root / w["note"], vault_root)
-            except (_ItemError, StoreError, ValueError) as exc:
-                if w["slug"] in data["moved"]:
-                    # Its original already moved: put it back, keep its index line.
-                    try:
-                        run.move_back(w["slug"])
-                    except (_ItemError, OSError) as back:
-                        run.save()
-                        raise ApplyError(f"{w['slug']} failed read-back ({exc}) and cannot be moved "
-                                         f"back to the store: {back}") from back
-                    data["moved"].remove(w["slug"])
-                data["written"].remove(w)
-                run.refuse(w["slug"], str(exc))
-        run.save()
-    return run.finish()
+    with _store_lock(backup_dir.parent, store, out):
+        data = _read_run(backup_dir)  # another run may have finished it before we got the lock
+        _, errors = validate_plan(data["plan"], store, vault_root, moved_dir=backup_dir / "moved")
+        if errors:
+            raise ApplyError("bad plan in run.json: " + "; ".join(errors))
+        out(f"resuming from state: {data['state']}")
+        return _Run(data, backup_dir, out).finish()
+
+
+def _default_project(store: Path, cwd: str) -> str:
+    """The project label for ``store``: the cwd's own when the cwd resolves to this store, else
+    the cwd a transcript in the store's project folder recorded. Never the caller's cwd by default."""
+    try:
+        if resolve_store(None, cwd) == store:
+            return canonical_project_name(cwd)
+    except StoreError:
+        pass
+    try:
+        logs = sorted(store.parent.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)[:5]
+    except OSError:
+        logs = []
+    for log in logs:
+        recorded = _transcript_cwd(str(log))
+        if recorded:
+            return canonical_project_name(recorded)
+    raise ApplyError(f"cannot tell which project {store} belongs to; pass --project")
 
 
 def _main_apply(args) -> int:
@@ -1082,7 +1155,7 @@ def _main_apply(args) -> int:
             raise ApplyError(f"vault is not a directory: {vault!r}; pass --vault")
         if not folder or Path(folder).is_absolute() or ".." in Path(folder).parts:
             raise ApplyError(f"insights folder must be vault-relative: {folder!r}")
-        project = args.project or canonical_project_name(os.getcwd())
+        project = args.project or _default_project(store, os.getcwd())
         backup_root = Path(args.backup_root or Path.home() / ".claude" / "backups")
         return apply(Path(args.plan), store, Path(vault), folder, project, backup_root,
                      args.apply, datetime.now().astimezone())
@@ -1107,12 +1180,13 @@ def _verify_run(backup_dir: Path, run: dict, store: Path | None) -> tuple[bool, 
     if store is not None and store.resolve() != live.resolve():
         raise ApplyError(f"run.json is for {live}")
     if run["state"] != "done":
-        return False, [dict(check="state", ok=False, detail=run["state"])]
+        return False, [dict(check=VERIFY_CHECKS[0], ok=False, detail=run["state"])]
 
     checks = []
 
-    def record(name, issues):
-        checks.append(dict(check=name, ok=not issues, detail=", ".join(sorted(issues)) or "ok"))
+    def record(name, issues, detail=None):
+        assert name in VERIFY_CHECKS, name
+        checks.append(dict(check=name, ok=not issues, detail=detail or ", ".join(sorted(issues)) or "ok"))
 
     full = backup_dir / "full-copy"
     moved_dir = backup_dir / "moved"
@@ -1138,7 +1212,7 @@ def _verify_run(backup_dir: Path, run: dict, store: Path | None) -> tuple[bool, 
         removed = {Path(name).stem for name in old - referenced}
         expected = moved & {Path(name).stem for name in old}
         detail = f"unexpected: {sorted(removed - expected)}; missing: {sorted(expected - removed)}"
-        checks.append(dict(check="removed-equals-moved", ok=removed == expected, detail=detail))
+        record("removed-equals-moved", [] if removed == expected else ["differs"], detail)
     else:
         record("removed-equals-moved", ["missing full-copy/MEMORY.md"])
 
@@ -1149,16 +1223,8 @@ def _verify_run(backup_dir: Path, run: dict, store: Path | None) -> tuple[bool, 
         try:
             note = _contained(vault / row["note"], vault)
             note_text, _ = _read_file(note)
-            if slug in moved:
-                original = read_entry(_contained(moved_dir / f"{slug}.md", backup_dir))
-            else:
-                # Refused or restored during the move: the original never left the store.
-                # The backup copy is what the note was read back against; the live file
-                # may have been edited since, which is why the move was refused.
-                kept = full / f"{slug}.md"
-                if not os.path.lexists(kept):
-                    kept = live / f"{slug}.md"
-                original = read_entry(_contained(kept, kept.parent))
+            # The note was written from the snapshot; a kept original may have been edited since.
+            original = read_entry(_contained((moved_dir if slug in moved else full) / f"{slug}.md", backup_dir))
             _check_note_text(note, note_text, original, action)
             if action == "new":
                 front = _frontmatter(note_text)
@@ -1173,16 +1239,30 @@ def _verify_run(backup_dir: Path, run: dict, store: Path | None) -> tuple[bool, 
     remaining = [f"still in store: {name}" for name in moved_names if os.path.lexists(live / name)]
     if before is None:
         missing.append("missing full-copy/MEMORY.md")
-    listed = run.get("full_copy")
     damaged = []
+    try:
+        raw, _ = _read_file(backup_dir / "manifest.json", _MANIFEST_LIMIT)
+        listed = json.loads(raw)["files"]
+    except StoreError as exc:
+        if (backup_dir / "manifest.json").exists():
+            raise ApplyError(f"cannot read manifest.json: {exc}") from exc
+        listed = None
+    except (ValueError, KeyError, TypeError, RecursionError) as exc:
+        raise ApplyError(f"cannot read manifest.json: {exc}") from exc
     if listed is None:
-        print("WARN backups-present: run.json lists no full-copy files (written before the list "
-              "existed); only full-copy/MEMORY.md and moved/ were checked")
+        print("WARN backups-present: manifest.json is missing (written before the manifest existed); "
+              "only full-copy/MEMORY.md and moved/ were checked")
     else:
         for row in listed:
             path = full / row["name"]
             try:
-                same = hashlib.sha256(_contained(path, full).read_bytes()).hexdigest() == row["sha256"]
+                _contained(path.parent, full)
+                if row["kind"] == "symlink":
+                    if not os.path.lexists(path):
+                        raise FileNotFoundError(path)
+                    same = os.path.islink(path) and os.readlink(path) == row["target"]
+                else:
+                    same = hashlib.sha256(_contained(path, full).read_bytes()).hexdigest() == row["sha256"]
             except (OSError, ValueError, _ItemError):
                 damaged.append(f"missing full-copy/{row['name']}")
                 continue
@@ -1193,7 +1273,7 @@ def _verify_run(backup_dir: Path, run: dict, store: Path | None) -> tuple[bool, 
     units = "{bytes} bytes, {chars} chars, {lines} lines"
     before_size = units.format(**_sizes(before)) if before is not None else "unavailable"
     detail = f"before: {before_size}; after: {units.format(**_sizes(text))}"
-    checks.append(dict(check="sizes", ok=True, detail=detail))
+    record("sizes", [], detail)
     return all(check["ok"] for check in checks), checks
 
 

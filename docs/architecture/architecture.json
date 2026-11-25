@@ -123,7 +123,7 @@
         "nodes": [
           {
             "label": "Capture / Recall",
-            "sub": "compress · recall · vault-ask · standup",
+            "sub": "compress · recall · vault-ask · standup · memory-consolidate",
             "color": "#8B5CF6"
           },
           {
@@ -438,7 +438,7 @@
           "files": [
             "hooks/memory_consolidate.py"
           ],
-          "purpose": "Stdlib CLI behind /memory-consolidate (#309): audit, apply, verify, smoke. audit reports the selected store (main worktree's store by default, via _cc_encoded_dirnames; symlinked stores and entries refused), MEMORY.md size in bytes, chars and lines against the 17,000/24,000-byte and 200-line limits, orphans, dangling links, duplicates and a mode (shrink, rescue, ok). apply takes a plan JSON of new/append/retire items, dry run by default. With --apply it refuses secret-shaped entries (file text or the MEMORY.md link label that titles the note) and entries on an index line that also points at staying entries, writes one note per fact with the body copied word for word (frontmatter migrated_from_memory and synced_from, no source_session) or appends a marked section, reads each back with a lossless check, copies the whole store to a backup dir, moves each original to <backup>/moved/, then rewrites the live MEMORY.md atomically with a stat check and adds one pointer line. An original is moved only when the live file and the backup copy both match the sha256 of the text its note was written from. run.json is written before the backup copy and records each state (backing-up, notes-written, moved, done) so apply --resume finishes an interrupted run, including one stopped during the copy; an OSError exits 2 with the resume line (exit 1 stays some-items-refused), and apply and verify take --store so a plan for another project applies. verify checks a finished run (links resolve, no duplicates, all indexed, removed set equals moved set, notes lossless, backups present including every file listed in run.json full_copy, sizes) against the run's baseline; smoke reindexes (non-wiping) and requires the expected note among the search hits."
+          "purpose": "Stdlib CLI behind /memory-consolidate (#309): audit, apply, verify, smoke. audit reports the selected store (main worktree's store by default, via _cc_encoded_dirnames; symlinked stores and entries refused), MEMORY.md size in bytes, chars and lines against the 17,000/24,000-byte and 200-line limits, orphans, dangling links, duplicates and a mode (shrink, rescue, ok). apply takes a plan JSON of new/append/retire items, dry run by default. With --apply it takes one lock per store (<backup root>/.memory-consolidate-<project dir>.lock; a dead pid's lock is taken over), refuses secret-shaped entries (file text or the MEMORY.md link label that titles the note) and entries on an index line that also points at staying entries, then copies the whole store into a temp sibling dir with manifest.json and run.json (state backed-up) and renames it into place, so every backup dir that exists is complete. From that copy it writes one note per fact with the body copied word for word (frontmatter migrated_from_memory and synced_from, no source_session) or appends a marked section, reads each back with a lossless check, moves each original to <backup>/moved/ only when it still matches the sha256 of the text checked before the backup, then rewrites the live MEMORY.md atomically with a stat check and adds one pointer line. apply --resume re-runs the same idempotent steps (notes, moves, index) and decides each move from the files on disk; the run.json states (backed-up, notes-written, moved, done) are progress markers only. An OSError exits 2 with the resume line once a backup dir exists (exit 1 stays some-items-refused), and apply and verify take --store, with the default project label taken from that store. verify checks a finished run (links resolve, no duplicates, all indexed, removed set equals moved set, notes lossless, backups present including every file and symlink listed in manifest.json, sizes) against the run's baseline; smoke reindexes (non-wiping) and requires the expected note among the search hits."
         }
       ]
     },
@@ -1358,7 +1358,7 @@
           "name": "Memory move backups",
           "kind": "datastore",
           "files": [],
-          "purpose": "~/.claude/backups/memory-moved-<YYYYMMDD-HHMMSS>-<project dir>/ (0700), one per /memory-consolidate apply run: run.json (state, plan, refused, written with each entry's sha256, moved, baseline, sizes, full_copy file list), full-copy/ (the whole memory store before the move) and moved/<slug>.md (each moved or retired original). A run never reuses an existing dir; apply --resume <dir> finishes one from its recorded state."
+          "purpose": "~/.claude/backups/memory-moved-<YYYYMMDD-HHMMSS>-<project dir>/ (0700), one per /memory-consolidate apply run: run.json (state as a progress marker, plan, planned entries with their sha256, refused, written, moved, baseline, sizes), manifest.json (every file and symlink under full-copy/), full-copy/ (the whole memory store before the move) and moved/<slug>.md (each moved or retired original). The dir is built as <dir>.tmp-<random> and renamed when complete, so a dir that exists is complete; a leftover .tmp- dir is a stopped copy and is ignored. A run never reuses an existing dir; apply --resume <dir> re-runs the same steps. One lock per store, <backup root>/.memory-consolidate-<project dir>.lock, keeps two runs apart."
         }
       ]
     },
@@ -2741,7 +2741,7 @@
     {
       "id": "memory-consolidate",
       "name": "/memory-consolidate move",
-      "description": "Moves chosen memory facts into the vault without losing any (#309): notes are written and read back before any original moves, the store is copied first, and the live index is rewritten last.",
+      "description": "Moves chosen memory facts into the vault without losing any (#309): the store is copied first (atomically), notes are written from that copy and read back before any original moves, and the live index is rewritten last.",
       "steps": [
         {
           "from": "sk-memory-consolidate",
@@ -2765,8 +2765,13 @@
         },
         {
           "from": "memory-consolidate-cli",
+          "to": "db-memory-backups",
+          "label": "store lock, then backup first: full-copy/, manifest.json, run.json in a .tmp- dir, renamed when complete"
+        },
+        {
+          "from": "memory-consolidate-cli",
           "to": "write-vault-note",
-          "label": "new note, body word for word, no source_session"
+          "label": "new note from the snapshot, body word for word, no source_session"
         },
         {
           "from": "memory-consolidate-cli",
@@ -2776,7 +2781,7 @@
         {
           "from": "memory-consolidate-cli",
           "to": "db-memory-backups",
-          "label": "full-copy/, run.json, moved/<slug>.md"
+          "label": "moved/<slug>.md; resume re-runs notes, moves and index from the files on disk"
         },
         {
           "from": "memory-consolidate-cli",

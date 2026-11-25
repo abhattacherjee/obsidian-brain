@@ -1,6 +1,7 @@
 """Verify and search the results of a real consolidation in a scratch HOME."""
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -44,10 +45,7 @@ def test_clean_run(env, backup, capsys):
     append_line(env["store"] / "MEMORY.md", "Résumé")
     ok, checks = mc.verify(backup, env["store"])
     assert ok
-    assert [row["check"] for row in checks] == [
-        "index-links-resolve", "no-duplicates", "all-indexed", "removed-equals-moved",
-        "notes-lossless", "backups-present", "sizes",
-    ]
+    assert [row["check"] for row in checks] == list(mc.VERIFY_CHECKS[1:])
     sizes = []
     for folder in (backup / "full-copy", env["store"]):
         data = (folder / "MEMORY.md").read_bytes()
@@ -174,20 +172,51 @@ def test_changed_full_copy_entry(backup, capsys):
 
 
 def strip_file_list(backup):
-    path = backup / "run.json"
-    data = json.loads(path.read_text())
-    del data["full_copy"]
-    path.write_text(json.dumps(data))
+    (backup / "manifest.json").unlink()
 
 
-def test_old_run_json_without_a_file_list_warns(backup, capsys):
+def test_old_run_without_a_manifest_warns(backup, capsys):
     strip_file_list(backup)
     (backup / "full-copy/stay.md").unlink()
     capsys.readouterr()
     assert mc.main(["verify", "--backup", str(backup)]) == 0
     out = capsys.readouterr().out.splitlines()
-    assert any(line.startswith("WARN backups-present: run.json lists no full-copy files") for line in out)
+    assert any(line.startswith("WARN backups-present: manifest.json is missing") for line in out)
     assert "PASS backups-present: ok" in out
+
+
+def with_symlink(env):
+    os.symlink("stay.md", env["store"] / "ref.txt")  # a relative link inside the store
+    return finish(env)
+
+
+def test_manifest_lists_the_symlink(env):
+    backup = with_symlink(env)
+    rows = json.loads((backup / "manifest.json").read_text())["files"]
+    assert dict(name="ref.txt", kind="symlink", target="stay.md") in rows
+    assert os.readlink(backup / "full-copy/ref.txt") == "stay.md"
+    assert mc.verify(backup)[0]
+
+
+def test_deleted_manifest_symlink_fails_backups_present(env, capsys):
+    backup = with_symlink(env)
+    (backup / "full-copy/ref.txt").unlink()
+    assert_failures(backup, capsys, "backups-present")
+    assert mc.verify(backup)[1][-2]["detail"] == "missing full-copy/ref.txt"
+
+
+def test_retargeted_manifest_symlink_fails_backups_present(env, capsys):
+    backup = with_symlink(env)
+    (backup / "full-copy/ref.txt").unlink()
+    os.symlink("feedback_a.md", backup / "full-copy/ref.txt")
+    assert_failures(backup, capsys, "backups-present")
+    assert mc.verify(backup)[1][-2]["detail"] == "changed full-copy/ref.txt"
+
+
+def test_manifest_has_its_own_size_cap(backup, monkeypatch):
+    monkeypatch.setattr(mc, "_MANIFEST_LIMIT", 10)
+    with pytest.raises(mc.ApplyError, match="cannot read manifest.json"):
+        mc.verify(backup)
 
 
 def test_still_in_store(env, backup, capsys):

@@ -24,8 +24,9 @@ Claude makes the judgement calls (keep or move, note type, dedupe). The CLI
 ## Rules
 
 - **Dry run first, always.** Show the dry run to the user and get a yes before `--apply`.
-- **Nothing is deleted.** `apply --apply` copies the whole store to a backup dir, then moves each
-  original to `<backup>/moved/<slug>.md`.
+- **Nothing is deleted.** `apply --apply` copies the whole store to a backup dir first (built
+  under a temporary name, renamed only when complete), writes the notes from that copy, then moves
+  each original to `<backup>/moved/<slug>.md`. One lock per store keeps two runs apart.
 - **Word for word.** Each new note copies the memory body exactly. Moved notes carry
   `migrated_from_memory: <slug>` and no `source_session` (retro would count them as the moving
   session's findings, #495).
@@ -155,9 +156,20 @@ python3 '<HOOKS>/memory_consolidate.py' apply --plan '<PLAN>' --store '<STORE>' 
 ```
 
 Keep the `backup:` line's path as `<BACKUP>`. Exit 1 means some items were refused and the rest
-were done. Exit 2 means the run could not go on. If it stopped after the backup dir was made
-(an I/O error such as a full disk), the error is followed by a `finish with: apply --resume
-<BACKUP>` line: run `apply --resume '<BACKUP>'` to finish it (`--resume` takes no `--store`).
+were done. Exit 2 means the run could not go on:
+
+- `another run holds the lock`: another `apply` or `--resume` is running on this store. Wait for
+  it. A lock left by a dead process is taken over (`WARN stale lock from pid N`).
+- `cannot tell which project ... belongs to; pass --project`: add `--project '<name>'`. The
+  default is the project of `<STORE>`, never the current directory's.
+- An I/O error such as a full disk, or `MEMORY.md kept changing`. Once the backup dir exists the
+  error is followed by a `finish with: apply --resume <BACKUP>` line. Run
+  `apply --resume '<BACKUP>'` (`--resume` takes no `--store`): it runs the same steps again
+  (notes, moves, index) from the backup's copy, and is safe to repeat. On a finished run it
+  prints `nothing to do`.
+
+A `WARN leftover partial backup <path>` line means an earlier run stopped while copying the store.
+It wrote no note and moved nothing; the partial dir can be deleted.
 
 ### Step 7 — Verify
 
@@ -167,7 +179,8 @@ python3 '<HOOKS>/memory_consolidate.py' verify --backup '<BACKUP>' --store '<STO
 
 It prints one line per check: `index-links-resolve`, `no-duplicates`, `all-indexed`,
 `removed-equals-moved`, `notes-lossless`, `backups-present`, `sizes`, then `verify: ok`.
-Every line must be `PASS`; a missing line counts as a failure.
+Every line must be `PASS`; a missing line counts as a failure. A run that is not finished prints
+one `state` line instead, as `FAIL`: resume it (Step 6), then verify again.
 Any `FAIL` (exit 1): report it to the user with its detail line. The originals are all in
 `<BACKUP>/moved/` and `<BACKUP>/full-copy/`, so nothing is lost.
 

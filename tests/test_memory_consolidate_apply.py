@@ -53,9 +53,15 @@ def entry_text(name, desc, body, mtype="feedback"):
     return f"---\nname: {name}\ndescription: {desc}\ntype: {mtype}\n---\n\n{body}"
 
 
+def _no_live_config(*args, **kwargs):
+    raise AssertionError("a test reached load_config(): it would read the live vault config")
+
+
 @pytest.fixture
 def env(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
+    # In-process runs must pass --vault and --insights-folder; subprocesses get HOME=tmp_path.
+    monkeypatch.setattr(mc, "load_config", _no_live_config)
     store = tmp_path / ".claude/projects/-x-proj/memory"
     store.mkdir(parents=True)
     (store / "MEMORY.md").write_text(INDEX, encoding="utf-8")
@@ -254,10 +260,18 @@ def test_apply_writes_reads_back_moves_and_edits_index(env):
     assert run["written"] == [dict(slug="feedback_a", action="new", note=str(note.relative_to(env["vault"])),
                                    sha256=digest["feedback_a"]),
                               dict(slug="feedback_b", action="append", note=TARGET, sha256=digest["feedback_b"])]
-    assert run["full_copy"] == sorted(
-        [dict(name=f"{s}.md", sha256=digest[s]) for s in ENTRIES]
-        + [dict(name="MEMORY.md", sha256=hashlib.sha256(INDEX.encode()).hexdigest())],
-        key=lambda f: f["name"])
+    # The file list lives in manifest.json, not in run.json.
+    assert json.loads((bdir / "manifest.json").read_text()) == dict(version=1, files=sorted(
+        [dict(name=f"{s}.md", kind="file", sha256=digest[s]) for s in ENTRIES]
+        + [dict(name="MEMORY.md", kind="file", sha256=hashlib.sha256(INDEX.encode()).hexdigest())],
+        key=lambda f: f["name"]))
+    assert oct((bdir / "manifest.json").stat().st_mode & 0o777) == "0o600"
+    assert run["planned"] == [dict(slug="feedback_a", action="new", title="Alpha lesson",
+                                   note=str(note.relative_to(env["vault"])), sha256=digest["feedback_a"]),
+                              dict(slug="feedback_b", action="append", title="Beta lesson", note=TARGET,
+                                   sha256=digest["feedback_b"]),
+                              dict(slug="project_c", action="retire", title="Old project", note=None,
+                                   sha256=digest["project_c"])]
     assert run["retired"] == ["project_c"]
     assert run["sizes"]["before"] == dict(bytes=len(INDEX.encode()), chars=len(INDEX), lines=9)
     assert run["sizes"]["after"]["bytes"] == len((env["store"] / "MEMORY.md").read_bytes())
@@ -270,7 +284,7 @@ def test_run_json_field_names(env):
     run = json.loads((backup_dir(env) / "run.json").read_text())
     assert set(run) == {"version", "state", "store", "vault", "insights_folder", "project", "created_at",
                         "updated_at", "backup_dir", "plan", "refused", "warnings", "written", "retired",
-                        "moved", "dropped_lines", "baseline", "sizes", "full_copy"}
+                        "moved", "dropped_lines", "baseline", "sizes", "planned"}
     assert run["dropped_lines"] == ["- [Alpha lesson](feedback_a.md) — first",
                                     "- [Beta lesson](feedback_b.md) — second",
                                     "- [Old project](project_c.md) — stale"]
@@ -637,19 +651,30 @@ def restore():
     mc.shutil.copytree = _REAL_COPYTREE
 
 
-def test_stop_after_step_2_finishes_on_rerun(env, monkeypatch):
-    crash_at(monkeypatch, "notes")
-    with pytest.raises(Crash):
-        run_apply(env, "--apply")
-    restore()
+def test_crash_before_the_rename_leaves_no_backup_and_no_notes(env, monkeypatch):
+    """A backup dir only exists once complete; notes are written after it (R2)."""
+    store_before, vault_before = tree_hash(env["store"]), tree_hash(env["vault"])
+
+    def crash(src, dst):
+        raise Crash("before the rename")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(mc.os, "rename", crash)
+        with pytest.raises(Crash):
+            run_apply(env, "--apply")
     assert not backup_dir(env).exists()
-    later = NOW + timedelta(minutes=5)
-    code, out = run_apply(env, "--apply", now=later)
+    [partial] = env["backups"].iterdir()
+    assert ".tmp-" in partial.name and (partial / "full-copy" / "stay.md").exists()
+    assert (partial / "run.json").exists() and (partial / "manifest.json").exists()
+    assert tree_hash(env["store"]) == store_before and tree_hash(env["vault"]) == vault_before
+    assert marked_notes(env, "feedback_a") == []
+    assert not list(env["backups"].glob(".memory-consolidate-*"))
+    # A rerun is not blocked by the partial dir, warns about it and finishes.
+    code, out = run_apply(env, "--apply")
     assert code == 0, out
-    assert any("(already written" in l or l.startswith("NEW feedback_a") for l in out)
-    # The rerun reuses the backup dir name its notes already carry.
-    run = assert_finished(env)
-    assert run["backup_dir"] == str(backup_dir(env))
+    assert f"WARN leftover partial backup {partial}" in out
+    assert mc._unfinished_runs(env["backups"], env["store"]) == []
+    assert_finished(env)
 
 
 @pytest.mark.parametrize("point", ["backup", "mid-4", "moved", "index-written"])
@@ -667,27 +692,6 @@ def test_stop_finishes_with_resume(env, monkeypatch, point):
     assert_finished(env)
 
 
-def test_resume_mid_4_after_moved_file_without_record(env, monkeypatch):
-    """Crash between the rename and the run.json update: the file in moved/ counts."""
-    real = mc._Run.save
-    state = {"n": 0}
-
-    def save(self, state_name=None):
-        if self.data["moved"] and state_name is None and state["n"] == 0:
-            state["n"] = 1
-            self.data["moved"].pop()
-            real(self)
-            raise Crash("after rename, before record")
-        real(self, state_name)
-
-    monkeypatch.setattr(mc._Run, "save", save)
-    with pytest.raises(Crash):
-        run_apply(env, "--apply")
-    restore()
-    assert main(["apply", "--resume", str(backup_dir(env))]) == 0
-    assert_finished(env)
-
-
 def test_resume_done_is_a_no_op(env):
     run_apply(env, "--apply")
     before = trees(env)
@@ -698,7 +702,7 @@ def test_resume_done_is_a_no_op(env):
 
 
 def test_resume_rechecks_notes_before_moving(env, monkeypatch):
-    crash_at(monkeypatch, "backup")
+    crash_at(monkeypatch, "notes")
     with pytest.raises(Crash):
         run_apply(env, "--apply", plan=write_plan(env, ITEMS[:2]))
     restore()
@@ -720,7 +724,7 @@ def test_resume_refuses_original_changed_after_backup(env, monkeypatch):
     (env["store"] / "feedback_b.md").write_text(entry_text("Beta", "d", "edited by another session"))
     result = cli(env, "apply", "--resume", str(backup_dir(env)))
     assert result.returncode == 1
-    assert "REFUSE feedback_b: original changed after the notes were written; not moved" in result.stdout
+    assert "REFUSE feedback_b: original changed after the backup copy; not moved" in result.stdout
     assert (env["store"] / "feedback_b.md").exists()
     assert "feedback_b.md" in (env["store"] / "MEMORY.md").read_text()
 
@@ -839,46 +843,44 @@ def test_audit_human_output_lists_counts_not_every_slug(env, capsys):
 
 # --- review fixes (PR #529, pass 1) ---------------------------------------------
 
-def test_original_edited_before_the_backup_copy_is_not_moved(env, monkeypatch):
-    """The vault note holds the older text, so the original must stay (C-001/X-001)."""
-    edited = entry_text("Beta", "Beta description", "Edited after the note was written.")
+def test_entry_edited_between_validate_and_backup_is_refused_with_no_note(env, monkeypatch):
+    """Notes come from the snapshot, so a changed snapshot refuses the item before any note (X-001)."""
+    edited = entry_text("Beta", "Beta description", "Edited after the plan was checked.")
+    real = mc.shutil.copytree
 
-    def edit(name):
-        if name == "notes":
-            (env["store"] / "feedback_b.md").write_text(edited, encoding="utf-8")
+    def edit_then_copy(src, dst, **kwargs):
+        (env["store"] / "feedback_b.md").write_text(edited, encoding="utf-8")
+        return real(src, dst, **kwargs)
 
-    monkeypatch.setattr(mc, "_checkpoint", edit)
+    monkeypatch.setattr(mc.shutil, "copytree", edit_then_copy)
     code, out = run_apply(env, "--apply", plan=write_plan(env, ITEMS[:2]))
+    restore()
     assert code == 1
-    assert any(l.startswith("REFUSE feedback_b: original changed before the backup copy") for l in out)
+    assert any(l.startswith("REFUSE feedback_b: changed during the run") for l in out)
+    assert (env["vault"] / TARGET).read_text() == TARGET_TEXT
     assert (env["store"] / "feedback_b.md").read_text() == edited
     assert "- [Beta lesson](feedback_b.md) — second" in (env["store"] / "MEMORY.md").read_text()
     run = json.loads((backup_dir(env) / "run.json").read_text())
-    assert run["moved"] == ["feedback_a"]
-    assert not (backup_dir(env) / "moved" / "feedback_b.md").exists()
+    assert run["moved"] == ["feedback_a"] and [w["slug"] for w in run["written"]] == ["feedback_a"]
+    assert main(["verify", "--backup", str(backup_dir(env))]) == 0
 
 
-def test_backup_copy_stop_is_journaled_and_resumes(env, monkeypatch):
-    """run.json exists before the copy, so the dir the notes name always has a journal (C-002/X-007)."""
-    def partial(src, dst, **kwargs):
-        os.mkdir(dst, 0o700)
-        (Path(dst) / "MEMORY.md").write_text("partial copy")
-        raise OSError(28, "No space left on device")
+def test_retired_entry_edited_between_backup_and_move_is_not_moved(env, monkeypatch):
+    edited = entry_text("Gamma", "Stale project", "Someone updated this after the backup.")
 
-    monkeypatch.setattr(mc.shutil, "copytree", partial)
-    with pytest.raises(OSError):
-        run_apply(env, "--apply")
+    def edit(name):
+        if name == "backup":
+            (env["store"] / "project_c.md").write_text(edited, encoding="utf-8")
+
+    monkeypatch.setattr(mc, "_checkpoint", edit)
+    code, out = run_apply(env, "--apply")
     restore()
-    run = json.loads((backup_dir(env) / "run.json").read_text())
-    assert run["state"] == "backing-up"
-    assert mc._unfinished_runs(env["backups"], env["store"]) == [backup_dir(env)]
-    [note] = marked_notes(env, "feedback_a")
-    assert f"`{backup_dir(env)}`" in note.read_text()
-    assert main(["apply", "--resume", str(backup_dir(env))]) == 0
-    assert_finished(env)
-    # Only the partial copy was replaced.
-    assert (backup_dir(env) / "full-copy" / "MEMORY.md").read_text() == INDEX
-    assert (backup_dir(env) / "full-copy" / "stay.md").exists()
+    assert code == 1
+    assert "REFUSE project_c: original changed after the backup copy; not moved" in out
+    assert (env["store"] / "project_c.md").read_text() == edited
+    assert not (backup_dir(env) / "moved" / "project_c.md").exists()
+    assert "- [Old project](project_c.md) — stale" in (env["store"] / "MEMORY.md").read_text()
+    assert audit(env["store"])["dangling"] == []
 
 
 def _args(env, *extra):
@@ -887,18 +889,19 @@ def _args(env, *extra):
             *extra]
 
 
-def test_os_error_in_the_copy_exits_2_with_the_resume_hint(env, monkeypatch, capsys):
+def test_os_error_in_the_copy_exits_2_and_leaves_no_backup(env, monkeypatch, capsys):
     def no_space(src, dst, **kwargs):
         raise OSError(28, "No space left on device")
 
     monkeypatch.setattr(mc.shutil, "copytree", no_space)
     assert main(_args(env, "--apply")) == 2
     err = capsys.readouterr().err
-    [bdir] = env["backups"].glob("memory-moved-*")
     assert "error: [Errno 28] No space left on device" in err
-    assert f"apply --resume {bdir}" in err
+    assert "--resume" not in err  # no run.json exists yet: there is nothing to resume
+    assert not backup_dir(env).exists()
+    assert marked_notes(env, "feedback_a") == []
     restore()
-    assert main(["apply", "--resume", str(bdir)]) == 0
+    assert main(_args(env, "--apply")) == 0
 
 
 @pytest.mark.parametrize("via_resume", [False, True])
@@ -963,26 +966,31 @@ def test_resume_read_back_failure_stops_when_the_store_path_is_taken(env, monkey
     note.write_text(note.read_text().replace("Line one of alpha.", "Line one of alpha?"))
     (env["store"] / "feedback_a.md").write_text("a new file another session made")
     assert main(["apply", "--resume", str(backup_dir(env))]) == 2
-    assert "feedback_a failed read-back" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "feedback_a is refused and its original is in" in err and "is taken" in err
     assert (env["store"] / "feedback_a.md").read_text() == "a new file another session made"
     assert (backup_dir(env) / "moved" / "feedback_a.md").exists()
 
 
-def test_resume_with_a_deleted_append_target_refuses_only_that_item(env, monkeypatch):
-    crash_at(monkeypatch, "backup")
+@pytest.mark.parametrize("point", ["backup", "moved"])
+def test_resume_with_a_deleted_append_target_refuses_only_that_item(env, monkeypatch, point):
+    """The note check runs on every resume, whatever state was saved (X-005, X-020)."""
+    crash_at(monkeypatch, point)
     with pytest.raises(Crash):
         run_apply(env, "--apply")
     restore()
     (env["vault"] / TARGET).unlink()
     result = cli(env, "apply", "--resume", str(backup_dir(env)))
     assert result.returncode == 1, result.stdout + result.stderr
-    assert "REFUSE feedback_b: read-back failed" in result.stdout
+    assert "REFUSE feedback_b: append target is missing or unreadable" in result.stdout
     assert (env["store"] / "feedback_b.md").exists()
+    assert not (backup_dir(env) / "moved" / "feedback_b.md").exists()
     assert "- [Beta lesson](feedback_b.md) — second" in (env["store"] / "MEMORY.md").read_text()
     for slug in ("feedback_a", "project_c"):
         assert not (env["store"] / f"{slug}.md").exists()
     run = json.loads((backup_dir(env) / "run.json").read_text())
     assert run["state"] == "done"
+    assert sorted(run["moved"]) == ["feedback_a", "project_c"]
     assert audit(env["store"])["dangling"] == []
 
 
@@ -1143,3 +1151,174 @@ def test_append_target_carrying_the_marker_twice_refuses_the_item(env):
     assert code == 2  # nothing could move
     assert f"REFUSE feedback_b: {TARGET} carries its marker 2 times" in out
     assert not any(l.startswith("APPEND feedback_b") for l in out)
+
+
+# --- review fixes (PR #529, pass 2): one lock, atomic backup, idempotent resume ----------
+
+def lock_file(env):
+    return env["backups"] / ".memory-consolidate--x-proj.lock"
+
+
+def test_lock_held_by_a_live_pid_exits_2(env):
+    lock_file(env).write_text(f"{os.getpid()} 2026-11-24T11:00:00-08:00\n")
+    before = trees(env)
+    result = cli_apply(env, write_plan(env), "--apply")
+    assert result.returncode == 2
+    assert "another run holds the lock" in result.stderr and f"pid {os.getpid()}" in result.stderr
+    assert trees(env) == before
+    assert lock_file(env).exists()  # the holder's lock is not ours to remove
+    # A dry run takes no lock, so it is not blocked.
+    assert cli_apply(env, write_plan(env)).returncode == 0
+
+
+def test_stale_lock_warns_and_is_taken(env):
+    dead = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead.wait()
+    lock_file(env).write_text(f"{dead.pid} 2026-11-24T11:00:00-08:00\n")
+    result = cli_apply(env, write_plan(env), "--apply")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert f"WARN stale lock from pid {dead.pid} (2026-11-24T11:00:00-08:00); taking it" in result.stdout
+    assert not lock_file(env).exists()
+
+
+def test_unreadable_lock_is_not_taken(env):
+    lock_file(env).write_text("garbage")
+    assert cli_apply(env, write_plan(env), "--apply").returncode == 2
+    assert lock_file(env).read_text() == "garbage"
+
+
+def test_the_lock_is_removed_after_a_crash(env, monkeypatch):
+    crash_at(monkeypatch, "mid-4")
+    with pytest.raises(Crash):
+        run_apply(env, "--apply")
+    restore()
+    assert not lock_file(env).exists()
+
+
+def test_a_second_resume_sees_the_lock_and_exits_2(env, monkeypatch, capsys):
+    crash_at(monkeypatch, "backup")
+    with pytest.raises(Crash):
+        run_apply(env, "--apply")
+    restore()
+    inner = []
+
+    def other_resume(name):
+        if name == "notes":
+            inner.append(main(["apply", "--resume", str(backup_dir(env))]))
+
+    monkeypatch.setattr(mc, "_checkpoint", other_resume)
+    assert main(["apply", "--resume", str(backup_dir(env))]) == 0
+    assert inner == [2]
+    assert "another run holds the lock" in capsys.readouterr().err
+    assert_finished(env)
+
+
+def test_resume_ignores_a_stale_moved_list(env, monkeypatch):
+    """Move status comes from the filesystem; a journal that says moved is not believed (X-004)."""
+    crash_at(monkeypatch, "mid-4")
+    with pytest.raises(Crash):
+        run_apply(env, "--apply")
+    restore()
+    path = backup_dir(env) / "run.json"
+    run = json.loads(path.read_text())
+    run["moved"] = ["feedback_b", "project_c"]  # neither has moved
+    path.write_text(json.dumps(run))
+    assert main(["apply", "--resume", str(backup_dir(env))]) == 0
+    assert_finished(env)
+
+
+def test_resume_with_a_moved_file_the_journal_does_not_know(env, monkeypatch):
+    """Crash after the rename, before any save: the file in moved/ counts, and a failed
+    read-back puts it back in the store (X-004)."""
+    crash_at(monkeypatch, "mid-4")
+    with pytest.raises(Crash):
+        run_apply(env, "--apply")
+    restore()
+    run = json.loads((backup_dir(env) / "run.json").read_text())
+    assert run["moved"] == [] and (backup_dir(env) / "moved" / "feedback_a.md").exists()
+    [note] = marked_notes(env, "feedback_a")
+    note.write_text(note.read_text().replace("Line one of alpha.", "Line one of alpha?"))
+    assert main(["apply", "--resume", str(backup_dir(env))]) == 1
+    assert (env["store"] / "feedback_a.md").read_text() == entry_text(*ENTRIES["feedback_a"])
+    assert not (backup_dir(env) / "moved" / "feedback_a.md").exists()
+    run = json.loads((backup_dir(env) / "run.json").read_text())
+    assert sorted(run["moved"]) == ["feedback_b", "project_c"]
+
+
+def test_resume_of_a_finished_run_says_nothing_to_do(env, capsys):
+    assert run_apply(env, "--apply")[0] == 0
+    before = trees(env)
+    capsys.readouterr()
+    assert main(["apply", "--resume", str(backup_dir(env))]) == 0
+    out = capsys.readouterr().out
+    assert "resuming from state: done" in out and "nothing to do" in out
+    assert trees(env) == before
+
+
+def test_every_backup_dir_is_complete(env, monkeypatch):
+    """The first moment a backup dir exists it has run.json, manifest.json and the copy, and no note yet."""
+    crash_at(monkeypatch, "backup")
+    with pytest.raises(Crash):
+        run_apply(env, "--apply")
+    restore()
+    bdir = backup_dir(env)
+    assert json.loads((bdir / "run.json").read_text())["state"] == "backed-up"
+    assert (bdir / "manifest.json").is_file() and (bdir / "full-copy" / "MEMORY.md").is_file()
+    assert marked_notes(env, "feedback_a") == []
+
+
+def test_notes_name_a_backup_dir_that_exists(env, monkeypatch):
+    seen = []
+
+    def check(name):
+        if name == "notes":
+            [note] = marked_notes(env, "feedback_a")
+            seen.append(f"`{backup_dir(env)}`" in note.read_text() and (backup_dir(env) / "run.json").is_file())
+
+    monkeypatch.setattr(mc, "_checkpoint", check)
+    assert run_apply(env, "--apply")[0] == 0
+    restore()
+    assert seen == [True]
+
+
+def _cli_from(env, cwd, store, *extra):
+    plan = env["tmp"] / f"plan-{store.parent.name}.json"
+    plan.write_text(json.dumps(dict(version=1, store=str(store), items=ITEMS[:1])))
+    return subprocess.run(
+        [sys.executable, str(SCRIPT), "apply", "--plan", str(plan), "--store", str(store), "--vault",
+         str(env["vault"]), "--insights-folder", "claude-insights", "--backup-root", str(env["backups"]), *extra],
+        capture_output=True, text=True, stdin=subprocess.DEVNULL, cwd=cwd, timeout=60,
+        env={**os.environ, "HOME": str(env["tmp"])})
+
+
+def test_default_project_comes_from_the_stores_project_not_the_cwd(env):
+    """--store for project B from a cwd in project A tags notes with B and keeps A's note (X-011/X-023)."""
+    tmp = env["tmp"]
+    cwd_a = tmp / "projA"
+    cwd_a.mkdir()
+    store_a = tmp / ".claude/projects" / re.sub("[^A-Za-z0-9]", "-", str(cwd_a)) / "memory"
+    store_a.mkdir(parents=True)
+    (store_a / "MEMORY.md").write_text(INDEX)
+    (store_a / "feedback_a.md").write_text(entry_text("Alpha", "A's description", "A's body."))
+    cwd_b = tmp / "projB"
+    cwd_b.mkdir()
+    (env["store"].parent / "session.jsonl").write_text(json.dumps(dict(cwd=str(cwd_b))) + "\n")
+
+    first = _cli_from(env, cwd_a, store_a, "--apply")  # cwd in A, store A: the cwd's own project
+    assert first.returncode == 0, first.stdout + first.stderr
+    result = _cli_from(env, cwd_a, env["store"], "--apply")  # cwd in A, store B
+    assert result.returncode == 0, result.stdout + result.stderr
+    notes = marked_notes(env, "feedback_a")
+    assert len(notes) == 2
+    projects = sorted(re.search(r"^project: (.+)$", n.read_text(), re.M).group(1) for n in notes)
+    assert projects == ["proja", "projb"]
+    [b_note] = [n for n in notes if "project: projb\n" in n.read_text()]
+    assert "claude/project/projb" in b_note.read_text() and "Alpha description" in b_note.read_text()
+
+
+def test_default_project_without_a_transcript_asks_for_project(env):
+    elsewhere = env["tmp"] / "elsewhere"
+    elsewhere.mkdir()
+    result = _cli_from(env, elsewhere, env["store"], "--apply")
+    assert result.returncode == 2 and "pass --project" in result.stderr
+    assert marked_notes(env, "feedback_a") == []
