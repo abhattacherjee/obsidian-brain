@@ -35,6 +35,8 @@ VENDORED = {
     ".claude/hooks/validate-branch-name.py": "templates/hooks/validate-branch-name.py",
     "scripts/commit-preflight.sh": "templates/scripts/commit-preflight.sh",
 }
+# Must name a released tree (a plugin cache directory or a checkout at a
+# release tag): it vouches for the files with its own plugin.json version.
 HARDEN_ROOT_ENV = "OB_HARDEN_REPO_ROOT"
 
 GATES = (
@@ -206,7 +208,9 @@ def _harden_roots():
     its doctor_core.py and its plugin.json.
 
     `released` is True for the env root and the plugin cache, whose
-    plugin.json version names a release. The marketplace clone and the dev
+    plugin.json version names a release. $OB_HARDEN_REPO_ROOT must therefore
+    name a released tree (a plugin cache directory or a checkout at a release
+    tag): it vouches with its own version. The marketplace clone and the dev
     checkout may hold unreleased templates under the next version, so they
     vouch through their ledger only."""
     home = Path(pwd.getpwuid(os.getuid()).pw_dir)
@@ -275,16 +279,39 @@ def _vendored_files():
     return {rel: (ROOT / rel).read_text(encoding="utf-8") for rel in VENDORED}
 
 
+def _generation_problem(found):
+    """None, or why `found` ({path: set of versions}) is not one generation:
+    a file matching no release ("unknown"), or known files sharing no release
+    ("mixed")."""
+    unknown = sorted(rel for rel, versions in found.items() if not versions)
+    if unknown:
+        return f"unknown: {unknown} match no harden-repo release"
+    if not set.intersection(*found.values()):
+        return f"mixed: the vendored files come from different releases: {found}"
+    return None
+
+
 def _assert_one_generation(roots, files):
     """The two assertions of the generation test: every file matches some
     release, and one release covers all of them."""
-    found = _vendored_versions(roots, files)
-    unknown = sorted(rel for rel, versions in found.items() if not versions)
-    assert not unknown, (
-        f"{unknown} match no harden-repo release in {[str(r[0]) for r in roots]}; "
-        "re-vendor with doctor.py --fix --safe rather than edit by hand.")
-    shared = set.intersection(*found.values())
-    assert shared, f"the vendored files come from different releases: {found}"
+    problem = _generation_problem(_vendored_versions(roots, files))
+    assert problem is None, (
+        f"{problem}; searched {[str(r[0]) for r in roots]}. Re-vendor with "
+        "doctor.py --fix --safe rather than edit by hand.")
+
+
+@pytest.mark.parametrize("found,expected", [
+    pytest.param({"a": {"1.5.0"}, "b": {"1.5.0", "1.5.1"}}, None, id="shared"),
+    pytest.param({"a": set(), "b": {"1.5.0"}}, "unknown", id="unknown"),
+    pytest.param({"a": {"1.4.0"}, "b": {"1.5.0"}}, "mixed", id="mixed"),
+])
+def test_the_generation_rule_on_its_own(found, expected):
+    """Runs in CI, where the ledger is absent: the unknown and mixed rules."""
+    problem = _generation_problem(found)
+    if expected is None:
+        assert problem is None, problem
+    else:
+        assert problem is not None and problem.startswith(expected), problem
 
 
 def test_vendored_files_are_one_released_generation():
@@ -345,8 +372,9 @@ def test_a_tree_without_the_current_release_fails_not_skips(tmp_path):
              if not set.intersection(*_vendored_versions([r], files).values())]
     if not stale:
         pytest.skip("every harden-repo tree found already knows this release")
-    with pytest.raises(AssertionError):
-        _assert_one_generation(stale, files)
+    # Call the rule itself: an AssertionError raised from inside could be a
+    # skip or a crash in disguise.
+    assert _generation_problem(_vendored_versions(stale, files)) is not None
 
 
 def test_an_unreleased_checkout_does_not_vouch_for_its_templates(tmp_path):

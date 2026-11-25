@@ -98,21 +98,25 @@ def _split_draft_gate(expr):
     return expr, None
 
 
-_BAD_GATE_PARTS = ("draft == true", "draft != false",
-                   "!github.event.pull_request.draft == false", "always()", "success()")
+# The only gates that skip drafts and nothing else: what harden-repo v1.5.0's
+# doctor writes, and the bare draft test. Anything else is a reason to look.
+_ALLOWED_GATES = (
+    f"github.event_name != 'pull_request' || {DRAFT_FIELD} == false",
+    f"{DRAFT_FIELD} == false",
+)
 
 
 def _draft_gate_problem(gate):
     """None for a gate that only skips drafts, else the reason it is not one.
-    A reversed gate (`draft == true`) would skip every ready PR and pass the
-    required check on a skipped run."""
+    An allowlist: whitespace collapsed and one pair of outer parentheses
+    stripped, the gate must equal an allowed text. A denylist missed
+    `... && false` and `... || true`."""
     flat = " ".join(str(gate).split())
-    if f"{DRAFT_FIELD} == false" not in flat:
-        return f"no `{DRAFT_FIELD} == false` in the gate: {flat}"
-    for part in _BAD_GATE_PARTS:
-        if part in flat:
-            return f"the gate contains `{part}`: {flat}"
-    return None
+    if flat.startswith("(") and flat.endswith(")"):
+        flat = flat[1:-1].strip()
+    if flat in _ALLOWED_GATES:
+        return None
+    return f"the gate is not one of {_ALLOWED_GATES}: {flat}"
 
 
 @_REQUIRES_YAML
@@ -133,9 +137,10 @@ def test_every_draft_gate_only_skips_drafts():
     if not gated:
         pytest.skip("no draft gate in ci.yml")
     for name, expr in gated.items():
-        _, gate = _split_draft_gate(expr)
+        base, gate = _split_draft_gate(expr)
         assert gate is not None, (name, expr)
         assert _draft_gate_problem(gate) is None, (name, _draft_gate_problem(gate))
+        assert base.strip() not in ("", "true", "always()"), (name, expr)
 
 
 def _ready_trigger_problem(wf):
@@ -190,6 +195,7 @@ REAL_DOCTOR_GATE = "github.event_name != 'pull_request' || github.event.pull_req
 @pytest.mark.parametrize("gate", [
     REAL_DOCTOR_GATE,
     "github.event.pull_request.draft ==\n  false",
+    "(github.event.pull_request.draft == false)",
 ])
 def test_a_draft_gate_that_skips_drafts_is_accepted(gate):
     assert _draft_gate_problem(gate) is None
@@ -198,7 +204,7 @@ def test_a_draft_gate_that_skips_drafts_is_accepted(gate):
 @pytest.mark.parametrize("gate", [
     "github.event.pull_request.draft == true",
     "github.event.pull_request.draft != false",
-    # Each bad part next to the good one: only the part list can reject these.
+    # Each bad part next to the good one: only an exact match can reject these.
     "github.event.pull_request.draft == false || github.event.pull_request.draft == true",
     "github.event.pull_request.draft == false || github.event.pull_request.draft != false",
     "github.event_name != 'pull_request' || github.event.pull_request.draft == true",
@@ -206,6 +212,11 @@ def test_a_draft_gate_that_skips_drafts_is_accepted(gate):
     "always() || github.event.pull_request.draft == false",
     "success() && github.event.pull_request.draft == false",
     "github.event_name == 'pull_request'",
+    "github.event.pull_request.draft == false && false",
+    "github.event.pull_request.draft == false || true",
+    "(github.event.pull_request.draft == false) || true",
+    f"{REAL_DOCTOR_GATE} && false",
+    f"{REAL_DOCTOR_GATE} || true",
 ])
 def test_a_reversed_or_widened_draft_gate_is_rejected(gate):
     assert _draft_gate_problem(gate) is not None

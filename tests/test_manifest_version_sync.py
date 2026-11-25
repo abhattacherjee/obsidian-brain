@@ -1,7 +1,8 @@
 """plugin.json and marketplace.json name the same version (#532).
 
 The preflight checks this in its LINT block, but skip modes (--docs-only,
---skip-tests, --auto) exit before that block. Before #532 the check ran ahead
+--skip-tests) exit before that block, and so does --auto when auto-detect
+finds docs or config files only. Before #532 the check ran ahead
 of the skip-mode exit, outside the harden-repo template; now CI runs it on
 every PR instead.
 """
@@ -32,7 +33,11 @@ def _version_sync_problems(plugin, market):
     plugins = market.get("plugins")
     if not isinstance(plugins, list):
         return [f"marketplace.json plugins is not a list: {plugins!r}"]
-    entries = [p for p in plugins if isinstance(p, dict) and p.get("name") == name]
+    bad = [p for p in plugins
+           if not isinstance(p, dict) or not isinstance(p.get("name"), str) or not p["name"]]
+    if bad:
+        return [f"marketplace.json plugins entry is not an object with a name: {bad!r}"]
+    entries = [p for p in plugins if p.get("name") == name]
     if not entries:
         return [f"marketplace.json has no entry for {name!r}"]
     return [f"marketplace entry {e.get('name')!r} has version {e.get('version')!r}, "
@@ -57,6 +62,11 @@ def test_a_matching_pair_has_no_problems():
     pytest.param({"name": "p", "version": ""},
                  {"plugins": [{"name": "p", "version": ""}]}, id="empty-version"),
     pytest.param(GOOD_PLUGIN, {"plugins": [{"version": "1.2.3"}]}, id="entry-without-name"),
+    pytest.param(GOOD_PLUGIN, {"plugins": [None, {"name": "p", "version": "1.2.3"}]},
+                 id="null-entry-beside-a-good-one"),
+    pytest.param(GOOD_PLUGIN, {"plugins": [{"name": None, "version": "1.2.3"},
+                                           {"name": "p", "version": "1.2.3"}]},
+                 id="entry-with-null-name-beside-a-good-one"),
     pytest.param(GOOD_PLUGIN, {"plugins": [{"name": "p", "version": "1.2.4"}]}, id="mismatch"),
     pytest.param(GOOD_PLUGIN, {"plugins": [{"name": "p", "version": "1.2.3"},
                                            {"name": "p", "version": "0.0.1"}]},

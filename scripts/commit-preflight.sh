@@ -526,9 +526,10 @@ echo "📋 Running lint checks..."
 # __HARDEN_LINT_START__
 # Plugin manifest version sync (obsidian-brain): plugin.json and
 # marketplace.json must name the same version. Lives in the LINT block so the
-# rest of this file stays the harden-repo template (#532). Skip modes
-# (--docs-only, --skip-tests, --auto) exit before this block; CI's
-# tests/test_manifest_version_sync.py checks the same pair on every PR.
+# rest of this file stays the harden-repo template (#532). --docs-only and
+# --skip-tests exit before this block, and so does --auto when it finds docs
+# or config files only; CI's tests/test_manifest_version_sync.py checks the
+# same pair on every PR.
 PLUGIN_JSON_PRE="$PROJECT_DIR/.claude-plugin/plugin.json"
 MARKETPLACE_JSON_PRE="$PROJECT_DIR/.claude-plugin/marketplace.json"
 if [ -f "$PLUGIN_JSON_PRE" ] && [ -f "$MARKETPLACE_JSON_PRE" ]; then
