@@ -642,22 +642,32 @@ def _store_lock(backup_root: Path, store: Path, out):
     runs never move the same store's files at once. A lock left by a dead pid is taken over."""
     _private_dirs(backup_root)
     path = backup_root / f".memory-consolidate-{store.parent.name}.lock"
-    for attempt in (0, 1):
-        try:
-            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
-            break
-        except FileExistsError:
-            pid, when = _lock_holder(path)
-            if attempt or pid is None or _pid_alive(pid):
-                who = f"pid {pid} since {when}" if pid else "an unreadable lock file; remove it if no run is active"
-                raise ApplyError(f"another run holds the lock {path} ({who})") from None
-            out(f"WARN stale lock from pid {pid} ({when}); taking it")
+    # The lock path only ever appears with its content: write a temp file, then hard-link it in.
+    fd, tmp_name = tempfile.mkstemp(dir=backup_root, prefix=".lock-tmp-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            os.fchmod(stream.fileno(), 0o600)
+            stream.write(f"{os.getpid()} {datetime.now().astimezone().isoformat(timespec='seconds')}\n")
+        for attempt in (0, 1):
             try:
-                os.unlink(path)
-            except FileNotFoundError:
-                pass
-    with os.fdopen(fd, "w", encoding="utf-8") as stream:
-        stream.write(f"{os.getpid()} {datetime.now().astimezone().isoformat(timespec='seconds')}\n")
+                os.link(tmp_name, path)
+                break
+            except FileExistsError:
+                pid, when = _lock_holder(path)
+                if attempt or pid is None or _pid_alive(pid):
+                    who = (f"pid {pid} since {when}" if pid
+                           else f"an unreadable or empty lock file; remove it if no run is active: {path}")
+                    raise ApplyError(f"another run holds the lock {path} ({who})") from None
+                out(f"WARN stale lock from pid {pid} ({when}); taking it")
+                try:
+                    os.unlink(path)
+                except FileNotFoundError:
+                    pass
+    finally:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
     try:
         yield
     finally:
@@ -690,6 +700,15 @@ class _Run:
         self.data["updated_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
         _write_json(self.dir / "run.json", self.data)
 
+    def _stop_if_indexed(self, slug: str, reason) -> None:
+        """Once the index step has run, an original in moved/ has lost its MEMORY.md line, so it
+        must not go back to the store on its own: stop and let a person fix both together."""
+        moved = self.dir / "moved" / f"{slug}.md"
+        if self.data["sizes"].get("after") and os.path.lexists(moved):
+            raise ApplyError(f"{slug}: its note failed after MEMORY.md was edited ({reason}); the original is "
+                             f"still in {moved} and its old index line is in run.json dropped_lines; fix the "
+                             f"note or restore both by hand, then resume")
+
     def write_notes(self) -> None:
         """Step 1: write each note from the snapshot, or reuse the one already there, and read it back."""
         d = self.data
@@ -715,6 +734,7 @@ class _Run:
                     continue
                 grew = _write_note(row, item, entry, vault, d["project"], now, self.store, self.dir)
             except (_ItemError, StoreError, OSError, ApplyError) as exc:
+                self._stop_if_indexed(slug, exc)
                 # An original that already moved goes back in move_all.
                 rows.pop(slug, None)
                 if slug in retired:
@@ -742,6 +762,7 @@ class _Run:
             in_store, in_moved = os.path.lexists(src), os.path.lexists(dst)
             if slug in refused:
                 if in_moved:
+                    self._stop_if_indexed(slug, "its note was refused")
                     # Its note failed (or was never written), so its original goes back.
                     if in_store:
                         raise ApplyError(f"{slug} is refused and its original is in {dst}, but the store "
@@ -824,6 +845,7 @@ class _Run:
                 raise ApplyError(f"MEMORY.md kept changing; finish with: apply --resume {self.dir}")
         finally:
             _release_lock(lock)
+        self.save()  # records dropped_lines and sizes.after: a resume then knows the index is done
         _checkpoint("index-written")
 
     def finish(self) -> int:
@@ -1240,34 +1262,31 @@ def _verify_run(backup_dir: Path, run: dict, store: Path | None) -> tuple[bool, 
     if before is None:
         missing.append("missing full-copy/MEMORY.md")
     damaged = []
+    listed = None
     try:
         raw, _ = _read_file(backup_dir / "manifest.json", _MANIFEST_LIMIT)
         listed = json.loads(raw)["files"]
     except StoreError as exc:
         if (backup_dir / "manifest.json").exists():
             raise ApplyError(f"cannot read manifest.json: {exc}") from exc
-        listed = None
+        damaged.append("missing manifest.json")
     except (ValueError, KeyError, TypeError, RecursionError) as exc:
         raise ApplyError(f"cannot read manifest.json: {exc}") from exc
-    if listed is None:
-        print("WARN backups-present: manifest.json is missing (written before the manifest existed); "
-              "only full-copy/MEMORY.md and moved/ were checked")
-    else:
-        for row in listed:
-            path = full / row["name"]
-            try:
-                _contained(path.parent, full)
-                if row["kind"] == "symlink":
-                    if not os.path.lexists(path):
-                        raise FileNotFoundError(path)
-                    same = os.path.islink(path) and os.readlink(path) == row["target"]
-                else:
-                    same = hashlib.sha256(_contained(path, full).read_bytes()).hexdigest() == row["sha256"]
-            except (OSError, ValueError, _ItemError):
-                damaged.append(f"missing full-copy/{row['name']}")
-                continue
-            if not same:
-                damaged.append(f"changed full-copy/{row['name']}")
+    for row in listed or []:
+        path = full / row["name"]
+        try:
+            _contained(path.parent, full)
+            if row["kind"] == "symlink":
+                if not os.path.lexists(path):
+                    raise FileNotFoundError(path)
+                same = os.path.islink(path) and os.readlink(path) == row["target"]
+            else:
+                same = hashlib.sha256(_contained(path, full).read_bytes()).hexdigest() == row["sha256"]
+        except (OSError, ValueError, _ItemError):
+            damaged.append(f"missing full-copy/{row['name']}")
+            continue
+        if not same:
+            damaged.append(f"changed full-copy/{row['name']}")
     record("backups-present", missing + remaining + damaged)
 
     units = "{bytes} bytes, {chars} chars, {lines} lines"

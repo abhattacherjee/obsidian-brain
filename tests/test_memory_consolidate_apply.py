@@ -1187,6 +1187,29 @@ def test_unreadable_lock_is_not_taken(env):
     assert lock_file(env).read_text() == "garbage"
 
 
+def test_empty_lock_is_not_taken_and_the_message_says_what_to_do(env):
+    lock_file(env).write_text("")
+    result = cli_apply(env, write_plan(env), "--apply")
+    assert result.returncode == 2
+    assert f"remove it if no run is active: {lock_file(env)}" in result.stderr
+    assert lock_file(env).read_text() == ""
+
+
+def test_a_write_failure_preparing_the_lock_leaves_no_lock(env, monkeypatch):
+    def full(fd, mode):
+        raise OSError(28, "No space left on device")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(mc.os, "fchmod", full)
+        with pytest.raises(OSError):
+            run_apply(env, "--apply")
+    assert not lock_file(env).exists()
+    assert not list(env["backups"].glob(".lock-tmp-*"))
+    code, out = run_apply(env, "--apply")  # the retry is not blocked
+    assert code == 0, out
+    assert not lock_file(env).exists()
+
+
 def test_the_lock_is_removed_after_a_crash(env, monkeypatch):
     crash_at(monkeypatch, "mid-4")
     with pytest.raises(Crash):
@@ -1322,3 +1345,26 @@ def test_default_project_without_a_transcript_asks_for_project(env):
     result = _cli_from(env, elsewhere, env["store"], "--apply")
     assert result.returncode == 2 and "pass --project" in result.stderr
     assert marked_notes(env, "feedback_a") == []
+
+
+def test_a_note_failing_after_the_index_edit_stops_instead_of_restoring(env, monkeypatch, capsys):
+    crash_at(monkeypatch, "index-written")
+    with pytest.raises(Crash):
+        run_apply(env, "--apply")
+    restore()
+    target = env["vault"] / TARGET
+    saved = target.read_text(encoding="utf-8")
+    target.unlink()
+    moved = backup_dir(env) / "moved" / "feedback_b.md"
+    assert moved.exists()
+    capsys.readouterr()
+    code = main(["apply", "--resume", str(backup_dir(env))])
+    err = capsys.readouterr().err
+    assert code == 2
+    assert err.startswith("error: feedback_b: its note failed after MEMORY.md was edited (")
+    assert f"the original is still in {moved} and its old index line is in run.json dropped_lines" in err
+    assert moved.exists() and not (env["store"] / "feedback_b.md").exists()
+    assert json.loads((backup_dir(env) / "run.json").read_text())["state"] != "done"
+    target.write_text(saved, encoding="utf-8")
+    assert main(["apply", "--resume", str(backup_dir(env))]) == 0
+    assert_finished(env)

@@ -175,14 +175,19 @@ def strip_file_list(backup):
     (backup / "manifest.json").unlink()
 
 
-def test_old_run_without_a_manifest_warns(backup, capsys):
+def test_missing_manifest_fails(backup, capsys):
+    strip_file_list(backup)
+    capsys.readouterr()
+    assert mc.main(["verify", "--backup", str(backup)]) == 1
+    assert "FAIL backups-present: missing manifest.json" in capsys.readouterr().out.splitlines()
+
+
+def test_missing_manifest_and_full_copy_entry_fails(backup, capsys):
     strip_file_list(backup)
     (backup / "full-copy/stay.md").unlink()
     capsys.readouterr()
-    assert mc.main(["verify", "--backup", str(backup)]) == 0
-    out = capsys.readouterr().out.splitlines()
-    assert any(line.startswith("WARN backups-present: manifest.json is missing") for line in out)
-    assert "PASS backups-present: ok" in out
+    assert mc.main(["verify", "--backup", str(backup)]) == 1
+    assert "FAIL backups-present: missing manifest.json" in capsys.readouterr().out.splitlines()
 
 
 def with_symlink(env):
