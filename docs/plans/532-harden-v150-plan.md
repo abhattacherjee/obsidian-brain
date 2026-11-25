@@ -33,7 +33,7 @@ skip-mode exit cannot stay:
 Delegate: claude — writes `.claude/` and `.github/`, which cx refuses; done by the doctor.
 
 ## Task 2: tests follow the new token location and template
-Delegate: codex — test-only, 4 files, one pytest check command.
+Delegate: claude — its tests only pass with the uncommitted Task 1 `.claude/` files, which cx cannot carry or check; one commit with Task 1.
 
 Measured with Task 1 applied: 104 failures (87 in
 `TestPreflightTokenSurvivesADeniedCall`, 16 in `test_vendored_hooks.py`, 1 in
@@ -77,7 +77,7 @@ Delegate: claude — design of a new check against an outside source; one file, 
   harden-repo checkout, and a copied ledger is just another pin.
 
 ## Task 4: CI checks the version sync and the draft gate
-Delegate: codex — test-only, 2 files, one pytest check command.
+Delegate: claude — `test_ci_workflow.py` reads the doctor-written `ci.yml`, uncommitted with Task 1; one commit.
 
 - New `tests/test_manifest_version_sync.py`: the real plugin.json version
   equals every marketplace.json entry with its name.

@@ -6,6 +6,7 @@ name: CI
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
     branches: [main, develop]
   push:
     branches: [main]
@@ -31,7 +32,7 @@ env:
 jobs:
   # ── Secret scan — runs on all PRs ──────────────────────────
   secret-scan:
-    if: github.event_name == 'pull_request'
+    if: (github.event_name == 'pull_request') && (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -53,7 +54,7 @@ jobs:
 
   # ── Changelog gate — PRs to main only ──────────────────────
   changelog-check:
-    if: github.event_name == 'pull_request' && github.base_ref == 'main'
+    if: (github.event_name == 'pull_request' && github.base_ref == 'main') && (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -85,7 +86,7 @@ jobs:
   # drop them. --durations lists the slowest tests in each log, for the next
   # time CI gets slow.
   python-tests:
-    if: github.event_name == 'pull_request'
+    if: (github.event_name == 'pull_request') && (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -114,7 +115,7 @@ jobs:
   # import and pass on the macOS system python3 (3.9). No coverage
   # gate here; the 3.12 job above owns that.
   python-tests-py39:
-    if: github.event_name == 'pull_request'
+    if: (github.event_name == 'pull_request') && (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
     # Pinned: ubuntu-latest is Ubuntu 26.04, which has no Python 3.9 build in
     # actions/python-versions (3.9.25 ships for 22.04 and 24.04 only).
     runs-on: ubuntu-24.04
@@ -143,7 +144,7 @@ jobs:
   # (odd lines for shard 1, even for shard 2), so the two shards together
   # run each collected test exactly once.
   timed-tests:
-    if: github.event_name == 'pull_request'
+    if: (github.event_name == 'pull_request') && (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
     # Pinned for the 3.9 shards: see python-tests-py39.
     runs-on: ubuntu-24.04
     strategy:
@@ -178,7 +179,7 @@ jobs:
 
   # ── DB-pollution guard — blocks bare ensure_index() in tests (GH #46) ─
   no-default-db-check:
-    if: github.event_name == 'pull_request'
+    if: (github.event_name == 'pull_request') && (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
     runs-on: ubuntu-latest
     timeout-minutes: 2
     steps:
@@ -191,7 +192,7 @@ jobs:
 
   # ── Security tests — runs on all PRs ──────────────────────────
   security-tests:
-    if: github.event_name == 'pull_request'
+    if: (github.event_name == 'pull_request') && (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -211,7 +212,7 @@ jobs:
   # `success` passes; failure, cancelled and skipped all fail.
   # tests/test_ci_workflow.py checks that `needs` lists every PR test job.
   tests-passed:
-    if: always() && github.event_name == 'pull_request'
+    if: (always() && github.event_name == 'pull_request') && (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
     needs: [python-tests, python-tests-py39, timed-tests, no-default-db-check, security-tests]
     runs-on: ubuntu-latest
     timeout-minutes: 2

@@ -4918,20 +4918,12 @@ class TestPreflightTokenSurvivesADeniedCall:
     CLAIM_HOLD = _vendored_hook_constant("require-preflight", "CLAIM_HOLD_SECONDS")
 
     @staticmethod
-    def _token_path(work):
-        """`/tmp/.preflight-token-<md5[:8]>`, keyed on the realpath of
-        `git rev-parse --path-format=absolute --git-common-dir`, as both
-        require-preflight.py's _get_token_path() and commit-preflight.sh
-        compute it."""
-        import hashlib
-        env = {k: v for k, v in os.environ.items()
-               if not k.startswith(("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX"))}
-        common = subprocess.run(
-            ["git", "-C", str(work), "rev-parse", "--path-format=absolute",
-             "--git-common-dir"],
-            env=env, check=True, capture_output=True, text=True).stdout.strip()
-        h = hashlib.md5(os.path.realpath(common).encode()).hexdigest()[:8]
-        return Path(f"/tmp/.preflight-token-{h}")
+    def _token_path(work, env=None):
+        """The vendored pair's token path for *work* (see
+        tests/preflight_token.py): under the test's tmp HOME, keyed on the
+        realpath of the git common dir, in a 0700 directory."""
+        from preflight_token import token_path
+        return token_path(work, env)
 
     @staticmethod
     def _git(work, env, *args):
@@ -4943,7 +4935,12 @@ class TestPreflightTokenSurvivesADeniedCall:
     @pytest.fixture
     def repo(self, tmp_path):
         work, env = TestHookBlockingPathsFire._repo(tmp_path)
-        token = self._token_path(work)
+        # One HOME for the hook and the preflight (_isolated_home uses the
+        # same directory), so both name the same token path (#532).
+        home = work.parent / "home"
+        home.mkdir(exist_ok=True)
+        env = {**env, "HOME": str(home)}
+        token = self._token_path(work, env)
         yield work, env, token
         token.unlink(missing_ok=True)
         Path(f"{token}.lock").unlink(missing_ok=True)
@@ -5484,7 +5481,7 @@ class TestPreflightTokenSurvivesADeniedCall:
         if init.returncode != 0:
             pytest.skip("this git cannot make a SHA-256 repo")
         self._git(work, env, self.C, "-q", "--allow-empty", "-m", "seed")
-        token = self._token_path(work)
+        token = self._token_path(work, env)
         try:
             self._write_token(work, env, token)
             data = json.loads(token.read_text())
@@ -5519,9 +5516,10 @@ class TestPreflightTokenSurvivesADeniedCall:
         assert self._decide(work, env, self.REG) == "allow"
         assert token.exists()
 
-    # --- --allow-empty (#116) -------------------------------------------------
-
-    EMPTY = "git " + C + " --allow-empty -m marker"
+    # --- the preflight's arguments ------------------------------------------
+    # #116 added --allow-empty; it went with the move to the harden-repo
+    # v1.5.0 template (#532), whose argument parser is outside the marker
+    # blocks. These pin that the flag fails closed rather than skipping.
 
     @staticmethod
     def _isolated_home(work, env):
@@ -5540,92 +5538,21 @@ class TestPreflightTokenSurvivesADeniedCall:
             cwd=work, env=self._isolated_home(work, env), capture_output=True,
             text=True, timeout=60)
 
-    def test_allow_empty_mints_a_token_for_an_empty_commit(self, repo):
-        work, env, token = repo
-        proc = self._preflight(work, env, "--allow-empty")
-        assert proc.returncode == 0, proc.stdout[-400:] + proc.stderr[-400:]
-        data = json.loads(token.read_text())
-        assert data["head"] == self._git(work, env, "rev-parse", "HEAD")
-        assert data["staged_files"] == 0
-        assert data["skip_reason"] == "empty commit (--allow-empty)"
-        assert self._decide(work, env, self.EMPTY) == "allow"
-
-    def test_the_empty_commit_spends_the_token(self, repo):
-        """Single use: once the empty commit has landed and real changes
-        are staged, the same token does not cover a second commit.
-
-        This passed vacuously before #418: the fixture looked for the token
-        at our old path, where the vendored preflight never writes, so "no
-        token" was all it saw. The claim is released first, or the deny
-        would be the claim hold, which keeps the token."""
-        work, env, token = repo
-        assert self._preflight(work, env, "--allow-empty").returncode == 0
-        assert token.exists()
-        assert self._decide(work, env, self.EMPTY) == "allow"
-        self._git(work, env, self.C, "-q", "--allow-empty", "-m", "marker")
-        (work / "f.txt").write_text("x")
-        self._git(work, env, "add", "f.txt")
-        self._release_claim(token)
-        decision, reason = self._decide_with_reason(work, env, self.REG)
-        assert decision == "deny"
-        assert "staged files changed since preflight ran" in reason, reason[:200]
-        assert not token.exists()
-
-    def test_allow_empty_refuses_when_files_are_staged(self, repo):
-        """Otherwise --allow-empty would be a way to skip the tests on real
-        changes."""
+    def test_allow_empty_is_refused_and_writes_no_token(self, repo):
+        """An unknown flag must not become a way to skip the checks."""
         work, env, token = repo
         (work / "f.txt").write_text("x")
         self._git(work, env, "add", "f.txt")
-        proc = self._preflight(work, env, "--allow-empty")
-        assert proc.returncode == 1
-        assert "files are staged" in proc.stdout
-        assert not token.exists()
-
-    def test_allow_empty_refuses_unstaged_tracked_changes(self, repo):
-        """The hook checks only expiry and HEAD, so `git commit -a` or
-        `git commit -m x <path>` would commit these with no scan or test."""
-        work, env, token = repo
-        (work / "f.txt").write_text("x")
-        self._git(work, env, "add", "f.txt")
-        self._git(work, env, self.C, "-q", "-m", "track f")
-        (work / "f.txt").write_text("changed")
         proc = self._preflight(work, env, "--allow-empty")
         assert proc.returncode == 1, proc.stdout[-400:]
-        assert "unstaged changes" in proc.stdout
-        assert "f.txt" in proc.stdout
+        assert "Unknown option: --allow-empty" in proc.stdout
         assert not token.exists()
 
-    def test_allow_empty_still_allows_an_untracked_file(self, repo):
-        """`git commit -a` never takes untracked files, and a pathspec
-        naming one errors in git, so an untracked file cannot slip through."""
-        work, env, token = repo
-        (work / "new.txt").write_text("x")
-        proc = self._preflight(work, env, "--allow-empty")
-        assert proc.returncode == 0, proc.stdout[-400:] + proc.stderr[-400:]
-        assert token.exists()
-
-    def test_allow_empty_refuses_when_git_cannot_read_the_index(self, repo):
-        """The staged list falls back to empty when git fails, so the flag
-        asks git itself, and a git error is not "nothing staged"."""
-        work, env, token = repo
-        self._preflight(work, env, "--not-a-flag")  # copies the script in
-        shim = work.parent / "fatal-git"
-        shim.mkdir()
-        (shim / "git").write_text("#!/bin/sh\nexit 128\n")
-        (shim / "git").chmod(0o755)
-        env = dict(env, PATH=f"{shim}{os.pathsep}{env.get('PATH', '')}")
-        proc = self._preflight(work, env, "--allow-empty")
-        assert proc.returncode == 1, proc.stdout[-400:]
-        assert "Could not read the git index (git exited 128)" in proc.stdout
-        assert not token.exists()
-
-    def test_nothing_staged_without_the_flag_is_still_refused(self, repo):
+    def test_nothing_staged_is_refused(self, repo):
         work, env, token = repo
         proc = self._preflight(work, env)
         assert proc.returncode == 1
         assert "No staged files" in proc.stdout
-        assert "--allow-empty" in proc.stdout
         assert not token.exists()
 
     def test_the_token_counts_staged_files_exactly(self, repo):

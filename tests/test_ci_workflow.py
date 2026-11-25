@@ -7,6 +7,8 @@ These tests keep the aggregator honest:
 - its `needs:` lists every test job, so a new job cannot merge unchecked;
 - its `if:` keeps `always()`: GitHub skips a job whose need failed unless
   it has `always()`, and a skipped required check counts as passing;
+- harden-repo's draft gate may AND a draft condition onto each `if:`, and
+  then `ready_for_review` must start a run (#532);
 - it has one step, whose env is exactly the join of every need's result;
 - `pull_request` has no `paths` filter, or the workflow may never start and
   the required check stays pending;
@@ -78,10 +80,68 @@ def test_aggregator_needs_every_pr_test_job():
         assert "continue-on-error" not in jobs[name], name
 
 
+AGGREGATOR_BASE_IF = "always() && github.event_name == 'pull_request'"
+DRAFT_FIELD = "github.event.pull_request.draft"
+# A PR opened as a draft gets skipped runs; marking it ready must start a
+# new one, or the skipped (and so "passing") required check would stand.
+READY_TYPES = {"opened", "synchronize", "reopened", "ready_for_review"}
+
+
+def _split_draft_gate(expr):
+    """(base, gate) for harden-repo's `(<base>) && (<gate>)` draft-gate
+    rewrite (v1.5.0, #532), or (expr, None) for an ungated `if:`. The base
+    is what #505 guards; the gate may only add the draft condition."""
+    expr = expr.strip()
+    if expr.startswith("(") and expr.endswith(")") and ") && (" in expr:
+        base, gate = expr[1:-1].split(") && (", 1)
+        return base, gate
+    return expr, None
+
+
 @_REQUIRES_YAML
 def test_aggregator_runs_always_on_pull_requests():
-    agg = _aggregator(_workflow())
-    assert agg["if"] == "always() && github.event_name == 'pull_request'"
+    """The #505 condition stays whole. The draft gate may be ANDed on, but
+    only as a condition on the PR's draft flag."""
+    base, gate = _split_draft_gate(_aggregator(_workflow())["if"])
+    assert base == AGGREGATOR_BASE_IF, base
+    if gate is not None:
+        assert DRAFT_FIELD in gate, gate
+        assert "always()" not in gate and "success()" not in gate, gate
+
+
+@_REQUIRES_YAML
+def test_a_draft_gate_comes_with_the_ready_for_review_trigger():
+    """Every draft-gated job is skipped on a draft, and GitHub counts a
+    skipped required check as passing. Only a run on `ready_for_review`
+    replaces it before the PR can merge."""
+    wf = _workflow()
+    gated = sorted(name for name, job in wf["jobs"].items()
+                   if DRAFT_FIELD in str(job.get("if", "")))
+    if not gated:
+        pytest.skip("no draft gate in ci.yml")
+    pull = (_triggers(wf) or {}).get("pull_request") or {}
+    types = set(pull.get("types") or [])
+    assert READY_TYPES <= types, (gated, sorted(types))
+
+
+@_REQUIRES_YAML
+def test_a_missing_ready_for_review_is_caught():
+    """Mutation control: drop `ready_for_review` and the check must fail."""
+    wf = copy.deepcopy(_workflow())
+    pull = _triggers(wf)["pull_request"]
+    pull["types"] = [t for t in pull.get("types") or [] if t != "ready_for_review"]
+    assert not READY_TYPES <= set(pull["types"])
+
+
+def test_the_draft_gate_split_keeps_the_base():
+    gated = ("(always() && github.event_name == 'pull_request') && "
+             "(github.event_name != 'pull_request' || github.event.pull_request.draft == false)")
+    assert _split_draft_gate(gated)[0] == AGGREGATOR_BASE_IF
+    assert _split_draft_gate(AGGREGATOR_BASE_IF) == (AGGREGATOR_BASE_IF, None)
+    # A rewrite that drops always() from the base is not the #505 base.
+    assert _split_draft_gate(
+        "(github.event_name == 'pull_request') && (github.event.pull_request.draft == false)"
+    )[0] != AGGREGATOR_BASE_IF
 
 
 @_REQUIRES_YAML

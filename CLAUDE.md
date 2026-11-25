@@ -100,7 +100,7 @@ When writing new hooks, skills, or scripts, follow these rules:
 - Hotfixes branch from `main`, merge to both `main` and `develop`
 - Run `./scripts/commit-preflight.sh` before every commit
 - Stage first, then commit in a separate Bash call. The preflight token binds the staged tree, so the hooks refuse a commit that could stage files in the same call (`git add … && git commit …`, `git commit -a`, `-m "$(…)"`).
-- The five `.claude/hooks/*.py` gates are vendored unchanged from harden-repo (v1.3.1, release commit `f2574b5`; `commit-preflight.sh` is still the v1.3.0 template, unchanged in v1.3.1). Fix them upstream, never by hand. `tests/test_vendored_hooks.py::test_hook_bytes_match_harden_repo_v131` pins their sha256; `scripts/commit-preflight.sh` is upstream's template plus repo parts and is not pinned.
+- The five `.claude/hooks/*.py` gates and `scripts/commit-preflight.sh` are vendored unchanged from harden-repo (v1.5.0, release commit `9424640`, #532). The preflight's repo parts live only in its `__HARDEN_LINT__` (manifest version sync) and `__HARDEN_TEST__` (pytest, 90% gate) marker blocks; anything outside them makes the doctor refuse to update `require-preflight.py`. Fix them upstream, never by hand, and update them with harden-repo's `doctor.py --fix --safe` (or fleet-sync). `tests/test_vendored_hooks.py::test_vendored_files_are_one_released_generation` checks all six against harden-repo's template ledger; it skips with no harden-repo tree (CI), and `OB_HARDEN_REPO_ROOT` names one. The token is `${XDG_CACHE_HOME:-$HOME/.cache}/claude/preflight/harden-token-<hash>`.
 
 ## Distribution & Release
 

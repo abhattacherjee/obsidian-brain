@@ -4,12 +4,12 @@ PreToolUse Hook: Enforce the Git Flow base branch of a PR
 
 Installed by /harden-repo into target repo's .claude/hooks/
 
-- gh pr create: a PR from a feature/* branch must target develop. The head
+- gh pr create: feature/* and configured branch prefixes must target develop. The head
   is --head/-H if given, else the current branch AND the heads it tracks
   (merge config, push ref, upstream), because gh opens the PR from those.
 - gh pr merge: before merging, reads each PR's base and head with
-  `gh pr view`. A feature/* PR must be based on develop; a release/* or
-  hotfix/* PR on main or (the back-merge) develop.
+  `gh pr view`. The same prefixes must target develop here. A release/* or
+  hotfix/* PR must target main or develop.
 - A create or merge that names its repository, or runs in a clone that
   shares a remote repository path with this one, is judged wherever it runs.
 - A merge must run as its own command: only cd, echo, true, `:` and a
@@ -26,6 +26,31 @@ import os
 import re
 import subprocess
 import sys
+
+
+# --- BEGIN crash guard v1 (keep in sync across all hook copies) ---
+def _deny_on_crash(exc_type, exc, tb):
+    # Exit 1 lets the call run. os._exit(2) blocks and drops buffered stdout.
+    try:
+        import traceback
+        traceback.print_exception(exc_type, exc, tb, file=sys.stderr)
+    except Exception:
+        pass
+    try:
+        sys.stderr.write(f"BLOCKED: this guard hook crashed ({exc_type.__name__}); "
+                         "blocking as a safety measure.\n")
+    except Exception:
+        pass
+    try:
+        sys.stderr.flush()
+    except Exception:
+        pass
+    os._exit(2)
+
+
+if __name__ == "__main__":
+    sys.excepthook = _deny_on_crash
+# --- END crash guard v1 ---
 
 
 # --- BEGIN shared command scanner v1 (keep in sync across all hook copies) ---
@@ -56,19 +81,10 @@ import sys
 #   * the body of a heredoc fed to a shell RUNNER (`bash <<EOF`, `sh -s <<EOF`,
 #     `cat <<EOF | bash`), which is a script rather than data — and is
 #     therefore scanned whether or not the delimiter was quoted.
-# Recursion is capped at _MAX_SCAN_DEPTH levels of nesting to bound work on
-# adversarial input: a payload nested deeper than that is still emitted as an
-# opaque token but is not parsed further. Three levels covers every realistic
-# wrapper stack (`sudo bash -c "eval ..."` is only two).
-#
-# ACCEPTED LIMIT: executed code nested 4+ levels deep — `$($($($(cmd))))` or
-# four stacked `bash -c` payloads — is NOT parsed, so a verb hidden that deep
-# is not matched. This is adversarial-only: no legitimate workflow nests that
-# far, and removing the cap makes work grow with attacker-controlled nesting
-# depth. See specs/043-parse-dont-grep-hook-commands.md. One partial
-# exception: an unparsed `$( ... )` left in COMMAND position with the verb as
-# a whole word inside it is reported as a possible verb by _may_hide_verb, so
-# `$($($($(git push origin main))))` does match, fail-closed.
+# Recursion is capped at _MAX_SCAN_DEPTH to bound work on adversarial input.
+# If a runner payload, substitution body, or any heredoc remains unread at
+# the cap, the scan raises ValueError. Each hook then denies the command
+# when its text names the hook's guarded verb (#95).
 #
 # Fail-closed contract: _scan_commands raises ValueError when it cannot parse
 # reliably (unbalanced quotes, an unterminated substitution). Callers MUST
@@ -82,6 +98,8 @@ import sys
 # (see CLAUDE.md), matching the existing _targets_this_project() precedent.
 # tests/hooks/test_scanner_sync.py enforces byte-identity across all copies.
 import fnmatch as _fnmatch
+import posixpath as _posixpath
+from collections import namedtuple as _namedtuple
 
 # The lookbehind and lookahead together reject `<<<` herestrings: without the
 # lookbehind, `<<<yes` would still match starting at offset 1. Group 1 is the
@@ -149,6 +167,200 @@ _GIT_REDIRECT_OPTS = ("-C", "--git-dir", "--work-tree")
 # name one resolvable directory. Callers read it as "this repo", the same
 # fail-closed reading they already give a `cd` they cannot resolve.
 _SCOPE_UNKNOWN = object()
+
+
+# The config sections this guard treats as safe: on the git versions
+# measured, their values are not run as commands and they load no other
+# config.
+_SAFE_CONFIG_SECTIONS = frozenset((
+    "user", "author", "committer", "color", "advice", "status", "i18n",
+    "column", "log", "blame",
+))
+_SAFE_CONFIG_KEYS = frozenset((
+    "core.quotepath", "core.autocrlf", "core.safecrlf", "core.filemode",
+    "core.ignorecase", "core.precomposeunicode", "core.abbrev",
+    "core.whitespace", "core.eol", "core.longpaths", "core.symlinks",
+    "core.commentchar", "core.commentstring", "core.untrackedcache",
+    "init.defaultbranch", "safe.directory", "push.default",
+    "push.autosetupremote", "push.followtags", "pull.rebase", "pull.ff",
+    "fetch.prune", "fetch.prunetags", "fetch.parallel", "merge.ff",
+    "merge.conflictstyle", "merge.log", "merge.renames", "rebase.autosquash",
+    "rebase.autostash", "rebase.updaterefs", "rebase.abbreviatecommands",
+    "rebase.missingcommitscheck", "commit.gpgsign", "commit.verbose",
+    "commit.cleanup", "commit.status", "commit.template", "tag.gpgsign",
+    "tag.sort", "diff.noprefix", "diff.renames", "diff.algorithm",
+    "diff.relative", "diff.mnemonicprefix", "diff.colormoved",
+    "diff.colormovedws", "diff.context", "diff.interhunkcontext",
+    "diff.statgraphwidth", "diff.indentheuristic", "diff.submodule",
+    "gc.auto", "maintenance.auto", "protocol.version", "http.sslverify",
+    "http.postbuffer", "http.version", "remote.pushdefault",
+    "branch.autosetupmerge", "branch.autosetuprebase", "branch.sort",
+    "versionsort.suffix",
+))
+_SAFE_CONFIG_SUBKEYS = frozenset((
+    ("remote", "url"), ("remote", "pushurl"), ("remote", "push"),
+    ("remote", "fetch"), ("remote", "mirror"), ("remote", "tagopt"),
+    ("remote", "prune"), ("branch", "remote"), ("branch", "merge"),
+    ("branch", "rebase"), ("branch", "pushremote"),
+    ("branch", "description"),
+))
+# Config values and environment variables git hands to another program.
+_COMMAND_CONFIG_KEYS = frozenset((
+    "core.fsmonitor", "core.editor", "core.pager", "core.sshcommand",
+    "core.askpass", "core.gitproxy", "core.alternaterefscommand",
+    "sequence.editor", "diff.external", "gpg.program", "credential.helper",
+    "interactive.difffilter", "web.browser", "imap.tunnel",
+    "sendemail.smtpserver", "sendemail.sendmailcmd", "sendemail.tocmd",
+    "sendemail.cccmd",
+))
+_COMMAND_CONFIG_SUBKEYS = frozenset((
+    ("diff", "command"), ("diff", "textconv"), ("filter", "clean"),
+    ("filter", "smudge"), ("filter", "process"), ("merge", "driver"),
+    ("difftool", "cmd"), ("mergetool", "cmd"), ("gpg", "program"),
+    ("gpg", "defaultkeycommand"), ("credential", "helper"),
+    ("browser", "cmd"), ("man", "cmd"), ("trailer", "command"),
+    ("trailer", "cmd"), ("guitool", "cmd"), ("remote", "receivepack"),
+    ("remote", "uploadpack"),
+))
+_GIT_COMMAND_ENV = frozenset((
+    "GIT_EXTERNAL_DIFF", "GIT_SSH", "GIT_SSH_COMMAND", "GIT_EDITOR",
+    "GIT_SEQUENCE_EDITOR", "GIT_PAGER", "GIT_ASKPASS", "SSH_ASKPASS",
+    "GIT_PROXY_COMMAND", "EDITOR", "VISUAL", "PAGER",
+))
+# Env vars that make git run a program this guard cannot read: one found in
+# a directory (exec path, template hooks), or an `ext::` URL's command, which
+# GIT_ALLOW_PROTOCOL=ext enables (measured: `git fetch 'ext::sh -c ...'`
+# runs it then, and not without it).
+_GIT_PATH_ENV = frozenset(("GIT_EXEC_PATH", "GIT_TEMPLATE_DIR",
+                           "GIT_ALLOW_PROTOCOL"))
+
+
+def _config_key_class(key):
+    """Classify a global config key without reading config or its value."""
+    if not isinstance(key, str):
+        return "other"
+    key = key.lower()
+    if re.search(r"[^a-z0-9._:/@+-]", key):
+        return "other"
+    parts = key.split(".")
+    if len(parts) < 2:
+        return "other"
+    section, name = parts[0], parts[-1]
+    if len(parts) == 2:
+        if key in _COMMAND_CONFIG_KEYS or section == "pager":
+            return "command"
+        if key in _SAFE_CONFIG_KEYS:
+            return "safe"
+    else:
+        if (section, name) in _COMMAND_CONFIG_SUBKEYS:
+            return "command"
+        if (section, name) in _SAFE_CONFIG_SUBKEYS:
+            return "safe"
+    if len(parts) in (2, 3) and section in _SAFE_CONFIG_SECTIONS:
+        return "safe"
+    return "other"
+
+
+def _unreadable_program_word(word):
+    """Whether a program word is computed, or a path this guard cannot read.
+
+    Only a file directly in /bin or /usr/bin is a named ceiling; a `..`
+    component (`/usr/bin/../../tmp/x`) climbs out of them."""
+    if "$" in word or "`" in word:
+        return True
+    if "/" not in word:
+        return False
+    if ".." in word.split("/"):
+        return True
+    return _posixpath.dirname(_posixpath.normpath(word)) not in (
+        "/bin", "/usr/bin")
+
+
+def _runs_unreadable_program(value):
+    """Whether a command value runs a computed or unreadable program: its
+    first word, or the program word of any statement in it (after env
+    prefixes and run wrappers such as `env` or `sudo`). A shell reading a
+    script file (`sh /tmp/x`) is not flagged: the script is a named
+    ceiling. A value the scanner cannot read counts as unreadable."""
+    if not isinstance(value, str):
+        return False
+    value = value[1:] if value.startswith("!") else value
+    words = value.lstrip().split(None, 1)
+    if not words:
+        return False
+    # A leading redirection (`</dev/null cat`) is not the program; the
+    # statement loop below reads past it.
+    if (not _REDIRECTION_RE.match(words[0]) and
+            _unreadable_program_word(words[0])):
+        return True
+    try:
+        for argv in _scan_commands(value):
+            words = list(argv)
+            aligned = _aligned_redirections(argv)
+            if aligned is not None:
+                # A redirection word, or its operand, is not a program.
+                words = [w for i, w in enumerate(words)
+                         if i not in aligned[1]]
+            # A shell keyword or group opener is not the program: the word
+            # after it is (`if true; then /tmp/x; fi`, `{ /tmp/x; }`).
+            while words and (words[0] in _SHELL_KEYWORDS or
+                             words[0] in ("{", "(")):
+                words = words[1:]
+            # `--` only ends a wrapper's options: the next word is the
+            # program, not an option value (`env -- ssh -i ~/.ssh/k`).
+            words = [w for w in words if w != "--"]
+            for at in _command_word_positions(words):
+                word = words[at]
+                if _ENV_ASSIGN_RE.match(word) or word.startswith("-"):
+                    continue
+                if _unreadable_program_word(word):
+                    return True
+    except Exception:  # noqa: BLE001 -- unreadable input must fail closed
+        return True
+    return False
+
+
+def _global_config_keys(argv, git_at, table):
+    """Yield (key, value, from_config_env) from one git's global options."""
+    n = len(argv)
+    if not isinstance(git_at, int) or not 0 <= git_at < n:
+        return
+    at = git_at + 1
+    if at >= len(table):
+        return
+    end = min(n, table[at])
+    while at < end:
+        token = argv[at]
+        if token in ("-c", "--config-env") and at + 1 < n:
+            key, sep, value = argv[at + 1].partition("=")
+            from_env = token == "--config-env"
+            yield key, None if from_env or not sep else value, from_env
+        elif token.startswith("--config-env="):
+            key = token[len("--config-env="):].partition("=")[0]
+            yield key, None, True
+        elif token.startswith("--exec-path="):
+            # An "other" key, so a helper git finds in this directory is
+            # treated as a possible hidden verb. Bare --exec-path only
+            # prints the path.
+            yield "--exec-path", token[len("--exec-path="):], False
+        at += 2 if token in _GIT_VALUE_OPTS else 1
+
+
+def _global_config_keys_for_gits(argv, gits, table):
+    """Read the union of git option ranges once, even for `git -C git ...`.
+
+    A git word inside an earlier range is an option or its value; the
+    remaining option slots are already covered by that earlier range.
+    Duplicate readings add no payload or hidden verb, and skipping them
+    keeps a long chain of overlapping ranges linear.
+    """
+    covered = 0
+    for git_at in gits:
+        if git_at + 1 < covered:
+            continue
+        yield from _global_config_keys(argv, git_at, table)
+        if 0 <= git_at + 1 < len(table):
+            covered = table[git_at + 1]
 
 
 def _quote_mask(text, quote=None):
@@ -1348,9 +1560,32 @@ def _split_statements(cmd):
     return [statement for statement, _depth in _split_statements_with_depth(cmd)]
 
 
+def _has_config_word(argv):
+    """Whether any word of *argv* is `-c`, `--config-env...` or
+    `--exec-path=...`: the only words that can set a git config key or an
+    exec path in the global-option slots. Cached on a scanned statement, so
+    a statement with none costs one cheap loop for every reader."""
+    cache = argv.__dict__ if type(argv) is _Argv else None
+    if cache is not None and "has_config_word" in cache:
+        return cache["has_config_word"]
+    found = False
+    for token in argv:
+        if token == "-c" or token.startswith(("--config-env", "--exec-path=")):
+            found = True
+            break
+    if cache is not None:
+        cache["has_config_word"] = found
+    return found
+
+
 def _runner_payload(argv):
     """The executed-code payload carried by *argv*, or '', or a tuple of
     candidate payloads (see _payload_after_flag).
+
+    For #165's whole-command literal positional shape, return the script
+    alone immediately: none of the positional words is read as code.
+    Otherwise, the readings below are kept and _extra_runner_payloads
+    appends candidates from every shell word before each return.
 
     A git run's command strings (`rebase -x`, `submodule foreach`, see
     _git_command_payloads) are payloads too. The call is made once, at the
@@ -1371,8 +1606,12 @@ def _runner_payload(argv):
     stdin here-string is returned, one per line: bash feeds the LAST one, so
     `bash <<< 'echo hi' <<< 'git push origin main'` pushes.
     """
+    if (literal := _literal_positional_script(argv)) is not None: return literal
     git_read = shell_read = string_read = watch_read = False
+    print_only = None
     payloads = []
+    if _has_feeder_or_interpreter(argv):
+        payloads.extend(_fed_shell_payloads(argv))
 
     def add(payload):
         for one in payload if isinstance(payload, tuple) else (payload,):
@@ -1383,6 +1622,7 @@ def _runner_payload(argv):
         # Every payload seen, with *payload* added; built once, at a return
         # (building it at each add made `trap trap ...` quadratic).
         add(payload)
+        add(_extra_runner_payloads(argv, payloads))
         if len(payloads) == 1:
             return payloads[0]
         return tuple(payloads) if payloads else ""
@@ -1390,6 +1630,19 @@ def _runner_payload(argv):
     for index, token in enumerate(argv):
         base = token.rsplit("/", 1)[-1]
         program = _program_base(token)
+        if "=" in token:
+            # Every such word counts, except a `NAME=value` printed by a
+            # print-only command (`echo GIT_EDITOR=...`) past the env
+            # prefix: that runs nothing. Over-matching: a word after a
+            # shell keyword (`then export ...`) is not told apart.
+            assignment = _ENV_WORD_RE.match(token)
+            if (assignment and assignment.group(2) and
+                    assignment.group(1) in _GIT_COMMAND_ENV):
+                if print_only is None:
+                    print_only = (_raw_print_only(argv),
+                                  _env_prefix_len(argv))
+                if not (print_only[0] and index >= print_only[1]):
+                    add(assignment.group(3))
         if program in _SHELL_RUNNERS and not shell_read:
             # Read once, at the first shell word: its search covers every
             # later shell word. It does not end the search: the word can be
@@ -1441,6 +1694,205 @@ def _runner_payload(argv):
             git_read = True
             add(_git_command_payloads(argv, index))
     return found("")
+
+
+def _literal_positional_script(argv):
+    """The sole #165 narrowing: a literal shell script and literal argv.
+
+    The whole original command is matched before comments, splitting or
+    normalisation by _prepare_literal_positional_script. Its exact text must
+    also be this entire top-level statement. Positional words are data, so
+    #165 drops all their payloads, including additions; this shape has no
+    redirection that could feed the shell. The script is still scanned.
+    """
+    raw = getattr(argv, "raw", None)
+    code = getattr(argv, "code", None)
+    if not getattr(argv, "top", False) or raw is None or code is None:
+        return None
+    cached = _LITERAL_POSITIONAL_MEMO.get(code)
+    script = cached[1] if cached is not None else None
+    if script is None or raw.strip() != code.strip():
+        return None
+    return script
+
+
+_LITERAL_POSITIONAL_MEMO = {}
+
+
+def _prepare_literal_positional_script(cmd, depth):
+    """Cache #165's literal shape for the original printable ASCII command.
+
+    Only a plain shell, -c, a single-quoted script and plain or single-quoted
+    positional words qualify; shell syntax outside quotes is excluded.
+    A cleaned comment reading has different text, so cannot use this memo.
+    Nested payloads cannot replace the top-level command's one-entry memo.
+    """
+    if depth:
+        return
+    def compute():
+        match = re.fullmatch(
+            r" *(?:" + "|".join(_SHELL_RUNNERS) + r") +-c +'([\x20-\x26\x28-\x7e]*)'"
+            r"(?: +(?:[A-Za-z0-9_./:=@%+,-]+|'[\x20-\x26\x28-\x7e]*'))* *", cmd)
+        return match.group(1) if match else None
+
+    _memo_call(_LITERAL_POSITIONAL_MEMO, cmd, compute)
+
+
+def _extra_runner_payloads(argv, existing):
+    """Append only new candidates, keeping develop's payload sequence intact."""
+    seen = set(existing)
+    payloads = []
+    for payload in _extra_shell_reads(argv)[0]:
+        if payload and payload not in seen:
+            seen.add(payload)
+            payloads.append(payload)
+    return tuple(payloads)
+
+
+def _extra_shell_reads(argv):
+    """Extra payloads, stdin readers and -c readers at EVERY shell word.
+
+    Return (payloads, stdin_reader, command_shell): a tuple of candidate
+    strings, a bool for any shell reading its program from stdin, then a
+    bool for any shell with a later -c cluster. The latter also makes
+    here-strings on every fd candidates for that shell's own stdin.
+
+    A single right-to-left word pass summarizes option suffixes and their
+    first -c cluster. No shell rescans or slices its suffix. Candidate
+    ranges are unioned by their earliest index, so repeated -co clusters
+    also emit only O(words) payloads. Develop's readers remain untouched.
+    """
+    if not any(_program_base(word) in _SHELL_RUNNERS for word in argv):
+        return ((), False, False)
+
+    raw_words = _aligned_raw_words(argv)
+    count = len(argv)
+    selected = [False] * count
+    many_from = count
+    # (single index, range start) describes _payload_after_flag's suffix.
+    operand = (count, count)
+    command = None
+    stdin_next = stdin_after_next = True
+    stdin_from = count
+    command_shell = False
+    here_strings = []
+    for index in range(count - 1, -1, -1):
+        word = argv[index]
+        if _program_base(word) in _SHELL_RUNNERS:
+            if command is not None:
+                command_shell = True
+                single, start = command
+                if single < count:
+                    selected[single] = True
+                many_from = min(many_from, start)
+            elif stdin_next:
+                stdin_from = index
+
+        match = _ANY_HERESTRING_RE.match(word)
+        raw_match = (_ANY_HERESTRING_RE.match(raw_words[index])
+                     if raw_words is not None else match)
+        if match and raw_match:
+            # An attached empty literal (3<<<'') has a value already.
+            # With no aligned raw words, assume an operator, fail-closed.
+            payload = match.group(1)
+            if not raw_match.group(1) and index + 1 < count:
+                payload = argv[index + 1]
+            here_strings.append((index, payload,
+                                 bool(_STDIN_HERESTRING_RE.match(word))))
+
+        if _RUNNER_FLAG_RE.match(word):
+            command = ((count, index + 1) if _cluster_takes_values(word)
+                       else operand)
+        if word in ("--", "-"):
+            operand = (index + 1, count)
+        elif len(word) > 1 and word[0] in "-+":
+            if _cluster_takes_values(word):
+                operand = (count, index + 1)
+        else:
+            operand = (index, count)
+
+        # What a shell with no later -c does when it reaches this word.
+        redirect = _REDIRECTION_RE.match(word)
+        if redirect:
+            stdin_here = (stdin_after_next if redirect.end() == len(word)
+                          else stdin_next)
+        elif _stdin_path(word) or word in ("-s", "-"):
+            stdin_here = True
+        elif word == "--":
+            stdin_here = stdin_next
+        elif word in _RUNNER_OPTIONS_WITH_VALUE or _BUNDLED_O_RE.match(word):
+            stdin_here = (stdin_after_next if index + 1 < count and
+                          not _REDIRECTION_RE.match(argv[index + 1])
+                          else stdin_next)
+        elif word.startswith(("-", "+")):
+            stdin_here = stdin_next
+        else:
+            stdin_here = False
+        stdin_after_next, stdin_next = stdin_next, stdin_here
+
+    payloads = [word for index, word in enumerate(argv)
+                if selected[index] or index >= many_from]
+    # Redirections feed the whole statement, even before the shell word.
+    payloads.extend(payload for index, payload, stdin in here_strings
+                    if command_shell or (stdin and stdin_from < count))
+    result = (tuple(payloads), stdin_from < count, command_shell)
+    return result
+
+
+def _extra_stdin_runner(argv):
+    """A shell hidden behind a wrapper value may consume a pipe (#165)."""
+    if (_raw_print_only(argv) or _read_only_run(argv) or
+            _literal_positional_script(argv) is not None):
+        return False
+    if not _extra_shell_reads(argv)[1]:
+        return False
+    # A wrapper option can take a program name as its value. Only skip
+    # this fallback for a lookup behind plain wrapper names.
+    for index, word in enumerate(argv):
+        if _ENV_ASSIGN_RE.match(word):
+            continue
+        if word == "command" and _command_lookup(argv, index):
+            return False
+        if word not in _RUN_WRAPPERS:
+            break
+    raw = getattr(argv, "raw", None)
+    if not raw:
+        return not any("<<" in word for word in argv)
+    mask, _quote = _quote_mask(raw)
+    return not any(raw.startswith("<<", index) and not mask[index]
+                   for index in range(len(raw)))
+
+
+# One exact top-level command maps to all its opener-line results. Nested
+# heredocs must not evict their outer opener; the command bounds memory.
+_EXTRA_HEREDOC_MEMO = {}
+
+
+def _extra_heredoc_runner(opener_line):
+    """Read each exact opener line once, even when it opens many heredocs."""
+    # Direct calls before a command scan share the None-keyed cache (#165).
+    command = next(iter(_EXTRA_HEREDOC_MEMO), None)
+    memo = _memo_call(_EXTRA_HEREDOC_MEMO, command, dict)
+    if opener_line not in memo:
+        memo[opener_line] = _extra_heredoc_runner_uncached(opener_line)
+    return memo[opener_line]
+
+
+def _extra_heredoc_runner_uncached(opener_line):
+    """A -c shell can execute its own heredoc input as code too (#165)."""
+    try:
+        return any(_extra_shell_reads(_split_words(statement))[2]
+                   for statement in _split_statements(opener_line))
+    except ValueError:
+        pass
+    # Disjoint segments keep a malformed opener with many heredocs linear.
+    for segment in _RUNNER_SEGMENT_SPLIT_RE.split(opener_line):
+        try:
+            if _extra_shell_reads(_split_words(segment))[2]:
+                return True
+        except ValueError:
+            continue
+    return False
 
 
 # Programs that run a command STRING through a shell (#110): `script -c CMD
@@ -1574,6 +2026,9 @@ def _git_command_payloads(argv, index):
         if base == "git" or base.startswith("git-"):
             gits.append(position)
     payloads = []
+    for key, value, _from_env in _global_config_keys_for_gits(argv, gits, table):
+        if _config_key_class(key) == "command" and value is not None:
+            payloads.append(value[1:] if value.startswith("!") else value)
     # Positional runners: every word after `foreach` / `run` is the command,
     # joined as git joins them for `sh -c`; options before it are dropped.
     # One pass over the words after the first git word.
@@ -1766,6 +2221,8 @@ def _env_split_string(argv, index):
 # A here-string on stdin: no fd, or an fd whose value is 0 (`0`, `00`). Any
 # other digit run is another fd. Group 1 is an attached word.
 _STDIN_HERESTRING_RE = re.compile(r"^0*<<<(.*)$", re.S | re.ASCII)
+# A -c shell's own input is read on every fd (#165).
+_ANY_HERESTRING_RE = re.compile(r"^[0-9]*<<<(.*)$", re.S | re.ASCII)
 # Another stdin source: a heredoc, `<file` or `<>file`, on fd 0 as above.
 _OTHER_STDIN_RE = re.compile(r"^0*(?:<<-?|<>|<)(?!<)", re.ASCII)
 
@@ -1952,6 +2409,7 @@ def _scan_commands(cmd, _depth=0):
     """_scan_commands_uncached, memoized for the whole command (depth 0)."""
     if _depth:
         return _scan_commands_uncached(cmd, _depth)
+    _memo_call(_EXTRA_HEREDOC_MEMO, cmd, dict)
     return list(_memo_call(_SCAN_MEMO, cmd,
                            lambda: _scan_commands_uncached(cmd)))
 
@@ -1968,6 +2426,7 @@ def _scan_commands_uncached(cmd, _depth=0):
     """
     if not cmd:
         return []
+    _prepare_literal_positional_script(cmd, _depth)
     # Comments go first, so no scanner below reads a quote inside one (#153).
     # Each nested payload comes back through here and is cleaned the same way.
     cleaned, doubtful = _blank_comments_checked(cmd)
@@ -2017,6 +2476,12 @@ def _scan_reading(cmd, _depth):
     """The statements of one reading of *cmd*: see _scan_commands_uncached."""
     scanned = []
     stripped, heredocs = _split_heredocs(cmd)
+    at_depth_limit = _depth >= _MAX_SCAN_DEPTH
+    # Skipping nested code at the cap could turn a guarded command into an ALLOW.
+    if at_depth_limit and (
+            any(marker in stripped for marker in ("$(", "`", "<(", ">("))
+            or heredocs):
+        raise ValueError("nested deeper than the scan limit")
     for statement in _split_statements(stripped):
         argv = _Argv(_split_words(statement))
         if not argv:
@@ -2025,17 +2490,17 @@ def _scan_reading(cmd, _depth):
         argv.top = not _depth
         argv.code = cmd  # the whole text this statement was split from
         scanned.append(argv)
-        if _depth >= _MAX_SCAN_DEPTH:
-            continue
         nested = _runner_payload(argv)
         # A tuple holds candidate payloads, each scanned alone (see
         # _payload_after_flag).
         for payload in nested if isinstance(nested, tuple) else (nested,):
             if payload:
+                if at_depth_limit:
+                    raise ValueError("nested deeper than the scan limit")
                 # Propagate ValueError: an unparseable payload must reach
                 # the caller, which denies it, not be silently dropped.
                 scanned.extend(_scan_commands(payload, _depth + 1))
-    if _depth < _MAX_SCAN_DEPTH:
+    if not at_depth_limit:
         # Extracted from the heredoc-STRIPPED text, so a `$(...)` inside a
         # heredoc with a QUOTED delimiter stays excluded — bash performs no
         # expansion there. An UNQUOTED delimiter is the opposite case: bash
@@ -2061,7 +2526,7 @@ def _scan_reading(cmd, _depth):
             # A body fed to `bash`/`sh` is the PROGRAM, so it is scanned as
             # code regardless of how its delimiter was quoted: `bash <<'EOF'`
             # still executes every line of it.
-            if _heredoc_feeds_runner(opener_line):
+            if _heredoc_feeds_runner(opener_line) or _extra_heredoc_runner(opener_line):
                 scanned.extend(_scan_commands(heredoc_body, _depth + 1))
         for body in substitutions:
             scanned.extend(_nested_copy(argv)
@@ -2673,8 +3138,13 @@ def _is_path_word(word):
 def _statement_letters(raw, tail):
     """_statement_letters_uncached, memoized by text: a long command often
     repeats one statement (`echo a && echo a && ...`). The facts are only
-    read, never changed, so one object can serve every copy."""
-    key = (raw, tuple(tail))
+    read, never changed, so one object can serve every copy.
+
+    *tail* changes the facts only through _glob_word_letters, for a word
+    with an unquoted `*`, `?` or `[`. Without any of those in *raw* (quoted
+    or not), the key leaves *tail* out, so every verb a hook asks about
+    shares one entry: the PR-base hook asks about 3 (#188)."""
+    key = (raw, tuple(tail) if any(ch in raw for ch in "*?[") else None)
     facts = _LETTERS_MEMO.get(key)
     if facts is None:
         facts = _bounded_put(_LETTERS_MEMO, key,
@@ -3029,14 +3499,29 @@ def _stdin_shell_fed(argv):
             any(_STDIN_FEED_RE.match(word) for word in rest))
 
 
+def _command_lookup(argv, index):
+    """Whether the options immediately following `command` request a lookup."""
+    for position in range(index + 1, len(argv)):
+        option = argv[position]
+        if option == "--" or not option.startswith("-"):
+            break
+        if not option.startswith("--") and ("v" in option or "V" in option):
+            return True
+    return False
+
+
 def _wrapped_command_index(argv):
     """The index of the first word of *argv* that is not a `VAR=value`
     word, a _RUN_WRAPPERS name or an option, or None. That is the command
     when every wrapper in front of it takes no option value: `sudo -u root
-    x` stops at `root`."""
+    x` stops at `root`. A `v` or `V` in a short option of `command`
+    requests a lookup, so there is no command to run."""
     for index, word in enumerate(argv):
+        base = _program_base(word)
+        if base == "command" and _command_lookup(argv, index):
+            return None
         if (_ENV_ASSIGN_RE.match(word) or
-                _program_base(word) in _RUN_WRAPPERS or word.startswith("-")):
+                base in _RUN_WRAPPERS or word.startswith("-")):
             continue
         return index
     return None
@@ -3072,6 +3557,754 @@ def _command_word_positions(argv):
             continue
         break
     return positions
+
+
+# Feeders supply command words and arguments from their input (#127).
+_FEEDERS = ("xargs", "parallel", "find")
+_FIND_EXEC = ("-exec", "-execdir", "-ok", "-okdir")
+_PARALLEL_INPUT = (":::", "::::", ":::+", "::::+")
+_INTERPRETER_NAMES = (
+    r"python[0-9.]*|pypy[0-9.]*|perl[0-9.]*|ruby[0-9.]*|node|nodejs|"
+    r"deno|bun|php[0-9.]*|lua[0-9.]*|luajit|rscript|osascript|tclsh|[gmn]?awk")
+_INTERPRETER_RE = re.compile(r"^(?:" + _INTERPRETER_NAMES + r")$")
+_INTERPRETER_PREFILTER_RE = re.compile(_INTERPRETER_NAMES, re.I)
+# Quotes, backslashes, `$` and backslash-newlines can split a program name
+# in the raw text (`'py'thon3`, `p\ython3`, `py$''thon3`); the prefilter
+# reads the text with them removed, so it over-matches rather than misses.
+_PREFILTER_SPLIT_RE = re.compile(r"\\\n|['\"\\$]")
+_FeederBoundaries = _namedtuple(
+    "_FeederBoundaries", "next_input next_end next_exec next_feeder next_flag skip")
+_PARALLEL_MARK_RE = re.compile(r"\{[^{}]*\}")
+_XARGS_VALUES = frozenset((
+    "--arg-file", "--delimiter", "--eof", "--replace", "--max-lines",
+    "--max-args", "--max-procs", "--max-chars", "--process-slot-var"))
+_PARALLEL_VALUES = frozenset((
+    "--arg-file", "--colsep", "--delimiter", "--jobs", "--sshlogin",
+    "--max-args", "--max-lines", "--max-replace-args"))
+
+
+def _execution_positions(argv):
+    """Command positions after leading shell keywords."""
+    start = 0
+    while start < len(argv) and argv[start] in _HEAD_LEAD_WORDS:
+        start += 1
+    return [start + i for i in _command_word_positions(argv[start:])]
+
+
+def _interpreter_at(argv, index):
+    """The language at a command position, including busybox awk."""
+    if index >= len(argv):
+        return None
+    base = _program_base(argv[index])
+    if base == "busybox" and index + 1 < len(argv):
+        return "awk" if _program_base(argv[index + 1]) == "awk" else None
+    return base if _INTERPRETER_RE.fullmatch(base) else None
+
+
+def _has_feeder_or_interpreter(argv):
+    """Cheap gate for statements whose code or input needs checking. Cached
+    on a scanned statement: every #127 check asks it first."""
+    if type(argv) is not _Argv:
+        return _has_feeder_or_interpreter_uncached(argv)
+    cache = argv.__dict__
+    key = "feeder_or_interpreter"
+    if key not in cache:
+        cache[key] = _has_feeder_or_interpreter_uncached(argv)
+    return cache[key]
+
+
+def _has_feeder_or_interpreter_uncached(argv):
+    """A word scan first: a statement where no word names a feeder, busybox
+    or an interpreter has none at a command position either."""
+    for word in argv:
+        base = _program_base(word)
+        if base in _FEEDERS or base == "busybox" or _INTERPRETER_RE.fullmatch(base):
+            break
+    else:
+        return False
+    return any(_program_base(argv[i]) in _FEEDERS or _interpreter_at(argv, i)
+               for i in _execution_positions(argv))
+
+
+def _feeder_boundaries(argv):
+    """Shared suffix tables for nested feeders and shell flags."""
+    if type(argv) is not _Argv:
+        return _feeder_boundaries_uncached(argv)
+    cache = argv.__dict__
+    key = "feeder_boundaries"
+    if key not in cache:
+        cache[key] = _feeder_boundaries_uncached(argv)
+    return cache[key]
+
+
+def _feeder_boundaries_uncached(argv):
+    """Build suffix tables once for each statement."""
+    n = len(argv)
+    tables = [[n] * (n + 1) for _ in range(5)]
+    aligned = _aligned_redirections(argv)
+    skip = aligned[1] if aligned else set()
+    for i in range(n - 1, -1, -1):
+        tests = (argv[i] in _PARALLEL_INPUT, argv[i] in (";", "+"),
+                 argv[i] in _FIND_EXEC,
+                 i not in skip and _program_base(argv[i]) in _FEEDERS,
+                 i not in skip and bool(_RUNNER_FLAG_RE.match(argv[i])))
+        for table, matches in zip(tables, tests):
+            table[i] = i if matches else table[i + 1]
+    return _FeederBoundaries(*tables, skip)
+
+
+def _feeder_commands(argv):
+    """Cache feeder commands on a scanned statement."""
+    if type(argv) is not _Argv:
+        return _feeder_commands_uncached(argv)
+    cache = argv.__dict__
+    key = "feeder_commands"
+    if key not in cache:
+        cache[key] = _feeder_commands_uncached(argv)
+    return cache[key]
+
+
+def _feeder_commands_uncached(argv):
+    """(start, end, mark, appends, parallel) for feeder commands.
+
+    Consume option values before looking for commands. Unknown options keep
+    both readings of their next word. Nested feeders use a work list.
+    """
+    if not _has_feeder_or_interpreter(argv):
+        return []
+    n = len(argv)
+    pending = [(i, n) for i in _execution_positions(argv)
+               if _program_base(argv[i]) in _FEEDERS][:1]
+    if not pending:
+        return []
+    # Boundaries are shared by nested feeders rather than searched again.
+    boundaries = _feeder_boundaries(argv)
+    next_input = boundaries.next_input
+    next_end = boundaries.next_end
+    next_exec = boundaries.next_exec
+    skip = boundaries.skip
+    found, seen = [], set()
+    cursor = 0
+    while cursor < len(pending):
+        at, end = pending[cursor]
+        cursor += 1
+        if at in seen:
+            continue
+        seen.add(at)
+        base = _program_base(argv[at])
+        if base == "find":
+            i = next_exec[at + 1]
+            while i < end:
+                start = i + 1
+                i = min(next_end[start], end)
+                found.append((start, i, "{}", False, False))
+                for j in _fed_command_positions(argv, start, i):
+                    if j < i and _program_base(argv[j]) in _FEEDERS:
+                        pending.append((j, i))
+                        break
+                i = next_exec[min(i + 1, n)]
+            continue
+        parallel = base == "parallel"
+        short = "aCdEIjLlNnPSs" if parallel else "adEIJLnPRsS"
+        longs = _PARALLEL_VALUES if parallel else _XARGS_VALUES
+        mark, alternatives = None, []
+        alternative_marks = {}
+        i = at + 1
+        while i < end:
+            if i in skip:
+                i += 1
+                continue
+            word = argv[i]
+            if word == "--":
+                i += 1
+                break
+            if word in _PARALLEL_INPUT or not word.startswith("-") or word == "-":
+                break
+            key = word.split("=", 1)[0]
+            if word.startswith("--") and key in longs:
+                if key == "--replace" and "=" not in word:
+                    mark = "{}"
+                    i += 1
+                    continue
+                value = word.split("=", 1)[1] if "=" in word else (
+                    argv[i + 1] if i + 1 < end else "")
+                if key == "--replace":
+                    mark = value
+                i += 1 if "=" in word else 2
+            elif not word.startswith("--"):
+                flags = "0trpvkquXm" if parallel else "0trpx"
+                step = 1
+                for offset, letter in enumerate(word[1:], 2):
+                    if letter in flags:
+                        continue
+                    if letter in short:
+                        value = word[offset:] if offset < len(word) else (
+                            argv[i + 1] if i + 1 < end else "")
+                        if letter in ("I", "J"):
+                            mark = value
+                        step = 1 if offset < len(word) else 2
+                    elif not parallel and letter in "eil":
+                        value = word[offset:]
+                        if not value:
+                            # Keep the reading where an optional value is absent.
+                            alternatives.append(i + 1)
+                            alternative_marks[i + 1] = "{}" if letter == "i" else mark
+                            value = argv[i + 1] if i + 1 < end else ""
+                            step = 2
+                        if letter == "i":
+                            mark = value or "{}"
+                    else:
+                        alternatives.append(i + 2)
+                    break
+                i += step
+            elif word in ("--null", "--verbose", "--no-run-if-empty",
+                          "--interactive", "--exit"):
+                i += 1
+            else:
+                alternatives.append(i + 2)
+                i += 1
+        command_end = min(next_input[min(i, n)], end) if parallel else end
+        for start in [i] + alternatives:
+            if start > command_end:
+                continue
+            if start < command_end and argv[start].startswith("-"):
+                continue
+            nested = None
+            for j in _fed_command_positions(argv, start, command_end):
+                if j < command_end and _program_base(argv[j]) in _FEEDERS:
+                    nested = j
+                    pending.append((j, command_end))
+                    break
+            command_mark = alternative_marks.get(start, mark)
+            appends = parallel or command_mark is None
+            if parallel and nested is None and any(_holds_feeder_mark(argv[j], command_mark, True)
+                                for j in range(start, command_end) if j not in skip):
+                appends = False
+            found.append((start, command_end, command_mark, appends, parallel))
+    return found
+
+
+def _holds_feeder_mark(text, mark, parallel):
+    """Whether a command word can receive replacement text."""
+    return ((mark is not None and mark in text) or
+            (parallel and bool(_PARALLEL_MARK_RE.search(text))))
+
+
+def _fed_command_positions(argv, start, end):
+    """Command candidates after a feeder and its wrappers."""
+    boundaries = _feeder_boundaries(argv)
+    next_feeder = boundaries.next_feeder
+    stop = min(next_feeder[start], end)
+    skip = boundaries.skip
+    indices = [i for i in range(start, stop) if i not in skip] + [stop]
+    # A sentinel reports a wrapper whose command must come from input.
+    tokens = [argv[i] for i in indices[:-1]] + ([argv[stop]] if stop < end else ["$R"])
+    for offset in _command_word_positions(tokens):
+        yield indices[offset]
+
+
+def _interpreter_code(argv, index, end, skip):
+    """(language, code candidates, script operand) for an interpreter.
+
+    Each candidate carries its word index for raw expansion checks. None
+    code means a flag whose code may be supplied by a feeder.
+    """
+    language = _interpreter_at(argv, index)
+    if not language:
+        return None, [], None
+    i = index + (2 if _program_base(argv[index]) == "busybox" else 1)
+    awk = language.endswith("awk")
+    values, flags = (), ()
+    if language.startswith(("python", "pypy")):
+        values = ("-W", "-X", "-Q")
+        flags = ("-I", "-v", "-E", "-s", "-S", "-u", "-B", "-b", "-d",
+                 "-O", "-q", "-x")
+    elif language.startswith("ruby"):
+        values = ("-I", "-r", "-C", "-E")
+        flags = ("-v", "-w", "-W", "-n", "-p", "-l", "-a")
+    elif language in ("node", "nodejs", "bun"):
+        values = ("-r", "--require", "--import", "--loader", "-C",
+                  "--conditions", "--input-type")
+        flags = ("-i", "-I")
+    elif language.startswith("perl"):
+        flags = ("-x", "-w", "-W", "-n", "-p", "-l", "-a")
+    elif awk:
+        values = ("-F", "-v", "-i", "-l", "-E", "--field-separator")
+    elif language.startswith("php"):
+        values = ("-d", "-c", "-z")
+    code, script, file_code = [], None, False
+    uncertain = False
+    while i < end:
+        if i in skip:
+            i += 1
+            continue
+        word = argv[i]
+        flag, attached = None, None
+        if language.startswith(("python", "pypy")):
+            if word.startswith("-m"):
+                module = word[2:] or (argv[i + 1] if i + 1 < end else "")
+                after = i + (1 if word[2:] else 2)
+                if module in ("timeit", "code"):
+                    code.append((after, " ".join(argv[after:end])))
+                return language, code, "module"
+            if word.startswith("-c"):
+                flag, attached = "c", word[2:] or None
+            elif re.fullmatch(r"-[a-zA-Z]*c", word):
+                flag = "c"
+        elif language.startswith("perl"):
+            if re.fullmatch(r"-[a-zA-Z]*[eE]", word):
+                flag = word[-1]
+            elif word.startswith(("-e", "-E")):
+                flag, attached = word[1], word[2:] or None
+        elif language in ("node", "nodejs", "bun"):
+            if word in ("-e", "-p", "-pe", "--eval", "--print"):
+                flag = word
+            elif word.startswith(("--eval=", "--print=")):
+                flag, attached = word.split("=", 1)
+            elif word.startswith(("-e", "-p")) and len(word) > 2:
+                flag, attached = word[:2], word[2:]
+        elif language == "deno" and word == "eval":
+            flag = word
+        elif language.startswith("php") and word[:2] in ("-r", "-B", "-R", "-E"):
+            flag, attached = word[:2], word[2:] or None
+        elif awk and (word in ("--source", "-e") or word.startswith("--source=")):
+            flag = word
+            attached = word.split("=", 1)[1] if "=" in word else None
+        elif word == "-e" and (language.startswith(("ruby", "lua")) or
+                                language in ("rscript", "osascript")):
+            flag = word
+        if flag is not None:
+            if attached is not None:
+                code.append((i, attached))
+                i += 1
+            else:
+                i += 1
+                while i < end and i in skip:
+                    i += 1
+                code.append((i, argv[i] if i < end else None))
+                i += 1
+            continue
+        if awk and (word.startswith("-f") or word == "--file"):
+            file_code = True
+            i += 2 if word in ("-f", "--file") else 1
+            continue
+        if language.startswith("php") and word.startswith("-f"):
+            script = word[2:] or (argv[i + 1] if i + 1 < end else None)
+            break
+        key = word.split("=", 1)[0]
+        if key in values:
+            i += 1 if "=" in word else 2
+            continue
+        if not word.startswith("--") and word[:2] in values:
+            i += 1
+            continue
+        if word == "--":
+            i += 1
+            if i < end:
+                script = argv[i]
+            break
+        if word.startswith("-") and word != "-":
+            if word not in flags:
+                uncertain = True
+            i += 1
+            continue
+        if uncertain and not code and not awk:
+            # An unknown option may have consumed this operand.
+            script = word
+            i += 1
+            continue
+        if awk and not file_code and (not code or uncertain):
+            code.append((i, word))
+            if uncertain:
+                i += 1
+                continue
+        elif not code:
+            script = word
+        break
+    return language, code, "file" if file_code and not code else script
+
+
+def _fed_run_hides_verb(argv, words):
+    """Whether feeder input may supply this verb or its arguments."""
+    if not words:
+        return False
+    if not hasattr(argv, "__dict__"):
+        argv = _Argv(argv)
+    commands = _feeder_commands(argv)
+    if not commands:
+        return False
+    table = None
+    shell_payloads = {}
+    shell_hidden = None
+    boundaries = _feeder_boundaries(argv)
+    next_flag, skip = boundaries.next_flag, boundaries.skip
+    for start, end, mark, appends, parallel in commands:
+        if start >= end:
+            if parallel:
+                return True
+            continue
+        for i in _fed_command_positions(argv, start, end):
+            if i >= end:
+                if appends:
+                    return True
+                continue
+            token = argv[i]
+            if _holds_feeder_mark(token, mark, parallel):
+                return True
+            base = _program_base(token)
+            if base in _RUN_WRAPPERS + _OPERAND_WRAPPERS:
+                continue
+            if token.startswith("-") or _ENV_ASSIGN_RE.match(token):
+                continue
+            name = _command_name(token)
+            if name and name[0] == words[0]:
+                tail, pos = list(words[1:]), i + 1
+                if len(name) > 1:
+                    if tail[:1] != [name[1]]:
+                        break
+                    tail = tail[1:]
+                elif words[0] == "git":
+                    if table is None:
+                        table = _git_subcommand_table(argv)
+                    pos = table[pos]
+                matched = True
+                for verb in tail:
+                    while pos < end and pos in skip:
+                        pos += 1
+                    if pos >= end:
+                        if appends:
+                            return True
+                        matched = False
+                        break
+                    if _holds_feeder_mark(argv[pos], mark, parallel):
+                        return True
+                    if argv[pos] != verb:
+                        matched = False
+                        break
+                    pos += 1
+                if matched and (appends or any(_holds_feeder_mark(argv[j], mark, parallel)
+                                              for j in range(pos, end) if j not in skip)):
+                    return True
+            if base in _SHELL_RUNNERS:
+                j = next_flag[i + 1]
+                if j < end:
+                    key = (j, end)
+                    if key not in shell_payloads:
+                        rest = [argv[k] for k in range(j, end) if k not in skip]
+                        shell_payloads[key] = _payload_after_flag(rest, 0)
+                    if appends and not shell_payloads[key]:
+                        return True
+                    payloads = shell_payloads[key]
+                    scripts = payloads if isinstance(payloads, tuple) else (payloads,)
+                    if appends and any(re.search(r"\$(?:[@*0-9]|\{[@*0-9]\})", script)
+                                       for script in scripts):
+                        return True
+                    if shell_hidden is None:
+                        shell_hidden = _fed_shell_hides_command(argv)
+                    if shell_hidden:
+                        return True
+            language, codes, _script = _interpreter_code(argv, i, end, skip)
+            if language and (any((code is None and appends) or
+                                (code is not None and _holds_feeder_mark(code, mark, parallel))
+                                for _at, code in codes) or
+                             any(_code_has_run(code or "", language) for _at, code in codes)):
+                return True
+    return False
+
+
+def _fed_shell_payloads(argv):
+    """Shell scripts with feeder placeholders replaced by expansions."""
+    if not hasattr(argv, "__dict__"):
+        argv = _Argv(argv)
+    commands = _feeder_commands(argv)
+    if not commands:
+        return []
+    found, seen = [], set()
+    next_flag = _feeder_boundaries(argv).next_flag
+    for start, end, mark, _appends, parallel in commands:
+        for i in _fed_command_positions(argv, start, end):
+            if i >= end:
+                continue
+            if _program_base(argv[i]) not in _SHELL_RUNNERS:
+                continue
+            j = next_flag[i + 1]
+            key = (j, end, mark, parallel)
+            if j < end and key not in seen:
+                seen.add(key)
+                payload = _payload_after_flag(argv[:end], j)
+                for script in payload if isinstance(payload, tuple) else (payload,):
+                    if _holds_feeder_mark(script, mark, parallel):
+                        if mark is not None:
+                            script = script.replace(mark, "$R") if mark else "$R"
+                        if parallel:
+                            script = _PARALLEL_MARK_RE.sub(lambda _m: "$R", script)
+                        found.append(script)
+    return found
+
+
+def _fed_shell_hides_command(argv):
+    """A placeholder in shell commands or interpreter code can run any verb."""
+    try:
+        for payload in _fed_shell_payloads(argv):
+            for statement in _scan_commands(payload):
+                for k in _execution_positions(statement):
+                    if "$R" in statement[k]:
+                        return True
+                    _language, codes, _script = _interpreter_code(
+                        statement, k, len(statement), set())
+                    if any("$R" in (code or "") for _at, code in codes):
+                        return True
+    except ValueError:
+        return True
+    return False
+
+
+def _verb_in_code(text, words):
+    """Whole verb tokens or their joined letters in foreign code."""
+    if not words or not text:
+        return False
+    lowered = text.lower()
+    tokens = set(re.findall(r"[a-z]+", lowered))
+    return (all(word in tokens for word in words) or
+            _letters_only("".join(words)).lower() in _letters_only(lowered))
+
+
+def _code_has_run(text, language):
+    """Find system, popen, subprocess, child_process, eval, qx and pty.
+
+    Also match spawn* and exec* tokens, backticks and %x. In awk, match
+    system(...), a pipe into getline, |&, or a print/printf pipe outside
+    strings and regex literals in the same statement.
+    """
+    lowered = text.lower()
+    tokens = set(re.findall(r"[a-z_]+", lowered))
+    if language.endswith("awk"):
+        lowered = lowered.replace("\\\n", "")
+        clean = []
+        quote, escaped, bracket = None, False, False
+        expect_value = True
+        i = 0
+        while i < len(lowered):
+            ch = lowered[i]
+            if quote:
+                clean.append(" ")
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif quote == "/" and ch == "[":
+                    bracket = True
+                elif quote == "/" and ch == "]":
+                    bracket = False
+                elif ch == quote and not bracket:
+                    quote = None
+                    expect_value = False
+            elif ch == '"' or (ch == "/" and expect_value):
+                quote = ch
+                clean.append(" ")
+            elif ch.isalpha() or ch == "_":
+                start = i
+                while i < len(lowered) and (lowered[i].isalnum() or lowered[i] == "_"):
+                    i += 1
+                word = lowered[start:i]
+                clean.append(word)
+                expect_value = word in ("print", "printf", "return", "exit", "delete")
+                continue
+            else:
+                clean.append(ch)
+                if ch in ";{}\n(,[=~!?:+*-/%^&|<>":
+                    expect_value = True
+                elif not ch.isspace():
+                    expect_value = False
+            i += 1
+        statement = "".join(clean)
+        if re.search(r"\bsystem\s*\(|\|\s*getline\b|\|&", statement):
+            return True
+        printing = False
+        for token in re.findall(r"[a-z_]+|[;{}\n|]", statement):
+            if token in (";", "{", "}", "\n"):
+                printing = False
+            elif token in ("print", "printf"):
+                printing = True
+            elif token == "|" and printing:
+                return True
+        return False
+    return (bool(tokens.intersection(("system", "popen", "subprocess", "child_process",
+                                      "eval", "qx", "pty"))) or
+            any(token.startswith(("spawn", "exec")) for token in tokens) or
+            "`" in text or "%x" in text)
+
+
+_INTERPRETER_CONTEXT_MEMO = {}
+
+
+def _interpreter_contexts(cmd):
+    """Return (stripped text, heredoc bodies, statement contexts, closes).
+
+    Bodies hold (opener offset, text). Contexts map each raw statement to
+    (pipeline start, statement start, statement end, incoming pipe) rows.
+    Closes map opening parentheses to their closing offsets.
+    """
+    cached = _INTERPRETER_CONTEXT_MEMO.get(cmd)
+    if cached is not None:
+        return cached
+    stripped, heredocs = _split_heredocs(cmd)
+    mask, _quote = _quote_mask(stripped)
+    # Use the heredoc lexer so arithmetic shifts are never openers.
+    positions = []
+    state = {"quote": None, "stack": [], "word_start": True}
+    offset = 0
+    for line in stripped.splitlines(keepends=True):
+        text = line[:-1] if line.endswith("\n") else line
+        _kept, line_mask = _comment_cut(text, state)
+        positions.extend(offset + match.start() for match in _HEREDOC_RE.finditer(text)
+                         if match.start() < len(line_mask) and not line_mask[match.start()])
+        offset += len(line)
+    openers = iter(positions)
+    bodies = [(next(openers, -1), body) for _line, _quoted, body, _done in heredocs]
+    stack, closes = [], {}
+    for i, ch in enumerate(stripped):
+        if mask[i]:
+            continue
+        if ch == "(":
+            stack.append(i)
+        elif ch == ")" and stack:
+            closes[stack.pop()] = i
+    contexts = {}
+    cursor = pipeline = 0
+    incoming = False
+    try:
+        statements = _split_statements_with_depth(stripped)
+    except ValueError:
+        statements = []
+    for raw, _depth in statements:
+        at, span = stripped.find(raw, cursor), len(raw)
+        if at < 0 and "\\\n" in stripped[cursor:]:
+            # bash drops a backslash-newline before it splits words, so
+            # `p\<newline>ython3` is `python3` in *raw* but not in the text.
+            found = re.compile(r"(?:\\\n)*".join(map(re.escape, raw))).search(
+                stripped, cursor)
+            if found:
+                at, span = found.start(), found.end() - found.start()
+        if at < 0:
+            continue
+        gap = stripped[cursor:at]
+        for separator in re.findall(r"&&|\|\||\|&|[;\n|&]", gap):
+            if separator in ("|", "|&"):
+                incoming = True
+            elif separator != "\n" or not incoming:
+                pipeline, incoming = at, False
+        end = at + span
+        contexts.setdefault(raw, []).append((pipeline, at, end, incoming))
+        cursor, incoming = end, False
+    return _bounded_put(_INTERPRETER_CONTEXT_MEMO, cmd, (stripped, bodies, contexts, closes))
+
+
+def _statement_input_fed(argv, cmd):
+    """Incoming pipe or stdin redirection on this statement."""
+    aligned = _aligned_raw_words(argv)
+    if any(_STDIN_FEED_RE.match(word) for word in (aligned or argv)):
+        return True
+    if aligned:
+        cuts, _targets = _attached_redirections(argv, aligned)
+        if any(_STDIN_FEED_RE.match(aligned[i][_attached_operator(aligned[i]):])
+               for i in cuts):
+            return True
+    if not cmd:
+        return False
+    _stripped, _bodies, contexts, _closes = _interpreter_contexts(cmd)
+    return any(row[3] for row in contexts.get(getattr(argv, "raw", ""), ()))
+
+
+def _inline_code_runs_verb(argv, words, cmd):
+    """Mentioned verbs, computed code, or run calls on incoming data."""
+    aligned = _aligned_redirections(argv)
+    skip = aligned[1] if aligned else set()
+    raw = aligned[0] if aligned else argv
+    tokens = argv
+    if aligned:
+        cuts, targets = _attached_redirections(argv, raw)
+        if cuts:
+            tokens = [cuts[j][1] if j in cuts else token
+                      for j, token in enumerate(argv)]
+            raw = [cuts[j][0] if j in cuts else word
+                   for j, word in enumerate(raw)]
+            skip = skip | targets
+    roots = _execution_positions(argv)
+    first_feeder = next((i for i in roots if _program_base(argv[i]) in _FEEDERS), len(argv))
+    positions = [(i, len(tokens)) for i in roots if i < first_feeder]
+    for start, end, _mark, _appends, _parallel in _feeder_commands(argv):
+        positions.extend((i, end) for i in _fed_command_positions(argv, start, end) if i < end)
+    seen = set()
+    for i, end in positions:
+        if (i, end) in seen:
+            continue
+        seen.add((i, end))
+        language, codes, _script = _interpreter_code(tokens, i, end, skip)
+        if not language or not codes:
+            continue
+        at, first = codes[0]
+        text = " ".join([first or ""] + [tokens[j] for j in range(at + 1, end)
+                                         if j not in skip])
+        run = _code_has_run("\n".join(code or "" for _at, code in codes), language)
+        if (not language.endswith("awk") or run) and _verb_in_code(text, words):
+            return True
+        if (any(at < len(raw) and _carries_expansion(_SQUOTED_SPAN_RE.sub("", raw[at]))
+                for at, _code in codes) and _verb_in_code(cmd or "", words)):
+            return True
+        if run and _statement_input_fed(argv, cmd):
+            return True
+    return False
+
+
+def _fed_program_runs_verb(cmd, words):
+    """Visible programs read from stdin or process substitutions."""
+    if (not _FED_TEXT_RE.search(cmd) or
+            not _INTERPRETER_PREFILTER_RE.search(_PREFILTER_SPLIT_RE.sub("", cmd))):
+        return False
+    stripped, bodies, contexts, closes = _interpreter_contexts(cmd)
+    # Prefix counts make repeated stdin readers share the heredoc checks.
+    body_hits = [0] * (len(stripped) + 1)
+    for at, body in bodies:
+        if at >= 0 and _verb_in_code(body, words):
+            body_hits[at + 1] += 1
+    for i in range(len(stripped)):
+        body_hits[i + 1] += body_hits[i]
+    visible = [0] * (len(stripped) + 1)
+    for raw, rows in contexts.items():
+        argv = _Argv(_split_words(raw))
+        argv.raw = raw
+        aligned = _aligned_redirections(argv)
+        skip = aligned[1] if aligned else set()
+        for i in _execution_positions(argv):
+            language, codes, script = _interpreter_code(argv, i, len(argv), skip)
+            if not language or codes or script not in (None, "-", "/dev/stdin", "/dev/fd/0", "/proc/self/fd/0", "<"):
+                continue
+            for pipeline, at, end, incoming in rows:
+                if incoming:
+                    visible[pipeline] += 1
+                    visible[at] -= 1
+                if _verb_in_code("\n".join(_stdin_herestrings(argv, i)), words):
+                    return True
+                if body_hits[end] > body_hits[pipeline if incoming else at]:
+                    return True
+                if raw.endswith("<") and stripped[end:end + 1] == "(":
+                    close = closes.get(end)
+                    if close is not None:
+                        visible[end + 1] += 1
+                        visible[close] -= 1
+    # Read overlapping producer spans once, so long pipelines stay linear.
+    depth = 0
+    start = None
+    for i, change in enumerate(visible):
+        depth += change
+        if depth and start is None:
+            start = i
+        elif not depth and start is not None:
+            if _verb_in_code(stripped[start:i], words):
+                return True
+            start = None
+    return False
 
 
 def _brace_expands(word):
@@ -3124,6 +4357,23 @@ def _overrides_git_alias(argv, toks, head):
             any(token.lower().startswith(_ALIAS_CONFIG_PREFIXES)
                 for token in toks[git_at + 1:])):
         return True
+    # A key in git's global-option slots (#132). A printed `git` sets
+    # nothing (`echo git -c alias.x=y x`), as for the alias check above.
+    # Only a `-c`, `--config-env` or `--exec-path=` word can hold such a
+    # key: a statement with none skips the table build.
+    if _has_config_word(argv):
+        printed = _raw_print_only(argv)
+        table = _git_subcommand_table(toks)
+        gits = (k for k, token in enumerate(toks)
+                if (_command_name(token) or ("",))[0] == "git" and
+                (k == 0 or not printed))
+        for key, value, from_env in _global_config_keys_for_gits(
+                toks, gits, table):
+            kind = _config_key_class(key)
+            if (kind == "other" or (from_env and kind != "safe") or
+                    (kind == "command" and
+                     _runs_unreadable_program(value or ""))):
+                return True
     # The same override from the environment, in any word of the statement
     # -- a prefix, `env`, `export` -- since a later git run inherits it:
     # `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.x GIT_CONFIG_VALUE_0='push
@@ -3131,15 +4381,190 @@ def _overrides_git_alias(argv, toks, head):
     return _sets_alias_environment(argv, toks, head)
 
 
+def _git_run_reads_unread_program(argv):
+    """Whether git may run an unreadable program even on a literal verb.
+
+    Unlike an alias, a hook, helper or config source can run another
+    program during a built-in verb. Keep ordinary statements off this
+    path, and read overlapping git option ranges only once. Cache on the
+    scanned statement: the result does not depend on the verb.
+    """
+    cache = argv.__dict__ if type(argv) is _Argv else {}
+    cache_key = "git_run_reads_unread_program"
+    if cache_key in cache:
+        return cache[cache_key]
+    try:
+        # One pass: a word with `=` (a NAME=value prefix, `-c k=v`,
+        # `--config-env=`, `--exec-path=`) or a bare `-c`/`--config-env`.
+        # Over-matching only sends a statement down the full read.
+        for token in argv:
+            if ("=" in token or token == "-c" or
+                    token.startswith("--config-env")):
+                break
+        else:
+            cache[cache_key] = False
+            return False
+        toks = argv[_env_prefix_len(argv):]
+        if not toks:
+            cache[cache_key] = False
+            return False
+        printed = _raw_print_only(argv)
+        table = _git_subcommand_table(toks)
+        gits = (k for k, token in enumerate(toks)
+                if (_command_name(token) or ("",))[0] == "git" and
+                (k == 0 or not printed))
+        for key, value, from_env in _global_config_keys_for_gits(
+                toks, gits, table):
+            if key.lower().startswith(("alias.", "include.", "includeif.")):
+                continue
+            kind = _config_key_class(key)
+            if (kind == "other" or (from_env and kind != "safe") or
+                    (kind == "command" and
+                     _runs_unreadable_program(value or ""))):
+                cache[cache_key] = True
+                return True
+        # Only assignments reaching this run count here. Config files and
+        # alias/include keys keep their older literal-verb checks.
+        words = [t.rsplit("/", 1)[-1] for t in toks]
+        runner = _wrapped_runner(toks, words)
+        if runner is not None:
+            for token in argv[:len(argv) - len(toks) + runner]:
+                match = _ENV_WORD_RE.match(token)
+                if match is None:
+                    continue
+                name, assign, value = match.groups()
+                if not assign:
+                    continue
+                if (name in _GIT_PATH_ENV or
+                        (name in _GIT_COMMAND_ENV and
+                         _runs_unreadable_program(value))):
+                    cache[cache_key] = True
+                    return True
+                if _GIT_CONFIG_PAIR_RE.match(name):
+                    key = value.strip("'\"")
+                    if (name.upper() == "GIT_CONFIG_PARAMETERS" or
+                            (_config_key_class(key) != "safe" and
+                             not key.lower().startswith(
+                                 ("alias.", "include.", "includeif.")))):
+                        cache[cache_key] = True
+                        return True
+        cache[cache_key] = False
+        return False
+    except Exception:  # noqa: BLE001 -- unreadable input must fail closed
+        cache[cache_key] = True
+        return True
+
+
 def _sets_git_alias(cmd):
-    """Whether any statement of *cmd* sets a git alias or include
-    (_overrides_git_alias). Never raises: it only picks a deny's wording."""
+    """Whether any statement of *cmd* makes _overrides_git_alias true. That
+    covers an alias or include, and also a git config key or environment
+    variable that makes git run another program (a command value, an
+    unlisted key, GIT_EXEC_PATH). _sets_git_alias_only keeps the alias and
+    include sources apart. Never raises: it only picks a deny's wording."""
     try:
         for argv in _scan_commands(cmd):
             toks = argv[_env_prefix_len(argv):]
             if toks and _overrides_git_alias(argv, toks,
                                              toks[0].rsplit("/", 1)[-1]):
                 return True
+    except Exception:  # noqa: BLE001 -- wording only; the deny stands
+        return False
+    return False
+
+
+def _sets_git_runner_config(cmd):
+    """Whether *cmd* sets a config or env source of another git program.
+
+    This only chooses a deny's explanation, so malformed input must never
+    raise and undo the deny.
+    """
+    try:
+        for argv in _scan_commands(cmd):
+            table = _git_subcommand_table(argv)
+            gits = (k for k, token in enumerate(argv)
+                    if (_command_name(token) or ("",))[0] == "git")
+            for key, _value, _from_env in _global_config_keys_for_gits(
+                    argv, gits, table):
+                kind = _config_key_class(key)
+                if ((kind == "other" and
+                        not key.lower().startswith(("alias.", "include.",
+                                                    "includeif."))) or
+                        (_from_env and kind != "safe") or
+                        (kind == "command" and
+                         _runs_unreadable_program(_value or ""))):
+                    return True
+            for token in argv:
+                match = _ENV_WORD_RE.match(token)
+                if match is None:
+                    continue
+                name, assign, value = match.groups()
+                if name in _GIT_COMMAND_ENV and _sets_alias_source(token):
+                    return True
+                if name in _GIT_PATH_ENV and assign:
+                    return True
+                if assign and _GIT_CONFIG_PAIR_RE.match(name):
+                    if (name.upper() == "GIT_CONFIG_PARAMETERS" or
+                            (_config_key_class(value.strip("'\"")) != "safe" and
+                             not value.strip("'\"").lower().startswith(
+                                 ("alias.", "include.", "includeif.")))):
+                        return True
+    except Exception:  # noqa: BLE001 -- wording only; the deny stands
+        return False
+    return False
+
+
+def _sets_git_alias_only(cmd):
+    """The original alias/include sources, for choosing a deny's wording.
+
+    _sets_git_alias now also sees runner settings through its widened
+    callees. Keep their original predicates here so an actual alias source
+    still takes precedence over the runner explanation in a mixed command.
+    """
+    def source(token):
+        match = _ENV_WORD_RE.match(token)
+        if match is None:
+            return False
+        name, assign, value = match.groups()
+        if _GIT_CONFIG_PAIR_RE.match(name):
+            value = value.lower().lstrip("'\"")
+            return (not assign or "alias." in value or "include" in value or
+                    "$" in value or "`" in value)
+        if name.upper() in ("GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM"):
+            return True
+        return bool(assign) and name in ("XDG_CONFIG_HOME", "HOME")
+
+    try:
+        for argv in _scan_commands(cmd):
+            toks = argv[_env_prefix_len(argv):]
+            if not toks:
+                continue
+            git_at = next((k for k, token in enumerate(toks)
+                           if (_command_name(token) or ("",))[0] == "git"), None)
+            if (git_at is not None and
+                    (git_at == 0 or not _raw_print_only(argv)) and
+                    any(token.lower().startswith(_ALIAS_CONFIG_PREFIXES)
+                        for token in toks[git_at + 1:])):
+                return True
+            words = [token.rsplit("/", 1)[-1] for token in toks]
+            runner = _wrapped_runner(toks, words)
+            if runner is not None and any(
+                    source(token)
+                    for token in argv[:len(argv) - len(toks) + runner]):
+                return True
+            index = 0
+            while index < len(toks) and words[index] in _RUN_WRAPPERS:
+                index += 1
+                while index < len(toks) and (toks[index].startswith("-") or
+                                             _is_env_assignment(toks[index])):
+                    index += 1
+            if index >= len(toks):
+                continue
+            rest = toks[index + 1:]
+            if (words[index] in _ENV_SETTING_HEADS or
+                    (words[index] == "printf" and "-v" in rest)):
+                if any(source(token) or token in ("HOME", "XDG_CONFIG_HOME")
+                       for token in rest):
+                    return True
     except Exception:  # noqa: BLE001 -- wording only; the deny stands
         return False
     return False
@@ -3247,6 +4672,8 @@ def _may_hide_verb(argv, words, spelled=(False, False, False, False)):
     # root`, #110). Its heredoc body is not scanned as code, so a heredoc
     # counts.
     if _stdin_shell_fed(argv):
+        return True
+    if _inline_code_runs_verb(argv, words, getattr(argv, "code", "")):
         return True
     if _raw_print_only(argv) or (not spelled[3] and _read_only_run(argv)):
         return False
@@ -3530,12 +4957,15 @@ def _is_env_assignment(token):
 
 
 def _sets_alias_source(token):
-    """Whether *token* may hand a later git run an alias through the
-    environment: a GIT_CONFIG_KEY_<n> / GIT_CONFIG_PARAMETERS word that is a
-    bare name (`read`, `printf -v`, `export NAME`) or whose value names an
-    alias or include key or is computed; or an assignment to
-    GIT_CONFIG_GLOBAL, GIT_CONFIG_SYSTEM, XDG_CONFIG_HOME or HOME, which
-    point git at a config file this guard cannot read."""
+    """Whether *token* may hand a later git run an alias or another program
+    through the environment: a GIT_CONFIG_KEY_<n> / GIT_CONFIG_PARAMETERS
+    word that is a bare name (`read`, `printf -v`, `export NAME`), whose
+    value names an alias, include or other key outside the safe list, or is
+    computed; a bare or unreadable-program value of a _GIT_COMMAND_ENV
+    variable (GIT_EDITOR, ...); an assignment to a _GIT_PATH_ENV variable;
+    or an assignment to GIT_CONFIG_GLOBAL, GIT_CONFIG_SYSTEM,
+    XDG_CONFIG_HOME or HOME, which point git at a config file this guard
+    cannot read."""
     match = _ENV_WORD_RE.match(token)
     if match is None:
         return False
@@ -3543,8 +4973,15 @@ def _sets_alias_source(token):
     if _GIT_CONFIG_PAIR_RE.match(name):
         value = value.lower().lstrip("'\"")
         return (not assign or "alias." in value or "include" in value or
-                "$" in value or "`" in value)
+                "$" in value or "`" in value or
+                (bool(assign) and
+                 (name.upper() == "GIT_CONFIG_PARAMETERS" or
+                  _config_key_class(value.strip("'\"")) != "safe")))
     if name.upper() in ("GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM"):
+        return True
+    if name in _GIT_COMMAND_ENV:
+        return not assign or _runs_unreadable_program(value)
+    if name in _GIT_PATH_ENV and assign:
         return True
     return bool(assign) and name in ("XDG_CONFIG_HOME", "HOME")
 
@@ -3573,11 +5010,15 @@ def _could_expand_uncached(argv):
     a stdin shell whose stdin may be fed (#110) count too, and so does a git
     alias override."""
     if (_runner_command_index(argv) is not None or
+            _has_feeder_or_interpreter(argv) or
             _stdin_shell_fed(argv) or
             _sets_program_name(argv) or _brace_command_word(argv) or
             any("alias." in token.lower() or "include" in token.lower() or
                 token in ("HOME", "XDG_CONFIG_HOME") or
                 _sets_alias_source(token) for token in argv)):
+        return True
+    if (_has_config_word(argv)
+            and any(_program_base(token) == "git" for token in argv)):
         return True
     raw = getattr(argv, "raw", None)
     if raw is not None:
@@ -3934,6 +5375,16 @@ def _verb_statement(argv, words, spelled=(False, False, False, False)):
     # and its arguments may be env's, not git's. Checked BEFORE the
     # literal-verb return, or the literal run is judged as written.
     unreadable = _env_split_unreadable(argv)
+    # Git can run an unreadable hook or helper during the literal verb. The
+    # cached answer is read here: this runs once per verb for each statement.
+    if not unreadable:
+        known = (argv.__dict__.get("git_run_reads_unread_program")
+                 if type(argv) is _Argv else None)
+        unreadable = (_git_run_reads_unread_program(argv) if known is None
+                      else known)
+    # A feeder may supply the verb's words, so the literal run cannot be judged as written.
+    unreadable = unreadable or (
+        _has_feeder_or_interpreter(argv) and _fed_run_hides_verb(argv, words))
     start, _end, name = _match_found(argv, words)
     if start >= 0 and not unreadable:
         if name is None:
@@ -3946,7 +5397,7 @@ def _verb_statement(argv, words, spelled=(False, False, False, False)):
             return _canonical_run(argv, start, name)
     if (unreadable or start >= 0 or
             _hides_verb(argv, words, spelled) or
-            _runner_stdin_unknown(argv)):
+            _runner_stdin_unknown(argv) or _extra_stdin_runner(argv)):
         i = _env_prefix_len(argv)
         return _hidden_run(argv[:i] + list(words) + argv[i:], argv)
     return None
@@ -3989,12 +5440,16 @@ def _find_statements(cmd, words):
     def compute():
         spelled = _command_spells_verb(cmd, words)
         found = []
+        program_texts = {cmd}
         for argv in _scan_commands(cmd):
+            program_texts.add(getattr(argv, "code", cmd))
             statement = _verb_statement(argv, words, spelled)
             if statement is not None:
                 found.append(statement)
         if _zsh_code_in(cmd):
             # zsh code the scanner cannot see may run the verb (#122).
+            found.append(_hidden_run(list(words) + ["$"], cmd))
+        if any(_fed_program_runs_verb(text, words) for text in program_texts):
             found.append(_hidden_run(list(words) + ["$"], cmd))
         return found
     return list(_memo_call(_FIND_MEMO, (cmd, tuple(words)), compute))
@@ -4108,10 +5563,13 @@ def _is_absolute_cd_target(target):
     return _normalised_cd_target(target) is not None
 
 
-# The ONE `cd` shape that moves the scope (#107): the command opens with a
-# plain `cd`, one literal absolute path from a safe alphabet, then `&&`.
-# Matched on the RAW text, before any quote removal or normalising.
-_EXACT_CD_RE = re.compile(r"[ \t]*cd[ \t]+(/[A-Za-z0-9._/@+-]*)[ \t]*&&")
+# One leading `cd`, one whole absolute or relative path word, then `&&`.
+# Match the raw text so only a single pair of quotes can admit spaces.
+_EXACT_CD_RE = re.compile(
+    r"[ \t]*cd[ \t]+(?:"
+    r"(?P<bare>[A-Za-z0-9._/@][A-Za-z0-9._/@+-]*)|"
+    r"""(?P<quote>["'])(?P<quoted>[A-Za-z0-9._/@][A-Za-z0-9._/@+ -]*)(?P=quote)"""
+    r")[ \t]*&&")
 # The one `cd` allowed after it: a plain `&& cd -` that ENDS the command
 # (#156 G-7). It runs after every other statement, so it moves none of them.
 # No leading `[ \t]*`: searched, that rescans every run of blanks (quadratic).
@@ -4262,14 +5720,100 @@ _ZSH_PAREN_RE = re.compile(r"[^\s$<>;&|(){}]\(")
 _ARRAY_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\+?=$")
 
 
+# Measured with zsh 5.9: `${(e)X}` evaluates X's text. `${~X}` and `$~X`
+# turn X's text into a pattern whose glob qualifier can run code. We can
+# match the braced forms by their first character alone: bash rejects
+# `${(`, `${~`, `${=` and `${^` as bad substitutions, so this wider match
+# costs no working bash expansion. The unbraced `$~`, `$=` and `$^` are
+# matched too. Bash prints them literally; denying them is the accepted
+# over-match. The GLOB_SUBST option is read from dequoted words instead
+# (_sets_glob_subst), because quoting cannot hide its name.
+def _zsh_param_code(raw):
+    """Whether *raw* holds a zsh parameter form (`${(e)X}`, `${~X}`, `$~X`,
+    `$=X`, `$^X`) outside single quotes, also inside an unquoted heredoc
+    body. A backslash before the `$` does not hide it (see below)."""
+    if re.search(r"\$\{?[(~=^]", raw) is None:
+        return False
+
+    def has_expansion(text, quoting=True):
+        quote = None
+        i = 0
+        while i < len(text):
+            ch = text[i]
+            if ch == "\\" and quote != "'":
+                if text[i + 1:i + 2] == "$":
+                    # A shell payload in double quotes reaches here with
+                    # its `\$` kept (the tokenizer matches shlex), but the
+                    # outer shell turns `\$` into `$` before zsh reads it:
+                    # `zsh -c "X='\$(cmd)'; echo \${(e)X}"` runs cmd.
+                    # So the `$` stays live.
+                    i += 1
+                    continue
+                i += 2
+                continue
+            if quoting and ch in ("'", '"'):
+                if quote is None:
+                    quote = ch
+                elif quote == ch:
+                    quote = None
+            elif ch == "$" and quote != "'" and text.startswith(
+                    ("${(", "${~", "${=", "${^", "$~", "$=", "$^"), i):
+                return True
+            i += 1
+        return False
+
+    try:
+        text, heredocs = _split_heredocs(raw)
+    except ValueError:
+        return has_expansion(raw)
+    return has_expansion(text) or any(
+        has_expansion(body, quoting=False)
+        for _, quoted_delim, body, _ in heredocs if not quoted_delim)
+
+
+# Measured with zsh 5.9, an unquoted `=name` expands to the command's
+# full path. Bash never runs such a word as a command. As an argument it
+# is rare, so denying it is safe. Skip the test operators `= ` and `==`
+# and the `[[ ]]` regex operator `=~`.
+def _zsh_equals_word(raw):
+    """Whether *raw* holds an unquoted word that starts with `=` and has a
+    name after it (`=git`). The `=` must follow whitespace or one of
+    `;&|(){}` and a backtick, and must not be escaped (`foo\\ =git` is one
+    word)."""
+    if not isinstance(raw, str) or "=" not in raw:
+        return False
+    try:
+        text = _strip_heredocs(raw)
+    except ValueError:
+        text = raw
+    # zsh drops a backslash-newline before it splits words, so
+    # `true; \<newline>=git` runs =git. Drop each unescaped one first.
+    text = re.sub(r"(?<!\\)((?:\\\\)*)\\\n", r"\1", text)
+    mask, _quote = _quote_mask(text)
+    for i, ch in enumerate(text):
+        if ch != "=" or mask[i] or i + 1 == len(text):
+            continue
+        if i and (mask[i - 1] or not (
+                text[i - 1].isspace() or text[i - 1] in ";&|(){}`")):
+            continue
+        following = text[i + 1]
+        if not following.isspace() and following not in "=~":
+            return True
+    return False
+
+
 def _zsh_code_word(raw):
-    """Whether text *raw* holds a word with zsh code in an unquoted `(` --
-    see _ARRAY_ASSIGN_RE's comment. A `(` inside `[[ ... ]]` is a bash
+    """Whether *raw* uses zsh parameter code, expands `=word`, or holds code
+    in an unquoted `(` (see _ARRAY_ASSIGN_RE). A `(` inside `[[ ... ]]` is a bash
     regex group (`[[ $b =~ ^(a|b)$ ]]`) and does not count.
 
     Checked on the WHOLE command by _find_statements and _cd_target: the
     statement splitter reads `(` and `)` as a subshell, so no single
     statement keeps the word whole."""
+    if _zsh_param_code(raw):
+        return True
+    if _zsh_equals_word(raw):
+        return True
     if not _ZSH_PAREN_RE.search(raw):
         return False  # fast path: no `(` glued to a word character
     raw = _strip_heredocs(raw)
@@ -4298,14 +5842,111 @@ def _zsh_code_word(raw):
     return False
 
 
+_ZSH_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?\+?=")
+_ZSH_SPECIAL_ARRAY_RE = re.compile(
+    r"^(?:functions|functions_source|aliases|galiases|saliases|dis_aliases|"
+    r"dis_galiases|dis_saliases|dis_functions|commands|nameddirs|userdirs|"
+    r"options|builtins|dis_builtins|reswords|dis_reswords)(?:\[[^\]]*\])?\+?=")
+
+
+# Measured with zsh 5.9, eval expands a newly defined alias, writing to
+# functions defines a callable function, and hash binds a name to a path.
+# The hook cannot follow a name defined in the command. Profile aliases
+# defined before the command are outside this check's scope (see #246).
+# A structural word the scanner leaves at the head (`then`, `do`, `{`, `!`)
+# is skipped, so `if true; then alias tt=git; fi` is still seen.
+def _defines_command_name(argv):
+    """Whether statement *argv* defines a command name zsh will later run:
+    `alias`, `hash`, or a write to a special array (`functions[tt]=...`)."""
+    index = 0
+    while index < len(argv) and (_ZSH_ASSIGNMENT_RE.match(argv[index])
+                                 or argv[index] in _HEAD_LEAD_WORDS):
+        if _ZSH_SPECIAL_ARRAY_RE.match(argv[index]):
+            return True
+        index += 1
+    while index < len(argv) and (
+            argv[index] in _HEAD_LEAD_WORDS or argv[index] in (
+                "builtin", "command", "noglob", "nocorrect", "exec", "-")):
+        index += 1
+    if index == len(argv):
+        return False
+
+    head = argv[index]
+    if head == "alias":
+        return any("=" in word for word in argv[index + 1:])
+    if head == "hash":
+        return any("=" in word or (word.startswith("-")
+                                   and not word.startswith("--")
+                                   and ("p" in word or "d" in word))
+                   for word in argv[index + 1:])
+    if head in ("typeset", "declare", "local", "export", "readonly",
+                "integer", "float"):
+        return any(_ZSH_SPECIAL_ARRAY_RE.match(word)
+                   for word in argv[index + 1:])
+    return False
+
+
+# Measured with zsh 5.9: zsh removes quotes and backslashes before `setopt`
+# reads its argument, so `setopt glob'subst'`, `glob""subst` and `glob\subst`
+# all turn GLOB_SUBST on. With it on, `X='*(e:cmd:)'; echo $X` runs cmd.
+# _scan_commands already yields quote-removed words, so a word that merely
+# NAMES the option is enough to deny: it may come from `setopt`, `unsetopt`,
+# `emulate`, `set -o` or `zsh -o`, and the `no` form turns it on in an
+# `unsetopt`. A word holding an expansion after those commands
+# (`setopt $o`, `set -o $o`) can name it at run time, so it is denied too.
+_GLOB_SUBST_NAMES = ("globsubst", "noglobsubst", "oglobsubst",
+                     "onoglobsubst")
+_OPTION_COMMANDS = ("setopt", "unsetopt", "emulate")
+
+
+def _sets_glob_subst(argv):
+    """Whether statement *argv* names the GLOB_SUBST option, or may name it
+    through an expansion (`setopt $o`). Over-matches: `echo globsubst`
+    does too, and is denied."""
+    for word in argv:
+        name = word.lower().replace("_", "").lstrip("-+")
+        if name in _GLOB_SUBST_NAMES or (
+                word[:1] in ("-", "+") and name.endswith("globsubst")):
+            return True
+    index = 0
+    while index < len(argv) and (
+            _ZSH_ASSIGNMENT_RE.match(argv[index])
+            or argv[index] in _HEAD_LEAD_WORDS
+            or argv[index] in ("builtin", "command", "noglob", "nocorrect",
+                               "exec", "-")):
+        index += 1
+        # `command -p setopt $o`: skip the precommand's own options.
+        while (index < len(argv) and argv[index - 1] in ("command", "exec")
+               and argv[index].startswith("-") and argv[index] != "-"):
+            index += 1
+    if index == len(argv):
+        return False
+    rest = argv[index + 1:]
+    if argv[index] in _OPTION_COMMANDS:
+        return any(_carries_expansion(word) for word in rest)
+    if argv[index] == "set":
+        if "--" in rest:
+            rest = rest[:rest.index("--")]  # then positional arguments
+        # `set -o $o`, and a bundle holding o (`set -eo $o`).
+        takes_name = any(word[:1] in ("-", "+") and word[1:2] != "-"
+                         and "o" in word[1:] for word in rest)
+        return takes_name and any(_carries_expansion(word) for word in rest)
+    return False
+
+
 def _zsh_code_in(cmd):
     """Whether *cmd*, or any code it runs -- a shell payload, `eval`, a
-    `$( )` body, a heredoc fed to a shell -- holds a zsh code word. Inside
-    quotes the outer check cannot see it: `zsh -c "echo /tmp(e:'cmd':)"`
-    runs cmd (PR #121 review, measured). Propagates ValueError."""
+    `$( )` body, a heredoc fed to a shell -- defines a command name or
+    holds a zsh code word. Inside quotes the outer check cannot see it:
+    `zsh -c "echo /tmp(e:'cmd':)"` runs cmd (PR #121 review, measured).
+    Propagates ValueError."""
     if _zsh_code_word(cmd):
         return True
-    texts = {getattr(argv, "code", None) for argv in _scan_commands(cmd)}
+    texts = set()
+    for argv in _scan_commands(cmd):
+        if _defines_command_name(argv) or _sets_glob_subst(argv):
+            return True
+        texts.add(getattr(argv, "code", None))
     return any(text and text != cmd and _zsh_code_word(text)
                for text in texts)
 
@@ -4555,6 +6196,11 @@ def _verb_runs_after_chain(cmd, verb):
                for argv in scanned)
 
 
+def _exact_cd_path(match):
+    """The literal path word of an exact cd, with any quotes removed."""
+    return match.group("bare") or match.group("quoted")
+
+
 # How many nested whole-command subshells _cd_target unwraps. Deeper is
 # _SCOPE_UNKNOWN: 1,100 nested `( ... )` once recursed past Python's limit,
 # and the crash let the command through (PR #121 review).
@@ -4571,10 +6217,11 @@ def _cd_target(cmd, verb=None):
     that never runs (`false && cd /tmp; git push origin main`), and `$C X`
     with C=cd. Each read as a push in another project while it ran HERE.
 
-    1. The command opens with a plain `cd`, ONE literal absolute path in
-       [A-Za-z0-9._/@+-] (no quotes, `~`, `$`, globs or backslashes), then
-       `&&` -- checked on the RAW text. If the `cd` fails, `&&` skips the
-       next command, but a later `;`, `||` or newline still runs it HERE,
+    1. The command opens with a plain `cd`, ONE literal absolute or relative
+       path word, then `&&`. The raw word uses the _EXACT_CD_RE alphabet.
+       A single pair of matching quotes also permits spaces after the first
+       character. Leading `-` and `+` are excluded. If the `cd` fails, `&&`
+       skips the next command, but a later `;`, `||` or newline still runs it HERE,
        so every run of *verb* must sit inside the unbroken `&&` chain
        (_verb_runs_after_chain, #154). A background `&` or
        `coproc` anywhere voids the shape. The answer is that path. The
@@ -4600,10 +6247,9 @@ def _cd_target(cmd, verb=None):
        is taken from the shorter command; anything else is read from the
        whole command.
 
-    Legitimate multi-`cd` shapes (`cd /a && npm ci && cd /a && git push`,
-    `cd sub && git push`) are unknown now; that cost was accepted. A file
-    the command sources, or a script it runs, may change directory too; that
-    is outside the command text and not read.
+    Legitimate multi-`cd` shapes like `cd /a && npm ci && cd /a && git push`
+    are unknown. A sourced file or script may also change directory outside
+    the visible command text.
 
     *verb* is the run rule 2a checks; with none, any nested statement
     counts. Propagates ValueError from the scanner.
@@ -4634,15 +6280,16 @@ def _cd_target(cmd, verb=None):
     hidden = (_defines_function(cmd) or _EXPORTED_FUNCTION in cmd or
               _zsh_code_in(cmd))
     match = _EXACT_CD_RE.match(cmd)
+    path = _exact_cd_path(match) if match else None
     # A background job cannot move this shell, so it voids only the exact
     # shape: `cd /x && true & cmd` runs the cd in the background.
-    if (match and not hidden and movers == [0] and
+    if (path is not None and not hidden and movers == [0] and
             not _runs_in_background(cmd) and
-            list(scanned[0]) == ["cd", match.group(1)]):
+            list(scanned[0]) == ["cd", path]):
         if (_verb_runs_nested(cmd, scanned, verb) or
                 _verb_runs_after_chain(cmd, verb)):
             return _SCOPE_UNKNOWN
-        return match.group(1)
+        return path
     if movers or hidden:
         return _SCOPE_UNKNOWN
     return None
@@ -4654,6 +6301,8 @@ def _git_redirect_target(argv, words):
     None means "no redirect option": the run obeys the shell's cwd, so the
     `cd` rules answer for it. _SCOPE_UNKNOWN means a redirect IS present but
     does not name one resolvable directory -- callers read that as this repo.
+    A path carrying expansion or starting with `~` returns _SCOPE_UNKNOWN
+    because the shell's environment can differ from the hook's.
 
     git applies `-C` first and resolves `--git-dir` / `--work-tree` from
     there, and a push updates the GIT DIR, so `--git-dir` decides when it is
@@ -4713,6 +6362,8 @@ def _git_redirect_target(argv, words):
     if "-C" in seen and len(seen) > 1:
         return _SCOPE_UNKNOWN
     path = gitdir if gitdir is not None else chdir
+    if path is not None and (_carries_expansion(path) or path.startswith("~")):
+        return _SCOPE_UNKNOWN
     if (path is not None and not path.startswith(("/", "~")) and
             (env_gitdir or _RELATIVE_REDIRECT_RE.fullmatch(path))):
         # A literal relative GIT_DIR, `-C` or `--git-dir` names a directory
@@ -5225,6 +6876,60 @@ def _anchor(path, base):
     return None
 
 
+def _resolve_cd_scope(target, base):
+    """Resolve a relative cd logically from the payload cwd, if enterable."""
+    if target is None or target is _SCOPE_UNKNOWN:
+        return target
+    absolute = _normalised_cd_target(target) is not None
+    if not absolute and os.environ.get("CDPATH") and (
+            target not in (".", "..") and
+            not target.startswith(("./", "../"))):
+        return _SCOPE_UNKNOWN
+    try:
+        if ".." in target.split("/"):
+            # Measured on macOS: from `/`, bash and zsh run
+            # `cd ./var/../tftpboot/..` and land in /private, because
+            # /tftpboot is missing so the shell falls back to the physical
+            # path. A shell run with `set -P` (bash) or `setopt chase_dots`
+            # (zsh) is physical too, and the hook cannot see that. So a `..`
+            # is only read logically when logical and physical agree.
+            if not _dotdot_is_stable(target, base, absolute):
+                return _SCOPE_UNKNOWN
+        if absolute:
+            return target
+        # _anchor rejects NUL and requires an absolute base for a relative
+        # path. A missing relative target may still be found via a
+        # shell-only CDPATH.
+        joined = _anchor(target, base)
+        if (joined is not None and os.path.isdir(joined) and
+                os.access(joined, os.X_OK)):
+            return joined
+    except (OSError, ValueError):
+        pass
+    return _SCOPE_UNKNOWN
+
+
+def _dotdot_is_stable(target, base, absolute):
+    """Whether every `..` in *target* reads the same logically and
+    physically: each prefix before a `..` is an existing directory, and the
+    folded path resolves to the same place as the raw one."""
+    if _has_nul(target) or _has_nul(base):
+        return False
+    raw = os.path.expandvars(os.path.expanduser(target))
+    if not absolute:
+        if not (isinstance(base, str) and base.startswith("/")):
+            return False
+        raw = os.path.join(base, raw)
+    parts = raw.split("/")
+    for index, part in enumerate(parts):
+        if part == "..":
+            prefix = "/".join(parts[:index]) or "/"
+            if not os.path.isdir(prefix):
+                return False
+    return (os.path.realpath(os.path.normpath(raw)) ==
+            os.path.realpath(raw))
+
+
 def _physical_path(path, base):
     """*path* resolved as the KERNEL resolves it -- `env -C`, `GIT_DIR`,
     `git -C` all chdir(2) or open through it -- so `link/..` is the
@@ -5319,10 +7024,9 @@ def _command_scope_uncached(cmd, verb=None, base=None):
     scope = _command_scope_raw(cmd, verb, base)
     if _has_nul(scope):
         return _SCOPE_UNKNOWN  # see _has_nul: no directory to follow
-    if (isinstance(scope, str) and base is not None and
-            _normalised_cd_target(scope) is None):
+    if isinstance(scope, str) and not scope.startswith("/"):
         anchored = _anchor(scope, base)
-        return anchored if anchored is not None else scope
+        return anchored if anchored is not None else _SCOPE_UNKNOWN
     return scope
 
 
@@ -5349,12 +7053,13 @@ def _command_scope_raw(cmd, verb=None, base=None):
     command. A hidden git run (#98) scores as unknown -- see the loop.
     *base* is the absolute payload cwd, or None. A relative GIT_DIR or
     `env -C` is anchored to it or to an absolute `cd`, else unknown.
-    _cd_target itself returns only an absolute path, None or unknown.
+    A relative `cd` is resolved against *base* before scoring the runs.
 
     Propagates ValueError like _cd_target does.
     """
     words = list(verb) if verb else []
     target = _cd_target(cmd, words or None)
+    target = _resolve_cd_scope(target, base)
     if not words:
         return target
     statements = _find_statements(cmd, words)
@@ -5463,13 +7168,11 @@ _MAX_INPUT_BYTES = 8 * _MAX_COMMAND_BYTES
 def _read_hook_input():
     """``(data, problem)`` from the hook's stdin (#152).
 
-    *problem* is None, or a phrase each hook puts in its own deny. A raise
-    here would exit 1, a NON-BLOCKING error, and the call would run, so every
-    failure is caught: a closed stdin (`sys.stdin` is None), a closed file
-    (ValueError), a non-blocking stdin with no data (read returns None),
-    invalid UTF-8, and the parse, where deep nesting raises RecursionError,
-    not a ValueError. *data* is whatever the JSON holds; each
-    hook still checks its shape.
+    *problem* is None, or a phrase each hook puts in its own deny. The crash
+    guard exits 2 on an uncaught exception. Catching read and parse failures
+    here gives the deny a specific reason, including for closed stdin,
+    invalid UTF-8, and JSON nested deeply enough to raise RecursionError.
+    *data* is whatever the JSON holds. Each hook still checks its shape.
     """
     try:
         raw = sys.stdin.buffer.read(_MAX_INPUT_BYTES + 1)
@@ -5491,6 +7194,7 @@ def _read_hook_input():
 # the review measured `$x` on 2 MB of lines at 8.5-10.3 s under load -- so the
 # hook stops itself first, at 7 s, and denies.
 _DEADLINE_SECONDS = 7.0
+_DEADLINE_ARMED = []
 _DEADLINE_REASON = (
     "This guard ran out of time checking this command; split it or write "
     "large content with the Write tool.")
@@ -5519,6 +7223,8 @@ def _arm_deadline():
     `try` that would swallow SystemExit. Writes straight to fd 1 for the same
     reason. A platform without setitimer runs without the deadline, as before.
     """
+    if _DEADLINE_ARMED:
+        return
     import signal as _signal
     if not hasattr(_signal, "setitimer"):
         return
@@ -5545,6 +7251,7 @@ def _arm_deadline():
     _signal.signal(_signal.SIGALRM, _expired)
     _signal.setitimer(_signal.ITIMER_REAL, _deadline_seconds(
         os.environ.get("HARDEN_HOOK_DEADLINE")))
+    _DEADLINE_ARMED.append(True)
 
 
 def _disarm_deadline():
@@ -5552,6 +7259,7 @@ def _disarm_deadline():
     import signal as _signal
     if hasattr(_signal, "setitimer"):
         _signal.setitimer(_signal.ITIMER_REAL, 0)
+    _DEADLINE_ARMED.clear()
 
 
 # Non-empty once _emit has started. A list, so no `global` is needed.
@@ -5569,10 +7277,22 @@ def _note_command(command, verb):
 
 
 def _add_alias_note(spec):
-    """Put the alias sentence before a deny reason in *spec* when the noted
-    command sets a git alias or include. Never raises: a crash here would
-    turn the deny into exit 1, which lets the command run."""
+    """Put a sentence before a deny reason in *spec*: the runner sentence
+    when the noted command sets a config key or environment variable that
+    makes git run another program (and no alias source), else the alias
+    sentence when it sets a git alias or include. The crash guard exits 2 on
+    an uncaught exception. Catch note errors here to preserve the deny reason."""
     try:
+        if (len(_NOTED_COMMAND) == 2 and
+                _sets_git_runner_config(_NOTED_COMMAND[0]) and
+                not _sets_git_alias_only(_NOTED_COMMAND[0])):
+            reason = spec.get("permissionDecisionReason", "")
+            spec["permissionDecisionReason"] = (
+                "This command sets git config or an environment variable that "
+                "can make git run another program. A hook cannot see what that "
+                "program runs, so it could run `%s`. Drop the setting or run "
+                "the git command itself.\n\n" % _NOTED_COMMAND[1]) + reason
+            return
         if len(_NOTED_COMMAND) != 2 or not _sets_git_alias(_NOTED_COMMAND[0]):
             return
         reason = spec.get("permissionDecisionReason", "")
@@ -5851,7 +7571,7 @@ def _git_common_dir(path):
         proc = _subprocess.run(
             ["git", "-C", str(path), "rev-parse", "--path-format=absolute",
              "--git-common-dir"],
-            capture_output=True, text=True, timeout=10)
+            capture_output=True, text=True, timeout=5)
     except (OSError, ValueError, _subprocess.SubprocessError):
         return None
     if proc.returncode != 0:
@@ -5993,6 +7713,122 @@ def _effective_cwd(cmd, default, verb=None, base=None):
         return default
     return resolved
 # --- END shared repo identity v1 ---
+
+
+# --- BEGIN shared repo config v1 (keep in sync across all hook copies) ---
+import json as _cfg_json
+import os as _cfg_os
+import re as _cfg_re
+import stat as _cfg_stat
+
+_REPO_CONFIG_NAME = "harden-repo.json"
+_CFG_MAX_BYTES = 16384
+
+
+def _repo_config_path():
+    hook_dir = _cfg_os.path.dirname(_cfg_os.path.abspath(__file__))
+    return _cfg_os.path.join(_cfg_os.path.dirname(hook_dir), _REPO_CONFIG_NAME)
+
+
+def _cfg_unique_keys(pairs):
+    obj = {}
+    for key, value in pairs:
+        if key in obj:
+            raise ValueError(f"duplicate key {key!r}")
+        obj[key] = value
+    return obj
+
+
+def _cfg_bad_constant(value):
+    raise ValueError(f"{value} is not a JSON number")
+
+
+def _cfg_object(value, name, keys):
+    if not isinstance(value, dict):
+        raise ValueError(f"{name} must be an object")
+    for key in value:
+        if key not in keys:
+            raise ValueError(f"unknown key {key!r} in {name}")
+    return value
+
+
+def _cfg_names(values, name, minimum, maximum, pattern, reserved=()):
+    if not isinstance(values, list) or not minimum <= len(values) <= maximum:
+        raise ValueError(f"{name} must be a list with {minimum} to {maximum} entries")
+    seen = set()
+    for index, item in enumerate(values):
+        if not isinstance(item, str) or not _cfg_re.fullmatch(pattern, item):
+            raise ValueError(f"{name}[{index}] must be a string matching {pattern}")
+        if item in reserved:
+            raise ValueError(f"{name}[{index}] {item!r} is reserved")
+        if item in seen:
+            raise ValueError(f"{name}[{index}] repeats {item!r}")
+        seen.add(item)
+    return tuple(values)
+
+
+def _load_repo_config(path=None):
+    config = {"branch_prefixes": (), "release_style": "version",
+              "package_dirs": ("packages",), "allow_skip_env": True}
+    try:
+        path = _repo_config_path() if path is None else path
+        try:
+            info = _cfg_os.lstat(path)
+        except FileNotFoundError:
+            return config, None
+        if not _cfg_stat.S_ISREG(info.st_mode):
+            raise ValueError("expected a regular file")
+        flags = _cfg_os.O_RDONLY | _cfg_os.O_NOFOLLOW | getattr(_cfg_os, "O_NONBLOCK", 0)
+        fd = _cfg_os.open(path, flags)
+        try:
+            # The file may have changed since lstat.
+            if not _cfg_stat.S_ISREG(_cfg_os.fstat(fd).st_mode):
+                raise ValueError("expected a regular file")
+            data = bytearray()
+            while chunk := _cfg_os.read(fd, _CFG_MAX_BYTES + 1 - len(data)):
+                data.extend(chunk)
+                if len(data) > _CFG_MAX_BYTES:
+                    raise ValueError(f"file exceeds {_CFG_MAX_BYTES} bytes")
+        finally:
+            _cfg_os.close(fd)
+        obj = _cfg_json.loads(data.decode("utf-8"), object_pairs_hook=_cfg_unique_keys,
+                              parse_constant=_cfg_bad_constant)
+        _cfg_object(obj, "config", ("version", "branch_prefixes", "releases", "preflight"))
+        version = obj.get("version", 1)
+        if type(version) is not int or version != 1:
+            raise ValueError("version must be the integer 1")
+        if "branch_prefixes" in obj:
+            config["branch_prefixes"] = _cfg_names(
+                obj["branch_prefixes"], "branch_prefixes", 0, 16, r"[a-z][a-z0-9-]{0,31}",
+                ("feature", "release", "hotfix", "main", "master", "develop"))
+        releases = _cfg_object(obj.get("releases", {}), "releases", ("style", "package_dirs"))
+        style = releases.get("style", config["release_style"])
+        if style not in ("version", "package"):
+            raise ValueError("releases.style must be 'version' or 'package'")
+        config["release_style"] = style
+        if "package_dirs" in releases:
+            if style != "package":
+                raise ValueError("releases.package_dirs requires style 'package'")
+            config["package_dirs"] = _cfg_names(releases["package_dirs"], "releases.package_dirs",
+                                                1, 8, r"[A-Za-z0-9_][A-Za-z0-9_-]{0,63}")
+        preflight = _cfg_object(obj.get("preflight", {}), "preflight", ("allow_skip_env",))
+        config["allow_skip_env"] = preflight.get("allow_skip_env", config["allow_skip_env"])
+        if not isinstance(config["allow_skip_env"], bool):
+            raise ValueError("preflight.allow_skip_env must be a boolean")
+        return config, None
+    except Exception as exc:  # noqa: BLE001 -- Fail closed on any read or config error.
+        return None, " ".join(str(exc).splitlines()) or type(exc).__name__
+
+
+def _repo_config_reason(problem):
+    return (f"❌ {_repo_config_path()}: {problem}. This hook denies the command until "
+            "you fix or remove the file. A missing file means defaults.")
+# --- END shared repo config v1 ---
+
+# Cover module initialization and main() with the same deadline.
+if __name__ == "__main__":
+    _arm_deadline()
+
 
 # The two verb runs this hook judges.
 CREATE = ["gh", "pr", "create"]
@@ -6460,8 +8296,10 @@ def _unreadable_create():
     block(
         "❌ PR base branch cannot be checked!\n\n"
         "gh pr create takes an option or a word this check cannot read "
-        "exactly (a variable, a command substitution, a glob, or an option "
-        "gh does not have), so the PR's head and base are unknown.\n"
+        "exactly (a variable, a command substitution, a glob, arguments "
+        "supplied by xargs, find -exec or parallel, inline code in python -c "
+        "or perl -e, or an option gh does not have), so the PR's head and "
+        "base are unknown.\n"
         "Write the options out literally, for example:\n\n"
         "  gh pr create --base develop --title \"...\"")
 
@@ -6470,10 +8308,8 @@ def _unreadable_create():
 # gh pr create
 # --------------------------------------------------------------------------- #
 
-def _check_create(argv, words, cwd, branch_unknown):
-    """Deny one create whose head may be a feature branch and whose bases
-    are not all develop. A create that cannot be read (see _gh_walk) has an
-    unknown head and is denied."""
+def _check_create(argv, words, cwd, branch_unknown, feature_prefixes):
+    """Require develop for feature branches, configured prefixes and unknown heads."""
     readable, _args, options = _gh_walk(
         argv, words, _CREATE_NAMES, _CREATE_TABLES, _CREATE_TEXT_VALUES)
     if not readable:
@@ -6494,11 +8330,14 @@ def _check_create(argv, words, cwd, branch_unknown):
         else:
             heads.append(branch)
             heads.extend(tracked)
-    feature = [head for head in heads if head.startswith("feature/")]
+    feature = [head for head in heads if head.startswith(feature_prefixes)]
     if not feature and not unknown:
-        return  # not a feature branch: Git Flow allows any base here
-    who = (f"Feature branch '{feature[0]}'" if feature else
-           "This PR's head branch cannot be read, so it")
+        return
+    if feature:
+        kind = feature[0].split("/", 1)[0]
+        who = f"{kind.capitalize()} branch '{feature[0]}'"
+    else:
+        who = "This PR's head branch cannot be read, so it"
     bases = [value for name, value in options if name == "base"]
     if not bases:
         block(
@@ -6581,10 +8420,8 @@ def _merge_targets(argv):
     return selectors, extras, (repos[0] if repos else None)
 
 
-def _check_merge(argv, cwd):
-    """Deny one merge unless every PR it may merge is based where Git Flow
-    says: feature/* on develop; release/* and hotfix/* on main or (the
-    back-merge) develop."""
+def _check_merge(argv, cwd, feature_prefixes):
+    """Check the base of every PR the command may merge."""
     selectors, extras, repo = _merge_targets(argv)
     repo_args = ["--repo", repo] if repo else []
     if not selectors:
@@ -6615,9 +8452,10 @@ def _check_merge(argv, cwd):
                 "Merge blocked because the safety check could not run.\n"
                 "Common causes: gh auth expired, network issue, invalid PR "
                 "number.")
-        if head.startswith("feature/") and base != "develop":
+        if head.startswith(feature_prefixes) and base != "develop":
+            kind = head.split("/", 1)[0]
             block(
-                f"❌ PR {selector} targets '{base}' but feature branches "
+                f"❌ PR {selector} targets '{base}' but {kind} branches "
                 "must merge to 'develop'!\n\n"
                 f"PR head: {head}\n"
                 f"PR base: {base}\n\n"
@@ -6775,10 +8613,10 @@ def _in_other_clone(command, default, words, payload_cwd):
 
 
 def main():
-    # A crash is exit 1, a NON-BLOCKING error: the PR would go ahead. Every
-    # wrong type below is therefore a deny. Stop before the harness timeout,
-    # which would let the tool call through -- see _arm_deadline. Armed before
-    # the read, so a stdin that never closes is bounded too (#152).
+    # The crash guard exits 2 on an uncaught exception. Check input types
+    # here so the deny identifies the malformed input.
+    # Stop before the harness timeout, which would let the tool call through.
+    # Arm the deadline before the read to bound a stdin that never closes (#152).
     _arm_deadline()
     input_data, problem = _read_hook_input()
     if problem:
@@ -6827,40 +8665,36 @@ def main():
     # A statement that names its repository is judged wherever it runs: a
     # `cd` out of the project does not change the repository gh acts on
     # (#151).
-    for words, found in creates:
+    feature_prefixes = None
+    for words, found in [*creates, (MERGE, merges)]:
         if not found:
             continue
+        merge = words == MERGE
         here = _targets_this_project(command, words, payload_cwd)
         clone = None
         judged = []
         for argv in found:
-            if here or _names_repo(command, argv, words, False):
+            if here or _names_repo(command, argv, words, merge):
                 judged.append(argv)
                 continue
             if clone is None:
                 clone = _in_other_clone(command, default, words, payload_cwd)
             if clone:
                 judged.append(argv)
-        if judged:
+        if not judged:
+            continue
+        if feature_prefixes is None:
+            config, problem = _load_repo_config()
+            if problem:
+                block(_repo_config_reason(problem))
+            feature_prefixes = tuple(prefix + "/" for prefix in ("feature", *config["branch_prefixes"]))
+        if not merge:
             cwd = _effective_cwd(command, default, words, base=payload_cwd)
             unknown = _scope_unknown(command, words, payload_cwd)
             for argv in judged:
-                _check_create(argv, words, cwd, unknown)
+                _check_create(argv, words, cwd, unknown, feature_prefixes)
+            continue
 
-    if merges:
-        here = _targets_this_project(command, MERGE, payload_cwd)
-        clone = None
-        judged = []
-        for argv in merges:
-            if here or _names_repo(command, argv, MERGE, True):
-                judged.append(argv)
-                continue
-            if clone is None:
-                clone = _in_other_clone(command, default, MERGE, payload_cwd)
-            if clone:
-                judged.append(argv)
-        merges = judged
-    if merges:
         _check_merge_alone(command)
         if _GH_REPO_ENV_RE.search(_QUOTES_RE.sub("", command)):
             block(
@@ -6874,8 +8708,8 @@ def main():
                 "the PR from that directory's repository. cd to a literal "
                 "path first.")
         cwd = _effective_cwd(command, default, MERGE, base=payload_cwd)
-        for argv in merges:
-            _check_merge(argv, cwd)
+        for argv in judged:
+            _check_merge(argv, cwd, feature_prefixes)
 
     # Not a PR command, or every check passed: allow.
     sys.exit(0)

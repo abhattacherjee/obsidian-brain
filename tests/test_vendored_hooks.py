@@ -1,14 +1,19 @@
-"""Subprocess acceptance tests for harden-repo v1.3.1 (release/v1.3.1, f2574b5).
+"""Subprocess acceptance tests for the vendored harden-repo hooks and preflight.
+
+The vendored files are whatever harden-repo release fleet-sync last applied
+(v1.5.0, 9424640, at #532). No test here pins one release's bytes: the
+generation test reads harden-repo's own template ledger instead.
 
 All Git state belongs to per-test repositories. Commands in hook payloads are
 judged, never executed; the Bash truth checks only run git --version or type.
 """
 
-import hashlib
+import importlib.util
 import json
 import math
 import os
 from pathlib import Path
+import pwd
 import shlex
 import shutil
 import subprocess
@@ -21,19 +26,16 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 HOOKS = ROOT / ".claude" / "hooks"
-# The vendored bytes at harden-repo v1.3.1, release commit f2574b5 (#418, #485).
-V131_SHA256 = {
-    "enforce-pr-base-branch.py":
-        "d19e6cdb6dad27298056c1162949810587e953820ae10b7ac85a58dc51e40d11",
-    "prevent-direct-push.py":
-        "55bedda32d22efc3479b8a33c23574a13a490ecf6570104fc15513d118371352",
-    "require-preflight.py":
-        "c522396fc9b2c0b0a9a46c654bb29e855a828fd4d34f6003ecdeacd85cd8144b",
-    "update-changelog-before-pr.py":
-        "6a9ec20375ed9cfe6a21b4a2e7a62db1697c29dc6577162f4330834f6ef7156a",
-    "validate-branch-name.py":
-        "c1db1f0b551b315d82f90c83fa0f9fd806ff4f85a8a4e3d5ad69faae775eab77",
+# The files harden-repo vendors here, by their path in its templates/.
+VENDORED = {
+    ".claude/hooks/enforce-pr-base-branch.py": "templates/hooks/enforce-pr-base-branch.py",
+    ".claude/hooks/prevent-direct-push.py": "templates/hooks/prevent-direct-push.py",
+    ".claude/hooks/require-preflight.py": "templates/hooks/require-preflight.py",
+    ".claude/hooks/update-changelog-before-pr.py": "templates/hooks/update-changelog-before-pr.py",
+    ".claude/hooks/validate-branch-name.py": "templates/hooks/validate-branch-name.py",
+    "scripts/commit-preflight.sh": "templates/scripts/commit-preflight.sh",
 }
+HARDEN_ROOT_ENV = "OB_HARDEN_REPO_ROOT"
 
 GATES = (
     pytest.param("require-preflight.py", "git", "commit -m x", id="preflight"),
@@ -81,12 +83,10 @@ def _git(repo, *args, cwd=None):
 
 
 def _token_path(repo, cwd):
-    """Match commit-preflight.sh's real git-common-dir key, including worktrees."""
-    common = _git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir",
-                  cwd=cwd)
-    key = os.path.realpath(common)
-    digest = hashlib.md5(key.encode()).hexdigest()[:8]
-    return Path(f"/tmp/.preflight-token-{digest}")
+    """The pair's token path for *cwd* under the repo's own HOME: the same
+    git-common-dir key for a worktree and its main checkout (#532)."""
+    from preflight_token import token_path
+    return token_path(cwd, repo.env)
 
 
 @pytest.fixture
@@ -111,6 +111,12 @@ def repo(tmp_path):
     env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull,
                GIT_CONFIG_NOSYSTEM="1", GIT_TERMINAL_PROMPT="0",
                CLAUDE_PROJECT_DIR=str(work))
+    # One HOME for the hooks and the preflight, so both name one token path,
+    # and `_heavy` never finds the live ~/.claude/bin/heavy (#525, #532).
+    home = tmp_path / "home"
+    home.mkdir()
+    env.pop("XDG_CACHE_HOME", None)
+    env["HOME"] = str(home)
     sandbox = Repo(work, env, tmp_path / "unused")
     _git(sandbox, "init", "-q", "-b", "main")
     for key, value in (("user.name", "Hook Test"),
@@ -125,7 +131,7 @@ def repo(tmp_path):
     token = _token_path(sandbox, work)
     lock = Path(str(token) + ".lock")
     # Refuse a hash collision or a stale file rather than remove someone
-    # else's machine-wide token. No /tmp globbing, even during teardown.
+    # else's token. No globbing, even during teardown.
     assert not os.path.lexists(token), f"Token path already occupied: {token}"
     assert not os.path.lexists(lock), f"Token lock already occupied: {lock}"
     sandbox = sandbox._replace(token=token)
@@ -189,13 +195,127 @@ def _write_bound_token(repo, cwd, **overrides):
     return token
 
 
-@pytest.mark.parametrize("hook", V131_SHA256, ids=list(V131_SHA256))
-def test_hook_bytes_match_harden_repo_v131(hook):
-    """#418: local edits cannot silently diverge from the v1.3.1 templates."""
-    assert hashlib.sha256((HOOKS / hook).read_bytes()).hexdigest() == V131_SHA256[hook], (
-        f"{hook} differs from harden-repo v1.3.1 (f2574b5); "
-        "re-vendor from harden-repo rather than edit by hand."
-    )
+def _harden_roots():
+    """harden-repo trees that can vouch for a vendored file, newest first.
+
+    $OB_HARDEN_REPO_ROOT, then the installed plugin (every cached version and
+    the marketplace clone) and the dev checkout, all under the real home: the
+    tests run with a tmp HOME. A tree counts only with its ledger, its
+    doctor_core.py and its plugin.json."""
+    home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+    candidates = []
+    if os.environ.get(HARDEN_ROOT_ENV):
+        candidates.append(Path(os.environ[HARDEN_ROOT_ENV]))
+    cache = home / ".claude/plugins/cache/harden-repo/repo-hardener"
+    if cache.is_dir():
+        candidates.extend(sorted(cache.iterdir()))
+    candidates.append(home / ".claude/plugins/marketplaces/harden-repo")
+    candidates.append(home / "dev/claude_workspace/harden-repo")
+    roots = []
+    for root in candidates:
+        if all((root / rel).is_file() for rel in (
+                "skills/harden-repo/data/template-ledger.json",
+                "skills/harden-repo/scripts/doctor_core.py",
+                ".claude-plugin/plugin.json")):
+            roots.append(root)
+    return roots
+
+
+def _load_doctor_core(root, index):
+    """That tree's own doctor_core, under a name of its own."""
+    spec = importlib.util.spec_from_file_location(
+        f"_ob_doctor_core_{index}", root / "skills/harden-repo/scripts/doctor_core.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _norm_version(version):
+    return version[1:] if version.startswith("v") else version
+
+
+def _vendored_versions(roots, files):
+    """{vendored path: set of harden-repo versions whose bytes it matches}.
+
+    A file matches a version when that tree's ledger records its hash for the
+    template (every release before the tree's own), or when it equals the
+    tree's own template (the tree's release). Hashes come from the tree's
+    doctor_core.artifact_hash, which sets marker bodies aside, so
+    commit-preflight.sh matches with this repo's LINT and TEST bodies in."""
+    found = {rel: set() for rel in files}
+    for index, root in enumerate(roots):
+        core = _load_doctor_core(root, index)
+        ledger = json.loads(
+            (root / "skills/harden-repo/data/template-ledger.json").read_text(encoding="utf-8"))
+        own = _norm_version(json.loads(
+            (root / ".claude-plugin/plugin.json").read_text(encoding="utf-8"))["version"])
+        for rel, text in files.items():
+            template_rel = VENDORED[rel]
+            digest = core.artifact_hash(text)
+            for version in (ledger.get(template_rel) or {}).get(digest) or []:
+                found[rel].add(_norm_version(version))
+            template = root / template_rel
+            if template.is_file() and digest == core.artifact_hash(
+                    template.read_text(encoding="utf-8")):
+                found[rel].add(own)
+    return found
+
+
+def _vendored_files():
+    return {rel: (ROOT / rel).read_text(encoding="utf-8") for rel in VENDORED}
+
+
+def test_vendored_files_are_one_released_generation():
+    """#418, #532: the five hooks and commit-preflight.sh are bytes some
+    harden-repo release shipped (outside the preflight's marker blocks), and
+    all six come from one release, so the hook never pairs with a script that
+    writes its token elsewhere. Any later release passes once fleet-sync
+    applies it: nothing here names a version.
+
+    Needs a harden-repo tree (see _harden_roots). CI has none, so it skips
+    there; a copied ledger would be one more pin to update by hand."""
+    roots = _harden_roots()
+    if not roots:
+        pytest.skip(f"no harden-repo tree found; set {HARDEN_ROOT_ENV}")
+    found = _vendored_versions(roots, _vendored_files())
+    unknown = sorted(rel for rel, versions in found.items() if not versions)
+    assert not unknown, (
+        f"{unknown} match no harden-repo release in {[str(r) for r in roots]}; "
+        "re-vendor with doctor.py --fix --safe rather than edit by hand.")
+    shared = set.intersection(*found.values())
+    assert shared, f"the vendored files come from different releases: {found}"
+
+
+def test_a_local_edit_matches_no_release():
+    """Mutation control for the generation test: one changed byte in a hook
+    is in no ledger, and a hook from another release breaks the shared set."""
+    roots = _harden_roots()
+    if not roots:
+        pytest.skip(f"no harden-repo tree found; set {HARDEN_ROOT_ENV}")
+    files = _vendored_files()
+    edited = dict(files)
+    hook = ".claude/hooks/prevent-direct-push.py"
+    edited[hook] = files[hook] + "# local edit\n"
+    assert not _vendored_versions(roots, edited)[hook]
+    found = _vendored_versions(roots, files)
+    assert found[hook], "the control needs the real file to match first"
+
+
+def test_a_tree_without_the_current_release_fails_not_skips(tmp_path):
+    """A harden-repo tree older than the vendored files (a stale plugin
+    cache) must fail the generation test, not skip it."""
+    roots = _harden_roots()
+    if not roots:
+        pytest.skip(f"no harden-repo tree found; set {HARDEN_ROOT_ENV}")
+    files = _vendored_files()
+    current = set.intersection(*_vendored_versions(roots, files).values())
+    assert current, "the vendored files must match a release first"
+    stale = [r for r in roots
+             if not set.intersection(*_vendored_versions([r], files).values())]
+    if not stale:
+        pytest.skip("every harden-repo tree found already knows this release")
+    found = _vendored_versions(stale, files)
+    assert not set.intersection(*found.values())
 
 
 def test_worktree_preflight_token_allows_its_own_checkout(repo):
@@ -388,33 +508,49 @@ def _write_manifests(root, plugin_version, market_version):
         {"plugins": [{"name": "probe", "version": market_version}]}), encoding="utf-8")
 
 
-@pytest.mark.parametrize("flags", [
-    pytest.param(["--docs-only"], id="docs-only"),
-    pytest.param(["--skip-tests", "probe"], id="skip-tests"),
-    pytest.param(["--auto"], id="auto"),
-])
+def _preflight(repo, *flags):
+    for name in ("pre-commit.sh",):
+        dest = repo.root / "scripts" / name
+        if not dest.exists():
+            shutil.copy2(ROOT / "scripts" / name, dest)
+    return subprocess.run(
+        ["bash", str(repo.root / "scripts" / "commit-preflight.sh"), *flags],
+        cwd=repo.root, env=repo.env, capture_output=True, text=True,
+        timeout=120, stdin=subprocess.DEVNULL,
+    )
+
+
 @pytest.mark.parametrize("market,expected_rc", [
     pytest.param("1.0.0", 0, id="in-sync-control"),
     pytest.param("0.0.0", 1, id="mismatch"),
 ])
-def test_version_sync_runs_before_every_skip_mode(repo, flags, market, expected_rc):
-    """Repo part of the vendored preflight: no skip flag bypasses version sync."""
+def test_version_sync_runs_in_the_lint_block(repo, market, expected_rc):
+    """Repo part of the preflight, in its LINT marker block since #532: a
+    version mismatch fails the run and leaves no token; in sync, the token
+    records that the check ran. Skip modes exit before the LINT block;
+    tests/test_manifest_version_sync.py covers them in CI."""
     _write_manifests(repo.root, "1.0.0", market)
     _git(repo, "add", ".claude-plugin")
-    # A tmp HOME, so the preflight's `_heavy` never finds the live
-    # ~/.claude/bin/heavy (#525).
-    home = repo.root.parent / "home"
-    home.mkdir(exist_ok=True)
-    proc = subprocess.run(
-        ["bash", str(repo.root / "scripts" / "commit-preflight.sh"), *flags],
-        cwd=repo.root, env={**repo.env, "HOME": str(home)}, capture_output=True,
-        text=True, timeout=60,
-        stdin=subprocess.DEVNULL,
-    )
+    proc = _preflight(repo)
     assert proc.returncode == expected_rc, proc.stdout[-800:] + proc.stderr[-400:]
     assert repo.token.exists() is (expected_rc == 0), "a failed preflight must leave no token"
     if expected_rc:
         assert "MISMATCH" in proc.stdout
+    else:
+        checks = json.loads(repo.token.read_text(encoding="utf-8"))["checks_run"]
+        assert "version-sync" in checks.split(","), checks
+
+
+def test_a_malformed_marketplace_fails_the_version_sync(repo):
+    """Exit 2 from the check (a structural error) fails the run too."""
+    _write_manifests(repo.root, "1.0.0", "1.0.0")
+    (repo.root / ".claude-plugin" / "marketplace.json").write_text(
+        json.dumps({"plugins": "not a list"}), encoding="utf-8")
+    _git(repo, "add", ".claude-plugin")
+    proc = _preflight(repo)
+    assert proc.returncode == 1, proc.stdout[-800:]
+    assert "version check failed (exit 2" in proc.stdout
+    assert not repo.token.exists()
 
 
 def test_staging_and_commit_in_one_call_cannot_reuse_a_checked_tree(repo):
