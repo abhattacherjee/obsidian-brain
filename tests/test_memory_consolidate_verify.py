@@ -224,6 +224,17 @@ def test_manifest_has_its_own_size_cap(backup, monkeypatch):
         mc.verify(backup)
 
 
+@pytest.mark.parametrize("files", [False, None, {}, [], "x"])
+def test_malformed_manifest_files_is_an_error(backup, files):
+    """A manifest whose file list is not a non-empty list stops verify; it never reads as empty."""
+    data = json.loads((backup / "manifest.json").read_text())
+    data["files"] = files
+    (backup / "manifest.json").write_text(json.dumps(data))
+    (backup / "full-copy/stay.md").unlink()
+    with pytest.raises(mc.ApplyError, match="cannot read manifest.json"):
+        mc.verify(backup)
+
+
 def test_still_in_store(env, backup, capsys):
     """An original copied back into the store fails backups-present (and is an orphan)."""
     (env["store"] / "project_c.md").write_text((backup / "moved/project_c.md").read_text())

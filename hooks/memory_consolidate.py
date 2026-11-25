@@ -1266,13 +1266,15 @@ def _verify_run(backup_dir: Path, run: dict, store: Path | None) -> tuple[bool, 
     try:
         raw, _ = _read_file(backup_dir / "manifest.json", _MANIFEST_LIMIT)
         listed = json.loads(raw)["files"]
+        if not isinstance(listed, list) or not listed:
+            raise TypeError("files must be a non-empty list")
     except StoreError as exc:
         if (backup_dir / "manifest.json").exists():
             raise ApplyError(f"cannot read manifest.json: {exc}") from exc
         damaged.append("missing manifest.json")
     except (ValueError, KeyError, TypeError, RecursionError) as exc:
         raise ApplyError(f"cannot read manifest.json: {exc}") from exc
-    for row in listed or []:
+    for row in listed if listed is not None else []:
         path = full / row["name"]
         try:
             _contained(path.parent, full)
