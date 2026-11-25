@@ -3222,7 +3222,7 @@
         ]
       }
     ],
-    "preflight": "./scripts/commit-preflight.sh — manifest-sync (always-on) + secret-scan + pytest cov>=90 (via the heavy-run slot); required before every commit, staged and committed in separate calls",
+    "preflight": "./scripts/commit-preflight.sh — manifest-sync (LINT block; skipped by --docs-only, --skip-tests and a docs-only --auto, and checked in CI by tests/test_manifest_version_sync.py) + secret-scan + pytest cov>=90 (via the heavy-run slot); required before every commit, staged and committed in separate calls",
     "plugin": "abhattacherjee/git-flow",
     "currentVersion": "3.4.2"
   },

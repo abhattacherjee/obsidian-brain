@@ -558,7 +558,11 @@ plugins = market.get("plugins")
 if not isinstance(plugins, list):
     sys.stderr.write("marketplace.json has no 'plugins' list\n")
     sys.exit(2)
-entries = [p for p in plugins if isinstance(p, dict) and p.get("name") == plugin_name]
+bad = [p for p in plugins if not isinstance(p, dict) or not isinstance(p.get("name"), str) or not p["name"]]
+if bad:
+    sys.stderr.write(f"marketplace.json plugins entry is not an object with a name: {bad!r}\n")
+    sys.exit(2)
+entries = [p for p in plugins if p.get("name") == plugin_name]
 if not entries:
     sys.stderr.write(f"marketplace.json has no entry for '{plugin_name}'\n")
     sys.exit(2)
