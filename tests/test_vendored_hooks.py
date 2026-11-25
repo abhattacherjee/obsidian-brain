@@ -304,9 +304,13 @@ def _assert_one_generation(roots, files):
     pytest.param({"a": {"1.5.0"}, "b": {"1.5.0", "1.5.1"}}, None, id="shared"),
     pytest.param({"a": set(), "b": {"1.5.0"}}, "unknown", id="unknown"),
     pytest.param({"a": {"1.4.0"}, "b": {"1.5.0"}}, "mixed", id="mixed"),
-    # Every pair shares a release, all three do not: a pairwise check passes this.
+    # Every file overlaps the first, none is shared by all: a compare-to-first
+    # rule passes this.
     pytest.param({"a": {"1.4.0", "1.5.0"}, "b": {"1.4.0"}, "c": {"1.5.0"}}, "mixed",
-                 id="pairwise-but-not-shared"),
+                 id="overlaps-the-first-but-not-shared"),
+    # Every pair overlaps, none is shared by all three: an all-pairs rule passes this.
+    pytest.param({"a": {"1.3.0", "1.4.0"}, "b": {"1.4.0", "1.5.0"}, "c": {"1.3.0", "1.5.0"}},
+                 "mixed", id="every-pair-overlaps-but-not-shared"),
 ])
 def test_the_generation_rule_on_its_own(found, expected):
     """Runs in CI, where the ledger is absent: the unknown and mixed rules."""
@@ -631,10 +635,13 @@ def test_version_sync_runs_in_the_lint_block(repo, market, expected_rc):
 @pytest.mark.parametrize("plugins", [
     pytest.param("not a list", id="not-a-list"),
     pytest.param([None, {"name": "probe", "version": "1.0.0"}], id="null-entry"),
+    pytest.param([{"version": "1.0.0", "note": "do-not-echo-42"},
+                  {"name": "probe", "version": "1.0.0"}], id="nameless-entry"),
 ])
 def test_a_malformed_marketplace_fails_the_version_sync(repo, plugins):
     """Exit 2 from the check (a structural error) fails the run too, including
-    a null entry beside a good one."""
+    a bad entry beside a good one. Only positions are reported: an entry's
+    other fields are never echoed."""
     _write_manifests(repo.root, "1.0.0", "1.0.0")
     (repo.root / ".claude-plugin" / "marketplace.json").write_text(
         json.dumps({"plugins": plugins}), encoding="utf-8")
@@ -642,6 +649,7 @@ def test_a_malformed_marketplace_fails_the_version_sync(repo, plugins):
     proc = _preflight(repo)
     assert proc.returncode == 1, proc.stdout[-800:]
     assert "version check failed (exit 2" in proc.stdout
+    assert "do-not-echo-42" not in proc.stdout + proc.stderr
     assert not repo.token.exists()
 
 
