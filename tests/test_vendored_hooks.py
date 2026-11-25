@@ -196,28 +196,35 @@ def _write_bound_token(repo, cwd, **overrides):
 
 
 def _harden_roots():
-    """harden-repo trees that can vouch for a vendored file, newest first.
+    """[(root, released)] for the harden-repo trees that can vouch for a
+    vendored file.
 
-    $OB_HARDEN_REPO_ROOT, then the installed plugin (every cached version and
-    the marketplace clone) and the dev checkout, all under the real home: the
-    tests run with a tmp HOME. A tree counts only with its ledger, its
-    doctor_core.py and its plugin.json."""
+    The roots are searched in a fixed order ($OB_HARDEN_REPO_ROOT, every
+    cached plugin version, the marketplace clone, the dev checkout, all under
+    the real home: the tests run with a tmp HOME) and every root's versions
+    are merged, so order does not matter. A tree counts only with its ledger,
+    its doctor_core.py and its plugin.json.
+
+    `released` is True for the env root and the plugin cache, whose
+    plugin.json version names a release. The marketplace clone and the dev
+    checkout may hold unreleased templates under the next version, so they
+    vouch through their ledger only."""
     home = Path(pwd.getpwuid(os.getuid()).pw_dir)
     candidates = []
     if os.environ.get(HARDEN_ROOT_ENV):
-        candidates.append(Path(os.environ[HARDEN_ROOT_ENV]))
+        candidates.append((Path(os.environ[HARDEN_ROOT_ENV]), True))
     cache = home / ".claude/plugins/cache/harden-repo/repo-hardener"
     if cache.is_dir():
-        candidates.extend(sorted(cache.iterdir()))
-    candidates.append(home / ".claude/plugins/marketplaces/harden-repo")
-    candidates.append(home / "dev/claude_workspace/harden-repo")
+        candidates.extend((path, True) for path in sorted(cache.iterdir()))
+    candidates.append((home / ".claude/plugins/marketplaces/harden-repo", False))
+    candidates.append((home / "dev/claude_workspace/harden-repo", False))
     roots = []
-    for root in candidates:
+    for root, released in candidates:
         if all((root / rel).is_file() for rel in (
                 "skills/harden-repo/data/template-ledger.json",
                 "skills/harden-repo/scripts/doctor_core.py",
                 ".claude-plugin/plugin.json")):
-            roots.append(root)
+            roots.append((root, released))
     return roots
 
 
@@ -237,13 +244,16 @@ def _norm_version(version):
 def _vendored_versions(roots, files):
     """{vendored path: set of harden-repo versions whose bytes it matches}.
 
-    A file matches a version when that tree's ledger records its hash for the
-    template (every release before the tree's own), or when it equals the
-    tree's own template (the tree's release). Hashes come from the tree's
+    `roots` is a list of (root, released) pairs from _harden_roots. A file
+    matches a version when that tree's ledger records its hash for the
+    template (every release before the tree's own), or, in a released tree
+    only, when it equals the tree's own template (the tree's release). An
+    unreleased checkout's plugin.json names the next version, which no
+    release has shipped yet. Hashes come from the tree's
     doctor_core.artifact_hash, which sets marker bodies aside, so
     commit-preflight.sh matches with this repo's LINT and TEST bodies in."""
     found = {rel: set() for rel in files}
-    for index, root in enumerate(roots):
+    for index, (root, released) in enumerate(roots):
         core = _load_doctor_core(root, index)
         ledger = json.loads(
             (root / "skills/harden-repo/data/template-ledger.json").read_text(encoding="utf-8"))
@@ -255,7 +265,7 @@ def _vendored_versions(roots, files):
             for version in (ledger.get(template_rel) or {}).get(digest) or []:
                 found[rel].add(_norm_version(version))
             template = root / template_rel
-            if template.is_file() and digest == core.artifact_hash(
+            if released and template.is_file() and digest == core.artifact_hash(
                     template.read_text(encoding="utf-8")):
                 found[rel].add(own)
     return found
@@ -265,6 +275,18 @@ def _vendored_files():
     return {rel: (ROOT / rel).read_text(encoding="utf-8") for rel in VENDORED}
 
 
+def _assert_one_generation(roots, files):
+    """The two assertions of the generation test: every file matches some
+    release, and one release covers all of them."""
+    found = _vendored_versions(roots, files)
+    unknown = sorted(rel for rel, versions in found.items() if not versions)
+    assert not unknown, (
+        f"{unknown} match no harden-repo release in {[str(r[0]) for r in roots]}; "
+        "re-vendor with doctor.py --fix --safe rather than edit by hand.")
+    shared = set.intersection(*found.values())
+    assert shared, f"the vendored files come from different releases: {found}"
+
+
 def test_vendored_files_are_one_released_generation():
     """#418, #532: the five hooks and commit-preflight.sh are bytes some
     harden-repo release shipped (outside the preflight's marker blocks), and
@@ -272,18 +294,25 @@ def test_vendored_files_are_one_released_generation():
     writes its token elsewhere. Any later release passes once fleet-sync
     applies it: nothing here names a version.
 
-    Needs a harden-repo tree (see _harden_roots). CI has none, so it skips
-    there; a copied ledger would be one more pin to update by hand."""
+    Needs a harden-repo tree (see _harden_roots). CI has none (harden-repo is
+    private), so it skips there; a copied ledger would be one more pin to
+    update by hand. The gap: in CI a hook edited without running the local
+    preflight is caught only by the shared-block test in tests/test_security.py
+    (test_the_shared_blocks_are_identical_in_all_five_hooks) and by
+    test_the_vendored_hooks_compile below. Edits outside the shared blocks
+    that still compile pass CI."""
     roots = _harden_roots()
     if not roots:
         pytest.skip(f"no harden-repo tree found; set {HARDEN_ROOT_ENV}")
-    found = _vendored_versions(roots, _vendored_files())
-    unknown = sorted(rel for rel, versions in found.items() if not versions)
-    assert not unknown, (
-        f"{unknown} match no harden-repo release in {[str(r) for r in roots]}; "
-        "re-vendor with doctor.py --fix --safe rather than edit by hand.")
-    shared = set.intersection(*found.values())
-    assert shared, f"the vendored files come from different releases: {found}"
+    _assert_one_generation(roots, _vendored_files())
+
+
+@pytest.mark.parametrize("rel", sorted(r for r in VENDORED if r.endswith(".py")))
+def test_the_vendored_hooks_compile(rel):
+    """Runs in CI, where the generation test skips: a hook that no longer
+    compiles fails here."""
+    path = ROOT / rel
+    compile(path.read_text(encoding="utf-8"), str(path), "exec")
 
 
 def test_a_local_edit_matches_no_release():
@@ -303,7 +332,9 @@ def test_a_local_edit_matches_no_release():
 
 def test_a_tree_without_the_current_release_fails_not_skips(tmp_path):
     """A harden-repo tree older than the vendored files (a stale plugin
-    cache) must fail the generation test, not skip it."""
+    cache) must fail the generation test's assertions, not skip them. This
+    control skips itself when no stale tree exists on this machine (CI, or
+    every tree already knows the release)."""
     roots = _harden_roots()
     if not roots:
         pytest.skip(f"no harden-repo tree found; set {HARDEN_ROOT_ENV}")
@@ -314,8 +345,33 @@ def test_a_tree_without_the_current_release_fails_not_skips(tmp_path):
              if not set.intersection(*_vendored_versions([r], files).values())]
     if not stale:
         pytest.skip("every harden-repo tree found already knows this release")
-    found = _vendored_versions(stale, files)
-    assert not set.intersection(*found.values())
+    with pytest.raises(AssertionError):
+        _assert_one_generation(stale, files)
+
+
+def test_an_unreleased_checkout_does_not_vouch_for_its_templates(tmp_path):
+    """A dev checkout's plugin.json names the next version; its templates
+    must not credit this repo's files to it. Positive control: the same tree
+    marked released does."""
+    roots = _harden_roots()
+    if not roots:
+        pytest.skip(f"no harden-repo tree found; set {HARDEN_ROOT_ENV}")
+    real = roots[0][0]
+    fake = tmp_path / "harden-fake"
+    for rel in ("skills/harden-repo/scripts/doctor_core.py",
+                "skills/harden-repo/data/template-ledger.json"):
+        (fake / rel).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(real / rel, fake / rel)
+    (fake / ".claude-plugin").mkdir()
+    (fake / ".claude-plugin/plugin.json").write_text(
+        json.dumps({"version": "9.9.9"}), encoding="utf-8")
+    files = _vendored_files()
+    for rel, text in files.items():
+        out = fake / VENDORED[rel]
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(text, encoding="utf-8")
+    assert all("9.9.9" not in v for v in _vendored_versions([(fake, False)], files).values())
+    assert all("9.9.9" in v for v in _vendored_versions([(fake, True)], files).values())
 
 
 def test_worktree_preflight_token_allows_its_own_checkout(repo):

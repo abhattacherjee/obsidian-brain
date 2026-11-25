@@ -92,3 +92,45 @@ def test_a_removed_secret_does_not_block(repo):
     git("add", "app.py")
     proc = _scan(work, env)
     assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+def _shim_env(tmp_path, env, name, body):
+    """Return env with a `name` shim first on PATH. `body` is shell text that
+    may use $REAL (the real binary, found before PATH changes)."""
+    real = shutil.which(name, path=env.get("PATH"))
+    assert real, name
+    shim_dir = tmp_path / f"shim-{name}"
+    shim_dir.mkdir()
+    shim = shim_dir / name
+    shim.write_text(f'#!/bin/bash\nREAL="{real}"\n{body}\n', encoding="utf-8")
+    shim.chmod(0o755)
+    shimmed = dict(env)
+    shimmed["PATH"] = f"{shim_dir}{os.pathsep}{env['PATH']}"
+    return shimmed
+
+
+def test_a_failed_added_line_filter_fails_closed(repo, tmp_path):
+    """`grep '^>'` exiting 2 must not be hidden by the scan's own exit 1 (a
+    pipeline reports the rightmost failure)."""
+    work, env, git = repo
+    (work / "app.py").write_text("print('ok')\n", encoding="utf-8")
+    git("add", "app.py")
+    shimmed = _shim_env(tmp_path, env, "grep",
+                        'for a in "$@"; do case "$a" in -*) continue;; esac\n'
+                        '  if [ "$a" = "^>" ]; then exit 2; fi; break; done\n'
+                        'exec "$REAL" "$@"')
+    proc = _scan(work, shimmed)
+    assert proc.returncode == 1, proc.stdout
+    assert "could not run" in proc.stdout
+
+
+def test_a_failed_staged_diff_fails_closed(repo, tmp_path):
+    work, env, git = repo
+    (work / "app.py").write_text("print('ok')\n", encoding="utf-8")
+    git("add", "app.py")
+    shimmed = _shim_env(tmp_path, env, "git",
+                        'case "$*" in *"diff --cached"*--output-indicator-new*) exit 128;; esac\n'
+                        'exec "$REAL" "$@"')
+    proc = _scan(work, shimmed)
+    assert proc.returncode == 1, proc.stdout
+    assert "Failed to read the staged diff" in proc.stdout

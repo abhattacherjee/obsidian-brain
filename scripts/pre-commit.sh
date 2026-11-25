@@ -24,8 +24,20 @@ fi
 SECRET_PATTERN="(sk-[a-zA-Z0-9_-]{20,}|AKIA[0-9A-Z]{16}|private_key|-----BEGIN.*PRIVATE KEY-----|ghp_[a-zA-Z0-9]{36}|gho_[a-zA-Z0-9]{36}|github_pat_[a-zA-Z0-9_]{82}|xox[bsapr]-[a-zA-Z0-9-]+|password\s*[:=]\s*['\"][^'\"]{8,}|Bearer\s+[A-Za-z0-9._-]{20,}|(token|secret|api_key)\s*[:=]\s*[A-Za-z0-9+/=]{40,})"
 # grep exits 1 for no match and 2 or more when it fails; a failure must not
 # read as "no secret".
-scan_status=0
-printf '%s\n' "$STAGED_DIFF" | grep '^>' | grep -E "$SECRET_PATTERN" >/dev/null || scan_status=$?
+# Two statements, not one pipeline: a pipeline reports the rightmost failure, so
+# a failed `grep '^>'` (2) followed by an empty `grep -E` (1) would read as "no secret".
+added_status=0
+SCAN_ADDED=$(printf '%s\n' "$STAGED_DIFF" | grep '^>') || added_status=$?
+if [ "$added_status" -ge 2 ]; then
+  echo ""
+  echo "❌ ERROR: the secret scan could not run (grep exited $added_status)."
+  exit 1
+fi
+scan_status=1
+if [ -n "$SCAN_ADDED" ]; then
+  scan_status=0
+  printf '%s\n' "$SCAN_ADDED" | grep -E "$SECRET_PATTERN" >/dev/null || scan_status=$?
+fi
 if [ "$scan_status" -ge 2 ]; then
   echo ""
   echo "❌ ERROR: the secret scan could not run (grep exited $scan_status)."

@@ -98,39 +98,79 @@ def _split_draft_gate(expr):
     return expr, None
 
 
+_BAD_GATE_PARTS = ("draft == true", "draft != false",
+                   "!github.event.pull_request.draft == false", "always()", "success()")
+
+
+def _draft_gate_problem(gate):
+    """None for a gate that only skips drafts, else the reason it is not one.
+    A reversed gate (`draft == true`) would skip every ready PR and pass the
+    required check on a skipped run."""
+    flat = " ".join(str(gate).split())
+    if f"{DRAFT_FIELD} == false" not in flat:
+        return f"no `{DRAFT_FIELD} == false` in the gate: {flat}"
+    for part in _BAD_GATE_PARTS:
+        if part in flat:
+            return f"the gate contains `{part}`: {flat}"
+    return None
+
+
 @_REQUIRES_YAML
 def test_aggregator_runs_always_on_pull_requests():
     """The #505 condition stays whole. The draft gate may be ANDed on, but
-    only as a condition on the PR's draft flag."""
+    only as a condition that skips drafts."""
     base, gate = _split_draft_gate(_aggregator(_workflow())["if"])
     assert base == AGGREGATOR_BASE_IF, base
     if gate is not None:
-        assert DRAFT_FIELD in gate, gate
-        assert "always()" not in gate and "success()" not in gate, gate
+        assert _draft_gate_problem(gate) is None, _draft_gate_problem(gate)
+
+
+@_REQUIRES_YAML
+def test_every_draft_gate_only_skips_drafts():
+    """Every gated job, not just the aggregator, gets the same check."""
+    gated = {name: job["if"] for name, job in _workflow()["jobs"].items()
+             if DRAFT_FIELD in str(job.get("if", ""))}
+    if not gated:
+        pytest.skip("no draft gate in ci.yml")
+    for name, expr in gated.items():
+        _, gate = _split_draft_gate(expr)
+        assert gate is not None, (name, expr)
+        assert _draft_gate_problem(gate) is None, (name, _draft_gate_problem(gate))
+
+
+def _ready_trigger_problem(wf):
+    """None when every draft-gated job comes with the READY_TYPES triggers
+    (or no job is gated), else the reason. Every draft-gated job is skipped
+    on a draft, and GitHub counts a skipped required check as passing. Only a
+    run on `ready_for_review` replaces it before the PR can merge."""
+    gated = sorted(name for name, job in wf["jobs"].items()
+                   if DRAFT_FIELD in str(job.get("if", "")))
+    if not gated:
+        return None
+    pull = (_triggers(wf) or {}).get("pull_request") or {}
+    types = set(pull.get("types") or [])
+    if not READY_TYPES <= types:
+        return f"{gated} are draft-gated but pull_request types are {sorted(types)}"
+    return None
 
 
 @_REQUIRES_YAML
 def test_a_draft_gate_comes_with_the_ready_for_review_trigger():
-    """Every draft-gated job is skipped on a draft, and GitHub counts a
-    skipped required check as passing. Only a run on `ready_for_review`
-    replaces it before the PR can merge."""
     wf = _workflow()
-    gated = sorted(name for name, job in wf["jobs"].items()
-                   if DRAFT_FIELD in str(job.get("if", "")))
-    if not gated:
+    if not any(DRAFT_FIELD in str(job.get("if", "")) for job in wf["jobs"].values()):
         pytest.skip("no draft gate in ci.yml")
-    pull = (_triggers(wf) or {}).get("pull_request") or {}
-    types = set(pull.get("types") or [])
-    assert READY_TYPES <= types, (gated, sorted(types))
+    assert _ready_trigger_problem(wf) is None, _ready_trigger_problem(wf)
 
 
 @_REQUIRES_YAML
 def test_a_missing_ready_for_review_is_caught():
-    """Mutation control: drop `ready_for_review` and the check must fail."""
+    """Mutation control: drop `ready_for_review` and the real check must fail."""
     wf = copy.deepcopy(_workflow())
+    if not any(DRAFT_FIELD in str(job.get("if", "")) for job in wf["jobs"].values()):
+        pytest.skip("no draft gate in ci.yml")
     pull = _triggers(wf)["pull_request"]
     pull["types"] = [t for t in pull.get("types") or [] if t != "ready_for_review"]
-    assert not READY_TYPES <= set(pull["types"])
+    assert _ready_trigger_problem(wf) is not None
 
 
 def test_the_draft_gate_split_keeps_the_base():
@@ -142,6 +182,33 @@ def test_the_draft_gate_split_keeps_the_base():
     assert _split_draft_gate(
         "(github.event_name == 'pull_request') && (github.event.pull_request.draft == false)"
     )[0] != AGGREGATOR_BASE_IF
+
+
+REAL_DOCTOR_GATE = "github.event_name != 'pull_request' || github.event.pull_request.draft == false"
+
+
+@pytest.mark.parametrize("gate", [
+    REAL_DOCTOR_GATE,
+    "github.event.pull_request.draft ==\n  false",
+])
+def test_a_draft_gate_that_skips_drafts_is_accepted(gate):
+    assert _draft_gate_problem(gate) is None
+
+
+@pytest.mark.parametrize("gate", [
+    "github.event.pull_request.draft == true",
+    "github.event.pull_request.draft != false",
+    # Each bad part next to the good one: only the part list can reject these.
+    "github.event.pull_request.draft == false || github.event.pull_request.draft == true",
+    "github.event.pull_request.draft == false || github.event.pull_request.draft != false",
+    "github.event_name != 'pull_request' || github.event.pull_request.draft == true",
+    "!github.event.pull_request.draft == false",
+    "always() || github.event.pull_request.draft == false",
+    "success() && github.event.pull_request.draft == false",
+    "github.event_name == 'pull_request'",
+])
+def test_a_reversed_or_widened_draft_gate_is_rejected(gate):
+    assert _draft_gate_problem(gate) is not None
 
 
 @_REQUIRES_YAML
