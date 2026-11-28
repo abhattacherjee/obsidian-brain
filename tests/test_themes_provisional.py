@@ -244,6 +244,26 @@ def test_stats_unassigned_matches_seeder(db):
     assert themes.theme_stats(db)["unassigned"] == len(themes.get_unassigned_notes(db))
 
 
+def test_stats_provisional_count_skips_vectorless_and_member_notes(db):
+    _seed(db, [("counted.md", "provisional", {"x": 1.0}), ("member.md", "provisional", {"x": 1.0})])
+    conn = sqlite3.connect(db)
+    try:
+        for path, vec in (("empty.md", ""), ("null.md", None)):
+            conn.execute("INSERT INTO notes (path, type, mtime, tfidf_vector, status) "
+                         "VALUES (?, 'claude-insight', 1.0, ?, 'provisional')", (path, vec))
+        conn.execute("INSERT INTO themes (name, summary, centroid, note_count, created_date, updated_date, project) "
+                     "VALUES ('t', 's', '{}', 1, '2026-10-20', '2026-10-20', 'proj')")
+        tid = conn.execute("SELECT id FROM themes WHERE name='t'").fetchone()[0]
+        conn.execute("INSERT INTO theme_members (theme_id, note_path, similarity, surprise, added_date) "
+                     "VALUES (?, 'member.md', 1.0, 0.0, '2026-10-20')", (tid,))
+        conn.commit()
+    finally:
+        conn.close()
+    stats = themes.theme_stats(db)
+    assert stats["provisional_unassigned"] == 1
+    assert stats["unassigned"] == 0
+
+
 def test_stats_nudge_ignores_provisional(db, monkeypatch, capsys):
     monkeypatch.setattr(consolidate_cli, "load_config", lambda: {
         "vault_path": db, "consolidate_unassigned_threshold": 1})
@@ -257,4 +277,4 @@ def test_stats_nudge_ignores_provisional(db, monkeypatch, capsys):
 
     _seed(db, [("another.md", None, {"x": 1.0})])
     consolidate_cli.run_stats()
-    assert any(line.startswith("NUDGE unassigned=2") for line in capsys.readouterr().out.splitlines())
+    assert "NUDGE unassigned=2 exceeds 1; run /consolidate" in capsys.readouterr().out.splitlines()

@@ -119,7 +119,7 @@ def test_stats_reports_counts(db, capsys):
     consolidate_cli.run_stats()
     out = capsys.readouterr().out
     assert "THEMES=1" in out
-    assert "UNASSIGNED=1" in out  # u.md never clustered
+    assert "UNASSIGNED=1" in out.splitlines()  # u.md never clustered
 
 
 def test_merge_combines_members_and_drops_second(db):
@@ -434,7 +434,8 @@ def test_main_config_valueerror_is_not_a_usage_error(monkeypatch):
 
 def test_main_stats_prints_real_output(db, capsys):
     assert consolidate_cli.main(["stats"]) == 0
-    assert "UNASSIGNED=" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert any(l.startswith("UNASSIGNED=") for l in out.splitlines())
 
 
 def test_direct_run_is_not_a_silent_noop():
@@ -519,4 +520,4 @@ def test_direct_run_valid_command_exits_0(tmp_vault, tmp_path):
     proc = subprocess.run([sys.executable, script, "stats"], capture_output=True, text=True,
                           stdin=subprocess.DEVNULL, timeout=60, env=env)
     assert proc.returncode == 0, proc.stderr
-    assert "UNASSIGNED=" in proc.stdout
+    assert any(l.startswith("UNASSIGNED=") for l in proc.stdout.splitlines())
