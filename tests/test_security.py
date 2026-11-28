@@ -2509,7 +2509,8 @@ class TestDecisionTimeIsBounded:
     # label -> command. Chosen to stress the three shapes rounds 1-3 each
     # found a fail-open or a blowup in: unbalanced quotes (CRIT-3), a long
     # run of global-option tokens (more `_GLOBAL_OPTS` iterations), and an
-    # argument near the stdin cap (`_push_invocations`'s `_SHLEX_MAX` path).
+    # argument near the stdin cap (the old hook sent it down a `_SHLEX_MAX`
+    # shortcut; v1.5.0 splits it with `_split_posix`).
     ADVERSARIAL_INPUTS = {
         "2000 unbalanced double-quotes":
             "git -a " + '"' * 2000 + " x",
@@ -3656,15 +3657,14 @@ class TestProtectedBranchDeletionIsBlocked:
         # every quoted token".
         ("singly-quoted release ref still stands down",
          f"{PUSH} --delete origin 'release/x'", "allow"),
-        # `_push_invocations` skips `shlex` for an argument string past
-        # `_SHLEX_MAX` (it is quadratic in a single token's length). That
-        # shortcut must not become a way to hide a ref: the whitespace split
-        # keeps the quotes on, and `_bare_ref` is what takes them off again.
+        # These two rows date from the old hook, which skipped `shlex` past
+        # `_SHLEX_MAX` (100,000 characters). v1.5.0 splits both sizes with
+        # `_split_posix`, so the rows now check that a quoted protected ref is
+        # still denied at both sizes.
         ("quoted protected ref past the shlex bound",
          f"{PUSH} --delete origin release/x " + "b" * 100_001 + f' "{MAIN}"',
          "deny"),
-        # The same shape under the bound, which DOES go through shlex — so the
-        # row above is testing the shortcut rather than just the ref matcher.
+        # The same shape at a small size (see the note above).
         ("quoted protected ref under the shlex bound",
          f"{PUSH} --delete origin release/x " + "b" * 10 + f' "{MAIN}"',
          "deny"),
@@ -3775,20 +3775,25 @@ class TestProtectedBranchDeletionIsBlocked:
             work, env, "prevent-direct-push", command)
         assert got == expected, f"{label}: expected {expected}, got {got}"
 
+    # The bar on one hook run of the 900 KB command, in seconds. On a laptop
+    # the hook takes ~0.7 s with its linear splitter and ~6.1 s with
+    # `shlex.split` swapped in. CI runs this test alone in timed-tests (#531).
+    STALL_BOUND_S = 3.0
+
     def test_a_large_command_does_not_stall_the_gate(self, tmp_path):
-        """`shlex` is quadratic in the length of a single argument.
+        """A ~900 KB argument must not stall the push gate.
 
-        This hook runs before EVERY Bash tool call, and the payload cap
-        upstream is 1 MB. Handing `shlex` a ~900 KB argument took 5.6s, against
-        0.03s for the same command on `develop` — measured, a ~185x regression
-        introduced by the delete gate itself. `_push_invocations` now skips
-        `shlex` past `_SHLEX_MAX`, which brought it back to 0.04s.
+        `shlex.split` is quadratic in the length of one argument. This hook
+        runs before every Bash call and reads up to 1 MB. The v1.5.0 hook
+        splits with `_split_posix`, which gives the same result as
+        `shlex.split` in linear time (harden-repo #97).
 
-        The bound is generous on purpose: it sits far below the 5.6s the
-        unfixed path took, and far above the ~0.04s the fixed one does, so it
-        catches the regression without going flaky on a loaded CI runner. The
-        verdict is asserted alongside the timing — a fast ALLOW would be the
-        worst possible way to pass this test.
+        Measured on a laptop: 0.7 s for this command with `_split_posix`, and
+        6.1 s with `shlex.split` swapped in. The bar is `STALL_BOUND_S`.
+        Under xdist on CI the run took 1.2-2.4 s, and twice 5-5.7 s next to
+        busy workers, so CI runs this test alone in timed-tests (#531).
+
+        The verdict is asserted on every run: a fast ALLOW must fail.
         """
         work, env = TestHookBlockingPathsFire._repo(tmp_path)
         self._stall_gate(work, env)
@@ -3801,9 +3806,9 @@ class TestProtectedBranchDeletionIsBlocked:
             _fail_timing(miss)
 
     def _large_command_stall(self, work, env):
-        """One timed run of the 900 KB command: None when it is under the
-        3.0 s bound, else why not. The verdict is asserted on every run and
-        never retried -- a fast ALLOW is a failure, not noise."""
+        """One timed run of the 900 KB command: None when it is under
+        `STALL_BOUND_S`, else why not. The verdict is asserted on every run
+        and never retried -- a fast ALLOW is a failure, not noise."""
         command = (f"{self.PUSH} --delete origin release/x "
                    + "b" * 900_000 + f" {self.MAIN}")
         started = time.monotonic()
@@ -3811,16 +3816,19 @@ class TestProtectedBranchDeletionIsBlocked:
             work, env, "prevent-direct-push", command)
         elapsed = time.monotonic() - started
         assert got == "deny", f"a 900 KB command must still deny, got {got}"
-        if elapsed < 3.0:
+        if elapsed < self.STALL_BOUND_S:
             return None
         return _TimingMiss(
-            f"the gate took {elapsed:.2f}s on a 900 KB command; the quadratic "
-            f"shlex path is back (it measured 5.6s, the fixed path 0.04s)",
-            elapsed / 3.0)
+            f"the gate took {elapsed:.2f}s on a 900 KB command, over the "
+            f"{self.STALL_BOUND_S:.1f}s bar; the linear splitter "
+            f"(_split_posix) takes ~0.7s on a laptop and shlex.split ~6.1s, "
+            f"so a quadratic split is the likely cause",
+            elapsed / self.STALL_BOUND_S)
 
     def test_a_gate_that_really_stalls_still_fails(self, tmp_path, monkeypatch):
         """The negative control on the retry (#437): a hook with a planted
-        3.5 s stall misses the 3.0 s bound on both runs, so the retry cannot
+        stall half a second over ``STALL_BOUND_S`` misses the bar on both
+        runs, so the retry cannot
         turn a real regression into a pass. It goes through ``_stall_gate``,
         the same path the real test takes, so deleting the failure call there
         turns this red."""
@@ -3830,7 +3838,9 @@ class TestProtectedBranchDeletionIsBlocked:
         anchor = "input_data, _input_problem = _read_hook_input()"
         assert src.count(anchor) == 1, "the plant's anchor line moved"
         hook.write_text(src.replace(
-            anchor, "import time as _t; _t.sleep(3.5)\n" + anchor),
+            anchor,
+            f"import time as _t; _t.sleep({self.STALL_BOUND_S + 0.5})\n"
+            + anchor),
             encoding="utf-8")
         monkeypatch.setenv("CI", "true")
         calls = []

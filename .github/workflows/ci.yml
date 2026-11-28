@@ -25,9 +25,13 @@ env:
   # Space-separated pytest node ids; none may contain a space or a glob.
   # The lessons speed test is here because under xdist it took 20.8 s of its
   # 30 s CI budget (1.4 s alone on a laptop).
+  # The 900 KB stall test is here because under xdist it took 1.2-2.4 s on
+  # passing runs and 5-5.7 s on PR #529's two failing runs, against its
+  # 3.0 s bar. It takes about 0.7 s on a laptop (#531).
   TIMED_TESTS: >-
     tests/test_security.py::TestDecisionTimeIsBounded
     tests/test_lessons_corpus.py::test_top_candidates_speed_4000_items
+    tests/test_security.py::TestProtectedBranchDeletionIsBlocked::test_a_large_command_does_not_stall_the_gate
 
 jobs:
   # ── Secret scan — runs on all PRs ──────────────────────────
@@ -173,7 +177,7 @@ jobs:
           # An empty @file makes pytest collect the whole suite, so stop.
           test -s "$shard_ids"
           echo "shard $SHARD: $(wc -l < "$shard_ids") of $(grep -c '::' "$ids") tests"
-          pytest "@$shard_ids" -q --tb=short --durations=15
+          pytest "@$shard_ids" -q --tb=short --durations=0 --durations-min=0.1
         env:
           SHARD: ${{ matrix.shard }}
 
