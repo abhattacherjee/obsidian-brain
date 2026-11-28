@@ -3658,7 +3658,7 @@ class TestProtectedBranchDeletionIsBlocked:
         ("singly-quoted release ref still stands down",
          f"{PUSH} --delete origin 'release/x'", "allow"),
         # These two rows date from the old hook, which skipped `shlex` past
-        # `_SHLEX_MAX` (100,000 bytes). v1.5.0 splits both sizes with
+        # `_SHLEX_MAX` (100,000 characters). v1.5.0 splits both sizes with
         # `_split_posix`, so the rows now check that a quoted protected ref is
         # still denied at both sizes.
         ("quoted protected ref past the shlex bound",

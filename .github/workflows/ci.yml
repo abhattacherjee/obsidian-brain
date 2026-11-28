@@ -177,7 +177,7 @@ jobs:
           # An empty @file makes pytest collect the whole suite, so stop.
           test -s "$shard_ids"
           echo "shard $SHARD: $(wc -l < "$shard_ids") of $(grep -c '::' "$ids") tests"
-          pytest "@$shard_ids" -q --tb=short --durations=0 --durations-min=0.5
+          pytest "@$shard_ids" -q --tb=short --durations=0 --durations-min=0.1
         env:
           SHARD: ${{ matrix.shard }}
 
