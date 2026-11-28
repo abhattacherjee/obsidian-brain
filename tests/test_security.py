@@ -2509,7 +2509,8 @@ class TestDecisionTimeIsBounded:
     # label -> command. Chosen to stress the three shapes rounds 1-3 each
     # found a fail-open or a blowup in: unbalanced quotes (CRIT-3), a long
     # run of global-option tokens (more `_GLOBAL_OPTS` iterations), and an
-    # argument near the stdin cap (`_push_invocations`'s `_SHLEX_MAX` path).
+    # argument near the stdin cap (the old hook sent it down a `_SHLEX_MAX`
+    # shortcut; v1.5.0 splits it with `_split_posix`).
     ADVERSARIAL_INPUTS = {
         "2000 unbalanced double-quotes":
             "git -a " + '"' * 2000 + " x",
@@ -3656,15 +3657,14 @@ class TestProtectedBranchDeletionIsBlocked:
         # every quoted token".
         ("singly-quoted release ref still stands down",
          f"{PUSH} --delete origin 'release/x'", "allow"),
-        # `_push_invocations` skips `shlex` for an argument string past
-        # `_SHLEX_MAX` (it is quadratic in a single token's length). That
-        # shortcut must not become a way to hide a ref: the whitespace split
-        # keeps the quotes on, and `_bare_ref` is what takes them off again.
+        # These two rows date from the old hook, which skipped `shlex` past
+        # `_SHLEX_MAX` (100,000 bytes). v1.5.0 splits both sizes with
+        # `_split_posix`, so the rows now check that a quoted protected ref is
+        # still denied at both sizes.
         ("quoted protected ref past the shlex bound",
          f"{PUSH} --delete origin release/x " + "b" * 100_001 + f' "{MAIN}"',
          "deny"),
-        # The same shape under the bound, which DOES go through shlex — so the
-        # row above is testing the shortcut rather than just the ref matcher.
+        # The same shape at a small size (see the note above).
         ("quoted protected ref under the shlex bound",
          f"{PUSH} --delete origin release/x " + "b" * 10 + f' "{MAIN}"',
          "deny"),
