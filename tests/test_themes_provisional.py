@@ -221,3 +221,40 @@ def test_an_error_after_the_prune_rolls_it_back_and_exits_1(db, monkeypatch):
     assert exc.value.code == 1
     assert calls == [1]
     assert _members(db) == ["a.md", "b.md", "p.md"]  # rolled back: no half-pruned state, no new theme
+
+
+def test_stats_leaves_provisional_out_of_unassigned(db):
+    _seed(db, [("eligible.md", None, {"x": 1.0})])
+    _seed(db, [(f"prov-{i}.md", status, {"x": 1.0}) for i, status in enumerate(PROVISIONAL)])
+    stats = themes.theme_stats(db)
+    assert stats["unassigned"] == 1
+    assert stats["provisional_unassigned"] == len(PROVISIONAL)
+
+
+def test_stats_unassigned_matches_seeder(db):
+    _seed(db, [("eligible.md", None, {"x": 1.0}), ("promoted.md", "promoted", {"x": 1.0})])
+    _seed(db, [(f"prov-{i}.md", status, {"x": 1.0}) for i, status in enumerate(PROVISIONAL)])
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute("INSERT INTO notes (path, type, mtime, tfidf_vector) "
+                     "VALUES ('empty.md', 'claude-insight', 1.0, '')")
+        conn.commit()
+    finally:
+        conn.close()
+    assert themes.theme_stats(db)["unassigned"] == len(themes.get_unassigned_notes(db))
+
+
+def test_stats_nudge_ignores_provisional(db, monkeypatch, capsys):
+    monkeypatch.setattr(consolidate_cli, "load_config", lambda: {
+        "vault_path": db, "consolidate_unassigned_threshold": 1})
+    _seed(db, [("eligible.md", None, {"x": 1.0})])
+    _seed(db, [(f"prov-{i}.md", status, {"x": 1.0}) for i, status in enumerate(PROVISIONAL[:3])])
+    consolidate_cli.run_stats()
+    out = capsys.readouterr().out
+    assert "UNASSIGNED=1" in out.splitlines()
+    assert "PROVISIONAL_UNASSIGNED=3" in out.splitlines()
+    assert "NUDGE" not in out
+
+    _seed(db, [("another.md", None, {"x": 1.0})])
+    consolidate_cli.run_stats()
+    assert any(line.startswith("NUDGE unassigned=2") for line in capsys.readouterr().out.splitlines())

@@ -125,6 +125,7 @@ def run_stats() -> None:
         print(f"THEMES={st['themes']}")
         print(f"MEMBERS={st['members']}")
         print(f"UNASSIGNED={st['unassigned']}")
+        print(f"PROVISIONAL_UNASSIGNED={st['provisional_unassigned']}")
         for t in st["largest"]:
             print(f"LARGEST id={t['id']} count={t['note_count']} name={t['name']}")
         nudge = int(config.get("consolidate_unassigned_threshold", 50))

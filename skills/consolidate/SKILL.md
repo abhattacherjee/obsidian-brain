@@ -93,7 +93,7 @@ from consolidate_cli import run_stats; run_stats()
 '
 ```
 
-Present `THEMES=`, `MEMBERS=`, `UNASSIGNED=`, the `LARGEST` rows, and any `NUDGE`.
+Present `THEMES=`, `MEMBERS=`, `UNASSIGNED=` (notes `/consolidate` can place), `PROVISIONAL_UNASSIGNED=` (provisional notes it skips until they are promoted), the `LARGEST` rows, and any `NUDGE`.
 
 ### Step 4 — Split
 

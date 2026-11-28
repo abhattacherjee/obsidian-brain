@@ -487,15 +487,26 @@ def detect_surprise(
 
 
 def theme_stats(db_path: str) -> dict:
-    """Read-only counts for /consolidate stats."""
-    from vault_index import _connect
+    """Read-only counts for /consolidate stats.
+
+    "unassigned" counts only notes the seeder can place, leaving provisional notes
+    out (#458/#535). "provisional_unassigned" counts the rest of the unassigned
+    notes with non-empty vectors.
+    """
+    from vault_index import _connect, NOT_PROVISIONAL_SQL
     conn = _connect(db_path)
     try:
         themes_n = conn.execute("SELECT COUNT(*) FROM themes").fetchone()[0]
         members_n = conn.execute("SELECT COUNT(*) FROM theme_members").fetchone()[0]
-        unassigned_n = conn.execute(
+        unassigned_sql = (
             "SELECT COUNT(*) FROM notes n LEFT JOIN theme_members m ON n.path = m.note_path "
             "WHERE m.note_path IS NULL AND n.tfidf_vector IS NOT NULL AND n.tfidf_vector != ''"
+        )
+        unassigned_n = conn.execute(
+            unassigned_sql + f" AND {NOT_PROVISIONAL_SQL.format(p='n.')}"
+        ).fetchone()[0]
+        provisional_unassigned_n = conn.execute(
+            unassigned_sql + f" AND NOT {NOT_PROVISIONAL_SQL.format(p='n.')}"
         ).fetchone()[0]
         largest = conn.execute(
             "SELECT id, name, note_count FROM themes ORDER BY note_count DESC, id LIMIT 5"
@@ -503,6 +514,7 @@ def theme_stats(db_path: str) -> dict:
     finally:
         conn.close()
     return {"themes": themes_n, "members": members_n, "unassigned": unassigned_n,
+            "provisional_unassigned": provisional_unassigned_n,
             "largest": [{"id": r[0], "name": r[1], "note_count": r[2]} for r in largest]}
 
 
